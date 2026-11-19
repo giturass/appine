@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: host shared-storage mounts and preserved /sdcard aliases)
 
 ## Responsibilities
 
@@ -80,7 +80,7 @@ Outside the module:
   `mount_ns`, `is_point_in`, `mount_nodes` (every attached and detached mount's root and point,
   which the FUSE and overlay node sweeps keep), `mount_events` (the counter polled through mounts
   and mountinfo).
-- **Changes**: `clone_mount`, `attach_tree`, `add_mount`, `add_copies`, `move_mount`,
+- **Changes**: `mount_shared_storage`, `clone_mount`, `attach_tree`, `add_mount`, `add_copies`, `move_mount`,
   `set_root_at`, `remove_mount`, `umount_tree`, `propagation_targets`, `propagate`,
   `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
@@ -121,6 +121,15 @@ Outside the module:
   device, and a cgroup2 mount is rooted at the caller's cgroup-namespace root. Superblock flags
   and mqueue device entries of dead instances are never pruned (device numbers only grow, so they
   are never reused).
+- Optional host storage is attached after `Vfs::open` by `Machine::mount_shared_storage`. A store
+  transaction creates missing `/storage/emulated/0` directories and mounts one in-process FUSE
+  instance there, with source `shared_storage`, nosuid, nodev, noexec and relatime, a writable
+  superblock and the initial instance owner. A missing `/sdcard` becomes a symlink to the canonical
+  path; an existing directory gets a second mount of the same instance, preserving its covered
+  store data; an existing symlink must resolve to the canonical directory, and other entries fail.
+  The host root is opened lazily, so missing Android permission does not prevent startup. The
+  attachment runs once, reports EBUSY on a duplicate and invalidates the fast resolver through its
+  Machine caller. These ordinary mounts participate in namespace copies, binds and collection.
 - Every change calls `mounts_changed`, which bumps the mount event counter polled through mounts
   and mountinfo (`kernel/procfs`; one counter for all namespaces) and makes `kernel/vfs`'s no-BKL
   resolver rebuild its mount points; the fast path's own epoch (`fast_changed`) is bumped by the
@@ -291,6 +300,7 @@ Outside the module:
 
 ### Inbound
 
+- `kernel/boot`: `Machine::mount_shared_storage` attaches host storage before guest boot/spawn.
 - The syscall dispatcher (the mount syscalls; collection at syscall end).
 - `kernel/ns`:
   - clone and unshare with `CLONE_NEWNS` (`copy_ns`);
@@ -334,7 +344,7 @@ Outside the module:
   - `Kernel::mount_max`;
   - every task's root and cwd (`in_use`, pivot_root's rewrite).
 - `kernel/cred`: `capable_wrt` over namespace owners, and `CAP_SYS_ADMIN`/`CAP_SYS_CHROOT`.
-- `kernel/fuse`: FUSE mount options and connections, and their abort at collection.
+- `kernel/fuse`: FUSE mount options and connections, its host shared-storage server and abort at collection.
 - `kernel/ipc`: the IPC namespace that an mqueue mount shows.
 
 ## Invariants and gotchas

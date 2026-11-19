@@ -1,11 +1,11 @@
 # android/build Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/build.md` for the paired decision history (not yet created; pre-split decisions D2–D7, D10, D12–D14, D20–D22, D24–D26 and D28 stay in `.agents/decisions/android/native.md`).
+> See `.agents/decisions/android/build.md` for the paired decision history; pre-split decisions D2–D7, D10, D12–D14, D20–D22, D24–D26 and D28 stay in `.agents/decisions/android/native.md`.
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: release shrinking, JNI keep rules and the Android release Cargo profile)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: restore signed release packaging and artifact verification in GitHub Actions)
 
 ## Responsibilities
 
@@ -34,10 +34,12 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Public entry points
 
-- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `assembleRelease` (the optimized APK), `connectedDebugAndroidTest` (with
+- Build: `./gradlew assembleDebug lintDebug` (what ordinary CI runs), `assembleRelease` (the optimized intermediate APK), `connectedDebugAndroidTest` (with
   `-Pandroid.testInstrumentationRunnerArguments.network=true` for the download of a distribution),
   `scripts/fetch-ghostty [dir]` (default `target/ghostty`), `scripts/release-sources [dir]` (default
   `target/release-sources`).
+- Distributed release: the manual `release.yml` workflow (`harness`), with optional `source_sha`
+  naming a full lowercase commit SHA; its artifact includes the signed APK and matching R8 mapping.
 
 ## Data flow / lifecycle
 
@@ -97,11 +99,18 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: signed with the debug key, versionCode 1 and versionName 1.0.0. R8 uses the
+- Release: Gradle's intermediate APK is signed with the debug key, versionCode 1 and versionName
+  1.0.0. `harness`'s release workflow builds and lints the requested source revision, then aligns
+  and signs the distribution APK with the established Appine PKCS12 key through SDK `apksigner`.
+  Passwords stay out of Gradle, and the workflow disables its configuration cache. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
   JNI declarations and the public void `VtSession.on*` callbacks looked up by the native pump;
   callbacks outside that pattern need a matching keep rule. The release mapping is under
   `app/build/outputs/mapping/release/`.
+  The final `appine-release-<full SHA>` artifact includes the APK, SHA-256 checksum, source SHA,
+  matching mapping and structural verification JSON. Verification pins the Appine certificate
+  and checks metadata, assets, JNI and the shared-storage `Native.start` descriptor, plus native
+  ELF/ZIP alignment; it neither installs the APK nor publishes a GitHub release.
 
 ### Notices
 
@@ -152,7 +161,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   documents provider, backup turned off (`allowBackup`, `fullBackupContent`, data extraction
   rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` and Settings can request at run time,
   and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the terminal banner’s user-initiated system dialog.
-  The app requests no storage permission. The debug source set's network security config allows cleartext to
+  `MANAGE_EXTERNAL_STORAGE` supports Settings' explicit all-files access action and direct
+  shared-storage file commands, with a targeted `ScopedStorage` lint suppression.
+  The debug source set's network security config allows cleartext to
   127.0.0.1 only (for the download tests).
 
 ### Released sources
@@ -183,7 +194,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ### Inbound
 
-- CI (`harness`) runs `assembleDebug lintDebug` and cargo-ndk clippy.
+- Ordinary CI (`harness`) runs `assembleDebug lintDebug` and cargo-ndk clippy; the manual release
+  workflow runs `assembleRelease lintRelease` before signing and verifying its artifacts.
 - `android/native` and `android/vtcore` require the native build; `android/tests` uses the debug
   app and instrumentation runner. `android/setup` reads assets and `BuildConfig`;
   `android/licenses` reads static notice assets.
@@ -210,14 +222,18 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   for Kitty graphics.
 - The K2 compiler reports unused variables and never-read assignments only with its extra
   warnings, which are off: they flag a variable read only by a local function as never read.
+- All-files access uses Android's special access settings rather than a runtime permission
+  dialog; other apps' `Android/data` directories remain protected by Android.
+- Only the release workflow's final artifact has the pinned Appine release signature;
+  Gradle's APK remains an intermediate. Preserve the established key and update the verifier's
+  pinned package/SDK/JNI contracts when their corresponding source declarations change.
 - `release-sources` relies on `fetch-ghostty` printing `fetch-ghostty: <source>` with the two
   tarballs at `<source>.tar.gz` and `<source>-deps.tar.gz`, and on `fetch-rootfs` printing the
   bundled packages' paths (ending in `.apk`) and the tarball's path last.
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key; the Alpine tarball's checksum
-  is checked only in `scripts/fetch-rootfs`.
+- The Alpine tarball's checksum is checked only in `scripts/fetch-rootfs`.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
 - `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball and
@@ -227,4 +243,12 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Open questions
 
-- Is the release variant meant to ship as configured?
+None.
+
+## To verify
+
+- Shared-storage resources compiled with aapt2 and the manifest parsed successfully. Kotlin
+  compilation and lint remain unverified without a configured Android SDK; Android device
+  authorization and vendor settings navigation also remain unverified.
+- The restored release workflow has not run on GitHub with the current source changes;
+  certificate, source-revision and packaging checks against a new cloud-built APK remain pending.

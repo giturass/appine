@@ -1,5 +1,6 @@
 package io.github.mthli.appine
 
+import android.os.Environment
 import java.io.IOException
 
 /**
@@ -131,10 +132,18 @@ internal object Native {
     @JvmStatic
     external fun browseWritten(store: String, top: String, path: String)
 
-    /** Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT. */
+    /**
+     * Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT. [sharedStorage] is mounted
+     * at /storage/emulated/0 and /sdcard; null disables it for isolated tests.
+     */
     @JvmStatic
     @Throws(IOException::class)
-    external fun start(store: String, tier: Int): Long
+    @Suppress("DEPRECATION")
+    external fun start(
+        store: String,
+        tier: Int,
+        sharedStorage: String? = Environment.getExternalStorageDirectory().absolutePath,
+    ): Long
 
     /**
      * Boots by `/etc/inittab` (the kernel/process map; OpenRC on Alpine): blocks until the sysinit

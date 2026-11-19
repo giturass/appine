@@ -162,6 +162,12 @@
 
     <string name="privacy_notification">Appine의 잠금을 해제하여 터미널 보기</string>
 
+    <!-- Shared storage access -->
+    <string name="settings_shared_storage">공유 저장소 접근</string>
+    <string name="shared_storage_on">/sdcard 및 /storage/emulated/0 읽기 및 쓰기 가능, 탭하여 권한 관리</string>
+    <string name="shared_storage_off">Linux 프로그램의 공유 저장소 읽기 및 쓰기, 모든 파일 접근 권한 필요</string>
+    <string name="shared_storage_no_app">공유 저장소 설정을 열 수 없습니다</string>
+
     <!-- File access and document roots -->
     <string name="settings_file_access">다른 앱의 파일 접근 허용</string>
     <string name="file_access_summary">HOME 디렉터리는 읽기 및 쓰기 가능, 나머지는 읽기 전용</string>

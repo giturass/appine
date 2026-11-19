@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: stronger contrast between selected and ordinary terminal controls)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: five-locale shared-storage permission labels and summaries)
 
 ## Responsibilities
 
@@ -89,6 +89,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   non-translatable resources and use only `other` for plurals. There is no in-app picker;
   Android 11–12 keep following the system language. Locale changes use
   normal activity recreation and the existing service-current tab fallback below.
+  All five locales include the shared-storage permission action's title, granted/required
+  summaries and missing-settings feedback; the action itself belongs to android/setup.
 - `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
   dynamic colours or views read resources. The terminal's night-qualified resources therefore
   match its fixed dark theme; other configuration fields and other activities remain independent.
@@ -387,6 +389,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Shared-storage copy passed aapt2 compilation and key/placeholder checks in all five locales;
+  device wrapping and native-speaker review remain unverified.
 
 - Control contrast passes debug assembly and lint. Device checks remain for wallpaper palettes,
   small-label readability and selected/ordinary/locked states; indicator geometry is unchanged.

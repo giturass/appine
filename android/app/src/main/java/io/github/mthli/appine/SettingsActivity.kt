@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.IBinder
 import android.view.View
 import android.widget.Toast
@@ -37,6 +38,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
 import java.io.IOException
 import kotlin.concurrent.thread
+import android.provider.Settings as SystemSettings
 
 /** Material 3 frame for the standard AndroidX settings list. */
 internal class SettingsActivity : AppCompatActivity(), Privacy.Listener, Privacy.ExportListener {
@@ -115,6 +117,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
     private lateinit var batteryUsage: Preference
     private lateinit var notifications: Preference
+    private lateinit var sharedStorage: Preference
     private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         updatePermissionActions()
     }
@@ -171,6 +174,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         batteryUsage = action(R.string.settings_battery_usage) {
             BatteryOptimization.openAppSettings(requireActivity())
         }.apply { setSummary(R.string.battery_prompt) }
+        sharedStorage = action(R.string.settings_shared_storage) { openSharedStorageSettings() }
         updatePermissionActions()
         runPolicy = choice(R.string.settings_run_policy) { s, value ->
             s.setRunPolicy(RunPolicy.entries.first { it.value == value })
@@ -214,7 +218,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, fileAccess)
+        group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, sharedStorage, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
         group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, telegram, project, privacyPolicy, licenses, version)
@@ -264,6 +268,20 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun updatePermissionActions() {
         notifications.isVisible = !NotificationPermission.enabled(requireContext())
         batteryUsage.isVisible = !BatteryOptimization.isExempt(requireContext())
+        sharedStorage.setSummary(if (Environment.isExternalStorageManager()) R.string.shared_storage_on else R.string.shared_storage_off)
+    }
+
+    private fun openSharedStorageSettings() {
+        if (Privacy.locked(requireContext())) return
+        try {
+            requireActivity().openPackageSettings(SystemSettings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        } catch (_: ActivityNotFoundException) {
+            try {
+                startActivity(Intent(SystemSettings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            } catch (_: ActivityNotFoundException) {
+                Toast.makeText(requireContext(), R.string.shared_storage_no_app, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun chooseLogExport() {

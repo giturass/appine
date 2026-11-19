@@ -164,6 +164,12 @@
 
     <string name="privacy_notification">Unlock Appine to view the terminal</string>
 
+    <!-- Shared storage access -->
+    <string name="settings_shared_storage">Shared storage access</string>
+    <string name="shared_storage_on">Read and write /sdcard and /storage/emulated/0, tap to manage access</string>
+    <string name="shared_storage_off">Allow Linux programs to read and write shared storage, requires all files access</string>
+    <string name="shared_storage_no_app">Cannot open shared storage settings</string>
+
     <!-- File access and document roots -->
     <string name="settings_file_access">Allow other apps to access files</string>
     <string name="file_access_summary">HOME directory is writable, others are read-only</string>

@@ -530,7 +530,8 @@ pub(super) fn write(
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
     // As fcntl may have changed it since the open
-    let append = file.borrow().flags & oflags::O_APPEND != 0;
+    let flags = file.borrow().flags;
+    let append = flags & oflags::O_APPEND != 0;
     let offset = if io.stream { Some(0) } else { offset };
     let start = take_pos(cx, file, offset)?;
     let vfs = cx.vfs()?;
@@ -547,7 +548,7 @@ pub(super) fn write(
         };
         // RLIMIT_FSIZE, as generic_write_checks applies it
         let data = &data[..super::fs::fsize_room(cx, at, data.len())?];
-        let n = fuse::write(cx, io.handle(), at, data)?;
+        let n = fuse::write(cx, (&io.conn, io.nodeid, io.fh, flags), at, data)?;
         vfs.fuse_mut().stale(io.id);
         Ok((n, at))
     })();

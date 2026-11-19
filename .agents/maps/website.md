@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (three source-research concerns and nine independently checked claims; static checks passed, external release and visual checks remain below)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: documented the Settings About policy link and removed the missing-entry debt)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional guest shared-storage permission and Android restrictions in the policy)
 
 ## Responsibilities
 
@@ -56,6 +56,9 @@ The ten policy sections cover local processing, diagnostics and support, network
 destinations, Android permissions, security, retention/deletion, choices, changes
 and contact. The policy distinguishes automatic mirror probes, local diagnostics,
 user-directed sharing and network traffic from guest programs.
+The permissions section describes optional all-files access for guest `/sdcard` and
+`/storage/emulated/0` paths, preserves Android's remaining storage restrictions and
+separately explains the default-off DocumentsProvider consent.
 
 ## Dependencies (inbound / outbound)
 
@@ -63,6 +66,7 @@ user-directed sharing and network traffic from guest programs.
 
 - `android/build`: source/merged permissions, dependencies and backup exclusions.
 - `android/setup`: mirrors, system downloads, repository protocols and Settings.
+- `android/native`: guest shared-storage mount paths.
 - `android/service`: diagnostics, terminal restoration and background execution.
 - `android/privacy`, `android/documents`, `android/file-import`, `android/terminal`:
   authentication, file grants, selected imports and clipboard interactions.
@@ -111,6 +115,10 @@ None currently recorded.
   release's Data safety declarations?
 
 ## To verify
+
+- The shared-storage wording passed HTML structure and source-coverage checks. The final
+  release manifest, Android authorization/revocation and direct shared-storage access remain
+  unverified for this permission; the updated page requires a separate deployment.
 
 - Production HTTP access without sign-in was checked from the deployment environment;
   accessibility from other regions, the Play Console policy URL and final Data safety

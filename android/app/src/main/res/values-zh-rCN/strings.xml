@@ -162,6 +162,12 @@
 
     <string name="privacy_notification">解锁 Appine 后查看终端</string>
 
+    <!-- Shared storage access -->
+    <string name="settings_shared_storage">访问共享存储</string>
+    <string name="shared_storage_on">读写 /sdcard 和 /storage/emulated/0，点按管理权限</string>
+    <string name="shared_storage_off">允许 Linux 程序读写共享存储，需要所有文件访问权限</string>
+    <string name="shared_storage_no_app">无法打开共享存储设置</string>
+
     <!-- File access and document roots -->
     <string name="settings_file_access">允许其他应用访问文件</string>
     <string name="file_access_summary">HOME 目录可读写，其他目录只读</string>

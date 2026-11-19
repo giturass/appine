@@ -1,9 +1,11 @@
 # harness/cli Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/harness/cli.md` for the paired decision history (not yet created; pre-split decisions D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41 stay in `.agents/decisions/harness.md`).
+> See `.agents/decisions/harness/cli.md` for the paired decision history (pre-split decisions D5, D6, D9, D11, D15, D20, D21, D25, D28, D32, D35 and the guest-test portions of D36, D40 and D41 stay in `.agents/decisions/harness.md`).
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: both-tier host shared-storage integration and concurrent path checks)
 
 ## Responsibilities
 
@@ -28,7 +30,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
   `--env N=V` (repeatable), `--pty`/`--no-pty`, `--memory-limit <n[KMG]|none>`,
   `--low-port-offset <n>`, `--always-map-low-ports`, `--init`, `--stats`, `-h`/`--help`,
   `--version`; `appine-run --rootfs <dir> --import <tar.gz>` makes a store.
-- `cargo test --workspace` (the three integration test files build only on aarch64 Linux).
+- `cargo test --workspace` (three existing integration files build on aarch64 Linux;
+  `shared_storage` also builds on aarch64 Android).
 
 ## Data flow / lifecycle
 
@@ -90,13 +93,23 @@ benchmarks are `harness`, differential testing `harness/diff`.
   BKL-watchdog tests run only in debug builds and return silently otherwise. No cargo test sends
   `appine-run` a stop signal. The rootfs tests, difftest, LTP and the survey choose the newest
   Alpine tarball by version (`version_key`, `sort -V`).
+- `shared_storage` imports Alpine into a fresh temporary store per tier/test and mounts a live host
+  directory through `Machine::mount_shared_storage`. Its six cases run with Interpreter and Dbt:
+  both aliases and uid 65534; Unicode/spaces, empty and 128 KiB binary files; raw getdents64/stat
+  inode agreement; append/truncate and namespace changes; fresh host edits; open inodes after host
+  replacement/unlink; guest-resolved symlinks; a missing host root becoming usable; preservation of
+  covered store `/sdcard` data; and four concurrent workers walking eight levels 128 times each.
+  Guest waits have 30 s deadlines, with 60 s for the concurrency stress. The inode probe is a
+  freestanding aarch64 C executable with direct syscalls, built with the host C driver.
+  Missing Alpine skips unless `APPINE_REQUIRE_ROOTFS=1`; this suite
+  does not exercise Android's settings UI or all-files grant.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
 - Developers, `harness` CI/benchmarks/LTP/survey/crash runners and `harness/diff` invoke appine-run.
-- Cargo test runs the three aarch64-Linux integration files.
+- Cargo test runs the four integration files, with the shared-storage suite available on Android too.
 
 ### Outbound
 
@@ -112,6 +125,10 @@ benchmarks are `harness`, differential testing `harness/diff`.
 - Required-rootfs/musl switches make missing prerequisites fail rather than silently skip;
   bug-injection and BKL-watchdog cases only run in debug builds.
 - RunOptions/Terminal/RunReport/RunError are kernel API types consumed here, not owned here.
+- On Termux, CLI integration linking needs the real system libandroid for the existing DNS bridge:
+  use `RUSTFLAGS='-L native=/system/lib64'` and
+  `LD_LIBRARY_PATH='/system/lib64:/data/data/com.termux/files/usr/lib'`; its linker stub omits
+  `android_res_*` symbols.
 
 ## Confirmed bugs / technical debt
 

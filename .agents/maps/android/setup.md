@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-18 (targeted verification only since the full mapping; latest change: localized privacy-policy entry in Settings About using the shared web-link action)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: shared-storage all-files authorization in Settings)
 
 ## Responsibilities
 
@@ -22,7 +22,8 @@
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
 - the settings screen, which displays service state and forwards choices, plus shared privacy
-  and notification authorization actions and navigation to system battery settings;
+  and notification authorization actions, all-files access for shared storage and navigation to
+  system battery settings;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
@@ -59,7 +60,8 @@ session consuming their state and events (`android/vt`).
   with android/licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (conditional notification and battery usage actions, running policy, privacy mode, file access), Terminal (CJK characters filling two
+  reset), Android (conditional notification and battery usage actions, running policy, privacy mode,
+  shared storage and file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
   mode and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -345,6 +347,13 @@ session consuming their state and events (`android/vt`).
 - App battery usage follows notifications and precedes the screen-off policy. It opens the
   system app details for this package. The row reads the system Doze exemption on creation and
   resume, remains available after banner dismissal, and disappears when the package is exempt.
+- Shared storage access stays visible below privacy mode and above the external file-access
+  switch, without requiring a service binding. A tap checks `Privacy.locked` and opens
+  `ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION` with the package URI, falling back to
+  `ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION` and localized feedback if neither is available.
+  Its nonpersistent summary reads `Environment.isExternalStorageManager()` on creation and
+  resume, describing read/write at `/sdcard` and `/storage/emulated/0` when granted. Android
+  retains the permission state; the action writes no Appine preference.
 
 - Diagnostic export is independent of service binding and kernel readiness. Its protected dialog
   offers Save to file or Share. Both call `Privacy.requestLogExport` before generating a ZIP;
@@ -403,9 +412,11 @@ session consuming their state and events (`android/vt`).
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  notification authorization, battery usage, diagnostic export, Telegram, project website, privacy policy, licenses and version remain usable. All preferences have stable resource-name keys and persistence
-  disabled: they render service values and their change listeners call service setters, never
-  writing a second preference store (privacy, notification authorization and battery usage use shared controllers). AndroidX manages row binding, disabled states and
+  notification authorization, battery usage, shared storage, diagnostic export, Telegram, project website,
+  privacy policy, licenses and version remain usable. All preferences have stable resource-name
+  keys and persistence disabled. Service-owned rows render service values and call its setters;
+  independent actions use their controllers or Android permission state, without writing a
+  second preference store. AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
 - Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
@@ -439,7 +450,8 @@ session consuming their state and events (`android/vt`).
   `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
   export authorization and dialog protection; Material Components and AndroidX (Settings),
   including AndroidX Browser for Telegram, the project website and privacy policy; android/terminal's NotificationPermission
-  for shared authorization history and settings navigation, and BatteryOptimization for exemption status and app details.
+  for shared authorization history and settings navigation, and BatteryOptimization for exemption status and app details;
+  Android's all-files access settings and `Environment` authorization state.
 
 ## Invariants and gotchas
 
@@ -514,6 +526,11 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- Shared-storage XML, key and format checks and aapt2 resource compilation passed for all five
+  locales. Kotlin compilation and lint could not run without a configured Android SDK.
+  Authorization, revocation, return-to-Settings summaries and vendor fallback screens remain
+  unverified on Android.
 
 - The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
   prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,

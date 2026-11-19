@@ -662,10 +662,19 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     _: JClass<'l>,
     store: JString<'l>,
     tier: jint,
+    shared_storage: JString<'l>,
 ) -> jlong {
     guarded!("Native.start", throws env, 0, {
         let Some(store) = string(&mut env, &store) else {
             return 0;
+        };
+        let shared_storage = if shared_storage.is_null() {
+            None
+        } else {
+            let Some(path) = string(&mut env, &shared_storage) else {
+                return 0;
+            };
+            Some(PathBuf::from(path))
         };
         let options = MachineOptions {
             tier: if tier == 1 {
@@ -682,6 +691,12 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
         };
         match Machine::start(&options) {
             Ok(m) => {
+                if let Some(path) = shared_storage {
+                    if let Err(e) = m.mount_shared_storage(&path) {
+                        throw(&mut env, format!("cannot mount shared storage: {e}"));
+                        return 0;
+                    }
+                }
                 let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
                 machines().insert(handle, Arc::new(m));
                 handle

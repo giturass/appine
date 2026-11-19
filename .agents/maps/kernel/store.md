@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: boot cleanup numbers; browse writes refusing the root as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects; host writers; boot mounts in kernel/mount last)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: record the reproduced boot-cleanup inode-reuse failure)
 
 ## Responsibilities
 
@@ -213,7 +213,7 @@ provider and rootfs installation UI (`android`).
   `/dev/shm` and `/run`; host-side openers pass none), remove detached tmpfs trees, sync, drop the
   `shared` rows of deleted files, delete nlink-0 rows no `shared` row uses as an object and their
   objects, delete the objects those dropped rows used that no row uses any more (unless one is a
-  live file's own data), taking all those numbers back out of the doomed list the emptying filled,
+  live file's own data), taking those numbers back out of the still-pending doomed list the emptying filled,
   commit. Then it downgrades to shared and increments `users`; if
   others are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
 
@@ -304,7 +304,7 @@ provider and rootfs installation UI (`android`).
 - Objects are always addressed by inode number, never by guest path.
 - Inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
   deletes those objects itself and must hand none of their numbers to the reaper, which unlinks
-  `objects/<ino>` without checking whose it is.
+  `objects/<ino>` without checking whose it is; the boot-cleanup debt below records a violation.
 - A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
   numbers a copy) at boot, so no new file gets it while the object lives.
 - When two or more rows use one object, every one of them is held, and nothing may write that
@@ -320,6 +320,12 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
+- **Boot cleanup and inode reuse:** `inode_numbers_reused_after_boot_keep_their_objects` sometimes
+  hands 60 reusable object numbers to the reaper instead of zero, recorded on Linux arm64 in
+  `docs/milestones.md` and reproduced alone on Android. The reaper can then unlink objects under
+  reused inode numbers. `Store::open` empties volatile and detached trees before `remove_orphans`,
+  whose filter reaches only numbers still in `doomed`; an early 5 ms auto-commit is a suspected
+  timing trigger, not yet verified with instrumentation.
 - **Shared mappings across connections:** when a Files app write gives a held file an object of its
   own, the running kernel moves its open descriptions there but not its shared mappings, which
   keep the old shared object.

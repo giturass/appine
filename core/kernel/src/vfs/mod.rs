@@ -2571,6 +2571,73 @@ impl Vfs {
         self.overlays.borrow_mut().sweep(keep, oldest)
     }
 
+    /// Exposes a host shared-storage directory in the boot namespace, preserving the store
+    /// entries covered by its mounts. The host root is opened only when a guest accesses it.
+    pub(crate) fn mount_shared_storage(&self, path: &Path) -> Result<(), Errno> {
+        let cred = Cred::root();
+        let mut conn = fuse::Conn::shared_storage(0, path, &cred, crate::pidns::PidNs::init())?;
+        if self
+            .mounts
+            .borrow()
+            .list
+            .iter()
+            .any(|m| m.source == b"shared_storage")
+        {
+            return Err(Errno::EBUSY);
+        }
+        let ps = crate::pseudo::Offline;
+        let (point, alias) = self.store.transaction(|store| {
+            let mut dir = ROOT;
+            let mut parent = ROOT;
+            for name in [b"storage".as_slice(), b"emulated", b"0"] {
+                parent = dir;
+                dir = match store.lookup(dir, name)? {
+                    Some(ino) if store.kind(ino)? == mode::S_IFDIR => ino,
+                    Some(_) => return Err(Errno::ENOTDIR),
+                    None => store.mkdir(dir, name, 0o755, 0, 0)?,
+                };
+            }
+            let target = Node::Store(ROOT_MOUNT, dir);
+            let point = (
+                target.clone(),
+                Some((Node::Store(ROOT_MOUNT, parent), b"0".to_vec())),
+            );
+            let alias = match store.lookup(ROOT, b"sdcard")? {
+                None => {
+                    store.symlink(ROOT, b"sdcard", b"/storage/emulated/0", 0, 0)?;
+                    None
+                }
+                Some(ino) if store.kind(ino)? == mode::S_IFDIR => Some((
+                    Node::Store(ROOT_MOUNT, ino),
+                    Some((Node::ROOT, b"sdcard".to_vec())),
+                )),
+                Some(ino) if store.kind(ino)? == mode::S_IFLNK => {
+                    let (node, _) =
+                        self.walk(&ps, &cred, &Node::ROOT, &Node::ROOT, b"/sdcard", true)?;
+                    if node == target {
+                        None
+                    } else {
+                        return Err(Errno::EEXIST);
+                    }
+                }
+                Some(_) => return Err(Errno::EEXIST),
+            };
+            Ok((point, alias))
+        })?;
+        let flags = ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME;
+        let (id, connection) = self.new_fuse(point, flags, b"shared_storage".to_vec(), |dev| {
+            conn.dev = dev;
+            conn
+        });
+        let dev = connection.borrow().dev;
+        self.set_sb_flags(dev, 0);
+        self.update_mount(id, |m| m.owner = None);
+        if let Some(alias) = alias {
+            self.add_fuse_mount(alias, flags, b"shared_storage".to_vec(), dev)?;
+        }
+        Ok(())
+    }
+
     /// Mounts a new FUSE instance served through connection `conn` (whose device number is
     /// filled in here), returning the new mount's id and the connection; INIT is queued by the
     /// caller.

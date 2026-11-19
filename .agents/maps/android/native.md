@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split android/build and android/tests into separate maps)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional shared-storage path in Native.start and mounting before handle registration)
 
 ## Responsibilities
 
@@ -38,7 +38,9 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
   `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
-- Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0; the kernel starts with
+- Kernel: `start(store, tier, sharedStorage)` (the nullable third argument defaults to
+  `Environment.getExternalStorageDirectory().absolutePath`; null disables mounting for isolated
+  callers; 1 = Tier 1, else Tier 0; the kernel starts with
   `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports;
   0 and an `IOException("cannot start: …")` on failure), `boot`, `setRoutes`, `takeListens`,
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
@@ -55,8 +57,12 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Handles
 
-- `start` builds `MachineOptions` (tier, exception trace), starts a `Machine` and registers it;
-  every call clones the `Arc` under the table lock and releases the lock before working, so a
+- `start` parses the nullable shared-storage path inside `guarded!`, builds `MachineOptions`
+  (tier, exception trace), starts a `Machine`, mounts the supplied path at `/storage/emulated/0`
+  and `/sdcard`, then registers it. A mount configuration error throws `IOException` and returns
+  0 before registration; missing host access is deferred to guest operations. Existing two-argument
+  Kotlin calls use the default path; the native descriptor is `(Ljava/lang/String;ILjava/lang/String;)J`.
+  Every call clones the `Arc` under the table lock and releases the lock before working, so a
   blocked call keeps its kernel alive across a concurrent `stop`.
 - `stop` removes the handle and then kills everything; `shutdown` runs the inittab shutdown
   (poweroff, 30 s) while the handle is still registered and then removes it. Both drop the removed
@@ -140,6 +146,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 - JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the libghostty-vt
   terminal's functions); each `external fun` has exactly one `Java_…` function.
+- `Native.start`'s default path and JNI third parameter must stay in sync; Settings owns Android's
+  all-files grant flow, while the kernel performs host access under the app's credentials.
 - The crate is `#![cfg(target_os = "android")]`, so it is empty on other hosts, where `build.rs`
   only prints its rerun lines.
 - Every JNI function's body goes in `guarded!` (with `throws env` exactly when Kotlin declares
@@ -161,5 +169,7 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ## To verify
 
+- Real-device shared-storage grant/revoke behavior and vendor restrictions; source-level JNI and
+  Kotlin signature checks and both-tier host tests do not establish Android permission UI behavior.
 - The static browser launcher on Debian and a 16 KB-page device; current bridge tests use Alpine on API 34.
 - ART's local-reference limit on API 30 and later.

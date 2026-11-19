@@ -41,13 +41,13 @@ zig.path=/opt/homebrew/bin/zig
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device
 ./gradlew connectedDebugAndroidTest    # instrumentation tests on a device or emulator
-./gradlew assembleRelease              # build app/build/outputs/apk/release/app-release.apk
 ```
 
 Both APKs build `libappine.so` for `arm64-v8a`. Debug uses Cargo's `release` profile to keep
 the interpreter fast. Release uses `android-release` for cross-crate LTO and a smaller library.
 
-The release APK uses R8 and resource shrinking and is signed with the local debug key.
+The release APK uses R8 and resource shrinking. Gradle's release output is an intermediate
+signed with the debug key; GitHub Actions produces the signed APK for distribution.
 `app/proguard-rules.pro` preserves JNI methods and the `VtSession.on*` callbacks Rust looks up
 by name. Archive `app/build/outputs/mapping/release/mapping.txt` with its APK to decode stack traces.
 
@@ -62,6 +62,40 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
 `adb shell settings put global http_proxy :0`. Deleting the setting instead leaves
 `global_http_proxy_host` and `global_http_proxy_port` behind, and the proxy stays in effect
 (with an empty exclusion list, so 127.0.0.1 goes to the proxy too) until the next reboot.
+
+## Release APKs in GitHub Actions
+
+The manual `release.yml` workflow builds and lints an exact Appine revision, aligns the APK
+for 16 KB pages, and signs it with the established Appine PKCS12 key after Gradle finishes.
+Signing passwords stay out of Gradle, and the release build disables its configuration cache.
+The ordinary `android.yml` workflow keeps building debug APKs on matching pushes and pull requests.
+
+Select the workflow branch and optionally set `source_sha` to a full lowercase, 40-character
+commit SHA available on GitHub. An empty value builds the selected branch's tip. For example,
+after the requested commit and workflow are on `master`:
+
+```sh
+gh workflow run release.yml --ref master -f source_sha="$(git rev-parse HEAD)"
+```
+
+Release signing uses these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `APPINE_RELEASE_KEYSTORE_BASE64` | Base64 of the established PKCS12 keystore |
+| `APPINE_RELEASE_STORE_PASSWORD` | Keystore password |
+| `APPINE_RELEASE_KEY_ALIAS` | Signing key alias |
+| `APPINE_RELEASE_KEY_PASSWORD` | Signing key password |
+
+Keep the established key and credentials outside the checkout, with a private backup.
+Supply secrets through private files or stdin rather than plaintext command-line arguments.
+The workflow decodes the key into the runner's temporary directory and removes it when finished.
+
+The `appine-release-<full SHA>` artifact contains `appine-1.0.0-<short SHA>-release.apk`,
+its SHA-256 checksum, `SOURCE_SHA`, the matching R8 `mapping.txt`, and `verification.json`.
+Verification pins Appine's signing certificate and checks the APK manifest, assets, JNI,
+shared-storage `Native.start` signature and ELF/ZIP alignment. It does not install the APK
+or exercise Android's all-files access grant. The workflow does not publish a GitHub release.
 
 ## Open source licenses
 

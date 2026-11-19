@@ -33,6 +33,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,8 @@ use crate::cell::RefCell;
 use crate::cred::{Cred, UserNs};
 use crate::errno::Errno;
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
+
+mod host;
 
 /// A FUSE node's number (in [`super::Node::Fuse`]), unique across all instances and never reused.
 pub(crate) type FuseId = u64;
@@ -486,6 +489,8 @@ pub(crate) struct Conn {
     /// daemon has answered it ([`Fuses::evict`]), as Linux evicts the inode then (the release
     /// holds the last reference to it, its dentry gone, and FUSE keeps no unused inode).
     doomed: HashSet<u64>,
+    /// The in-process shared-storage server, when no guest daemon serves this connection.
+    host: Option<Arc<host::Host>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,7 +579,34 @@ impl Conn {
             forget_batch: 16,
             opens: HashMap::new(),
             doomed: HashSet::new(),
+            host: None,
         }
+    }
+
+    /// An already initialized connection to host shared storage; opening its root is lazy.
+    pub fn shared_storage(
+        dev: u64,
+        path: &std::path::Path,
+        cred: &Cred,
+        pid_ns: Rc<crate::pidns::PidNs>,
+    ) -> Result<Conn, Errno> {
+        let host = Arc::new(host::Host::new(path)?);
+        let opts = Options {
+            rootmode: Some(mode::S_IFDIR | 0o777),
+            user_id: Some(0),
+            group_id: Some(0),
+            allow_other: true,
+            max_read: DEFAULT_MAX_PAGES * PAGE,
+            subtype: Some(b"shared_storage".to_vec()),
+            ..Options::default()
+        };
+        let mut c = Conn::new(dev, opts, cred, pid_ns);
+        c.state = InitState::Ready;
+        c.minor = KERNEL_MINOR;
+        c.flags = init::ATOMIC_O_TRUNC | init::BIG_WRITES;
+        c.max_write = DEFAULT_MAX_PAGES * PAGE;
+        c.host = Some(host);
+        Ok(c)
     }
 
     /// The user namespace IDs in requests and replies are in.
@@ -590,7 +622,7 @@ impl Conn {
         if self.opts.allow_other {
             let mut ns = Some(cred.user_ns.clone());
             while let Some(n) = ns {
-                if Rc::ptr_eq(&n, &self.user_ns) {
+                if n.id == self.user_ns.id {
                     return true;
                 }
                 ns = n.parent.clone();
@@ -767,6 +799,51 @@ impl Conn {
             None
         }
     }
+
+    /// Completes a sent request; an abort that won the race keeps its error. Returns whether
+    /// callers waiting for answers need waking.
+    fn answer(&mut self, unique: u64, reply: Result<Vec<u8>, Errno>) -> bool {
+        let (opcode, background, nodeid) = match self.requests.get(&unique) {
+            Some(r) if matches!(r.state, ReqState::Sent) => (
+                u32::from_le_bytes(r.message[4..8].try_into().unwrap()),
+                r.background,
+                u64::from_le_bytes(r.message[16..24].try_into().unwrap()),
+            ),
+            _ => return false,
+        };
+        if reply == Err(Errno::ENOSYS) {
+            self.no |= match opcode {
+                op::OPEN => no::OPEN,
+                op::OPENDIR => no::OPENDIR,
+                op::FLUSH => no::FLUSH,
+                op::ACCESS => no::ACCESS,
+                op::CREATE => no::CREATE,
+                op::FSYNC => no::FSYNC,
+                op::FSYNCDIR => no::FSYNCDIR,
+                op::GETXATTR => no::GETXATTR,
+                op::SETXATTR => no::SETXATTR,
+                op::LISTXATTR => no::LISTXATTR,
+                op::REMOVEXATTR => no::REMOVEXATTR,
+                op::LSEEK => no::LSEEK,
+                op::FALLOCATE => no::FALLOCATE,
+                op::RENAME2 => no::RENAME2,
+                _ => 0,
+            };
+        }
+        if background {
+            self.requests.remove(&unique);
+            if matches!(opcode, op::RELEASE | op::RELEASEDIR) && self.doomed.contains(&nodeid) {
+                SWEEP.store(true, Ordering::Relaxed);
+            }
+            if opcode == op::INIT {
+                init_reply(self, reply);
+                return true;
+            }
+            return false;
+        }
+        self.requests.get_mut(&unique).unwrap().state = ReqState::Done(reply);
+        true
+    }
 }
 
 /// Queues `FUSE_INIT` on a new connection (6.1's `fuse_send_init`); nobody waits for it, and its
@@ -886,7 +963,36 @@ fn request(
     let unique = conn
         .borrow_mut()
         .queue(opcode, nodeid, Some(caller), args, (false, force));
-    request_wake_object(readers(conn));
+    let host = conn.borrow().host.clone();
+    if let Some(host) = host {
+        let (messages, forgets) = {
+            let mut c = conn.borrow_mut();
+            let pending: Vec<_> = c.pending.drain(..).collect();
+            let messages = pending
+                .into_iter()
+                .filter_map(|u| {
+                    let r = c.requests.get_mut(&u)?;
+                    r.state = ReqState::Sent;
+                    Some((u, r.message.clone()))
+                })
+                .collect();
+            (messages, c.forgets.drain(..).collect())
+        };
+        // Sent requests remain in Conn: cache eviction must keep their nodes while unlocked.
+        let replies = cx.unlocked(move || host.dispatch(messages, forgets));
+        let mut wake = false;
+        {
+            let mut c = conn.borrow_mut();
+            for (u, reply) in replies {
+                wake |= c.answer(u, reply);
+            }
+        }
+        if wake {
+            request_wake_object(answers(conn));
+        }
+    } else {
+        request_wake_object(readers(conn));
+    }
     wait_answer(cx, conn, unique)
 }
 
@@ -1221,58 +1327,22 @@ pub(crate) fn dev_write(
         }
         return Ok(len);
     }
-    let (opcode, background) = match c.requests.get(&unique) {
-        Some(r) if matches!(r.state, ReqState::Sent) => (
-            u32::from_le_bytes(r.message[4..8].try_into().unwrap()),
-            r.background,
-        ),
-        _ => return Err(Errno::ENOENT),
-    };
+    if !matches!(
+        c.requests.get(&unique).map(|r| &r.state),
+        Some(ReqState::Sent)
+    ) {
+        return Err(Errno::ENOENT);
+    }
     let reply = if error == 0 {
         Ok(body.to_vec())
     } else {
         Err(Errno(-error))
     };
-    if reply == Err(Errno::ENOSYS) {
-        c.no |= match opcode {
-            op::OPEN => no::OPEN,
-            op::OPENDIR => no::OPENDIR,
-            op::FLUSH => no::FLUSH,
-            op::ACCESS => no::ACCESS,
-            op::CREATE => no::CREATE,
-            op::FSYNC => no::FSYNC,
-            op::FSYNCDIR => no::FSYNCDIR,
-            op::GETXATTR => no::GETXATTR,
-            op::SETXATTR => no::SETXATTR,
-            op::LISTXATTR => no::LISTXATTR,
-            op::REMOVEXATTR => no::REMOVEXATTR,
-            op::LSEEK => no::LSEEK,
-            op::FALLOCATE => no::FALLOCATE,
-            op::RENAME2 => no::RENAME2,
-            _ => 0,
-        };
-    }
-    if background {
-        // A release drop_caches waited for: its node goes at the end of this syscall
-        if let Some(r) = c.requests.remove(&unique)
-            && matches!(opcode, op::RELEASE | op::RELEASEDIR)
-            && c.doomed
-                .contains(&u64::from_le_bytes(r.message[16..24].try_into().unwrap()))
-        {
-            SWEEP.store(true, Ordering::Relaxed);
-        }
-        if opcode == op::INIT {
-            init_reply(&mut c, reply);
-            drop(c);
-            request_wake_object(answers(&conn));
-        }
-        return Ok(len);
-    }
-    if let Some(r) = c.requests.get_mut(&unique) {
-        r.state = ReqState::Done(reply);
-    }
+    let wake = c.answer(unique, reply);
     drop(c);
-    request_wake_object(answers(&conn));
+    if wake {
+        request_wake_object(answers(&conn));
+    }
     Ok(len)
 }
 
@@ -1389,9 +1459,12 @@ impl Node {
     }
 }
 
-/// Whether something valid `until` and fetched by syscall `token` can be used now.
+/// Whether something valid `until`, or fetched since this syscall started, can be used now.
+/// A later syscall's query also counts: concurrent zero-validity walks must not erase each
+/// other's retry progress.
 fn fresh(until: Option<Instant>, t: u64) -> bool {
-    (t != 0 && t == token()) || until.is_some_and(|u| Instant::now() < u)
+    let current = token();
+    (current != 0 && t >= current) || until.is_some_and(|u| Instant::now() < u)
 }
 
 impl Fuses {
@@ -1784,7 +1857,7 @@ impl Fuses {
     /// Symlink `id`'s target, when this syscall has read it.
     pub fn link(&self, id: FuseId) -> Option<&[u8]> {
         match &self.nodes.get(&id)?.link {
-            Some((target, t)) if *t == token() => Some(target),
+            Some((target, t)) if fresh(None, *t) => Some(target),
             _ => None,
         }
     }
@@ -2415,6 +2488,74 @@ pub(crate) fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_tokens_preserve_zero_validity_walk_progress() {
+        new_syscall();
+        let older = token();
+        let mut f = Fuses::default();
+        let root = f.add(Rc::new(RefCell::new(conn(Options::default()))));
+        new_syscall();
+        let newer = token();
+        let e = Entry {
+            nodeid: 2,
+            attr: Attr {
+                ino: 2,
+                mode: mode::S_IFLNK | 0o777,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+        let child = f.enter(root, b"link", &e).unwrap();
+        f.set_link(child, b"target".to_vec());
+        f.enter_negative(root, b"absent", None);
+        // The newer lookup happened after the older syscall started: both may use it.
+        TOKEN.set(older);
+        assert_eq!(f.cached_child(root, b"link"), Some(Some(child)));
+        assert!(f.node(child).fresh_attr().is_some());
+        assert_eq!(f.link(child), Some(b"target".as_slice()));
+        assert_eq!(f.cached_child(root, b"absent"), Some(None));
+        TOKEN.set(0);
+        assert_eq!(f.cached_child(root, b"link"), None);
+        assert!(f.node(child).fresh_attr().is_none());
+        assert_eq!(f.link(child), None);
+        TOKEN.set(older);
+        // Explicit invalidation still forces a fresh request, even within the older syscall.
+        f.stale(child);
+        f.forget_child(root, b"absent");
+        assert!(f.node(child).fresh_attr().is_none());
+        assert_eq!(f.cached_child(root, b"absent"), None);
+        TOKEN.set(newer);
+        new_syscall();
+        assert_eq!(f.cached_child(root, b"link"), None);
+        assert_eq!(f.link(child), None);
+    }
+
+    #[test]
+    fn shared_storage_allows_copies_of_the_same_user_namespace() {
+        let cred = Cred::root();
+        let c = Conn::shared_storage(
+            77,
+            std::path::Path::new("/shared-storage"),
+            &cred,
+            crate::pidns::PidNs::init(),
+        )
+        .unwrap();
+        assert!(c.allows(&Cred::root()));
+        let mut child = Cred::root();
+        child.user_ns = UserNs::child(&child.user_ns, 0, true);
+        assert!(c.allows(&child));
+        let c = Conn::shared_storage(
+            78,
+            std::path::Path::new("/shared-storage"),
+            &child,
+            crate::pidns::PidNs::init(),
+        )
+        .unwrap();
+        assert!(c.allows(&child));
+        assert!(!c.allows(&Cred::root()));
+    }
 
     fn conn(opts: Options) -> Conn {
         Conn::new(0x30, opts, &Cred::root(), crate::pidns::PidNs::init())

@@ -50,7 +50,7 @@
     <main>
       <header>
         <h1>Privacy Policy</h1>
-        <p class="meta">Effective <time datetime="2026-11-17">November 17, 2026</time></p>
+        <p class="meta">Effective <time datetime="2026-11-19">November 19, 2026</time></p>
         <p>Matthew Lee ("I", "me", or "the developer") develops Appine, an Android app
           for running a Linux command-line environment on your device. This policy explains
           how Appine handles information, uses Android permissions, and lets you control your data.</p>
@@ -173,9 +173,14 @@
             Android verifies your biometrics or screen-lock credential. Appine receives the
             authentication result, not your fingerprint, face template, PIN, pattern, or password.</li>
         </ul>
-        <p>Appine uses Android's file picker for imports and exports rather than requesting
-          broad access to shared storage. It does not request Android permissions for your
-          contacts, location, camera, microphone, SMS, or call logs.</p>
+        <p>Appine uses Android's file picker for imports and exports. If you grant Android's
+          optional <code>MANAGE_EXTERNAL_STORAGE</code> (all-files access) through
+          <strong>Shared storage access</strong> in Appine settings, Linux programs can read
+          and write shared storage through <code>/sdcard</code> and
+          <code>/storage/emulated/0</code>. Android continues to enforce its storage
+          restrictions, including protection of other apps' private directories.</p>
+        <p>Appine does not request Android permissions for your contacts, location, camera,
+          microphone, SMS, or call logs.</p>
         <p><strong>Allow other apps to access files</strong> is an Appine setting, off by default. Enabling
           it exposes the Linux environment through Android's system file picker. Other apps
           can access files or folders you grant them; access outside the Linux home directory

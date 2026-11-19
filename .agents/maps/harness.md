@@ -5,13 +5,14 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split harness/cli and harness/diff into separate maps)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: restore manual release APK construction and pinned signing verification)
 
 ## Responsibilities
 
 `harness` owns development-container and CI orchestration, benchmarks, LTP, workload surveys
 and power-loss testing. Root: `tests/bench/`, `tests/survey/`, `tests/crash/`, `scripts/dev`,
-`scripts/dev.Dockerfile`, `scripts/build-ltp`, `scripts/ltp`, `scripts/survey` and `.github/workflows/`.
+`scripts/dev.Dockerfile`, `scripts/build-ltp`, `scripts/ltp`, `scripts/survey`, `.github/workflows/`
+and `.github/scripts/`.
 
 The command-line front end, cargo integration tests and guest programs are `harness/cli`;
 differential cases and Starnix/gVisor builders are `harness/diff`. Instruction lockstep tests
@@ -35,7 +36,11 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   `tests/crash/crash.sh <appine|native> <power|kill> [runs] [bin]` (as root in the VM).
 - CI: quick checks on every push and pull request (`ci.yml`), the APK when its inputs change or on
   demand (`android.yml`), the slow suites nightly, on pushes to master and on demand (`full.yml`,
-  `gh workflow run full.yml --ref <branch>`).
+  `gh workflow run full.yml --ref <branch>`), and a signed release APK on demand (`release.yml`,
+  optional `source_sha` selects a full lowercase, 40-character commit SHA).
+- `python3 .github/scripts/verify_appine_release.py <APK>`; optional `--source-root`,
+  `--output-dir` and `--expected-source-sha` override the source checkout, report directory and
+  expected revision.
 
 ## Data flow / lifecycle
 
@@ -109,6 +114,21 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   `target/ghostty` and Zig's global cache cached by the script's hash), then cargo-ndk clippy at
   API level 30, `assembleDebug lintDebug`, the APK as an artifact. Both quick workflows cancel a
   run in progress when the same branch is pushed again.
+- `release.yml`, manual only on x86_64: validates the requested full commit SHA, checks out
+  workflow tools and the source separately in the current repository, confirms the source
+  revision, installs the same Rust/NDK/Zig inputs plus SDK build-tools 36.0.0, then runs
+  `assembleRelease lintRelease` with no daemon or configuration cache. It decodes the established
+  Appine PKCS12 key under `RUNNER_TEMP`, aligns the intermediate APK with `zipalign -P 16`, and
+  signs with `apksigner` using the four `APPINE_RELEASE_*` repository secrets through environment
+  variables. The temporary key is removed even after failure; credentials never enter Gradle.
+- The release verifier requires a clean source checkout at the expected revision, pins the
+  Appine certificate and a modern single-signer signature with SDK `apksigner verify`, and checks
+  manifest identity/SDK/all-files permission, source assets, bundled packages, the static browser,
+  JNI exports and the shared-storage `Native.start` DEX descriptor, native dependencies and
+  16 KB ELF/ZIP alignment. `appine-release-<full SHA>` contains the final APK, checksum, source
+  SHA, matching R8 mapping and JSON verification; a failed run uploads lint/verifier diagnostics.
+  The release job has a 60-minute timeout, groups concurrency by source SHA without cancelling
+  a running build, and never publishes a GitHub release.
 - `full.yml`, nightly at 18:00 UTC on develop when its tip was committed in the last 25 hours, on
   pushes to master and on demand: the network test, a lockstep run of 200,000 iterations,
   `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
@@ -119,7 +139,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   runner every 10 s, `target/difftest` deleted before and after, so every run imports the store and
   installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
   samples uploaded as the `difftest` artifact whatever the result), and the engine tests built
-  with clang. No workflow sets a timeout, and `full.yml` has no concurrency group.
+  with clang. The quick and full workflows have no timeout, and `full.yml` has no concurrency group.
 - Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes,
   the performance probe (`appine-bench`).
 
@@ -157,6 +177,9 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   there makes it (cargo test builds debug, lockstep builds only `appine-lockstep`), and difftest
   never builds one.
 - CI's clang step relies on the runner image's clang; CI installs only llvm and musl-tools.
+- Release signing must preserve the backed-up Appine key and the verifier's certificate pin.
+  The verifier also pins package version/SDKs and the shared-storage JNI descriptor; update those
+  checks together with their corresponding source contracts.
 
 ## Open questions
 
@@ -167,3 +190,6 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 - Whether IPv6 is available inside `scripts/dev` containers (if not, the two always-map low-port
   cases skip with a message captured by the test harness); how much Docker's default seccomp in
   `scripts/dev` differs from the unconfined Linux difftest path.
+- The restored manual release workflow has passed local syntax and validation checks, but has
+  not run on GitHub with the current changes; device installation and all-files access remain
+  outside the verifier's structural coverage.

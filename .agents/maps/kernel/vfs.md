@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: FUSE routing includes the in-process host shared-storage server)
 
 ## Responsibilities
 
@@ -105,7 +105,8 @@ capabilities (`kernel/cred`).
   `path_connected`) and enters anything mounted there; other names are looked up and lifted to the
   topmost mount stacked on the result. `NO_XDEV` makes a `..` or lookup that changes mount `EXDEV`,
   `BENEATH` a `..` from the start. A FUSE lookup or readlink reads `kernel/fuse`'s cache or fails
-  with the internal `FUSE_RETRY`: the dispatcher asks the daemon and reruns the syscall (`EIO` after
+  with the internal `FUSE_RETRY`: the dispatcher asks the connection's guest daemon or host server
+  and reruns the syscall (`EIO` after
   16384 reruns). A name not found is first passed to `Pseudo::missing` (only here), so procfs counts
   fixed names Linux has under `/proc` and `/sys` and names directly in the boot `/dev`
   (`kernel/signal`'s unimplemented paths).
@@ -128,7 +129,7 @@ capabilities (`kernel/cred`).
   `build_open_flags`; `BENEATH|IN_ROOT` `EINVAL`; scoped resolution starts at the dirfd, `IN_ROOT`
   absolute paths too. `RESOLVE_CACHED` is only a pre-check (`EAGAIN` for create, truncate,
   `O_TMPFILE` and, through 6.1's macro comparison, `O_DIRECTORY`), then a normal walk, which still
-  asks a FUSE daemon on a miss.
+  asks the FUSE connection's server on a miss.
 - Creation (`resolve_parent_with`): trailing slashes trimmed (only slashes: the root and `.`), a
   prefix walked with follow; a slash-free name returns the dirfd's directory or the cwd without a
   search check (callers check); then `ENAMETOOLONG` and `ENOTDIR`; a last `.`/`..` is left to the
@@ -138,7 +139,7 @@ capabilities (`kernel/cred`).
   `EACCES` (`EROFS` read-only) and other synthetic directories `store_dir`'s
   `EROFS`/`EPERM`/`EACCES`, dangling store, overlay and FUSE symlinks are followed to create their
   targets (a fresh 40-link count; `NO_SYMLINKS`/nosymfollow `ELOOP`; `NO_XDEV`'s root-taken rule
-  approximated), a FUSE directory asks the daemon.
+  approximated), a FUSE directory asks the connection's server.
 - Back to paths: `reach` climbs through mount points (or the recorded dentry for mounts on files)
   and stops as unreachable at a namespace-tree root, detached root, tmpfs root, the store root
   inside a bind, a parentless synthetic node, another mount's overlay or FUSE root, or a forgotten
@@ -228,7 +229,7 @@ capabilities (`kernel/cred`).
   `AT_STATX_*` sync flag; newfstatat takes only `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`.
 - statfs: the store reports ext4's magic with the host's `statvfs` of the objects directory, tmpfs
   its magic and limits (recounted), an overlay overlayfs's magic with the store's capacity, FUSE
-  what the daemon answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
+  what the connection's server answers, synthetic nodes the magic of their kind with zero sizes; `f_flags` from
   the mount plus the filesystem's read-only, sync and mand (nsfs only `ST_VALID`). fstatfs of any
   pipe (FIFOs too) reports pipefs, of a message queue mqueue, of other node-less fds the root
   filesystem's figures.

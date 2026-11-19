@@ -18,6 +18,9 @@
 
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Guest file commands need direct read/write access to Android shared storage. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+
     <!-- localeConfig enables the system language picker on Android 13+; older versions ignore it. -->
     <application
             android:name=".MainApplication"

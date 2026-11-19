@@ -162,6 +162,12 @@
 
     <string name="privacy_notification">Appineのロックを解除してターミナルを表示</string>
 
+    <!-- Shared storage access -->
+    <string name="settings_shared_storage">共有ストレージへのアクセス</string>
+    <string name="shared_storage_on">/sdcardと/storage/emulated/0の読み書きが可能、タップして権限を管理</string>
+    <string name="shared_storage_off">Linuxプログラムによる共有ストレージの読み書きには、すべてのファイルへのアクセス権が必要</string>
+    <string name="shared_storage_no_app">共有ストレージの設定を開けません</string>
+
     <!-- File access and document roots -->
     <string name="settings_file_access">他のアプリによるファイルへのアクセスを許可</string>
     <string name="file_access_summary">HOMEディレクトリは読み書き可能、その他は読み取り専用</string>

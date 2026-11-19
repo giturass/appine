@@ -5,27 +5,30 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: a node drop_caches keeps for a release in flight is forgotten when the release is answered)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: host shared-storage server, namespace IDs, concurrent zero-validity retries and current write flags)
 
 ## Responsibilities
 
-`kernel/fuse` is FUSE as Linux 6.1's `fs/fuse` has it: filesystems a guest process (the daemon:
-sshfs, rclone mount, fuse-overlayfs, any libfuse program) serves through `/dev/fuse`. It provides:
+`kernel/fuse` implements the FUSE connection and file-operation machinery, following Linux 6.1's
+`fs/fuse` for guest daemons (sshfs, rclone mount, fuse-overlayfs and libfuse programs) served through
+`/dev/fuse`, and using the same machinery for an in-process host shared-storage server. It provides:
 
 - the connection (`Conn`): mount options, `FUSE_INIT` negotiation, the request queue, requests in
   Linux's wire format matched with replies by `unique`, interrupts, notifications, and aborting;
 - the `/dev/fuse` device file: attaching to a connection, read, write, readv/writev, splice, poll
   and the clone ioctl;
-- a cache of what the daemon said about nodes, names, attributes and links (`Fuses`), which path
+- a cache of what the server said about nodes, names, attributes and links (`Fuses`), which path
   resolution reads under the BKL, and the retry that fetches what it lacks;
 - the file syscalls on FUSE nodes and open FUSE files: open and create, reads and writes,
   directory listing, namespace changes, attribute and xattr changes, statfs, access, fsync,
   fallocate, flushing and releasing, reading mapped pages as they are touched, and copies of
   programs for execve;
-- forgetting nodes nothing uses (`FUSE_FORGET`).
+- forgetting nodes nothing uses (`FUSE_FORGET`);
+- descriptor-anchored host shared-storage operations with Android's host permissions.
 
-Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request helpers) and
-`core/kernel/src/syscall/fuse.rs` (the file syscalls on FUSE nodes).
+Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request helpers),
+`core/kernel/src/vfs/fuse/host.rs` (the host server) and `core/kernel/src/syscall/fuse.rs`
+(the file syscalls on FUSE nodes).
 
 Outside the module: the walker, mount table, fd tables and the dispatch of every file syscall
 (`kernel/vfs` and `kernel/files`, which hand FUSE nodes and files to this module), the syscall
@@ -41,8 +44,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   device files, the next `unique` (even, from 2), the queues `pending` and `interrupts` plus
   `requests` by unique, the `forgets` to send with Linux's `forget_batch`, `opens`, the open
   handles of each node id, and `doomed`, the node ids `drop_caches` kept only for a release in
-  flight.
-- `Req` — the whole message, its state (`Pending` until read, `Sent` until answered, `Done` with
+  flight, and an optional `Arc<host::Host>` when served in process.
+- `Req` — the whole message, its state (`Pending` until read or host dispatch, `Sent` until answered, `Done` with
   the reply or error), whether nobody waits for it (`background`: INIT, RELEASE) and whether its
   caller was interrupted.
 - `Options` — `fd`, `rootmode`, `user_id`/`group_id` (kernel IDs), `default_permissions`,
@@ -70,10 +73,12 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - `Io` (syscall side) — a copy of a handle's fields, taken so no borrow is held while waiting.
 - `SetAttr` — the fields a `FUSE_SETATTR` sets; times as leave, now, or a value.
 - `Errno::FUSE_RETRY` (600) — internal: a walk needs a reply; never returned to the guest.
+- `host::Host` / `State` — a mutex-protected host root, O_PATH anchors indexed by host device and
+  inode, lookup counts and open file/directory handles; all access runs outside the BKL.
 
 ## Public entry points
 
-- Connection and device (`vfs::fuse`): `Options::parse`/`show`, `Conn::new`/`allows`/`abort`,
+- Connection and device (`vfs::fuse`): `Options::parse`/`show`, `Conn::new`/`shared_storage`/`allows`/`abort`,
   `send_init`, `call`, `call_as`, `background`, `dev_read`, `dev_write`, `DevFile` (`new`,
   `attach`, `readiness`, `object`), `atomic_o_trunc`, `dont_mask`.
 - Cache and retries: `Fuses` (`add`, `remove`, `root_of`, `conn`, `conn_of`, `get`, `node`,
@@ -129,6 +134,30 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
   ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
 
+### Host shared storage
+
+- `kernel/mount` creates `Conn::shared_storage`: subtype `shared_storage`, `allow_other`, no
+  `default_permissions`, already Ready at the current protocol version, with `ATOMIC_O_TRUNC`,
+  `BIG_WRITES` and 128 KiB request limits. It needs no device file or INIT exchange.
+- The trusted root path must be absolute and contain no NUL. It is opened lazily as an O_PATH
+  directory; failed host opens leave it unopened so later operations retry after a permission grant
+  or directory creation. Once opened, the root remains anchored to that directory.
+- LOOKUP opens one validated name relative to its parent's descriptor with O_PATH and O_NOFOLLOW.
+  Host symlink text is returned by READLINK and followed by the guest walker. Reopens use
+  `/proc/self/fd`, preserving open inodes across host rename, replacement and unlink. Ordinary host
+  I/O opens only regular files and directories.
+- Namespace operations, reads/writes, truncate/timestamps, directory cookies, fsync, statfs, seek
+  and fallocate use host descriptors. WRITE applies the current guest append flag and uses a host
+  append write when set. Host errors are returned as guest errnos.
+- Attributes expose host inode numbers, matching readdir, with guest uid/gid zero and only ordinary
+  permission/type bits. Guest ownership or permission changes are rejected unless they match that
+  presented metadata; no host ownership or privileged mode bits are applied. New files use at most
+  0666 and directories 0777, with umasks. Hard links and xattr writes are EOPNOTSUPP; xattr reads
+  report ENODATA and lists are empty, so host capabilities and SELinux labels stay hidden.
+- Entry and attribute validity is zero: later syscalls query again to see other apps' changes.
+  Guest users share the Android app's host access; inotify still reports only changes made through
+  this kernel.
+
 ### Requests and waiting
 
 - `call` waits until INIT has been answered (only a kill stops that), queues the request with the
@@ -144,6 +173,10 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   daemon and the call is EINTR.
 - One wake object per side: every reply wakes every waiter of the connection, every new request
   every reader.
+- For a host connection, `request` drains pending messages and forgets, marks requests Sent and
+  keeps them in `Conn.requests`, then uses `Cx::unlocked` for the host mutex and dispatch. Replies
+  use the same `Conn::answer` path as device replies; an abort that won the race keeps its error.
+  Keeping Sent requests lets eviction retain their nodes while the BKL is released.
 - `background` queues RELEASE and RELEASEDIR with nobody waiting (an open file's last reference
   dropping), unless the connection is refused or aborted; their replies are dropped. When the
   connection is borrowed as the last reference goes, the release and the node's open count wait in
@@ -180,9 +213,10 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 ### The node cache and retries
 
 - Each syscall gets a new token (`new_syscall`, which also drops the program copies of the last
-  one). A cached name, attribute or link is usable while its validity lasts or when fetched by the
-  current syscall, however short its validity; a symlink target only within the syscall that read
-  it.
+  one). A cached name or attribute is usable while its validity lasts, or when its fetch token is
+  at least the current nonzero syscall token; symlink text follows the same token rule without a
+  timed validity. Thus a later-started overlapping syscall can fill a zero-validity cache for an
+  earlier walk without erasing its retry progress; explicit invalidation still removes validity.
 - A walk in a FUSE directory reads the cache: `fuse_child` for a name, the cached type for
   `is_dir` and symlinks, the cached parent for `..` (no `..` lookup is ever sent), the cached link
   for a target. What it lacks becomes a `Query` (`need`) and the internal `FUSE_RETRY`; the
@@ -223,7 +257,8 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 - `fuse_permission` (6.1's `fuse_permission`): EACCES, root included, unless the mount allows the
   process (with `allow_other`, anyone in the mounter's user namespace or one below; otherwise only
-  a process whose real, effective and saved user and group IDs are the mounter's). Then with
+  a process whose real, effective and saved user and group IDs are the mounter's). Namespace IDs
+  are compared, since the initial namespace may be represented by distinct Rc copies. Then with
   `default_permissions` the cached attributes decide (fetched again when out of date; callers able
   to search everything need none for a search); without it only executing a regular file is
   checked (some execute bit).
@@ -260,7 +295,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - A write with `O_APPEND` (as the open file's flags are now) asks the daemon for the size first
   and writes there, one append per node at a time from the size to the write (the node's
   `appending`, waited for on the lock channel, as 6.1 holds the inode lock); `RLIMIT_FSIZE` cuts
-  writes (`SIGXFSZ` and EFBIG at the limit).
+  writes (`SIGXFSZ` and EFBIG at the limit). WRITE carries those current flags, including fcntl changes.
 - lseek: `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE` through `FUSE_LSEEK` (a daemon
   without it has data up to the end).
 - copy_file_range and splice treat FUSE files like regular ones and copy block by block.
@@ -335,7 +370,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ### Inbound
 
-- `kernel/mount`: mount(2) (`fuse_mount`) and collection.
+- `kernel/mount`: mount(2) (`fuse_mount`), host shared-storage attachment and collection.
 - `kernel/vfs`: the walk (`fuse_child`, `fuse_permission`, kind, readlink, parents) and the FUSE
   branches of getdents, stat, statfs, access, chdir and the attribute and namespace syscalls.
 - `kernel/files`: opening `/dev/fuse` and the FUSE branches of open, the I/O routes, readv/writev,
@@ -360,6 +395,7 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   `capable_wrt`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
+- Host libc and `std::fs`: descriptor-based shared-storage operations and metadata.
 - `kernel/mm`: `Fill` (`window`, `store`, `first_unread`, `has_fills`).
 - The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
   (`watched`) for `in_use`.
@@ -391,6 +427,9 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Confirmed bugs / technical debt
 
+- **Host releases wait for another request:** background RELEASE/RELEASEDIR and FORGET queues are
+  drained by the next host request; the final unused host handles and anchors can stay open until
+  another shared-storage operation or connection teardown.
 - **No page cache:** a mapped page keeps what was read when first touched, so a shared mapping
   never sees later writes through the mount or another process, separate mmap calls read
   separately, and a shared writable mapping is refused (SQLite's WAL `-shm` file and programs

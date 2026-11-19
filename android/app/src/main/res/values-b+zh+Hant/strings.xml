@@ -162,6 +162,12 @@
 
     <string name="privacy_notification">解鎖 Appine 以查看終端機</string>
 
+    <!-- Shared storage access -->
+    <string name="settings_shared_storage">存取共用儲存空間</string>
+    <string name="shared_storage_on">讀寫 /sdcard 和 /storage/emulated/0，點按管理權限</string>
+    <string name="shared_storage_off">允許 Linux 程式讀寫共用儲存空間，需要所有檔案存取權限</string>
+    <string name="shared_storage_no_app">無法開啟共用儲存空間設定</string>
+
     <!-- File access and document roots -->
     <string name="settings_file_access">允許其他應用程式存取檔案</string>
     <string name="file_access_summary">HOME 目錄可讀寫，其他目錄唯讀</string>

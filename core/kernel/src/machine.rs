@@ -17,7 +17,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -171,6 +171,23 @@ impl Machine {
             timers: Some(timers),
             watchdog,
         })
+    }
+
+    /// Mounts host shared storage at `/storage/emulated/0` and `/sdcard`, before any guest
+    /// process starts. Host access errors are reported by file operations, so granting Android
+    /// storage permission does not require restarting the machine.
+    pub fn mount_shared_storage(&self, path: &Path) -> Result<(), Errno> {
+        crate::bug::host_call("Machine::mount_shared_storage", || {
+            let k = self.shared.lock();
+            if k.stopping || k.groups.len() != 1 {
+                return Err(Errno::EBUSY);
+            }
+            let vfs = k.vfs.as_ref().ok_or(Errno::ENODEV)?;
+            vfs.mount_shared_storage(path)?;
+            self.shared.fast_changed();
+            Ok(())
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit (waited for), boot and

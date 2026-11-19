@@ -1,11 +1,11 @@
 # kernel/boot Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/boot.md` for the paired decision history (not yet created; decisions from before the split are D9, D35, D53, the host-stop part of D30 and the host-spawn part of D43 in `.agents/decisions/kernel/process.md`; the process reaping contract remains D16 there).
+> See `.agents/decisions/kernel/boot.md` for the paired decision history (decisions from before the split are D9, D35, D53, the host-stop part of D30 and the host-spawn part of D43 in `.agents/decisions/kernel/process.md`; the process reaping contract remains D16 there).
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional host shared-storage attachment before guest boot and spawn)
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@ spawning host-started programs, running inittab's boot and shutdown plans, handl
 requests and tearing the machine down.
 
 Root: `core/kernel/src/inittab.rs`; in `machine.rs`, `MachineOptions`, `Stdio`, the
-`Machine` owner and `SHUTDOWN_TIMEOUT`, `Machine::start`/`start_kernel`, `boot`,
+`Machine` owner and `SHUTDOWN_TIMEOUT`, `Machine::start`/`start_kernel`, `mount_shared_storage`, `boot`,
 `spawn`/`spawn_process`, `shutdown`, `inittab`, `run_init_process`, `kill_all`, `take_power`,
 `Drop for Machine` and `run`; and `reboot` in `syscall/misc.rs`.
 The `INIT` constant in `kernel.rs` belongs here. The boot/power fields (`init_handlers`,
@@ -41,7 +41,7 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 
 ## Public entry points
 
-- `Machine::start`, `spawn`, `boot`, `shutdown`, `kill_all`, `take_power`, `Drop for Machine`.
+- `Machine::start`, `mount_shared_storage`, `spawn`, `boot`, `shutdown`, `kill_all`, `take_power`, `Drop for Machine`.
 - `run` is the CLI's kernel entry point; it uses `RunOptions`, returns `RunReport`/`RunError`
   and calls the console and wait APIs owned by `kernel/tty` and `kernel/process`.
 - `inittab::parse`, `boot_plan`, `shutdown_plan`, `program`, `script`.
@@ -55,6 +55,13 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
   an internal error. Options configure the store, memory and low-port policy, with
   `debug.exception-trace` set before PID 1 is created when the host requests it.
 - The Android host enables exception tracing; the CLI wrapper keeps the arm64 default off.
+- `Machine::mount_shared_storage(&Path)` optionally attaches host storage through `kernel/mount`
+  at `/storage/emulated/0` and `/sdcard`, then invalidates the fast resolver. It needs a store
+  (ENODEV otherwise), no stopping state or groups besides virtual init (EBUSY), and a not-yet-mounted
+  shared-storage instance. It runs in `host_call` and returns EIO on a contained panic. Android
+  calls it between start and handle registration, before guest boot/spawn; host path access errors
+  are deferred to file operations, allowing later permission grants without restarting the machine.
+  `MachineOptions` remains unchanged for exhaustive host callers.
 - Host-launched processes bypass `RLIMIT_NPROC` and `threads-max` by design; guest clone checks
   remain in `kernel/process`. Loading uses `kernel/exec`'s `loader::load`, and actual task and
   host-thread creation uses `kernel/process`'s `task::start`.
@@ -116,6 +123,7 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 - `kernel/vfs`, `kernel/store`: opening the store, reading inittab, boot log and final sync;
   `kernel/oom` and `kernel/net`: initial limit and port-map options; `engine`: tier availability
   and fault guard; `hal`: host fd limit, events and stop-pipe polling.
+- `kernel/mount`, `kernel/fuse`: optional host shared-storage attachment and its lazy server.
 
 ## Invariants and gotchas
 
