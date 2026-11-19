@@ -532,8 +532,12 @@ session consuming their state and events (`android/vt`).
 
 ## To verify
 
-- The preference-row and shared-page redesign has static source, XML and cached AndroidX/Material
-  API checks only; runtime layout, large fonts, TalkBack and scroll/dialog restoration with
+- The preference-row and shared-page redesign passed static source, XML and cached AndroidX/Material
+  API checks, CI debug/release assembly/lint and signed-APK verification for source
+  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
+  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
+  [Android](https://github.com/giturass/appine/actions/runs/44601362739));
+  runtime layout, large fonts, TalkBack and scroll/dialog restoration with
   the new styling remain unverified. Earlier API 34 checks below predate this redesign.
 
 - Shared-storage authorization, revocation, return-to-Settings summaries and vendor fallback

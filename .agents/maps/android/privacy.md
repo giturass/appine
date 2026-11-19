@@ -111,7 +111,11 @@ None recorded in the parent mapping for this concern.
 
 ## To verify
 
-- The redesigned shield has static source, XML and cached Material API checks only;
+- The redesigned shield passed static source, XML and cached Material API checks,
+  CI debug/release assembly/lint and signed-APK verification for source
+  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
+  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
+  [Android](https://github.com/giturass/appine/actions/runs/44601362739));
   runtime centering, insets, large-font wrapping, button layout and light/dark appearance
   remain unverified. Earlier API 34 checks below predate this redesign.
 

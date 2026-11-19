@@ -161,8 +161,12 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 
 ## To verify
 
-- The current tonal-key redesign has static source, Kotlin syntax, XML/resource and cached
-  Material API checks only. Resized touch targets, pressed feedback, one-shot/locked/SYM states
+- The current tonal-key redesign passed static source, Kotlin syntax, XML/resource and cached
+  Material API checks, CI debug/release assembly/lint and signed-APK verification for source
+  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
+  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
+  [Android](https://github.com/giturass/appine/actions/runs/44601362739)).
+  Resized touch targets, pressed feedback, one-shot/locked/SYM states
   and wallpaper palettes need fresh device verification; earlier build/device results below
   used the prior row styling. State transitions and indicator geometry are unchanged.
 

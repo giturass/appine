@@ -111,5 +111,9 @@ None recorded in the parent mapping for this concern.
 - The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and
   tablet layouts remain untried. Prior API 34 emulator checks covered offline rendering,
   no horizontal overflow, scroll restoration, list navigation and light/dark Material colours.
-- The current row/toolbar redesign has static source, XML and cached Material API checks only;
+- The current row/toolbar redesign passed static source, XML and cached Material API checks,
+  CI debug/release assembly/lint and signed-APK verification for source
+  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
+  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
+  [Android](https://github.com/giturass/appine/actions/runs/44601362739));
   runtime layout, accessibility and restoration with the new styling remain unverified.
