@@ -691,11 +691,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
         };
         match Machine::start(&options) {
             Ok(m) => {
-                if let Some(path) = shared_storage {
-                    if let Err(e) = m.mount_shared_storage(&path) {
-                        throw(&mut env, format!("cannot mount shared storage: {e}"));
-                        return 0;
-                    }
+                if let Some(path) = shared_storage
+                    && let Err(e) = m.mount_shared_storage(&path)
+                {
+                    throw(&mut env, format!("cannot mount shared storage: {e}"));
+                    return 0;
                 }
                 let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
                 machines().insert(handle, Arc::new(m));
