@@ -391,13 +391,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Shared-storage copy passed aapt2 compilation and key/placeholder checks in all five locales;
   device wrapping and native-speaker review remain unverified.
 
-- The 48 dp shared bar height and square controls passed source/layout review; CI and signed-APK
-  checks remain pending for this refinement. The preceding Material 3 terminal/page redesign and
-  importer removal passed static source, Kotlin syntax, XML/resource, locale and cached Material
-  API checks, CI debug/release assembly/lint and
-  signed-APK verification for source `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
-  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
-  [Android](https://github.com/giturass/appine/actions/runs/44601362739)).
+- The 48 dp shared bar height and square controls passed source/layout review. The Material 3
+  terminal/page design and importer removal passed CI debug/release assembly/lint and
+  signed-APK verification for source `daf981e18859524310cd0f59632bc83ec30a3a0c`
+  ([Release](https://github.com/giturass/appine/actions/runs/44607898415),
+  [Android](https://github.com/giturass/appine/actions/runs/44607893291)).
   Runtime layout, resized touch targets,
   wallpaper palettes, large fonts, TalkBack and IME/focus behavior need fresh device verification;
   earlier device and build results below concern the prior styling.

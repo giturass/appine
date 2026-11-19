@@ -232,13 +232,11 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ## To verify
 
-- The 48 dp bar height and square controls passed source/layout review; CI and signed-APK checks
-  remain pending for this refinement. The preceding 56 dp control/list redesign passed static
-  source, Kotlin syntax, XML/resource and cached Material API checks, CI debug/release assembly/lint
-  and signed-APK verification for source
-  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
-  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
-  [Android](https://github.com/giturass/appine/actions/runs/44601362739)).
+- The 48 dp bar height and square controls passed source/layout review, CI debug/release
+  assembly/lint and signed-APK verification for source
+  `daf981e18859524310cd0f59632bc83ec30a3a0c`
+  ([Release](https://github.com/giturass/appine/actions/runs/44607898415),
+  [Android](https://github.com/giturass/appine/actions/runs/44607893291)).
   Runtime selection, touch targets, scrolling/focus, ended-tab fading,
   wallpaper palettes and TalkBack need fresh device verification. Earlier build/device checks
   below used the prior control geometry; progress/status colour-role mappings and animation
