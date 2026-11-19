@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: Material 3 session controls, selected containers and resized tab-list rows; import action removed)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 48 dp square session controls and shared toolbar height)
 
 ## Responsibilities
 
@@ -50,7 +50,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ### The tab bar
 
-- One 56 dp row in any window, with 48 dp tab/control widths. The optional session-list icon,
+- One 48 dp row in any window, with square 48 dp tab/control bounds. The optional session-list icon,
   shown by default and controlled by Settings' Terminal switch, occupies the first 48 dp;
   scrolling tabs start to its right. Close (hidden without a current tab), new-session and
   overflow controls reserve 144 dp at the end. New-session has a filled primary background
@@ -232,8 +232,10 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ## To verify
 
-- The current control/list redesign passed static source, Kotlin syntax, XML/resource and cached
-  Material API checks, CI debug/release assembly/lint and signed-APK verification for source
+- The 48 dp bar height and square controls passed source/layout review; CI and signed-APK checks
+  remain pending for this refinement. The preceding 56 dp control/list redesign passed static
+  source, Kotlin syntax, XML/resource and cached Material API checks, CI debug/release assembly/lint
+  and signed-APK verification for source
   `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
   ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
   [Android](https://github.com/giturass/appine/actions/runs/44601362739)).

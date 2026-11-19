@@ -445,7 +445,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     companion object {
         /** The shared height of the session and search bars. */
-        const val BAR_DP = 56
+        const val BAR_DP = 48
 
         /** The touch width of numbered sessions and icon actions. */
         const val ITEM_DP = 48

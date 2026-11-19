@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: Material 3 terminal chrome, shared page resources and terminal file-import removal)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 48 dp shared session/search bar height and square top controls)
 
 ## Responsibilities
 
@@ -55,7 +55,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   and opens system app details from Settings.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
-- `SearchBarView` — a 56 dp search bar with a tonal `EditText` (without suggestions, IME action
+- `SearchBarView` — a 48 dp search bar with a tonal `EditText` (without suggestions, IME action
   Search), the count ("selected/total") and 48 dp vector previous/next/close controls; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
   `Target` (`search`, `step`, `close`).
@@ -236,7 +236,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 ### Finding text
 
 - "Find" (⋮) or Ctrl+Shift+F, with a current tab, puts the search bar in the tab bar's place
-  (the tab bar is gone, the place keeps its 56 dp, so the terminal keeps its rows) and brings the
+  (the tab bar is gone, the place keeps its 48 dp, so the terminal keeps its rows) and brings the
   keyboard up on its text, which is kept from the last search and selected, so typing replaces it;
   that text is searched for again at once. Every change of the text searches anew in the tab shown
   (`VtView.search`; query, steps and scroll-bar marks are android/vtview's Search, frame progress
@@ -333,7 +333,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   swallowed; a volume key's repeats are taken only while it is the remembered key, so a press
   left to the system keeps its repeats and release there and the volume changes as usual.
 - Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
-  bar's 56 dp and the scrolling extra keys' 40 or 80 dp share that allowance with selection handles
+  bar's 48 dp and the scrolling extra keys' 40 or 80 dp share that allowance with selection handles
   at the edge.
 - `MainActivity` is a `FragmentActivity` on a Material theme: Material dialogs and AppCompat's
   `PopupMenu` take the theme. Its inflater leaves unqualified XML tags as framework widgets;
@@ -391,8 +391,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Shared-storage copy passed aapt2 compilation and key/placeholder checks in all five locales;
   device wrapping and native-speaker review remain unverified.
 
-- The Material 3 terminal/page redesign and importer removal passed static source, Kotlin syntax,
-  XML/resource, locale and cached Material API checks, CI debug/release assembly/lint and
+- The 48 dp shared bar height and square controls passed source/layout review; CI and signed-APK
+  checks remain pending for this refinement. The preceding Material 3 terminal/page redesign and
+  importer removal passed static source, Kotlin syntax, XML/resource, locale and cached Material
+  API checks, CI debug/release assembly/lint and
   signed-APK verification for source `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
   ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
   [Android](https://github.com/giturass/appine/actions/runs/44601362739)).
