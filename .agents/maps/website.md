@@ -1,11 +1,11 @@
 # website Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/website.md` for the paired decision history (not yet created).
+> See `.agents/decisions/website.md` for the paired decision history.
 >
 > Verified: 2026-11-17 (three source-research concerns and nine independently checked claims; static checks passed, external release and visual checks remain below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional guest shared-storage permission and Android restrictions in the policy)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: release-permission residuals and the existing paired decision history)
 
 ## Responsibilities
 
@@ -116,15 +116,13 @@ None currently recorded.
 
 ## To verify
 
-- The shared-storage wording passed HTML structure and source-coverage checks. The final
-  release manifest, Android authorization/revocation and direct shared-storage access remain
-  unverified for this permission; the updated page requires a separate deployment.
+- Android authorization/revocation and installed-app shared-storage access remain unverified
+  for the new permission; the updated policy requires a separate deployment.
 
 - Production HTTP access without sign-in was checked from the deployment environment;
   accessibility from other regions, the Play Console policy URL and final Data safety
   declarations have not been verified.
-- The existing merged release manifest was inspected, not rebuilt. Verify the final
-  release artifact and its SDK behavior against the policy before submission.
+- Android runtime behavior against the policy remains unverified before submission.
 - HTML structure, permission coverage and local HTTP delivery passed checks. Favicon
   source geometry checks passed; the transparent icon and black
   facial details were inspected at 16, 32 and 128px on light, dark and checkerboard

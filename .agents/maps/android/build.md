@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: restore signed release packaging and artifact verification in GitHub Actions)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: completed release packaging checks and remaining Android device coverage)
 
 ## Responsibilities
 
@@ -247,8 +247,5 @@ None.
 
 ## To verify
 
-- Shared-storage resources compiled with aapt2 and the manifest parsed successfully. Kotlin
-  compilation and lint remain unverified without a configured Android SDK; Android device
-  authorization and vendor settings navigation also remain unverified.
-- The restored release workflow has not run on GitHub with the current source changes;
-  certificate, source-revision and packaging checks against a new cloud-built APK remain pending.
+- Android device installation, shared-storage authorization/revocation, vendor settings
+  navigation and execution on 16 KB-page devices remain unverified.

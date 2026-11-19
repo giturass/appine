@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: restore manual release APK construction and pinned signing verification)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: completed release checks and remaining structural coverage limits)
 
 ## Responsibilities
 
@@ -190,6 +190,6 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 - Whether IPv6 is available inside `scripts/dev` containers (if not, the two always-map low-port
   cases skip with a message captured by the test harness); how much Docker's default seccomp in
   `scripts/dev` differs from the unconfined Linux difftest path.
-- The restored manual release workflow has passed local syntax and validation checks, but has
-  not run on GitHub with the current changes; device installation and all-files access remain
-  outside the verifier's structural coverage.
+- Device installation, all-files authorization/revocation and installed-app shared-storage
+  access remain outside the release verifier's structural coverage, including execution on
+  16 KB-page devices.

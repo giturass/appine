@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: shared-storage all-files authorization in Settings)
+> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: remaining Android device coverage for shared-storage authorization)
 
 ## Responsibilities
 
@@ -527,10 +527,8 @@ session consuming their state and events (`android/vt`).
 
 ## To verify
 
-- Shared-storage XML, key and format checks and aapt2 resource compilation passed for all five
-  locales. Kotlin compilation and lint could not run without a configured Android SDK.
-  Authorization, revocation, return-to-Settings summaries and vendor fallback screens remain
-  unverified on Android.
+- Shared-storage authorization, revocation, return-to-Settings summaries and vendor fallback
+  screens remain unverified on Android.
 
 - The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
   prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,
