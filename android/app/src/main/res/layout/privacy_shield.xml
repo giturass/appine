@@ -8,8 +8,7 @@
         android:layout_height="match_parent"
         android:fillViewport="true"
         android:fitsSystemWindows="true"
-        android:scrollbars="none"
-        android:background="?attr/colorSurface">
+        android:scrollbars="none">
 
     <FrameLayout
             android:layout_width="match_parent"
