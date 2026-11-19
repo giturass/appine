@@ -76,10 +76,10 @@ class TabListTest {
         assertEquals(view.height, list.height)
         assertTrue(list.canScrollVertically(-1))
         val current = list.findViewHolderForAdapterPosition(49)!!.itemView
-        assertEquals(view.dp(32), current.height)
+        assertEquals(view.dp(TabListView.ROW_DP), current.height)
         assertTrue(current.bottom <= list.height)
-        layout(view, view.dp(480))
-        assertEquals(view.dp(320), list.height)
+        layout(view, view.dp(TabListView.ROW_DP) * (TabListView.MAX_VISIBLE_ROWS + 1))
+        assertEquals(view.dp(TabListView.ROW_DP) * TabListView.MAX_VISIBLE_ROWS, list.height)
     }
 
     @Test fun openingAndScrollingPreserveTheEditorsFocus() = instrumentation.runOnMainSync {
@@ -96,7 +96,7 @@ class TabListTest {
         view.open(sessions, sessions.last())
         layout(root)
         assertSame("Opening the list must keep the editor as the IME target", editor, root.findFocus())
-        (view.getChildAt(0) as RecyclerView).scrollBy(0, -view.dp(32))
+        (view.getChildAt(0) as RecyclerView).scrollBy(0, -view.dp(TabListView.ROW_DP))
         assertSame(editor, root.findFocus())
         view.close()
         assertSame("Dismissing the list must not require reconnecting the editor", editor, root.findFocus())

@@ -4,4 +4,52 @@
 
     <color name="ic_foreground_stroke_color">#3DDC84</color>
 
+    <color name="appine_primary">#326941</color>
+    <color name="appine_on_primary">#FFFFFF</color>
+    <color name="appine_primary_container">#B4F1BA</color>
+    <color name="appine_on_primary_container">#00210B</color>
+    <color name="appine_secondary">#526351</color>
+    <color name="appine_on_secondary">#FFFFFF</color>
+    <color name="appine_secondary_container">#D5E8D0</color>
+    <color name="appine_on_secondary_container">#101F10</color>
+    <color name="appine_tertiary">#39656B</color>
+    <color name="appine_on_tertiary">#FFFFFF</color>
+    <color name="appine_tertiary_container">#BDEAF0</color>
+    <color name="appine_on_tertiary_container">#001F23</color>
+    <color name="appine_surface">#F6FBF1</color>
+    <color name="appine_on_surface">#181D17</color>
+    <color name="appine_surface_variant">#DFE5D9</color>
+    <color name="appine_on_surface_variant">#42493F</color>
+    <color name="appine_surface_container_lowest">#FFFFFF</color>
+    <color name="appine_surface_container_low">#F0F5EB</color>
+    <color name="appine_surface_container">#EAF0E5</color>
+    <color name="appine_surface_container_high">#E4EADF</color>
+    <color name="appine_surface_container_highest">#DFE5D9</color>
+    <color name="appine_outline">#72796E</color>
+    <color name="appine_outline_variant">#C2C9BD</color>
+
+    <color name="appine_dark_primary">#99D5A1</color>
+    <color name="appine_dark_on_primary">#003919</color>
+    <color name="appine_dark_primary_container">#18512B</color>
+    <color name="appine_dark_on_primary_container">#B4F1BA</color>
+    <color name="appine_dark_secondary">#B9CCB5</color>
+    <color name="appine_dark_on_secondary">#253423</color>
+    <color name="appine_dark_secondary_container">#3B4B39</color>
+    <color name="appine_dark_on_secondary_container">#D5E8D0</color>
+    <color name="appine_dark_tertiary">#A1CED4</color>
+    <color name="appine_dark_on_tertiary">#00363C</color>
+    <color name="appine_dark_tertiary_container">#204D52</color>
+    <color name="appine_dark_on_tertiary_container">#BDEAF0</color>
+    <color name="appine_dark_surface">#10150F</color>
+    <color name="appine_dark_on_surface">#DFE5D9</color>
+    <color name="appine_dark_surface_variant">#42493F</color>
+    <color name="appine_dark_on_surface_variant">#C2C9BD</color>
+    <color name="appine_dark_surface_container_lowest">#0B100A</color>
+    <color name="appine_dark_surface_container_low">#181D17</color>
+    <color name="appine_dark_surface_container">#1C211B</color>
+    <color name="appine_dark_surface_container_high">#262C25</color>
+    <color name="appine_dark_surface_container_highest">#31372F</color>
+    <color name="appine_dark_outline">#8C9387</color>
+    <color name="appine_dark_outline_variant">#42493F</color>
+
 </resources>

@@ -80,15 +80,6 @@
     <string name="link_hidden_file">ファイルへのアクセスは無効です。設定で「他のアプリによるファイルへのアクセスを許可」を有効にしてください</string>
     <string name="link_missing_file">ファイルが見つかりません</string>
 
-    <!-- File import -->
-    <string name="import_files">ファイルをインポート</string>
-    <string name="importing_files">ファイルをインポート中…</string>
-    <string name="import_file_name">インポートしたファイル</string>
-    <string name="import_file_failed">%1$sをインポートできません：%2$s</string>
-    <string name="import_files_saved">ホームディレクトリに保存しました：\n\n^1</string>
-    <string name="import_picker_missing">ファイル選択アプリがありません</string>
-    <string name="copy_paths">パスをコピー</string>
-
     <!-- Program status and command completion -->
     <string name="status_percent">%1$s、%2$d%%</string>
     <string name="status_message">%1$s：%2$s</string>

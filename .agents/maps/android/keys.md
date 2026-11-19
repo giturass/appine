@@ -1,11 +1,11 @@
 # android/keys Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/keys.md` for the paired decision history (not yet created; pre-split decisions D4, D12, D14, D15 and D19–D23 stay in `.agents/decisions/android/terminal.md`).
+> See `.agents/decisions/android/keys.md` for the paired decision history (pre-split decisions D4, D12, D14, D15 and D19–D23 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: shared terminal control colours with stronger state contrast)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 40 dp tonal extra-key rows and filled modifier/SYM states with preserved press backgrounds)
 
 ## Responsibilities
 
@@ -44,7 +44,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 
 ### Extra keys
 
-- Rows of 32 dp with 12 dp labels (not sp, so the system font scale leaves them as they are).
+- Rows of 40 dp with 12 dp labels (not sp, so the system font scale leaves them as they are).
   Below 600 dp available width, portrait windows retain two rows, as do landscape windows with
   configuration height above 480 dp. In that layout, the
   eight columns share the width, each at least 45 dp (the last one takes the pixels left over), so
@@ -55,9 +55,9 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   the last column's key. A sideways slide past the touch slop then scrolls and cancels the key it
   started on, unless that key is already held, and with gesture navigation the scrolling part is
   excluded from the system's back gesture. With nothing to scroll the keys keep every touch and the
-  edge its gesture. No lines are drawn between or around the keys.
+  edge its gesture. Inset rounded tonal backgrounds separate keys without shrinking their touch bounds.
 - An available width of at least 600 dp in either orientation, or landscape with configuration
-  `screenHeightDp <= 480`, uses one 32 dp row. `onMeasure` chooses the mode from its width
+  `screenHeightDp <= 480`, uses one 40 dp row. `onMeasure` chooses the mode from its width
   constraint after the root's system-bar/cutout/IME side padding; keyboard height does not choose
   the mode. Configuration changes request measurement rather than choosing from old view bounds.
   CTRL, ALT, SHIFT and SYM stay fixed at the right on the main page;
@@ -74,17 +74,19 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   leaves one column empty before SYM. Mode changes during measurement reparent existing key views, retaining the
   selected page and modifier states, cancelling pending presses/repeats and resetting horizontal
   scroll to the start when switching layouts. They do not recreate the terminal or its IME connection.
-- A key is shaded while pressed and acts when the finger lifts (with a key-click haptic), not at
-  all if the finger left it by more than the touch slop. Held past the long-press timeout, the
+- A key uses its drawable's pressed/ripple state and acts when the finger lifts (with a key-click
+  haptic), not at all if the finger left it by more than the touch slop. Cancellation clears
+  `isPressed` and retains the tonal or selected background. Held past the long-press timeout, the
   arrows, PGUP and PGDN repeat every 80 ms until the finger lifts or leaves the key (no act on
   release then); the modifiers and SYM act on their long press then, with a long-press haptic, and
   not again on release; other keys still act once on release. No key has a swipe or popup. Keys
   with a long press also answer an accessibility service's long click (the touch never reaches
   the view's own long-press detection).
-- Labels use Ui.kt's `terminalControlColor`: ordinary labels blend on-surface-variant with 40%
-  black, while active labels and indicators blend primary with 25% white, retaining wallpaper hues.
-- CTRL, ALT and SHIFT: a tap turns them on for the next key (active colour only) or off, a locked
-  one too; a long press locks them on (active colour and the
+- Keys sit on colorSurfaceContainer with rounded tonal backgrounds. Ui.kt's `terminalControlColor`
+  supplies ordinary labels from on-surface-variant and active labels/indicators from
+  on-primary-container; `terminalControlBackground` fills selected keys with primary-container.
+- CTRL, ALT and SHIFT: a tap turns them on for the next key (filled container) or off, a locked
+  one too; a long press locks them on (filled container and the
   indicator) until tapped, one a tap turned on included, with a toast naming the key ("CTRL
   locked"), or turns a locked one off. Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
@@ -93,7 +95,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   shows the function keys, and from them the first page again. Two-row mode keeps `%` above SYM
   with symbols and SHIFT above SYM with functions; single-row mode fixes only SYM on either page.
   A page stays, for any number
-  of keys, until SYM turns it; SYM's label takes the active colour and the indicator while another
+  of keys, until SYM turns it; SYM uses a filled active container and indicator while another
   page than the first is shown. The function keys and PGUP/PGDN go to `VtView.press` as their key
   codes, so the modifiers apply as on a keyboard (SHIFT, F5 sends `CSI 15;2~`). Turning the page
   leaves the modifiers as they are: CTRL and ALT apply to symbols and function keys too (CTRL,
@@ -138,8 +140,9 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   `getRightPaddingOffset`) carries the edge into `×` or the last column without changing either.
   `canScrollHorizontally` counts the end padding as shown (from 315 dp on the keys would find
   nothing to scroll), so the extra keys compare the grid's width with the room between the
-  paddings. How far a fade reaches in (12 dp into `×` at 14 dp, 6 dp into SHIFT at 12 dp) fits
-  the blank before the glyph in Roboto; another label size or font can put the fade over it.
+  paddings. The bar's 12 dp fade inset aligns with its vector-icon padding; the extra keys'
+  6 dp inset fits the blank before the 12 dp SHIFT label in Roboto. Another label size or font
+  can put the keys' fade over their text.
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
   label: `refresh` invalidates the shown grid and the fixed column (turning pages refreshes the
@@ -158,8 +161,10 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 
 ## To verify
 
-- The shared control palette passes debug assembly and lint; device checks remain for one-shot,
-  locked and SYM states across wallpaper palettes. State transitions and indicator geometry are unchanged.
+- The current tonal-key redesign has static source, Kotlin syntax, XML/resource and cached
+  Material API checks only. Resized touch targets, pressed feedback, one-shot/locked/SYM states
+  and wallpaper palettes need fresh device verification; earlier build/device results below
+  used the prior row styling. State transitions and indicator geometry are unchanged.
 
 - Single-row extra keys passed debug assembly/lint and API 34 checks at 360 × 640 dp: three pages,
   scrolling to PGDN, input with Shift+F5 and locked Ctrl+], and page/modifier retention through

@@ -230,9 +230,11 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         super.onViewCreated(view, savedInstanceState)
         listView.itemAnimator = null
         listView.clipToPadding = false
+        setDivider(null)
+        listView.setPadding(requireContext().dp(16), requireContext().dp(8), requireContext().dp(16), requireContext().dp(24))
         ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
-            listView.updatePadding(bottom = bars.bottom)
+            listView.updatePadding(bottom = bars.bottom + requireContext().dp(24))
             insetsApplied = true
             allowStateRestoration()
             WindowInsetsCompat.CONSUMED
@@ -393,10 +395,32 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         isPersistent = false
         isIconSpaceReserved = false
         isSingleLineTitle = false
+        layoutResource = R.layout.settings_item
+        val iconRes = when (title) {
+            R.string.settings_distro -> R.drawable.ic_settings_system
+            R.string.settings_login -> R.drawable.ic_settings_account
+            R.string.settings_reset -> R.drawable.ic_settings_reset
+            R.string.settings_notifications -> R.drawable.ic_settings_notifications
+            R.string.settings_battery_usage -> R.drawable.ic_settings_battery
+            R.string.settings_run_policy -> R.drawable.ic_settings_run
+            R.string.settings_privacy, R.string.settings_privacy_policy -> R.drawable.ic_lock
+            R.string.settings_shared_storage, R.string.settings_file_access -> R.drawable.ic_settings_storage
+            R.string.settings_fill_wide -> R.drawable.ic_notification
+            R.string.settings_cursor_style, R.string.settings_cursor_blink -> R.drawable.ic_settings_cursor
+            R.string.settings_show_tab_list -> R.drawable.ic_settings_tabs
+            R.string.settings_volume_keys -> R.drawable.ic_settings_volume
+            R.string.settings_tier -> R.drawable.ic_settings_debug
+            R.string.settings_export_logs -> R.drawable.ic_settings_export
+            R.string.settings_licenses -> R.drawable.ic_settings_license
+            R.string.settings_telegram, R.string.settings_project, R.string.settings_version -> R.drawable.ic_settings_link
+            else -> 0
+        }
+        if (iconRes != 0) setIcon(iconRes)
     }
 
     private fun action(title: Int, onClick: () -> Unit): Preference =
         Preference(requireContext()).configure(title).apply {
+            widgetLayoutResource = R.layout.settings_navigation
             setOnPreferenceClickListener {
                 onClick()
                 true
@@ -423,6 +447,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
     private fun choice(title: Int, change: (TerminalService, String) -> Unit): ListPreference =
         ListPreference(requireContext()).configure(title).apply {
+            widgetLayoutResource = R.layout.settings_navigation
             setDialogTitle(title)
             setOnPreferenceChangeListener { _, value ->
                 val s = service ?: return@setOnPreferenceChangeListener false
@@ -433,7 +458,9 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
     private fun group(heading: Int, vararg rows: Preference) {
-        val category = PreferenceCategory(requireContext()).configure(heading)
+        val category = PreferenceCategory(requireContext()).configure(heading).apply {
+            layoutResource = R.layout.settings_category
+        }
         preferenceScreen.addPreference(category)
         for (row in rows) category.addPreference(row)
     }

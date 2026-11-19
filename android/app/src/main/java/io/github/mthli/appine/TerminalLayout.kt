@@ -41,9 +41,9 @@ internal class TerminalLayout(
         setBackgroundColor(Color.BLACK)
     }
     private val status = TextView(context).apply {
-        // In the muted colour of the bars' labels, read once onCreate has applied the
-        // wallpaper's colours (Android 12 and later)
+        setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
         setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
+        setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
         gravity = Gravity.CENTER
         setText(R.string.starting)
     }
@@ -72,11 +72,11 @@ internal class TerminalLayout(
         enable: () -> Unit,
         dismiss: () -> Unit,
     ) = LinearLayout(context).apply {
-        val rowHeight = context.dp(32)
+        val rowHeight = context.dp(48)
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, rowHeight)
         isVisible = false
         orientation = LinearLayout.HORIZONTAL
-        setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+        setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainerLow))
         fun button(action: () -> Unit) = Button(context).apply {
             setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
@@ -100,12 +100,10 @@ internal class TerminalLayout(
             setText(message)
             ellipsize = TextUtils.TruncateAt.END
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(context.dp(10), 0, context.dp(10), 0)
+            setPadding(context.dp(16), 0, context.dp(16), 0)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        addView(button(dismiss).apply {
-            text = "×"
-            contentDescription = context.getString(dismissLabel)
-        }, LinearLayout.LayoutParams(rowHeight, ViewGroup.LayoutParams.MATCH_PARENT))
+        addView(context.terminalIconButton(R.drawable.ic_close, dismissLabel) { dismiss() },
+            LinearLayout.LayoutParams(rowHeight, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
     private val content: LinearLayout
@@ -115,8 +113,8 @@ internal class TerminalLayout(
      * Moves the extra keys with the IME as it shows or hides. The system lays the root out for the
      * end as the animation starts (so the terminal regrids once, at the start), and the keys are
      * drawn from where they were on screen to their new place along the IME's own curve: as it
-     * shows, they rise through the IME's room (black) to the terminal's new bottom; as it hides,
-     * they sink over the terminal's new rows, which they hide while passing, being black.
+     * shows, they rise through the IME's room to the terminal's new bottom; as it hides,
+     * their opaque surface covers the terminal's new rows while passing.
      */
     private val keysFollowIme = object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_STOP) {
         /** The IME animation being followed; an earlier one ending late leaves the keys alone. */
@@ -195,7 +193,7 @@ internal class TerminalLayout(
         }
         root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
             // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
             clipToPadding = false
             addView(bars, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))

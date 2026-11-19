@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (three source-research concerns and nine independently checked claims; static checks passed, external release and visual checks remain below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: release-permission residuals and the existing paired decision history)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: privacy-policy descriptions aligned with terminal file-import removal)
 
 ## Responsibilities
 
@@ -58,7 +58,10 @@ and contact. The policy distinguishes automatic mirror probes, local diagnostics
 user-directed sharing and network traffic from guest programs.
 The permissions section describes optional all-files access for guest `/sdcard` and
 `/storage/emulated/0` paths, preserves Android's remaining storage restrictions and
-separately explains the default-off DocumentsProvider consent.
+separately explains the default-off DocumentsProvider consent. Appine's own picker flow saves
+diagnostic exports; the policy separately describes Linux files exposed through Android's
+file picker and ordinary clipboard copy, paste and program-read actions. The choices section
+includes saving or sharing logs.
 
 ## Dependencies (inbound / outbound)
 
@@ -68,8 +71,8 @@ separately explains the default-off DocumentsProvider consent.
 - `android/setup`: mirrors, system downloads, repository protocols and Settings.
 - `android/native`: guest shared-storage mount paths.
 - `android/service`: diagnostics, terminal restoration and background execution.
-- `android/privacy`, `android/documents`, `android/file-import`, `android/terminal`:
-  authentication, file grants, selected imports and clipboard interactions.
+- `android/privacy`, `android/documents`, `android/terminal`:
+  authentication, file grants and clipboard interactions.
 - Maintainer-supplied developer identity/contact and actual support-mail handling.
 - `android/terminal`: launcher foreground vector and `values/colors.xml` are the
   design sources for favicon geometry and colors, with no automatic synchronization.

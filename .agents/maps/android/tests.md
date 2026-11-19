@@ -1,9 +1,11 @@
 # android/tests Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/tests.md` for the paired decision history (not yet created; pre-split decisions D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D29 stay in `.agents/decisions/android/native.md`).
+> See `.agents/decisions/android/tests.md` for the paired decision history (pre-split decisions D5, D8, the test portions of D9, D12–D14, D16, D19 and D23–D29 stay in `.agents/decisions/android/native.md`).
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: terminal file-import removal and shared tab-list geometry)
 
 ## Responsibilities
 
@@ -29,7 +31,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
 ### Tests
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
-  and preserved editor focus during opening/scrolling/dismissal; all three cases passed on API 34.
+  and preserved editor focus during opening/scrolling/dismissal. Row height, scrolling increments
+  and the ten-row cap follow `TabListView.ROW_DP` and `MAX_VISIBLE_ROWS`, covering short and
+  tall viewports.
 
 - `ShellTitleTest` uses separate stores for two cases: real bash/ash title restoration after
   a program exits, directory changes and Unicode/control paths; bash also covers command titles,
@@ -39,10 +43,6 @@ debug variant, manifest and network-security configuration belong to `android/bu
 - `TerminalResizeTest` uses isolated stores and shell-free terminals for seven API 34 checks:
   preview pixels under full-frame requests and subrow layouts, split control sequences, quiet
   output, timeout, complete repaint and detach cleanup. It drives layout/draw directly, not the IME.
-- `TerminalFilesTest` uses isolated stores for binary/empty imports, collisions, name/home
-  escaping, read/close failure cleanup and missing homes; a real guest shell checks reads and
-  clipboard quoting. A locked MainActivity checks pending-picker retention across recreation;
-  all seven cases passed on API 34.
 - `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
   report retention, own-PID capture excluding another process, read-only share intents and
   provider root confinement, plus rejection of locked/stale export callbacks and recreation.
@@ -122,6 +122,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
 None.
 
 ## To verify
+
+- Updated tab-list geometry and focus checks require a fresh device run after the Material 3
+  control/row resizing; the earlier three-case API 34 pass used the prior geometry.
 
 - Diagnostic exports passed six instrumentation cases and seven privacy cases on API 34;
   debug/release assembly and lint passed. Manual checks covered authentication before picker

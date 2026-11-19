@@ -1,11 +1,11 @@
 # android/licenses Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/licenses.md` for the paired decision history (not yet created; pre-split decisions D3, D4, D13, the license-page part of D50 and D55 stay in `.agents/decisions/android/terminal.md`; the newer offline-reader decision remains in bd580227 Decision 1 with its android/terminal tag until distilled).
+> See `.agents/decisions/android/licenses.md` for the paired decision history (pre-split decisions D3, D4, D13, the license-page part of D50 and D55 stay in `.agents/decisions/android/terminal.md`; the newer offline-reader decision remains in bd580227 Decision 1 with its android/terminal tag until distilled).
 >
 > Verified: 2026-11-14 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: tonal license rows and reader toolbar hierarchy)
 
 ## Responsibilities
 
@@ -51,12 +51,16 @@ instrumentation tests belong to android/tests. This module consumes those assets
   license; Alpine shows a localized package count and "Multiple licenses", and SQLite "Public
   domain". Standalone texts stay in the catalog and assets for links from Android libraries and
   Alpine, but do not appear in the main list. Upstream alternatives remain in the body.
-- The page (`page.xml`): a `MaterialToolbar` (title, back arrow) in an `AppBarLayout` that lifts
-  while the content below it is scrolled, over a `FrameLayout` with the app bar's scrolling
-  behaviour, containing the list's `NestedScrollView` or the reader's WebView; edge to edge (wallpaper
-  colours from Android 12 on through `DynamicColors`), with the bar padded under the status bar
-  and content clear of the navigation bar. The reader's toolbar names the entry, Back and Up
-  finish it, and the list's scroll view retains its place, including across recreation.
+- The shared page (`page.xml`) has a `MaterialToolbar` of at least 72 dp with TitleLarge title,
+  BodySmall subtitle and back arrow, inside an `AppBarLayout` that lifts to colorSurfaceContainer
+  while content scrolls. Its scrolling `FrameLayout` hosts the list's `NestedScrollView` or the
+  reader's WebView; each activity applies status, navigation and cutout insets edge to edge.
+  Dynamic colours follow the wallpaper from Android 12 on. The reader's toolbar names the
+  entry and shows its localized subtitle; Back and Up finish it. The list retains its place
+  across recreation.
+- List items are rounded tonal rows of at least 80 dp with TitleMedium titles, BodyMedium
+  summaries and a decorative chevron. The list has 16 dp side/top padding and 24 dp below
+  the navigation inset.
 - The reader uses AndroidX `WebViewAssetLoader` on `appassets.androidplatform.net`; only the
   selected HTML file, shared CSS and an in-memory theme stylesheet can load. JavaScript, file,
   content and network access are disabled. HTTP(S) links open Custom Tabs; local links to other
@@ -79,7 +83,8 @@ instrumentation tests belong to android/tests. This module consumes those assets
 
 ### Outbound
 
-- android/terminal: shared `Theme.Appine`, localized strings, `page.xml`, `dp` and `themeColor`.
+- android/terminal: shared `Theme.Appine`, localized strings, `page.xml`,
+  `settings_item_background.xml`, `ic_chevron_right.xml`, `dp` and `themeColor`.
 - android/build: `assets/notices/index.json`, the selected HTML and shared CSS.
 - AndroidX WebKit's asset loader, WebView, Custom Tabs for external HTTP(S) links, AppCompat,
   Material Components, insets helpers and the system-selected browser.
@@ -104,5 +109,7 @@ None recorded in the parent mapping for this concern.
 ## To verify
 
 - The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and
-  tablet layouts remain untried. API 34 emulator checks cover offline rendering, no horizontal
-  overflow, scroll restoration on recreation, list navigation and light/dark Material colours.
+  tablet layouts remain untried. Prior API 34 emulator checks covered offline rendering,
+  no horizontal overflow, scroll restoration, list navigation and light/dark Material colours.
+- The current row/toolbar redesign has static source, XML and cached Material API checks only;
+  runtime layout, accessibility and restoration with the new styling remain unverified.

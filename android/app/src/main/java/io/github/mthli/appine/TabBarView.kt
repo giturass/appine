@@ -4,7 +4,6 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
@@ -24,9 +23,9 @@ import androidx.core.view.updateLayoutParams
 import io.github.mthli.appine.TabBarView.Companion.LEAVE_SCALE
 
 /**
- * The tab bar, one row in any window: a scrolling row of tabs, each a square with its number (a
- * long press shows its title), with an optional `⧉` fixed at the left and `×` (closes the current tab), `+`,
- * Import and `⋮` over its end. Tabs fade into the left part of `×` while more lie beyond. Scrolled away from the
+ * The tab bar, one row in any window: a scrolling row of numbered session controls (a
+ * long press shows its title), with an optional session list fixed at the left and close, new
+ * session and menu icons over its end. Tabs fade into the close button while more lie beyond. Scrolled away from the
  * current tab, the row brings it back into view a few seconds after it comes to rest. When tabs
  * close, the ones after them slide into their places and then roll to their new numbers. The
  * other tabs show what their programs report: progress under the number, a dot for a program
@@ -40,22 +39,19 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     /** Where taps on the bar go: the activity, which owns the sessions. */
     interface Target {
-        /** `⧉`: toggle the list of tab titles. */
+        /** Toggle the list of session titles. */
         fun listTabs()
 
         /** A tab was tapped. */
         fun show(session: VtSession)
 
-        /** `×`: the current tab is to close. */
+        /** Close the current session. */
         fun closeCurrent()
 
-        /** `+`. */
+        /** Open a session. */
         fun newTab()
 
-        /** `@`: select files to import. */
-        fun importFiles()
-
-        /** `⋮`: its menu, at [anchor]. */
+        /** Open the overflow menu at [anchor]. */
         fun menu(anchor: View)
     }
 
@@ -88,8 +84,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     /** Brings the current tab back into view a while after the row was scrolled away from it. */
     private val returnToCurrentTab = Runnable { revealCurrentTab() }
 
-    // On black like the terminal; the theme's colours, from the wallpaper on Android 12 and later,
-    // as the extra keys'
+    private val surfaceColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainer)
 
     /** The buttons and the other tabs' numbers. */
     private val mutedColor = terminalControlColor(selected = false)
@@ -154,48 +149,27 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
-    private val listButton = button("⧉") { target.listTabs() }.apply {
-        contentDescription = context.getString(R.string.tab_list)
-        tooltipText = contentDescription
-    }
+    private val listButton = context.terminalIconButton(R.drawable.ic_tab_list, R.string.tab_list) { target.listTabs() }
+
+    /** Hidden while there is no current tab. */
+    private val closeButton = context.terminalIconButton(R.drawable.ic_close, R.string.close_tab) { target.closeCurrent() }
 
     /**
-     * `×`, hidden while there is no current tab. The multiplication sign, which Roboto draws like
-     * its +; U+2715 (✕) is not in Roboto, and the fallback font's is larger and thinner than + and ⋮.
-     */
-    private val closeButton = button("×") { target.closeCurrent() }.apply {
-        contentDescription = context.getString(R.string.close_tab)
-        tooltipText = contentDescription
-    }
-
-    private val importButton = button("@") { target.importFiles() }.apply {
-        contentDescription = context.getString(R.string.import_files)
-        tooltipText = contentDescription
-    }
-
-    /**
-     * `×`, `+`, Import and `⋮` over the row's end. Black but for the left part of × the fade reaches into,
+     * Close, new session and menu over the row's end. Opaque but for the part the fade reaches into,
      * so the tabs under the buttons are hidden, and taking every touch there, so a tab under the
      * hidden × cannot be tapped; TalkBack skips the group and reads each button.
      */
     private val buttons = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
-        background = InsetDrawable(Color.BLACK.toDrawable(), dp(FADE_INTO_CLOSE_DP), 0, 0, 0)
+        background = InsetDrawable(surfaceColor.toDrawable(), dp(FADE_INTO_CLOSE_DP), 0, 0, 0)
         // The inset comes as padding with the background, which would widen the group to the
-        // left by as much and keep the black at the left of ×
+        // left by as much and keep the surface at the left of the close button
         setPadding(0, 0, 0, 0)
         isClickable = true
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
-        addView(button("+") { target.newTab() }.apply {
-            contentDescription = context.getString(R.string.new_tab)
-            tooltipText = contentDescription
-        }, item())
-        addView(importButton, item())
-        addView(button("⋮") { target.menu(it) }.apply {
-            contentDescription = context.getString(R.string.more_options)
-            tooltipText = contentDescription
-        }, item())
+        addView(context.terminalIconButton(R.drawable.ic_add, R.string.new_tab, prominent = true) { target.newTab() }, item())
+        addView(context.terminalIconButton(R.drawable.ic_more, R.string.more_options) { target.menu(it) }, item())
     }
 
     // With gesture navigation, a slide from the screen's left edge over the tabs scrolls them
@@ -206,10 +180,10 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     private val exclusion = listOf(excluded)
 
     init {
-        setBackgroundColor(Color.BLACK)
-        scroll.setPadding(0, 0, buttons.childCount * dp(BAR_DP), 0)
-        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply { marginStart = dp(BAR_DP) })
-        addView(listButton, LayoutParams(dp(BAR_DP), LayoutParams.MATCH_PARENT, Gravity.START))
+        setBackgroundColor(surfaceColor)
+        scroll.setPadding(0, 0, buttons.childCount * dp(ITEM_DP), 0)
+        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply { marginStart = dp(ITEM_DP) })
+        addView(listButton, LayoutParams(dp(ITEM_DP), LayoutParams.MATCH_PARENT, Gravity.START))
         addView(buttons, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT, Gravity.END))
     }
 
@@ -262,21 +236,15 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         if (currentTab != null) scroll.post { revealCurrentTab() }
     }
 
-    fun setImportEnabled(enabled: Boolean) {
-        importButton.isEnabled = enabled
-        importButton.alpha = if (enabled) 1f else 0.38f
-    }
-
     fun setListOpen(open: Boolean) {
         listButton.isSelected = open
-        listButton.setTextColor(if (open) currentColor else mutedColor)
     }
 
     fun setListVisible(visible: Boolean) {
         val visibility = if (visible) View.VISIBLE else View.GONE
         if (listButton.visibility == visibility) return
         listButton.visibility = visibility
-        scroll.updateLayoutParams<LayoutParams> { marginStart = if (visible) dp(BAR_DP) else 0 }
+        scroll.updateLayoutParams<LayoutParams> { marginStart = if (visible) dp(ITEM_DP) else 0 }
         scroll.post { revealCurrentTab() }
     }
 
@@ -387,8 +355,8 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     }
 
     /**
-     * A tab in the row: its number (from [i]) in a square as tall as the bar, the current one in
-     * the primary colour above the row's indicator ([currentTab]), an ended one faded. Tap shows
+     * A tab in the row: its number (from [i]), the current one in a filled primary container
+     * above the row's indicator ([currentTab]), an ended one faded. Tap shows
      * it; a long press shows its title.
      *
      * The indicator goes by the current tab's place in the row ([moveIndicator]), not by where the
@@ -400,7 +368,8 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
             text = number(i)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
             gravity = Gravity.CENTER
-            foreground = touchFeedback()
+            background = terminalControlBackground()
+            setPadding(0, 0, 0, 0)
             setOnClickListener {
                 it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 target.show(session)
@@ -422,6 +391,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
             view.tooltipText = title(session)
             view.alpha = if (session.isRunning) 1f else ENDED_ALPHA
             if (slideFrom?.containsKey(this) != true) view.text = number(i)
+            view.isSelected = session === current
             view.setTextColor(if (session === current) currentColor else mutedColor)
         }
 
@@ -470,37 +440,27 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         return if (session.isRunning) text else context.getString(R.string.tab_ended, text)
     }
 
-    /** A button: a square as tall as the bar ([item]) with its label centred. */
-    private fun button(label: String, onClick: (View) -> Unit) = TextView(context).apply {
-        text = label
-        setTextColor(mutedColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
-        gravity = Gravity.CENTER
-        background = touchFeedback()
-        setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            onClick(it)
-        }
-    }
-
-    /** A tab or a button: a square as tall as the bar. */
-    private fun item() = LinearLayout.LayoutParams(dp(BAR_DP), ViewGroup.LayoutParams.MATCH_PARENT)
+    /** A tab or icon action keeps a full 48 dp touch width. */
+    private fun item() = LinearLayout.LayoutParams(dp(ITEM_DP), ViewGroup.LayoutParams.MATCH_PARENT)
 
     companion object {
-        /** The bar's height, and the side of its tabs and buttons (the search bar's too). */
-        const val BAR_DP = 32
+        /** The shared height of the session and search bars. */
+        const val BAR_DP = 56
+
+        /** The touch width of numbered sessions and icon actions. */
+        const val ITEM_DP = 48
 
         /**
-         * The size of the buttons' labels. In dp, not sp: the bar's height is fixed, so its labels
-         * ignore the system font scale. The search bar's text and buttons take it too.
+         * The size of list titles and search text. In dp, not sp: terminal chrome has a fixed
+         * height, so these labels ignore the system font scale.
          */
         const val BAR_LABEL_DP = 14f
 
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
-        private const val TAB_NUMBER_DP = 14f
+        private const val TAB_NUMBER_DP = 16f
 
         /**
-         * How far the fade reaches into `×`, ending in the blank before its glyph; the rest of
+         * How far the fade reaches into Close, ending at its icon padding; the rest of
          * [ExtraKeysView.FADE_DP] lies at its left.
          */
         private const val FADE_INTO_CLOSE_DP = 12

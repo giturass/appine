@@ -3,31 +3,51 @@
 <!-- A Material 3 license list item with a headline and supporting text. -->
 <LinearLayout
         xmlns:android="http://schemas.android.com/apk/res/android"
-        android:orientation="vertical"
+        xmlns:app="http://schemas.android.com/apk/res-auto"
+        android:orientation="horizontal"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:minHeight="72dp"
-        android:paddingTop="12dp"
-        android:paddingBottom="12dp"
-        android:paddingStart="16dp"
-        android:paddingEnd="24dp"
+        android:layout_marginBottom="6dp"
+        android:minHeight="80dp"
+        android:paddingVertical="16dp"
+        android:paddingHorizontal="20dp"
         android:gravity="center_vertical"
-        android:background="?attr/selectableItemBackground">
+        android:focusable="true"
+        android:screenReaderFocusable="true"
+        android:background="@drawable/settings_item_background">
 
-    <TextView
-            android:id="@+id/title"
-            android:layout_width="match_parent"
+    <LinearLayout
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:textAppearance="?attr/textAppearanceBodyLarge"
-            android:textColor="?attr/colorOnSurface"
-            />
+            android:layout_weight="1"
+            android:layout_marginEnd="16dp"
+            android:orientation="vertical">
 
-    <TextView
-            android:id="@+id/summary"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textAppearance="?attr/textAppearanceBodyMedium"
-            android:textColor="?attr/colorOnSurfaceVariant"
+        <TextView
+                android:id="@+id/title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textAppearance="?attr/textAppearanceTitleMedium"
+                android:textColor="?attr/colorOnSurface"
+                />
+
+        <TextView
+                android:id="@+id/summary"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textAppearance="?attr/textAppearanceBodyMedium"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                />
+
+    </LinearLayout>
+
+    <androidx.appcompat.widget.AppCompatImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:src="@drawable/ic_chevron_right"
+            android:importantForAccessibility="no"
+            app:tint="?attr/colorOnSurfaceVariant"
             />
 
 </LinearLayout>

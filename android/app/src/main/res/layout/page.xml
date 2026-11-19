@@ -8,19 +8,32 @@
         xmlns:app="http://schemas.android.com/apk/res-auto"
         android:id="@+id/root"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:background="?attr/colorSurface">
 
     <com.google.android.material.appbar.AppBarLayout
             android:id="@+id/app_bar"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content">
+            android:layout_height="wrap_content"
+            android:elevation="0dp"
+            app:liftOnScroll="true"
+            app:liftOnScrollColor="?attr/colorSurfaceContainer">
 
         <com.google.android.material.appbar.MaterialToolbar
                 android:id="@+id/toolbar"
                 android:layout_width="match_parent"
-                android:layout_height="?attr/actionBarSize"
+                android:layout_height="wrap_content"
+                android:minHeight="72dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="12dp"
                 app:navigationContentDescription="@string/navigate_up"
                 app:navigationIcon="?attr/homeAsUpIndicator"
+                app:navigationIconTint="?attr/colorOnSurface"
+                app:titleMarginStart="8dp"
+                app:titleTextAppearance="?attr/textAppearanceTitleLarge"
+                app:titleTextColor="?attr/colorOnSurface"
+                app:subtitleTextAppearance="?attr/textAppearanceBodySmall"
+                app:subtitleTextColor="?attr/colorOnSurfaceVariant"
                 />
 
     </com.google.android.material.appbar.AppBarLayout>

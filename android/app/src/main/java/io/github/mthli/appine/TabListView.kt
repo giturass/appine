@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.text.TextUtils
@@ -18,8 +19,10 @@ import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.shape.MaterialShapeDrawable
+import com.google.android.material.shape.ShapeAppearanceModel
 
-/** A flat list over the terminal, flush with the tab bar, without resizing the terminal. */
+/** A tonal session list below the toolbar, without resizing the terminal or taking its focus. */
 @SuppressLint("ViewConstructor")
 internal class TabListView(context: Context, private val target: Target) : FrameLayout(context) {
     interface Target {
@@ -48,7 +51,18 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         layoutManager = manager
         adapter = rows
         itemAnimator = DefaultItemAnimator()
-        setBackgroundColor(Color.BLACK)
+        background = MaterialShapeDrawable(
+            ShapeAppearanceModel.builder()
+                .setBottomLeftCornerSize(dp(20).toFloat())
+                .setBottomRightCornerSize(dp(20).toFloat())
+                .build(),
+        ).apply {
+            fillColor = ColorStateList.valueOf(themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+        }
+        setPadding(dp(8), 0, dp(8), 0)
+        clipToPadding = false
+        clipToOutline = true
+        elevation = dp(8).toFloat()
         isVerticalScrollBarEnabled = true
         isScrollbarFadingEnabled = true
         verticalScrollbarThumbDrawable = context.themeDrawable(android.R.attr.scrollbarThumbVertical)
@@ -57,6 +71,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
 
     init {
         visibility = GONE
+        setBackgroundColor(Color.argb(96, 0, 0, 0))
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
         ViewCompat.setAccessibilityPaneTitle(this, context.getString(R.string.tab_list))
         // Consume the dismissing tap so it cannot also move the shell's cursor or open a link.
@@ -109,7 +124,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         // A short landscape/IME viewport leaves the remaining rows scrollable.
-        val contentHeight = rows.itemCount.coerceAtMost(MAX_VISIBLE_ROWS) * dp(TabBarView.BAR_DP)
+        val contentHeight = rows.itemCount.coerceAtMost(MAX_VISIBLE_ROWS) * dp(ROW_DP)
         list.layoutParams.height = minOf(contentHeight, MeasureSpec.getSize(heightMeasureSpec))
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
@@ -144,11 +159,15 @@ internal class TabListView(context: Context, private val target: Target) : Frame
 
     private inner class Row : RecyclerView.ViewHolder(LinearLayout(context)) {
         private var entry: Entry? = null
-        private val number = label(NUMBER_DP).apply { gravity = Gravity.CENTER }
+        private val number = label(NUMBER_DP).apply {
+            gravity = Gravity.CENTER
+            background = terminalControlBackground(tonal = true)
+            setPadding(0, 0, 0, 0)
+        }
         private val title = label(TabBarView.BAR_LABEL_DP).apply {
             gravity = Gravity.CENTER_VERTICAL
             ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, 0, dp(8), 0)
+            setPadding(dp(8), 0, dp(8), 0)
         }
         private val select = object : LinearLayout(context) {
             override fun dispatchDraw(canvas: Canvas) {
@@ -160,16 +179,13 @@ internal class TabListView(context: Context, private val target: Target) : Frame
             }
         }.apply {
             orientation = LinearLayout.HORIZONTAL
-            background = touchFeedback()
+            background = terminalControlBackground()
+            setPadding(0, 0, 0, 0)
             isFocusable = true
             addView(number, square())
             addView(title, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f))
         }
-        private val close = label(TabBarView.BAR_LABEL_DP).apply {
-            text = "×"
-            gravity = Gravity.CENTER
-            setTextColor(muted)
-            background = touchFeedback()
+        private val close = context.terminalIconButton(R.drawable.ic_close, R.string.close_tab) {}.apply {
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
             isFocusable = true
         }
@@ -177,7 +193,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
         init {
             (itemView as LinearLayout).apply {
                 orientation = LinearLayout.HORIZONTAL
-                layoutParams = RecyclerView.LayoutParams(LayoutParams.MATCH_PARENT, dp(TabBarView.BAR_DP))
+                layoutParams = RecyclerView.LayoutParams(LayoutParams.MATCH_PARENT, dp(ROW_DP))
                 addView(select, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f))
                 addView(close, square())
             }
@@ -205,6 +221,7 @@ internal class TabListView(context: Context, private val target: Target) : Frame
                 number.setTextColor(color)
                 title.setTextColor(color)
                 select.isSelected = entry.selected
+                number.isSelected = entry.selected
             }
             if (previous?.running != entry.running) select.alpha = if (entry.running) 1f else ENDED_ALPHA
             val status = marks.describe(entry.running, entry.progress, entry.status)
@@ -215,11 +232,12 @@ internal class TabListView(context: Context, private val target: Target) : Frame
             }
             select.invalidate()
             close.contentDescription = context.getString(R.string.close_tab_description, entry.number, entry.title)
+            close.tooltipText = close.contentDescription
         }
     }
 
-    /** Numbers and close buttons have the same square bounds as the navigation controls. */
-    private fun square() = LinearLayout.LayoutParams(dp(TabBarView.BAR_DP), LayoutParams.MATCH_PARENT)
+    /** Numbers and close buttons share the navigation controls' touch width. */
+    private fun square() = LinearLayout.LayoutParams(dp(TabBarView.ITEM_DP), LayoutParams.MATCH_PARENT)
 
     private fun label(size: Float) = TextView(context).apply {
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, size)
@@ -228,8 +246,9 @@ internal class TabListView(context: Context, private val target: Target) : Frame
     }
 
     companion object {
-        private const val MAX_VISIBLE_ROWS = 10
-        private const val NUMBER_DP = 14f
+        const val ROW_DP = 56
+        const val MAX_VISIBLE_ROWS = 10
+        private const val NUMBER_DP = 16f
         private const val ENDED_ALPHA = 0.38f
     }
 }

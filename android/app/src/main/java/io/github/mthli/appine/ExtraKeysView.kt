@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
@@ -176,7 +175,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     /**
-     * The fixed keys at the right edge over the grid's end. Black but for their left part the
+     * The fixed keys at the right edge over the grid's end. Opaque but for their left part the
      * fade reaches into, so the keys under it are hidden; its keys fill it and take every touch on
      * it, a key showing through the fade too.
      */
@@ -187,7 +186,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         }
     }.apply {
         orientation = LinearLayout.VERTICAL
-        background = InsetDrawable(Color.BLACK.toDrawable(), fadeIntoLast, 0, 0, 0)
+        background = InsetDrawable(themeColor(com.google.android.material.R.attr.colorSurfaceContainer).toDrawable(), fadeIntoLast, 0, 0, 0)
         // The inset comes as padding with the background, which would narrow the keys and move
         // them right by as much
         setPadding(0, 0, 0, 0)
@@ -198,18 +197,16 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
-    // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
-    // labels, a key that is on and its indicator, and a key while pressed
+    // The same tonal containers and paired text roles as the session controls.
     private val labelColor = terminalControlColor(selected = false)
     private val onColor = terminalControlColor(selected = true)
     private val indicatorPaint = indicatorPaint(onColor)
-    private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
 
     /** The height of a row, in pixels. */
     private val rowHeight = (ROW_DP * density).roundToInt()
 
     init {
-        setBackgroundColor(Color.BLACK)
+        setBackgroundColor(themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
         page(
             arrayOf(
                 special("ESC", KeyEvent.KEYCODE_ESCAPE),
@@ -365,6 +362,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         setTextColor(labelColor)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, LABEL_DP)
         isSingleLine = true
+        background = terminalControlBackground(tonal = true)
+        setPadding(0, 0, 0, 0)
     }
 
     /** A key for the fixed column, laid out to fill a cell of it. */
@@ -394,8 +393,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     private fun refresh() {
+        symView.isSelected = shown != KEYS
         symView.setTextColor(if (shown != KEYS) onColor else labelColor)
-        for (m in modifiers) m.view.setTextColor(if (m.on) onColor else labelColor)
+        for (m in modifiers) {
+            m.view.isSelected = m.on
+            m.view.setTextColor(if (m.on) onColor else labelColor)
+        }
         // Their indicators; only the page shown is in the view
         pages[shown].grid.invalidate()
         fixed.invalidate()
@@ -404,7 +407,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     /**
      * Draws the indicator, as under the current tab, under the keys in [container] that stay on
      * until tapped (a locked modifier, and SYM with another page than the first shown; a modifier
-     * on for the next key only shows the colour), over the keys so that a pressed key's shading
+     * on for the next key uses a filled container), over the keys so that a pressed key's shading
      * does not hide it.
      */
     private fun indicateKeys(canvas: Canvas, container: View) {
@@ -466,7 +469,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 MotionEvent.ACTION_DOWN -> {
                     held = false
                     cancelled = false
-                    view.setBackgroundColor(pressedColor)
+                    view.drawableHotspotChanged(e.x, e.y)
+                    view.isPressed = true
                     if (key.repeats || key.longPress != null) {
                         view.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
                     }
@@ -511,7 +515,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         fun cancel() {
             cancelled = true
             view.removeCallbacks(this)
-            view.background = null
+            view.isPressed = false
         }
     }
 
@@ -590,7 +594,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         private const val MIN_COLUMN_DP = 45f
 
         /** The height of a row. */
-        private const val ROW_DP = 32f
+        private const val ROW_DP = 40f
 
         /**
          * The size of the labels; HOME, the widest, takes about 34 dp of a 45 dp column. In dp, not

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: remaining Android device coverage for shared-storage authorization)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: Material 3 preference rows, icons and shared page hierarchy)
 
 ## Responsibilities
 
@@ -425,13 +425,17 @@ session consuming their state and events (`android/vt`).
   warning about reading or copying sensitive home/system files; only Enable saves true, while
   Cancel, Back, outside tap or recreation leaves it off. Disabling acts immediately through the service.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
-  (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
-  handles neither `uiMode` nor `density`), which restores the fragment, scroll position and an
-  open login/running-policy/cursor choice dialog, then rebinds and renders. Other open dialogs are dropped.
-  The activity applies top and side insets; the fragment pads its RecyclerView above navigation
-  bars with clipping disabled, so the final preference can scroll clear of them.
-  Adapter state restoration waits for the first service render and window insets, so initially
-  empty summaries and missing bottom padding cannot shift the saved scroll position.
+  (`DynamicColors`), edge to edge. The shared toolbar is at least 72 dp tall. Categories use
+  `settings_category.xml`; preferences use rounded tonal `settings_item.xml` rows of at least
+  80 dp, with leading icons, TitleMedium titles and BodyMedium summaries. Actions and list
+  choices have decorative chevrons; switches keep the Material widget. The RecyclerView has
+  no dividers, 16 dp side gutters, 8 dp top padding and 24 dp below the navigation inset.
+  A dark-mode or display size change recreates the screen (it handles neither `uiMode` nor
+  `density`), restoring the fragment, scroll position and an open login/running-policy/cursor
+  choice dialog, then rebinding and rendering. Other open dialogs are dropped. The activity
+  applies top and side insets; the list disables clipping to padding. Adapter state restoration
+  waits for the first service render and window insets, so initially empty summaries and
+  missing bottom padding cannot shift the saved scroll position.
 
 ## Dependencies (inbound / outbound)
 
@@ -444,6 +448,7 @@ session consuming their state and events (`android/vt`).
 
 ### Outbound
 
+- android/terminal supplies the shared page, preference/category layouts, icons and tonal row resources.
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
   proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
@@ -526,6 +531,10 @@ session consuming their state and events (`android/vt`).
   deleted?
 
 ## To verify
+
+- The preference-row and shared-page redesign has static source, XML and cached AndroidX/Material
+  API checks only; runtime layout, large fonts, TalkBack and scroll/dialog restoration with
+  the new styling remain unverified. Earlier API 34 checks below predate this redesign.
 
 - Shared-storage authorization, revocation, return-to-Settings summaries and vendor fallback
   screens remain unverified on Android.

@@ -80,15 +80,6 @@
     <string name="link_hidden_file">檔案存取已停用，請在設定中開啟「允許其他應用程式存取檔案」</string>
     <string name="link_missing_file">找不到此檔案</string>
 
-    <!-- File import -->
-    <string name="import_files">匯入檔案</string>
-    <string name="importing_files">正在匯入檔案…</string>
-    <string name="import_file_name">匯入的檔案</string>
-    <string name="import_file_failed">無法匯入 %1$s：%2$s</string>
-    <string name="import_files_saved">已儲存至家目錄：\n\n^1</string>
-    <string name="import_picker_missing">沒有可用的檔案選擇器</string>
-    <string name="copy_paths">複製路徑</string>
-
     <!-- Program status and command completion -->
     <string name="status_percent">%1$s，%2$d%%</string>
     <string name="status_message">%1$s：%2$s</string>

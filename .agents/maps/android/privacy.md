@@ -1,11 +1,11 @@
 # android/privacy Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/privacy.md` for the paired decision history (not yet created; the pre-split boundary is D4 in `.agents/decisions/android/terminal.md`; privacy decisions not yet distilled into that snapshot remain in f61072f3 Decision 1 and c7309c0c Decision 3 with their android/terminal tags).
+> See `.agents/decisions/android/privacy.md` for the paired decision history (the pre-split boundary is D4 in `.agents/decisions/android/terminal.md`; privacy decisions not yet distilled into that snapshot remain in f61072f3 Decision 1 and c7309c0c Decision 3 with their android/terminal tags).
 >
 > Verified: 2026-11-14 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: authentication shield hierarchy and button spacing)
 
 ## Responsibilities
 
@@ -63,8 +63,12 @@ their own last-moment input, clipboard, browser and export checks.
 - `MainApplication` (`android/native`) installs `Privacy` on every FragmentActivity, including Settings, licenses and the non-exported `NotificationActivity`. Default-off `privacy_mode` accepts AndroidX Biometric 1.1.0 strong biometrics or device credentials; enabling and disabling both authenticate, enabling after a confirmation.
 - Authentication lives only in memory. The last stopped activity locks and covers pages unless recreating; overlapping internal navigation preserves it. Screen-off invalidates pending authentication and locks immediately. Pausing alone leaves visible content in place; resumed locked pages authenticate or offer Unlock/Leave after cancellation or unavailability.
 - Each activity's ViewModel retains the prompt's purpose/generation through recreation, never through process death. Successful callbacks complete only when resumed with an interactive, unlocked device; report-copy/clipboard/input checks also refuse access while no page is resumed.
-- Enabled pages and all app dialogs use `FLAG_SECURE`; `showPrivate`/`Privacy.protect` track dialog windows weakly and update existing ones on changes. The shield also covers restored dialog windows. Terminal input, clipboard answers, browser launches and title toasts check the gate; pausing cancels title toasts and denies an open clipboard question.
-- `privacy_shield.xml` presents a decorative lock, heading, authentication hint, filled Unlock button and text Leave button using the covered page's theme. Its scrollable content centers within system insets, has 24 dp horizontal/32 dp vertical padding and caps the inner column at 360 dp as the window resizes; text and buttons can grow with the font scale.
+- Enabled pages and all app dialogs use `FLAG_SECURE`; `showPrivate`/`Privacy.protect` track dialog windows weakly and update existing ones on changes. The shield also covers restored dialog windows. Terminal input, clipboard answers, browser launches and activity toasts check the gate; pausing cancels activity toasts and denies an open clipboard question.
+- `privacy_shield.xml` uses the covered page's surface/theme, with a decorative 96 dp lock
+  emblem on a rounded primary-container square, HeadlineMedium heading, BodyLarge authentication
+  hint, filled Unlock button of at least 56 dp and text Leave button of at least 48 dp.
+  Its scrollable content centers within system insets, keeps 24 dp horizontal/32 dp vertical
+  padding and a 360 dp maximum inner width; text and buttons can grow with font scale.
 - Only report-copy actions created during privacy mode enter `NotificationActivity`, never the exported launcher. It copies after the gate opens and then finishes. Normal report copying uses a non-exported receiver; exit, download cancellation and running-policy actions run directly in the service even while locked. Background programs, saved terminals and rootfs data are retained; this is access protection, not encryption or history removal.
 
 ## Dependencies (inbound / outbound)
@@ -75,7 +79,7 @@ their own last-moment input, clipboard, browser and export checks.
 - android/terminal: `MainActivity` and `TerminalLinks` check the gate; `Ui.showPrivate` registers
   dialogs before showing them; the activity resumes deferred work through `onPrivacyUnlocked`.
 - android/setup: Settings requests mode changes and fresh export authorization, rechecks it
-  before collection/handoff and protects restored dialogs.
+  before collection/handoff, protects restored dialogs and uses the decorative lock icon.
 - android/vtview: copy/paste access and preview dialogs. android/licenses' activities receive
   the same automatic lifecycle protection as every other FragmentActivity.
 - android/service: mode listeners, clipboard guards and private report-copy action intents.
@@ -106,6 +110,10 @@ their own last-moment input, clipboard, browser and export checks.
 None recorded in the parent mapping for this concern.
 
 ## To verify
+
+- The redesigned shield has static source, XML and cached Material API checks only;
+  runtime centering, insets, large-font wrapping, button layout and light/dark appearance
+  remain unverified. Earlier API 34 checks below predate this redesign.
 
 - Fresh diagnostic-export credential authentication, cancellation, wrong PIN and screen-off
   invalidation were checked on API 34; ordinary unlock did not replay an export. Real biometric

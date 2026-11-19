@@ -80,15 +80,6 @@
     <string name="link_hidden_file">文件访问已关闭，请在设置中开启「允许其他应用访问文件」</string>
     <string name="link_missing_file">找不到这个文件</string>
 
-    <!-- File import -->
-    <string name="import_files">导入文件</string>
-    <string name="importing_files">正在导入文件…</string>
-    <string name="import_file_name">导入的文件</string>
-    <string name="import_file_failed">无法导入 %1$s：%2$s</string>
-    <string name="import_files_saved">已保存到主目录：\n\n^1</string>
-    <string name="import_picker_missing">没有可用的文件选择器</string>
-    <string name="copy_paths">复制路径</string>
-
     <!-- Program status and command completion -->
     <string name="status_percent">%1$s，%2$d%%</string>
     <string name="status_message">%1$s：%2$s</string>

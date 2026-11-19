@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<resources>
+    <color name="appine_primary">@color/appine_dark_primary</color>
+    <color name="appine_on_primary">@color/appine_dark_on_primary</color>
+    <color name="appine_primary_container">@color/appine_dark_primary_container</color>
+    <color name="appine_on_primary_container">@color/appine_dark_on_primary_container</color>
+    <color name="appine_secondary">@color/appine_dark_secondary</color>
+    <color name="appine_on_secondary">@color/appine_dark_on_secondary</color>
+    <color name="appine_secondary_container">@color/appine_dark_secondary_container</color>
+    <color name="appine_on_secondary_container">@color/appine_dark_on_secondary_container</color>
+    <color name="appine_tertiary">@color/appine_dark_tertiary</color>
+    <color name="appine_on_tertiary">@color/appine_dark_on_tertiary</color>
+    <color name="appine_tertiary_container">@color/appine_dark_tertiary_container</color>
+    <color name="appine_on_tertiary_container">@color/appine_dark_on_tertiary_container</color>
+    <color name="appine_surface">@color/appine_dark_surface</color>
+    <color name="appine_on_surface">@color/appine_dark_on_surface</color>
+    <color name="appine_surface_variant">@color/appine_dark_surface_variant</color>
+    <color name="appine_on_surface_variant">@color/appine_dark_on_surface_variant</color>
+    <color name="appine_surface_container_lowest">@color/appine_dark_surface_container_lowest</color>
+    <color name="appine_surface_container_low">@color/appine_dark_surface_container_low</color>
+    <color name="appine_surface_container">@color/appine_dark_surface_container</color>
+    <color name="appine_surface_container_high">@color/appine_dark_surface_container_high</color>
+    <color name="appine_surface_container_highest">@color/appine_dark_surface_container_highest</color>
+    <color name="appine_outline">@color/appine_dark_outline</color>
+    <color name="appine_outline_variant">@color/appine_dark_outline_variant</color>
+</resources>

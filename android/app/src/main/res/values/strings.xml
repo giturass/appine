@@ -82,15 +82,6 @@
     <string name="link_hidden_file">File access is disabled. Enable in Settings: \"Allow other apps to access files\"</string>
     <string name="link_missing_file">Cannot find this file</string>
 
-    <!-- File import -->
-    <string name="import_files">Import files</string>
-    <string name="importing_files">Importing files…</string>
-    <string name="import_file_name">Imported file</string>
-    <string name="import_file_failed">Could not import %1$s: %2$s</string>
-    <string name="import_files_saved">Saved to your home directory:\n\n^1</string>
-    <string name="import_picker_missing">No file picker is available</string>
-    <string name="copy_paths">Copy paths</string>
-
     <!-- Program status and command completion -->
     <string name="status_percent">%1$s, %2$d%%</string>
     <string name="status_message">%1$s: %2$s</string>

@@ -60,9 +60,9 @@ when behavior changes:
 - `AndroidManifest.xml`, the merged release manifest and Gradle dependencies:
   permissions, including AndroidX biometric permissions, and included SDKs.
 - `Rootfs.kt`: automatic mirror probes, download destinations and repository protocols.
-- `Diagnostics.kt` and `Tabs.kt`: local data, exported diagnostics and retention.
-- `Privacy.kt`, `Documents.kt`, `TerminalFiles.kt` and terminal clipboard handlers:
-  authentication, grants, imports and clipboard access.
+- `Diagnostics.kt`, `Tabs.kt` and `SettingsActivity.kt`: local data, diagnostic exports and retention.
+- `Privacy.kt`, `Documents.kt` and terminal clipboard handlers:
+  authentication, grants and clipboard access.
 - `res/xml/data_extraction_rules.xml`: backup and transfer exclusions.
 
 These paths are under `android/app/src/main/` unless they refer to build inputs or

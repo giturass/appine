@@ -42,6 +42,7 @@ class LicensesActivity : AppCompatActivity() {
         val list = NestedScrollView(this).apply {
             id = R.id.license_list
             clipToPadding = false
+            setPadding(dp(16), dp(16), dp(16), dp(24))
             addView(rows)
         }
         findViewById<FrameLayout>(R.id.content).addView(list)
@@ -50,7 +51,7 @@ class LicensesActivity : AppCompatActivity() {
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
             v.setPadding(bars.left, 0, bars.right, 0)
             appBar.updatePadding(top = bars.top)
-            list.updatePadding(bottom = bars.bottom)
+            list.updatePadding(bottom = bars.bottom + dp(24))
             WindowInsetsCompat.CONSUMED
         }
     }

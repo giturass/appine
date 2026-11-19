@@ -1,11 +1,11 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and the retired `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: five-locale shared-storage permission labels and summaries)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: Material 3 terminal chrome, shared page resources and terminal file-import removal)
 
 ## Responsibilities
 
@@ -19,13 +19,16 @@ in `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/mai
 android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`.
 
-Controls are `android/tabbar` and `android/keys`; retained file-copy work is `android/file-import`.
-All MainActivity adapters, picker/dialog handling, shared strings and themes remain here.
-`Theme.Appine` is Material 3 DayNight; `Theme.Appine.Terminal` is always dark with black window
-and system bars. Shared resources include `Widget.Appine.MorePopup`,
-`ThemeOverlay.Appine.CheckPopup` (framework checkbox without its own ripple), `page.xml`
-and `preference_switch.xml` (MaterialSwitch at AndroidX's `switchWidget` ID). Settings uses
-AndroidX category/row layouts.
+Controls are `android/tabbar` and `android/keys`. All MainActivity adapters, dialog handling,
+shared strings and themes remain here. `Theme.Appine` is Material 3 DayNight;
+`Theme.Appine.Terminal` inherits the fixed dark theme, with a black window and surface-container
+system bars. Shared green light/dark fallback roles support dynamic wallpaper colours from
+Android 12 on. Shared resources include `Widget.Appine.MorePopup`,
+`ThemeOverlay.Appine.CheckPopup` (framework checkbox without its own ripple), `page.xml`,
+`settings_category.xml`, `settings_item.xml`, `settings_navigation.xml` and
+`preference_switch.xml` (MaterialSwitch at AndroidX's `switchWidget` ID). Settings layouts
+preserve AndroidX's standard title, summary, icon and widget IDs. Shared rounded row backgrounds
+and decorative chevrons also serve the license list.
 
 Session ownership, saving, reports and event routing are `android/service`; build and notice
 assets are `android/build`; authentication is `android/privacy`, notice UI `android/licenses`.
@@ -40,9 +43,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   the open question whether a
   program may read the clipboard (`clipboardQuestion`).
 - `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
-  applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
+  applied: a surface-container column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
   a shared overlay frame containing a column of optional permission banners (notifications, then battery usage),
-  the terminal body (`VtView`, status text and `ProgressLine` along its top) and `ExtraKeysView`,
+  the black terminal body (`VtView`, status text and `ProgressLine` along its top) and `ExtraKeysView`,
   with `TabListView` above that column;
   exposes the root and interactive views, keeps the status view private behind `showStatus` and
   `showTerminal`, and owns the IME animation callback `keysFollowIme`.
@@ -52,17 +55,19 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   and opens system app details from Settings.
 - `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
-- `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
-  without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
+- `SearchBarView` — a 56 dp search bar with a tonal `EditText` (without suggestions, IME action
+  Search), the count ("selected/total") and 48 dp vector previous/next/close controls; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
   `Target` (`search`, `step`, `close`).
 - `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
   `selectableItemBackground`); `showPrivate` registers dialog security with android/privacy before showing it.
-  `terminalControlColor` separates states on black: ordinary labels blend on-surface-variant
-  with 40% black, selected labels and indicators blend primary with 25% white. Tab controls
-  and extra keys share it; progress/status marks keep their own theme colours.
+  `terminalControlColor` pairs selected text/indicators with on-primary-container and ordinary
+  text with on-surface-variant. `terminalControlBackground` supplies inset rounded, stateful
+  containers and ripples; `terminalIconButton` adds vector tint, localized descriptions/tooltips
+  and tap feedback. Tab controls and extra keys share them; progress/status marks keep their
+  own theme colours.
   `monospaceMessage` substitutes a styled value into a localized `^1` template with TextUtils,
   leaving the explanation in the dialog's normal font.
 
@@ -74,8 +79,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
   `onSettingsChanged`,
-  `onNotice`, `onRestarting`, `onExitAll`, `onOpenUrl`; `onPrivacyUnlocked` from the privacy gate,
-  and the `OpenMultipleDocuments` activity-result callback for import.
+  `onNotice`, `onRestarting`, `onExitAll`, `onOpenUrl`; `onPrivacyUnlocked` from the privacy gate
+  resumes pending notices.
 
 ## Data flow / lifecycle
 
@@ -127,7 +132,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   implements their targets, validates session identity and privacy, opens/closes the list,
   coordinates focus, Back and accessibility, and performs session/menu actions.
 - Numbered-tab titles use native tooltips owned by `TabBarView`; the activity's shared toast
-  helper remains for extra-key notices, link failures and file-import feedback.
+  helper remains for extra-key notices and link failures.
 - The list closes on tab switching, search, other bar actions, extra-key input, pause and restart;
   list close buttons retain it while using the existing busy confirmation.
 - The list starts directly below the top bar and overlays both permission banners, terminal
@@ -148,10 +153,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
   `PopupMenu` placed like a
   toolbar's overflow menu) are Material 3 in the theme's dark colours, from the wallpaper on
-  Android 12 and later (`DynamicColors`). The tab bar, the extra keys and what lies under the
-  system bars are black like the terminal; tab/list controls and extra keys use
-  `terminalControlColor` for stronger state contrast while preserving wallpaper hues.
-  Status text, permission banners and search controls retain their original theme colours.
+  Android 12 and later (`DynamicColors`). The tab/search bars, extra keys and system-inset
+  backdrop use surface containers; selected controls have rounded filled primary containers
+  and paired text roles. The terminal body remains black. Status text uses BodyLarge typography,
+  while permission banners and search controls share the tonal hierarchy.
 - "Keep screen on" is available even without a current tab and applies to the whole terminal
   window. Its right-side checkbox reflects the activity's choice, persisted as `keep_screen_on`
   in the activity's private preferences, so recreating or reopening the activity keeps it.
@@ -163,12 +168,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Permission banners
 
-- The notification and battery banners share a 32 dp row design below the top bar, including
-  during search. Each localized 14 dp message is start-aligned with
-  10 dp horizontal padding and fallback line spacing disabled. It ellipsizes in narrow windows
-  and fills the clickable space before a separate 32 dp close button.
-  Both buttons use background touch feedback with tint cleared over the container's surface colour,
-  muted text and tap haptics. The close button has a localized accessibility description.
+- The notification and battery banners share a 48 dp surface-container-low row below the top
+  bar, including during search. Each localized 14 dp message is start-aligned with 16 dp horizontal
+  padding and fallback line spacing disabled. It ellipsizes in narrow windows and fills the
+  clickable space before a separate 48 dp vector close control. Both actions use background
+  touch feedback and tap haptics; the close control has a localized description and tooltip.
 - The notification banner appears while notifications are disabled. Closing it persists `dismissed_notification_prompt` in MainActivity preferences;
   recreating or relaunching the activity does not show it again. Closing does not request
   permission or alter authorization history. The tab list hides both buttons from accessibility
@@ -202,12 +206,6 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `modifiersUsed`. Search focus does not redirect extra keys into the search field.
 - `TerminalLayout` owns insets and IME translation; the key view chooses its own row layout.
 
-### File-import integration
-
-- `android/file-import` owns retained selection, copying and results. The activity launches
-  `OpenMultipleDocuments`, enables Import from `occupied`, resumes copies only when unlocked,
-  and presents/copies paths through a protected dialog. Recreation must not consume a result.
-
 ### Hardware-keyboard shortcuts
 
 - Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
@@ -238,7 +236,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 ### Finding text
 
 - "Find" (⋮) or Ctrl+Shift+F, with a current tab, puts the search bar in the tab bar's place
-  (the tab bar is gone, the place keeps its 32 dp, so the terminal keeps its rows) and brings the
+  (the tab bar is gone, the place keeps its 56 dp, so the terminal keeps its rows) and brings the
   keyboard up on its text, which is kept from the last search and selected, so typing replaces it;
   that text is searched for again at once. Every change of the text searches anew in the tab shown
   (`VtView.search`; query, steps and scroll-bar marks are android/vtview's Search, frame progress
@@ -315,9 +313,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide`,
   `volumeKeysSwitchTabs` and `showTabList`; `Documents.fileLink`
   (android/documents).
-- `android/file-import`: retained `TerminalFiles` request/copy/result and shell-escaped paths.
 - `android/tabbar`: tab bar/list and `ProgressLine`; `android/keys`: extra keys and modifiers.
-- android/privacy: `Privacy.locked` guards input, clipboard, imports, browser launches and
+- android/privacy: `Privacy.locked` guards input, clipboard, browser launches and
   toasts; `Ui.showPrivate` delegates dialog-window security to `Privacy.protect`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (the shared themes and page
   layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation compat;
@@ -336,11 +333,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   swallowed; a volume key's repeats are taken only while it is the remembered key, so a press
   left to the system keeps its repeats and release there and the volume changes as usual.
 - Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
-  bar's 32 dp, the scrolling extra keys' 32 or 64 dp and a selection handle at the edge leave room
-  under it.
+  bar's 56 dp and the scrolling extra keys' 40 or 80 dp share that allowance with selection handles
+  at the edge.
 - `MainActivity` is a `FragmentActivity` on a Material theme: Material dialogs and AppCompat's
-  `PopupMenu` take the theme, but the views it builds or inflates from XML are the framework's (no
-  AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing there. The text
+  `PopupMenu` take the theme. Its inflater leaves unqualified XML tags as framework widgets;
+  explicitly constructed or named AppCompat widgets support their own APIs and attributes. The text
   selection handles `VtView` draws read framework attributes, which AppCompat forwards to the
   Material 3 colours (the handles are the primary colour). The system floating text menu has its
   own theme and resources: on S23 Android 16 its surface/text follow configuration night mode
@@ -348,7 +345,8 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   MainActivity's early configuration override aligns them and survives configuration updates.
   Keep the override limited to night mode so locale, font scale, density and window size still update.
   Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
-  so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
+  so `Theme.Appine.Terminal` sets them to colorSurfaceContainer. It explicitly uses dark fallback
+  roles because notification and privacy dialogs also use this theme in light configurations.
 - `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
   its root to the window: its view adapters access the activity's layout once input, grid and
   search callbacks begin. The activity still detaches the session on restart and destruction.
@@ -363,13 +361,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   pages also recreate for dark mode (android/setup and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
   including delayed IME/paste callbacks; pausing cancels activity toasts and denies the open clipboard
-  question. Dialogs use `showPrivate`, and deferred import results require a resumed unlocked page.
+  question. Dialogs use `showPrivate`.
 - An activity the system recreates (a configuration change it does not handle, or after killing
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
   is read in `onCreate` only without a saved state and without
   `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
   front. A recreated `MainActivity` drops ordinary dialogs, the search bar and the extra keys'
-  modifiers/page; a retained import result is shown again after the page resumes unlocked.
+  modifiers/page.
 - Back uses `OnBackPressedDispatcher` with `closeSearchOnBack` enabled only during search and
   `closeTabListOnBack` only while the tab list is open. List callbacks carry the session, never
   a position; the activity checks it still exists before selecting or confirming its close. Dismissing
@@ -393,8 +391,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Shared-storage copy passed aapt2 compilation and key/placeholder checks in all five locales;
   device wrapping and native-speaker review remain unverified.
 
-- Control contrast passes debug assembly and lint. Device checks remain for wallpaper palettes,
-  small-label readability and selected/ordinary/locked states; indicator geometry is unchanged.
+- The Material 3 terminal/page redesign and importer removal have static source, Kotlin syntax,
+  XML/resource, locale and cached Material API checks only. Runtime layout, resized touch targets,
+  wallpaper palettes, large fonts, TalkBack and IME/focus behavior need fresh device verification;
+  earlier device and build results below concern the prior styling.
 
 - System per-app language selection: verify all five languages and returning to the system
   default on Android 13+, including retaining the current terminal tab across recreation.
@@ -430,7 +430,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   still need device verification. Settings and licenses should continue following the system.
 - Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
   checked on API 34; a complete Codex OAuth login and its callback remain unverified.
-- Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
+- Earlier runtime checks here used emulators (a Pixel 4a API 34, and the outer display of a Pixel
   10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
   real phones, tablets or foldables. Unverified beyond that:
   - App Links, browsers without Custom Tabs and missing

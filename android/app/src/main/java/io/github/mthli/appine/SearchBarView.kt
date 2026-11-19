@@ -2,11 +2,9 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Color
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -15,7 +13,6 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.annotation.StringRes
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
 
@@ -44,13 +41,13 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         fun close()
     }
 
-    // On black like the tab bar it stands in for, in the theme's colours
+    // Shares the session bar's surface so opening search does not change its visual hierarchy.
     private val mutedColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val textColor = themeColor(com.google.android.material.R.attr.colorOnSurface)
 
     /** The text to find: one line, without suggestions (commands and paths, not words). */
     private val field = EditText(context).apply {
-        background = null
+        background = terminalControlBackground(tonal = true)
         setPadding(dp(BAR_PADDING_DP), 0, dp(BAR_PADDING_DP), 0)
         gravity = Gravity.CENTER_VERTICAL
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, TabBarView.BAR_LABEL_DP)
@@ -85,12 +82,12 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
 
     init {
         orientation = HORIZONTAL
-        setBackgroundColor(Color.BLACK)
+        setBackgroundColor(themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
         addView(field, LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         addView(count, LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        addView(button("↑", R.string.find_previous) { target.step(older = true) }, item())
-        addView(button("↓", R.string.find_next) { target.step(older = false) }, item())
-        addView(button("×", R.string.find_close) { target.close() }, item())
+        addView(context.terminalIconButton(R.drawable.ic_arrow_up, R.string.find_previous) { target.step(older = true) }, item())
+        addView(context.terminalIconButton(R.drawable.ic_arrow_down, R.string.find_next) { target.step(older = false) }, item())
+        addView(context.terminalIconButton(R.drawable.ic_close, R.string.find_close) { target.close() }, item())
     }
 
     /** As tall as the tab bar ([TabBarView.BAR_DP]), whatever the parent offers. */
@@ -133,21 +130,7 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         return true
     }
 
-    /** A button as the tab bar's: a square as tall as the bar with its label centred. */
-    private fun button(label: String, @StringRes description: Int, onClick: (View) -> Unit) = TextView(context).apply {
-        text = label
-        contentDescription = context.getString(description)
-        setTextColor(mutedColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, TabBarView.BAR_LABEL_DP)
-        gravity = Gravity.CENTER
-        background = touchFeedback()
-        setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            onClick(it)
-        }
-    }
-
-    private fun item() = LayoutParams(dp(TabBarView.BAR_DP), ViewGroup.LayoutParams.MATCH_PARENT)
+    private fun item() = LayoutParams(dp(TabBarView.ITEM_DP), ViewGroup.LayoutParams.MATCH_PARENT)
 
     private companion object {
         /** The room before the text and around the count (dp). */

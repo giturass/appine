@@ -45,6 +45,7 @@ class LicenseActivity : AppCompatActivity() {
         setContentView(R.layout.page)
         findViewById<MaterialToolbar>(R.id.toolbar).apply {
             title = entry.title
+            subtitle = entry.subtitle(this@LicenseActivity)
             setNavigationOnClickListener { finish() }
         }
         val content = findViewById<FrameLayout>(R.id.content)
