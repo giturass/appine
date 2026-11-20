@@ -139,11 +139,12 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             requestBatteryExemption = { BatteryOptimization.requestExemption(this) },
             dismissBatteryPrompt = { dismissPrompt(PREF_DISMISSED_BATTERY_PROMPT) },
         )
-        updateTerminalBackground(Color.BLACK)
         updatePermissionPrompts()
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
+        // The system-bar controller requires the decor created by setContentView.
+        updateTerminalBackground(Color.BLACK)
     }
 
     private fun updateTerminalBackground(color: Int) {

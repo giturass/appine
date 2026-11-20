@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: accepted-frame backgrounds across terminal chrome and transparent system bars with adaptive icon/text contrast)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: window-decor ordering before initial system-bar appearance)
 
 ## Responsibilities
 
@@ -349,7 +349,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   roles because notification and privacy dialogs also use this theme in light configurations.
 - `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
   its root to the window: its view adapters access the activity's layout once input, grid and
-  search callbacks begin. The activity still detaches the session on restart and destruction.
+  search callbacks begin. Initialize system-bar appearance only after `setContentView` creates
+  the window decor; an unattached layout root does not initialize `PhoneWindow`'s controller.
+  The activity still detaches the session on restart and destruction.
 - The system lays the window out with the IME's end insets as its animation starts, when it hides
   as well as when it shows, so without a `WindowInsetsAnimation` callback the extra keys jump
   there at once. The keys rising with the IME are drawn inside the root's bottom padding, which

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: OpenRC upgrade/recovery tests and accepted-frame background/margin regression cases)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: fresh main-activity launch and system-bar controller regression)
 
 ## Responsibilities
 
@@ -29,6 +29,11 @@ debug variant, manifest and network-security configuration belong to `android/bu
 ## Data flow / lifecycle
 
 ### Tests
+
+- `MainActivityTest` launches a fresh task on API 35+ and checks that `MainActivity` creates its
+  window decor and system-bar controller during `onCreate`, preventing reuse through `singleTask`.
+  It follows normal service startup and should run on a disposable debug installation; the case
+  has compiled but has not executed on a device.
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
   and preserved editor focus during opening/scrolling/dismissal. Row height, scrolling increments
