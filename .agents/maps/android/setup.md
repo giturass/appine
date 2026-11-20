@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: Material 3 preference rows, icons and shared page hierarchy)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: one-time offline OpenRC setup on new and existing Alpine stores and About version 1.0.1 (2))
 
 ## Responsibilities
 
@@ -13,10 +13,10 @@
 
 - the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
   importing them into a new store, and writing first-boot configuration, which on Alpine makes
-  bash, bundled with the app, the login shell;
+  bash the login shell;
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
-  terminal's shell integration), the osclock script run before boot and the boot log's failed services;
+  terminal's shell integration), one-time OpenRC setup on Alpine, the osclock script run before boot and the boot log's failed services;
 - package mirrors: built-in lists, one speed probe after an import, writing the fastest into
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
@@ -27,7 +27,7 @@
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
-`android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
+`android/app/src/main/assets/login.sh`, `android/app/src/main/assets/install-openrc.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
 `android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
 
@@ -82,14 +82,14 @@ session consuming their state and events (`android/vt`).
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
   and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
-  `/var/cache/appine/{bash,procps,bubblewrap}/` (packages until installed), and `/run/appine-install.lock`.
+  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), and `/run/appine-install.lock`.
 
 ## Public entry points
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
-  `updateProfile`; around boot: `PREFER_OSCLOCK`, `failedServices`.
+  `updateProfile`; around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
@@ -105,12 +105,12 @@ session consuming their state and events (`android/vt`).
 - Alpine: `scripts/fetch-rootfs` downloads the bundled packages from the branch's `main`
   repository (doas, and bash with readline, libncursesw and ncurses-terminfo-base, each checked by
   its pinned sha256 only; also procps-ng, libproc2, libintl, utmps-libs and skalibs-libs, sharing
-  the ncurses dependencies; also bubblewrap and libcap2; apk checks signatures at install) and, unless a copy with the
+  the ncurses dependencies; also bubblewrap and libcap2, openrc, openrc-user, ifupdown-ng and bridge; apk checks signatures at install) and, unless a copy with the
   pinned sha256 is already there, the minirootfs: its GPG signature is
   checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
   gpg a warning), then its pinned sha256. Gradle bundles the newest fetched files by version
   (`BuildConfig.ALPINE_BRANCH` is taken from the name, `edge` without one) as `rootfs.tgz`,
-  `doas.apk`, `{bash,procps,bubblewrap}/<file name>` without checking them again, and fails without them; `prepare`
+  `doas.apk`, `{bash,procps,bubblewrap,openrc}/<file name>` without checking them again, and fails without them; `prepare`
   copies the tarball asset to the cache.
 - Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
   reused; else `fetch` tries the sources in order (probed by speed when there are several; Debian
@@ -160,7 +160,7 @@ session consuming their state and events (`android/vt`).
     ash; accounts busybox's `adduser` makes later take the shell of `$SHELL` or of the account
     running it, so from a root tab they get bash too; procps-ng and its six dependencies are
     staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
-    with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores receive neither new bundle;
+    with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores do not receive these import-time files;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
@@ -190,11 +190,20 @@ session consuming their state and events (`android/vt`).
 - Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
-- On the boot thread, which runs while tabs can already log in (a restored tab starts its shell
-  when first shown): `PREFER_OSCLOCK`, without a console, adds osclock to the boot runlevel when
+- On Alpine, `ensureOpenRc` checks the per-store marker `/var/lib/appine/openrc-setup-done`.
+  On an unmarked store it checks apk offline. If OpenRC is already installed, it writes only the
+  marker and leaves boot asynchronous. A staged `/var/cache/appine/install-openrc.sh` (including
+  one left by an older app) resumes an incomplete installation even if the package is present.
+- For a missing or pending install, setup rebuilds its private package cache from the APK's
+  OpenRC bundle and libcap2 from its bubblewrap assets. The installer uses a temporary virtual
+  package for missing dependencies, records openrc by name in world and removes the virtual package.
+  Setup runs inittab before tabs open, verifies the lock directory and default runlevel, removes the
+  cache and installer and writes the marker. Later removal persists. A failed migration on an
+  existing store reports the error and allows a login for repairs. The next start retries.
+- Both first and subsequent boots run `PREFER_OSCLOCK` without a console. It adds osclock to the boot runlevel when
   `rc-update` and the osclock service exist and no runlevel has hwclock, osclock or swclock (a
   dangling link counts); the thread waits for it, ignores its exit status and only logs an
-  exception. After boot, `failedServices` lists the services `/var/log/boot.log` says failed to
+  exception. On subsequent boots tabs can log in while inittab runs. After boot, `failedServices` lists the services `/var/log/boot.log` says failed to
   start, for the service's notification.
 
 ### Prompt marks
@@ -407,7 +416,7 @@ session consuming their state and events (`android/vt`).
   The licenses summary names GNU AGPL 3.0 or later; the full copyright, warranty disclaimer and
   license text remain in the Appine notice on the license page.
 - About's final Version action shows `BuildConfig.VERSION_NAME` followed by `BuildConfig.VERSION_CODE`
-  in parentheses (`1.0.0 (1)`). It opens the HTTPS Google Play
+  in parentheses (`1.0.1 (2)`). It opens the HTTPS Google Play
   details URL for `BuildConfig.APPLICATION_ID`, first restricted to `com.android.vending`, then
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.

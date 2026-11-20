@@ -11,12 +11,14 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.StringRes
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.children
 import androidx.core.view.isVisible
 
 /**
@@ -76,7 +78,7 @@ internal class TerminalLayout(
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, rowHeight)
         isVisible = false
         orientation = LinearLayout.HORIZONTAL
-        setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainerLow))
+        setBackgroundColor(Color.BLACK)
         fun button(action: () -> Unit) = Button(context).apply {
             setTextColor(context.themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
@@ -107,6 +109,7 @@ internal class TerminalLayout(
     }
 
     private val content: LinearLayout
+    private val body: FrameLayout
     val root: LinearLayout
 
     /**
@@ -170,7 +173,7 @@ internal class TerminalLayout(
             addView(tabBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(searchBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        val body = FrameLayout(context).apply {
+        body = FrameLayout(context).apply {
             setBackgroundColor(Color.BLACK)
             addView(screen)
             addView(status)
@@ -193,7 +196,7 @@ internal class TerminalLayout(
         }
         root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(context.themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+            setBackgroundColor(Color.BLACK)
             // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
             clipToPadding = false
             addView(bars, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -210,6 +213,23 @@ internal class TerminalLayout(
             WindowInsetsCompat.CONSUMED
         }
         ViewCompat.setWindowInsetsAnimationCallback(root, keysFollowIme)
+    }
+
+    fun setTerminalBackgroundColor(color: Int) {
+        root.setBackgroundColor(color)
+        body.setBackgroundColor(color)
+        screen.setBackgroundColor(color)
+        status.setTextColor(status.terminalControlColor(selected = false, backgroundColor = color))
+        tabBar.setTerminalBackgroundColor(color)
+        searchBar.setTerminalBackgroundColor(color)
+        keys.setTerminalBackgroundColor(color)
+        for (prompt in arrayOf(notificationPrompt, batteryPrompt)) {
+            prompt.setBackgroundColor(color)
+            for (child in prompt.children) when (child) {
+                is Button -> child.setTextColor(child.terminalControlColor(selected = false, backgroundColor = color))
+                is ImageView -> child.imageTintList = child.terminalControlTint(color)
+            }
+        }
     }
 
     fun updateTabListControls() {

@@ -536,6 +536,36 @@ class TerminalService : Service() {
      */
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
+    private class StartedKernel(
+        val handle: Long, val browser: BrowserBridge, val booted: Boolean, val setupError: String?,
+    )
+
+    /** Owns the new handle and browser endpoint until both can be handed to the main thread. */
+    private fun startKernel(tier: Int, importing: Boolean): StartedKernel {
+        val browser = BrowserBridge { url ->
+            machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
+        }
+        var handle = 0L
+        try {
+            Rootfs.ensureBrowser(this, browser.configuration)
+            Rootfs.updateProfile(this)
+            val store = Rootfs.store(this).path
+            // Exclude DocumentsProvider opens while the kernel opens the store.
+            handle = Rootfs.access.write { Native.start(store, tier) }
+            var setupError: String? = null
+            val booted = Rootfs.installed(this) == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
+                if (importing) throw e
+                Log.w(TAG, "OpenRC setup will retry at the next start", e)
+                setupError = e.message ?: e.toString()
+            }
+            return StartedKernel(handle, browser, booted, setupError)
+        } catch (e: Throwable) {
+            browser.close()
+            if (handle != 0L) Native.stop(handle)
+            throw e
+        }
+    }
+
     /**
      * Starts the kernel; when [distro] is non-null, prepares its rootfs first (the store must
      * already be deleted).
@@ -547,7 +577,6 @@ class TerminalService : Service() {
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
         val tier = tier
         thread(name = "appine-start") {
-            var bridge: BrowserBridge? = null
             val result = runCatching {
                 if (distro != null) {
                     Rootfs.prepare(this, distro, progress = { done, total ->
@@ -559,45 +588,37 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
-                val browser = BrowserBridge { url ->
-                    machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
-                }
-                bridge = browser
-                Rootfs.ensureBrowser(this, browser.configuration)
-                Rootfs.updateProfile(this)
-                // The kernel must be the only user of the store when it opens it (a separate
-                // opening by the DocumentsProvider does not count, see Rootfs.access)
-                Rootfs.access.write { Native.start(Rootfs.store(this).path, tier) }
+                startKernel(tier, importing = distro != null)
             }
-            if (result.isFailure) bridge?.close()
             main.post {
                 starting = false
                 if (destroyed) {
-                    bridge?.close()
-                    result.onSuccess { m -> thread(name = "appine-stop") { Native.shutdown(m) } }
+                    result.onSuccess { kernel ->
+                        kernel.browser.close()
+                        thread(name = "appine-stop") { Native.shutdown(kernel.handle) }
+                    }
                     return@post
                 }
                 if (exiting) {
-                    // "Exit all" while starting: stop the kernel that has just come up (not booted
-                    // yet, so without the inittab shutdown) and finish exiting
+                    // OpenRC setup may already have booted this kernel.
                     progress = null
-                    bridge?.close()
-                    finishExit(result.getOrDefault(0L), booted = false)
+                    val kernel = result.getOrNull()
+                    kernel?.browser?.close()
+                    finishExit(kernel?.handle ?: 0L, booted = kernel?.booted == true)
                     return@post
                 }
-                result.onSuccess { m ->
-                    browserBridge = bridge
-                    started(m)
-                }.onFailure { startFailed(distro, it) }
+                result.onSuccess(::started).onFailure { startFailed(distro, it) }
             }
         }
     }
 
     /**
-     * The kernel [m] has started: restores the tabs of a killed run, boots, and starts polling;
+     * Publishes the kernel, restores the tabs of a killed run, boots if needed and starts polling;
      * or replaces the store at once when a distro download finished meanwhile.
      */
-    private fun started(m: Long) {
+    private fun started(kernel: StartedKernel) {
+        val m = kernel.handle
+        browserBridge = kernel.browser
         machine = m
         booting = true
         guestActivity.reset(SystemClock.elapsedRealtime())
@@ -612,6 +633,7 @@ class TerminalService : Service() {
             return
         }
         updateWakeLock()
+        kernel.setupError?.let(::tell)
         Tabs.markRunning(this)
         restore?.let { saved -> restoreTabs(saved) }
         restore = null
@@ -620,11 +642,7 @@ class TerminalService : Service() {
         // Booting waits for the sysinit and wait commands (OpenRC starting services) without
         // occupying worker: tabs open as usual
         thread(name = "appine-boot") {
-            runCatching {
-                val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
-                Native.waitFor(m, Native.spawn(m, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
-            }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
-            Native.boot(m)
+            if (!kernel.booted) Rootfs.boot(m)
             // Boot finished: notify when OpenRC services did not start (the output is in
             // boot.log, which nobody reads)
             val failed = Rootfs.failedServices(this)

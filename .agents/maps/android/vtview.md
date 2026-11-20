@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: system selection menu uses the terminal activity's pinned night configuration)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: accepted-frame background callback and same-frame margin repaint, with resize-preview background regression cases)
 
 ## Responsibilities
 
@@ -49,7 +49,8 @@ stays here; it calls android/vtrender to decode frames and paint the grid, curso
 - `VtView(context, host)`, built by `MainActivity`: `attach` (show a tab, or none), `setFontSize`,
   `setFillWide`, `press` and `type` (the extra keys), `search`, `searchStep` and `endSearch`,
   `jumpToPrompt`, `bell`, `altScreen`; the framework's drawing, scrolling, touch, hover, pointer,
-  key, focus and IME callbacks. `Host` is the activity's side.
+  key, focus and IME callbacks. `Host` is the activity's side; optional `onBackgroundColor`
+  reports a changed default background only when a frame is accepted for display.
 - From the session (android/vt): `onStarted` (the shell started: take the whole screen) and an
   invalidate on animation after output.
 
@@ -61,6 +62,9 @@ stays here; it calls android/vtrender to decode frames and paint the grid, curso
   reads it through android/vtrender's `VtFrame`, and applies the header to interaction state and
   `VtScreen`. `VtImages.take` copies image pixels and `VtRenderer.takeRows` updates the grid bitmap;
   the renderer draws the grid, cursor and preedit, then the view draws scroll-bar search marks and handles.
+- The whole canvas is cleared after frame application, using the accepted default background so
+  subrow margins change on the same draw. A changed background also notifies the host for chrome;
+  stale-grid frames and held resize-preview frames leave both colours and host state unchanged.
 - The view owns regridding, full-frame requests, animation redraws and applying mode, selection,
   scroll, pointer and search-count fields. It rejects frames at an old grid size and requests a
   full frame after attaching, shell start, regridding, default-colour or wide-cell changes, or late
@@ -529,6 +533,9 @@ select a command's output and move the cursor by taps:
   A physical-device report still found occasional old text at IME opening with that first
   version; whether the corrected cases explain it, actual IME animation interruptions and
   touch/tab cleanup still need end-to-end verification.
+- Two added `TerminalResizeTest` cases cover OSC 11 same-frame margin repaint and withholding
+  background callbacks for pending resize frames. They compile with warnings as errors against
+  API 37.0 but have not been executed on a device.
 - `TerminalInputTest` exercises the real connection, paste encoder and confirmation dialogs on
   API 34: immediate replacement, no replay on finish, confirmation/cancellation, IME menu paste,
   bracketed paste/terminator checks, ordinary Chinese composition/Enter, and trailing-newline

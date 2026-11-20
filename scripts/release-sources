@@ -9,7 +9,7 @@
 #   appine-<commit>-vendor.tar.gz     cargo vendor: the crates statically linked into the app
 #   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK and of
 #                                     the packages bundled beside it (bash, readline, procps-ng,
-#                                     libintl, bubblewrap, libcap2): each one's
+#                                     libintl, bubblewrap, libcap2, bridge): each one's
 #                                     directory at its aports commit (APKBUILD, patches) and the
 #                                     upstream sources
 #   libghostty-vt-<version>.tar.gz    the libghostty-vt source release the terminal is built

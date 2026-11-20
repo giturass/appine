@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.res.Configuration
+import android.graphics.Color
 import android.os.Bundle
 import android.os.IBinder
 import android.view.Gravity
@@ -24,6 +25,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
+import androidx.core.graphics.ColorUtils
 import androidx.core.view.WindowCompat
 import androidx.core.view.isVisible
 import androidx.fragment.app.FragmentActivity
@@ -137,10 +139,20 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             requestBatteryExemption = { BatteryOptimization.requestExemption(this) },
             dismissBatteryPrompt = { dismissPrompt(PREF_DISMISSED_BATTERY_PROMPT) },
         )
+        updateTerminalBackground(Color.BLACK)
         updatePermissionPrompts()
         renderTabs()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(layout.root)
+    }
+
+    private fun updateTerminalBackground(color: Int) {
+        layout.setTerminalBackgroundColor(color)
+        val light = ColorUtils.calculateContrast(Color.BLACK, color) >= ColorUtils.calculateContrast(Color.WHITE, color)
+        WindowCompat.getInsetsController(window, layout.root).apply {
+            isAppearanceLightStatusBars = light
+            isAppearanceLightNavigationBars = light
+        }
     }
 
     /** A notification of a tab was tapped while this activity exists (it is `singleTask`). */
@@ -708,6 +720,8 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun modifiersUsed() = layout.keys.modifiersUsed()
 
         override fun onSearchCount(total: Int, selected: Int) = layout.searchBar.setCount(total, selected)
+
+        override fun onBackgroundColor(color: Int) = updateTerminalBackground(color)
 
         override fun onLink(uri: String) = links.open(uri)
     }

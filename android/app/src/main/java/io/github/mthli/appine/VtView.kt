@@ -102,6 +102,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
          * counted from the newest (1 for the newest), 0 when none is selected.
          */
         fun onSearchCount(total: Int, selected: Int)
+
+        /** The displayed frame changed the terminal's default background. */
+        fun onBackgroundColor(color: Int) {}
     }
 
     /** The tab shown, null for none. */
@@ -604,8 +607,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     // ---- Frames ----
 
     override fun onDraw(c: Canvas) {
-        c.drawColor(screen.defaultBg)
-        if (!renderer.hasGrid) return
+        if (!renderer.hasGrid) {
+            c.drawColor(screen.defaultBg)
+            return
+        }
         if (SystemClock.uptimeMillis() >= resizePreviewUntil) clearResizePreview()
         if (tab != 0L) {
             val f = full
@@ -613,6 +618,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             val buffer = VtNative.frame(tab, f)
             if (buffer != null) apply(VtFrame(buffer)) else full = f
         }
+        c.drawColor(screen.defaultBg)
         resizePreview?.let {
             c.drawBitmap(it, 0f, 0f, null)
             postInvalidateOnAnimation()
@@ -727,13 +733,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (monitorCursor && cursorMoved) updateCursorAnchor()
         updateBlink()
         if (cursorMoved) restartBlink()
-        if (frame.defaultFg != screen.defaultFg || frame.defaultBg != screen.defaultBg) {
+        val backgroundChanged = frame.defaultBg != screen.defaultBg
+        if (frame.defaultFg != screen.defaultFg || backgroundChanged) {
             // Rows that did not change still have the old default colours
             screen.defaultFg = frame.defaultFg
             screen.defaultBg = frame.defaultBg
             full = true
             postInvalidateOnAnimation()
         }
+        if (backgroundChanged) host.onBackgroundColor(screen.defaultBg)
         // Pixels that came later than the frame that placed the images (one that did not repaint
         // every row): the rows they reach are asked for again
         if (images.take(tab, frame) && frame.dirty != VtFrame.DIRTY_FULL) {

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
@@ -127,6 +128,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private val symView: TextView
 
     private val density = resources.displayMetrics.density
+    private var surfaceColor = Color.BLACK
+    private val fixedBackground = surfaceColor.toDrawable()
 
     /**
      * How far the fade reaches into the last column, in whole pixels, rounded down as
@@ -186,7 +189,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         }
     }.apply {
         orientation = LinearLayout.VERTICAL
-        background = InsetDrawable(themeColor(com.google.android.material.R.attr.colorSurfaceContainer).toDrawable(), fadeIntoLast, 0, 0, 0)
+        background = InsetDrawable(fixedBackground, fadeIntoLast, 0, 0, 0)
         // The inset comes as padding with the background, which would narrow the keys and move
         // them right by as much
         setPadding(0, 0, 0, 0)
@@ -206,7 +209,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private val rowHeight = (ROW_DP * density).roundToInt()
 
     init {
-        setBackgroundColor(themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+        setBackgroundColor(surfaceColor)
         page(
             arrayOf(
                 special("ESC", KeyEvent.KEYCODE_ESCAPE),
@@ -267,6 +270,14 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         // Their widths and the scroll view's end padding are set in onMeasure.
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT, Gravity.END))
+    }
+
+    /** Matches the surface behind the controls to the terminal's background. */
+    fun setTerminalBackgroundColor(color: Int) {
+        if (surfaceColor == color) return
+        surfaceColor = color
+        setBackgroundColor(color)
+        fixedBackground.color = color
     }
 
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =

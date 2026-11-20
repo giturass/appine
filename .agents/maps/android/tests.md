@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: terminal file-import removal and shared tab-list geometry)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: OpenRC upgrade/recovery tests and accepted-frame background/margin regression cases)
 
 ## Responsibilities
 
@@ -40,9 +40,11 @@ debug variant, manifest and network-security configuration belong to `android/bu
   pipelines, literal/control text, history fallback, exit-status preservation and hook reloads.
   These and the two existing prompt-mark/login tests passed on API 34.
 
-- `TerminalResizeTest` uses isolated stores and shell-free terminals for seven API 34 checks:
+- `TerminalResizeTest` uses isolated stores and shell-free terminals for nine checks:
   preview pixels under full-frame requests and subrow layouts, split control sequences, quiet
-  output, timeout, complete repaint and detach cleanup. It drives layout/draw directly, not the IME.
+  output, timeout, complete repaint and detach cleanup, plus same-frame OSC 11 margin repaint and
+  background retention during pending resize output. It drives layout/draw directly, not the IME.
+  The original seven passed on API 34; the two new cases have been compiled but not run on device.
 - `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
   report retention, own-PID capture excluding another process, read-only share intents and
   provider root confinement, plus rejection of locked/stale export callbacks and recreation.
@@ -87,6 +89,12 @@ debug variant, manifest and network-security configuration belong to `android/bu
   persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps
   or repositories, checks a missing libcap dependency, concurrent retries and user removal, and
   runs root and unprivileged sandboxes with namespaces, read-only root and private tmpfs.
+  `newSystemsBootOpenRcBeforeLogin` removes the apk trust keys from a fresh store and retries
+  offline after restoring them. It checks the default runlevel, first-login osclock management,
+  world, cache cleanup and user removal. Two upgrade cases cover an older Alpine without login
+  caches and an existing dependency-only OpenRC installation with custom configuration.
+  `interruptedOpenRcSetupKeepsTheUpgradeRecoverable` restarts between apk transactions, repairs
+  a custom inittab from a login after verification fails, and finishes setup on the next start.
   Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
@@ -122,6 +130,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
 None.
 
 ## To verify
+
+- The current app resources and all app/instrumentation Kotlin sources compile against API 37.0
+  with warnings as errors; new OpenRC/background cases and the integrated UI need device execution.
 
 - Updated tab-list geometry and focus checks require a fresh device run after the Material 3
   control/row resizing; the earlier three-case API 34 pass used the prior geometry.

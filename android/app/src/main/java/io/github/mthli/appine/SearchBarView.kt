@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Color
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -11,8 +12,10 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.children
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
 
@@ -82,12 +85,18 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
 
     init {
         orientation = HORIZONTAL
-        setBackgroundColor(themeColor(com.google.android.material.R.attr.colorSurfaceContainer))
+        setBackgroundColor(Color.BLACK)
         addView(field, LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         addView(count, LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         addView(context.terminalIconButton(R.drawable.ic_arrow_up, R.string.find_previous) { target.step(older = true) }, item())
         addView(context.terminalIconButton(R.drawable.ic_arrow_down, R.string.find_next) { target.step(older = false) }, item())
         addView(context.terminalIconButton(R.drawable.ic_close, R.string.find_close) { target.close() }, item())
+    }
+
+    fun setTerminalBackgroundColor(color: Int) {
+        setBackgroundColor(color)
+        count.setTextColor(count.terminalControlColor(selected = false, backgroundColor = color))
+        for (button in children.filterIsInstance<ImageView>()) button.imageTintList = button.terminalControlTint(color)
     }
 
     /** As tall as the tab bar ([TabBarView.BAR_DP]), whatever the parent offers. */

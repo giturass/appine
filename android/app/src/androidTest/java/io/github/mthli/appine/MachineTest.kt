@@ -52,6 +52,26 @@ class MachineTest {
 
     private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier).also { machines.add(it) }
 
+    private fun withAlpineStore(name: String, test: (String) -> Unit) {
+        val store = File(context.cacheDir, name)
+        store.deleteRecursively()
+        try {
+            Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+            test(store.path)
+        } finally {
+            store.deleteRecursively()
+        }
+    }
+
+    private fun <T> withMachine(store: String, test: (Long) -> T): T {
+        val machine = Native.start(store, 1)
+        return try {
+            test(machine)
+        } finally {
+            Native.stop(machine)
+        }
+    }
+
     /** Reads the console until the session ends, normalising line breaks to \n. */
     private fun readAll(machine: Long, console: Int): String {
         val out = ByteArrayOutputStream()
@@ -76,6 +96,12 @@ class MachineTest {
 
     /** Runs `sh -c script` on a new console and returns the output and the exit code. */
     private fun sh(machine: Long, script: String) = run(machine, "/bin/sh", "sh", "-c", script)
+
+    private fun checkedShell(machine: Long, script: String): String {
+        val (output, status) = sh(machine, script)
+        assertEquals("$script\n$output", 0, status)
+        return output
+    }
 
     /**
      * Runs the login script on a new console as a terminal tab does ([ConsolePty.script], with
@@ -480,6 +506,96 @@ class MachineTest {
         } finally {
             Native.stop(machine)
             store.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun newSystemsBootOpenRcBeforeLogin() = withAlpineStore("store-openrc") { store ->
+        withMachine(store) { machine ->
+            val bundle = "/var/cache/appine/openrc"
+            checkedShell(machine, "rm -f /etc/apk/repositories; mv /etc/apk/keys /tmp/keys")
+            assertThrows(IOException::class.java) { Rootfs.ensureOpenRc(context, machine, store) }
+            checkedShell(machine, "mv /tmp/keys /etc/apk/keys")
+            assertTrue(Rootfs.ensureOpenRc(context, machine, store))
+
+            val firstLogin = plain(login(machine,
+                "cat /run/openrc/softlevel; echo\nrc-service osclock stop && rc-service osclock start && echo service-ready\nexit\n"))
+            assertTrue(firstLogin, firstLogin.contains("\ndefault\n"))
+            assertTrue(firstLogin, firstLogin.contains("\nservice-ready\n"))
+            checkedShell(machine, "test ! -e $bundle && grep -qx openrc /etc/apk/world && " +
+                "! grep -E '^([.]appine-openrc|bridge|ifupdown-ng|openrc-user)' /etc/apk/world")
+            checkedShell(machine, "apk del --no-network openrc")
+            assertFalse(Rootfs.ensureOpenRc(context, machine, store))
+            checkedShell(machine, "! apk info -e openrc")
+        }
+    }
+
+    @Test
+    fun existingAlpineInstallsMissingOpenRcOnce() = withAlpineStore("store-openrc-upgrade") { store ->
+        withMachine(store) { machine ->
+            // An older Alpine store after login has no import bundles or staged installer.
+            checkedShell(machine, "rm -rf /var/cache/appine /etc/apk/repositories")
+            assertTrue(Rootfs.ensureOpenRc(context, machine, store))
+            checkedShell(machine, "rc-service osclock stop && rc-service osclock start")
+            checkedShell(machine, "apk del --no-network openrc")
+        }
+        withMachine(store) { machine ->
+            assertFalse(Rootfs.ensureOpenRc(context, machine, store))
+            checkedShell(machine, "! apk info -e openrc")
+        }
+    }
+
+    @Test
+    fun interruptedOpenRcSetupKeepsTheUpgradeRecoverable() = withAlpineStore("store-openrc-interrupted") { store ->
+        val errors = mutableListOf<IOException>()
+        withMachine(store) { machine ->
+            checkedShell(machine, "mv /etc/apk/keys /tmp/keys")
+            assertFalse(Rootfs.ensureOpenRc(context, machine, store) { errors.add(it) })
+            assertEquals(1, errors.size)
+            // Stop between the installer's two apk transactions, with a custom inittab.
+            checkedShell(machine, """
+                set -e
+                mv /tmp/keys /etc/apk/keys
+                apk --no-network --repositories-file /dev/null add --virtual .appine-openrc /var/cache/appine/openrc/*.apk
+                cp /etc/inittab /tmp/inittab
+                echo '::sysinit:/bin/true' > /etc/inittab
+            """.trimIndent())
+        }
+        withMachine(store) { machine ->
+            assertTrue(Rootfs.ensureOpenRc(context, machine, store) { errors.add(it) })
+            assertEquals(2, errors.size)
+            val recovery = plain(login(machine, "mv /tmp/inittab /etc/inittab && echo repaired\nexit\n"))
+            assertTrue(recovery, recovery.contains("\nrepaired\n"))
+        }
+        withMachine(store) { machine ->
+            assertTrue(Rootfs.ensureOpenRc(context, machine, store))
+            checkedShell(machine, "grep -qx openrc /etc/apk/world && ! apk info -e .appine-openrc")
+        }
+    }
+
+    @Test
+    fun existingAlpineKeepsInstalledOpenRc() = withAlpineStore("store-openrc-installed") { store ->
+        val world = withMachine(store) { machine ->
+            assertTrue(Rootfs.ensureOpenRc(context, machine, store))
+            // Model a store from before the migration, with OpenRC installed as a dependency.
+            checkedShell(machine, """
+                set -e
+                apk add --no-network --virtual .user-init openrc
+                apk del --no-network openrc
+                apk info -e openrc
+                rm /var/lib/appine/openrc-setup-done /var/log/appine-openrc.log
+                echo '# user setting' >> /etc/rc.conf
+            """.trimIndent())
+            checkedShell(machine, "cat /etc/apk/world")
+        }
+        withMachine(store) { machine ->
+            assertFalse(Rootfs.ensureOpenRc(context, machine, store))
+            assertEquals(world, checkedShell(machine, "cat /etc/apk/world"))
+            checkedShell(machine, "grep -qx '# user setting' /etc/rc.conf && " +
+                "test ! -e /var/log/appine-openrc.log && test ! -e /var/cache/appine/openrc")
+            checkedShell(machine, "apk del --no-network .user-init && ! apk info -e openrc")
+            assertFalse(Rootfs.ensureOpenRc(context, machine, store))
+            checkedShell(machine, "! apk info -e openrc")
         }
     }
 

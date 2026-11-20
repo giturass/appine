@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 48 dp shared session/search bar height and square top controls)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: accepted-frame backgrounds across terminal chrome and transparent system bars with adaptive icon/text contrast)
 
 ## Responsibilities
 
@@ -64,7 +64,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
   `selectableItemBackground`); `showPrivate` registers dialog security with android/privacy before showing it.
   `terminalControlColor` pairs selected text/indicators with on-primary-container and ordinary
-  text with on-surface-variant. `terminalControlBackground` supplies inset rounded, stateful
+  text with on-surface-variant when contrast reaches 4.5:1, otherwise black or white; `terminalControlTint` pairs icon states. `terminalControlBackground` supplies inset rounded, stateful
   containers and ripples; `terminalIconButton` adds vector tint, localized descriptions/tooltips
   and tap feedback. Tab controls and extra keys share them; progress/status marks keep their
   own theme colours.
@@ -153,10 +153,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
   `PopupMenu` placed like a
   toolbar's overflow menu) are Material 3 in the theme's dark colours, from the wallpaper on
-  Android 12 and later (`DynamicColors`). The tab/search bars, extra keys and system-inset
-  backdrop use surface containers; selected controls have rounded filled primary containers
-  and paired text roles. The terminal body remains black. Status text uses BodyLarge typography,
-  while permission banners and search controls share the tonal hierarchy.
+  Android 12 and later (`DynamicColors`). The terminal body, tab/search bars, extra keys, permission
+  banners and system-inset backdrop share the accepted frame's default background, initially black.
+  MainActivity receives `Host.onBackgroundColor` and updates layout surfaces and system-bar icon
+  brightness; selected controls retain filled primary containers and paired text roles. Status text uses BodyLarge typography.
 - "Keep screen on" is available even without a current tab and applies to the whole terminal
   window. Its right-side checkbox reflects the activity's choice, persisted as `keep_screen_on`
   in the activity's private preferences, so recreating or reopening the activity keeps it.
@@ -168,7 +168,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Permission banners
 
-- The notification and battery banners share a 48 dp surface-container-low row below the top
+- The notification and battery banners share a 48 dp row on the terminal background below the top
   bar, including during search. Each localized 14 dp message is start-aligned with 16 dp horizontal
   padding and fallback line spacing disabled. It ellipsizes in narrow windows and fills the
   clickable space before a separate 48 dp vector close control. Both actions use background
@@ -345,7 +345,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   MainActivity's early configuration override aligns them and survives configuration updates.
   Keep the override limited to night mode so locale, font scale, density and window size still update.
   Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
-  so `Theme.Appine.Terminal` sets them to colorSurfaceContainer. It explicitly uses dark fallback
+  so `Theme.Appine.Terminal` sets them transparent and disables contrast scrims. It explicitly uses dark fallback
   roles because notification and privacy dialogs also use this theme in light configurations.
 - `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
   its root to the window: its view adapters access the activity's layout once input, grid and
@@ -387,6 +387,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   while it has the keyboard, rather than on the terminal?
 
 ## To verify
+
+- Continuous backgrounds and readable controls during OSC 11 changes, tab/search transitions,
+  permission banners and IME animations still need physical-device verification.
 
 - Shared-storage copy passed aapt2 compilation and key/placeholder checks in all five locales;
   device wrapping and native-speaker review remain unverified.

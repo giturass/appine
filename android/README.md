@@ -12,6 +12,10 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   switches the distribution, resets the rootfs, chooses the package mirror, the login
   account and the execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
   and release builds).
+  On the first launch of a new or upgraded Alpine system, Appine checks for OpenRC.
+  If it is missing, Appine installs it offline and boots it before opening a tab. An existing
+  installation keeps its configuration. After setup, users can remove OpenRC with `apk del`.
+  If setup fails on an upgrade, the terminal opens for repairs and the next start retries.
   Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
@@ -91,7 +95,7 @@ Keep the established key and credentials outside the checkout, with a private ba
 Supply secrets through private files or stdin rather than plaintext command-line arguments.
 The workflow decodes the key into the runner's temporary directory and removes it when finished.
 
-The `appine-release-<full SHA>` artifact contains `appine-1.0.0-<short SHA>-release.apk`,
+The `appine-release-<full SHA>` artifact contains `appine-1.0.1-<short SHA>-release.apk`,
 its SHA-256 checksum, `SOURCE_SHA`, the matching R8 `mapping.txt`, and `verification.json`.
 Verification pins Appine's signing certificate and checks the APK manifest, assets, JNI,
 shared-storage `Native.start` signature and ELF/ZIP alignment. It does not install the APK
@@ -120,9 +124,9 @@ Keep notices in the same change as dependency updates:
   simultaneously linked versions, such as jni-sys 0.3 and 0.4.
 - `android.html` lists the resolved Android runtime libraries, including transitive ones;
   check both debug and release runtime classpaths when changing the version catalog.
-- `alpine.html` records the bundled rootfs and doas/bash/procps/bubblewrap packages, with versions,
+- `alpine.html` records the bundled rootfs and doas/bash/procps/bubblewrap/OpenRC packages, with versions,
   license expressions and aports commits. Compare with the artifacts Gradle selects in
-  `target/rootfs`, and count shared ncurses packages only once.
+  `target/rootfs`, and count shared packages only once.
 - Preserve license wording, copyright notices and all required component notices when
   editing HTML. Use paragraphs and headings for reflow; do not shrink fixed-width text.
   Keep IDs stable across upgrades, and update the separate source bundles as before

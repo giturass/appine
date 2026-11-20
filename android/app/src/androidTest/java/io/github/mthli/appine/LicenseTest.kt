@@ -39,11 +39,11 @@ class LicenseTest {
         assertFalse(titles.any { it.contains("Termux") })
         val alpine = text("Alpine Linux")
         assertTrue(alpine, Regex("""busybox \S+\s+License: GPL-2.0-only\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
-        // The packages bundled beside it: doas, bash, procps-ng and bubblewrap with their libraries
+        // The Alpine packages bundled alongside the minirootfs
         assertTrue(alpine, Regex("""\ndoas \S+\s+License: ISC\s""").containsMatchIn(alpine))
         assertTrue(alpine, Regex("""\nbash \S+\s+License: GPL-3.0-or-later\s+aports: main/bash at [0-9a-f]{40}""").containsMatchIn(alpine))
         assertTrue(alpine, alpine.contains("\nreadline ") && alpine.contains("\nlibncursesw "))
-        for (name in listOf("procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs")) {
+        for (name in listOf("procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs", "openrc", "openrc-user", "bridge", "ifupdown-ng")) {
             assertTrue(alpine, alpine.contains("\n$name "))
         }
         assertEquals(1, Regex("""\nlibncursesw """).findAll(alpine).count())

@@ -57,8 +57,10 @@
         <item name="colorSurfaceContainerHighest">@color/appine_dark_surface_container_highest</item>
         <item name="colorOutline">@color/appine_dark_outline</item>
         <item name="colorOutlineVariant">@color/appine_dark_outline_variant</item>
-        <item name="android:statusBarColor">?attr/colorSurfaceContainer</item>
-        <item name="android:navigationBarColor">?attr/colorSurfaceContainer</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
         <item name="android:windowBackground">@android:color/black</item>
         <!-- Keep CJK and other fallback glyphs from changing line height in controls and tooltips. -->
         <item name="android:fallbackLineSpacing">false</item>

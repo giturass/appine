@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 48 dp square session controls and shared toolbar height)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: terminal-matched bar and fixed-group backgrounds with ordinary label/icon contrast updates)
 
 ## Responsibilities
 
@@ -42,7 +42,7 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 
 ## Public entry points
 
-- `TabBarView.render`, `refreshStatus`, `setListOpen`, `setListVisible`.
+- `TabBarView.render`, `refreshStatus`, `setListOpen`, `setListVisible`, `setTerminalBackgroundColor`.
 - `TabListView.open`, `render`, `refreshStatus`, `close`; `ProgressLine.show`.
 - `TabBarView.Target` and `TabListView.Target` send user actions to MainActivity.
 
@@ -66,10 +66,12 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   buttons lets the last tab scroll out from under them. While more tabs lie beyond, the row
   fades out over 32 dp ending 12 dp inside the close control, at its icon padding
   (the scroll view's right fading edge; the left edge does not fade).
-- The bar uses colorSurfaceContainer. Ui.kt's `terminalControlColor` supplies ordinary text
-  from on-surface-variant and selected text/indicators from on-primary-container.
+- The bar and fixed group's retained drawable follow the displayed terminal background, initially
+  black. `setTerminalBackgroundColor` updates inactive labels and ordinary icon tints for contrast.
+  Ui.kt's `terminalControlColor` retains on-surface-variant at 4.5:1 or chooses black/white;
+  selected text/indicators use on-primary-container.
   `terminalControlBackground` supplies inset rounded containers and ripples; selected tabs and
-  the open-list button have filled primary containers. Extra keys share this palette;
+  the open-list button have filled primary containers. Extra keys share the filled-control palette;
   progress/status marks retain their theme-role mapping and animation logic.
 - A tab shows its number (from 1, by position): the current one in a rounded filled primary
   container above the indicator, the others muted, an ended one faded (38% opacity, its indicator too). The current

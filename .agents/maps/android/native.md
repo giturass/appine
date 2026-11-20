@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional shared-storage path in Native.start and mounting before handle registration)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: pre-login OpenRC probe, installation and boot calls on appine-start, retaining the shared-storage start contract)
 
 ## Responsibilities
 
@@ -84,9 +84,9 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 - All callers are JVM threads; the bridge attaches no native thread to the JVM, and guest and timer
   threads never call into Java. The main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
-  start), `appine-start` (`start`), the service's worker (the poll's calls, `setRoutes`,
+  start), `appine-start` (`start`, OpenRC setup's `spawn`/`waitFor`, and `boot` when setup installs it), the service's worker (the poll's calls, `setRoutes`,
   `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
-  (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
+  (`spawn`, `waitFor`, `boot` only when setup did not already boot), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
   provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
   the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside
   `pump`.

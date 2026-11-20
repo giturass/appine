@@ -263,15 +263,19 @@ internal object Rootfs {
             """.trimIndent()
     }
 
-    /** Stages a bundled package set only at import; login removes it after a successful install. */
+    /** Copies a bundle from the APK to the guest's package cache. */
     @Throws(IOException::class)
     private fun cachePackages(context: Context, store: String, bundle: String): Boolean {
         val packages = context.assets.list(bundle).orEmpty()
         for (name in packages) {
-            val data = context.assets.open("$bundle/$name").use { it.readBytes() }
-            write(store, "/var/cache/appine/$bundle/$name", data)
+            cachePackage(context, store, "$bundle/$name")
         }
         return packages.isNotEmpty()
+    }
+
+    private fun cachePackage(context: Context, store: String, source: String, target: String = source) {
+        val data = context.assets.open(source).use { it.readBytes() }
+        write(store, "/var/cache/appine/$target", data)
     }
 
     /**
@@ -335,7 +339,7 @@ if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 """
 
     private fun asset(context: Context, name: String): String =
-        context.assets.open(name).bufferedReader().readText()
+        context.assets.open(name).bufferedReader().use { it.readText() }
 
     private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
         write(store, path, text.toByteArray(), overwrite)
@@ -584,6 +588,86 @@ netns = "host"
         "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
         "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
         "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
+
+    private const val OPENRC_INSTALL = "/var/cache/appine/install-openrc.sh"
+    private const val OPENRC_DONE = "/var/lib/appine/openrc-setup-done"
+
+    private fun runBootCommand(machine: Long, command: String): Int {
+        val argv = arrayOf("sh", "-c", command)
+        val pid = Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+        return Native.waitFor(machine, pid)
+    }
+
+    /** Prefers the guest clock and runs the existing inittab. */
+    fun boot(machine: Long) {
+        runCatching { runBootCommand(machine, PREFER_OSCLOCK) }
+            .onFailure { Log.w(TAG, "cannot prefer osclock", it) }
+        Native.boot(machine)
+    }
+
+    private fun needsOpenRcSetup(machine: Long, store: String): Boolean {
+        if (Native.readFile(store, OPENRC_DONE) != null) return false
+        // A staged installer from this or an older build must finish even if apk installed
+        // openrc before the process was killed.
+        if (Native.readFile(store, OPENRC_INSTALL) != null) return true
+
+        val probe = "apk --no-network --repositories-file /dev/null info -e openrc >/dev/null"
+        return when (val status = runBootCommand(machine, probe)) {
+            0 -> {
+                write(store, OPENRC_DONE, "")
+                false
+            }
+            1 -> true // Package missing
+            else -> throw IOException("Cannot check for OpenRC (exit $status)")
+        }
+    }
+
+    private fun installOpenRc(context: Context, machine: Long, store: String) {
+        // Rebuild this private cache on retry, including after an app update with new pins.
+        if (runBootCommand(machine, "rm -rf /var/cache/appine/openrc") != 0) {
+            throw IOException("Cannot prepare the OpenRC package cache")
+        }
+        cachePackages(context, store, "openrc")
+        val libcap = context.assets.list("bubblewrap").orEmpty().single { it.startsWith("libcap2-") }
+        cachePackage(context, store, "bubblewrap/$libcap", "openrc/$libcap")
+        write(store, OPENRC_INSTALL, asset(context, "install-openrc.sh"))
+        val logPath = "/var/log/appine-openrc.log"
+        val status = runBootCommand(machine, "sh $OPENRC_INSTALL >$logPath 2>&1")
+        if (status != 0) {
+            val log = Native.readFile(store, logPath)?.decodeToString()?.trim().orEmpty()
+            throw IOException("Cannot install OpenRC (exit $status)\n$log".trimEnd())
+        }
+    }
+
+    /**
+     * Checks OpenRC once per Alpine store. Returns whether inittab ran, even if verification
+     * failed and the caller lets an existing store open a terminal to repair its configuration.
+     */
+    fun ensureOpenRc(
+        context: Context, machine: Long, store: String, onFailure: (IOException) -> Unit = { throw it },
+    ): Boolean {
+        var booted = false
+        try {
+            if (!needsOpenRcSetup(machine, store)) return false
+            installOpenRc(context, machine, store)
+            boot(machine)
+            booted = true
+            val finish = """
+                set -e
+                test -d /run/openrc/exclusive
+                test "$(cat /run/openrc/softlevel)" = default
+                rm -rf /var/cache/appine/openrc
+                rm -f $OPENRC_INSTALL
+            """.trimIndent()
+            if (runBootCommand(machine, finish) != 0) {
+                throw IOException("Cannot finish OpenRC setup. See /var/log/boot.log")
+            }
+            write(store, OPENRC_DONE, "")
+        } catch (e: IOException) {
+            onFailure(e)
+        }
+        return booted
+    }
 
     /**
      * The services that did not start at this boot: OpenRC writes

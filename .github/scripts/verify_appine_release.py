@@ -194,7 +194,7 @@ def verify_apk(path):
     manifest = command([AAPT2, "dump", "xmltree", str(path), "--file", "AndroidManifest.xml"], "manifest.txt")
     package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.M)
     require(package is not None, "Package metadata missing")
-    require(package.groups() == ("io.github.mthli.appine", "1", "1.0.0"), f"Unexpected package metadata: {package.groups()}")
+    require(package.groups() == ("io.github.mthli.appine", "2", "1.0.1"), f"Unexpected package metadata: {package.groups()}")
     require(re.search(r"^(?:minSdkVersion|sdkVersion):'30'$", badging, re.M) is not None, "Expected minSdk 30")
     require("targetSdkVersion:'37'" in badging, "Expected targetSdk 37")
     require("application-debuggable" not in badging, "Release APK must not be debuggable")
@@ -230,7 +230,7 @@ def verify_apk(path):
         for name in required:
             require(name in entries and archive.getinfo(name).file_size > 0, f"Missing or empty APK entry: {name}")
         package_counts = {}
-        for prefix, expected in (("bash", 4), ("procps", 7), ("bubblewrap", 2)):
+        for prefix, expected in (("bash", 4), ("procps", 7), ("bubblewrap", 2), ("openrc", 4)):
             count = sum(name.startswith(f"assets/{prefix}/") and name.endswith(".apk") for name in entries)
             require(count == expected, f"Expected {expected} bundled {prefix} packages, found {count}")
             package_counts[prefix] = count

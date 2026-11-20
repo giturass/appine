@@ -269,6 +269,10 @@ On 2026-11-17, `vfs::store::tests::inode_numbers_reused_after_boot_keep_their_ob
 in the Linux arm64 workspace suite. After reopening the store, the test counted 60 objects handed
 to the reaper where it expected zero. It passed on its own and on a full rerun. The cause is unknown.
 
+On 2026-11-19, Android's `MachineTest.documentsChangesReachTheKernelAndBack` missed the
+close-after-write event for `w.txt` once on the API 37 16 KB emulator while the API 34 suite ran
+in parallel. The isolated test and a full `MachineTest` rerun passed. The cause is unknown.
+
 ## R1 measurements
 
 Ratios relative to native, under the [measurement conditions](#measurement-conditions); details in the corresponding file.

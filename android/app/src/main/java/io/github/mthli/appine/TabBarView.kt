@@ -4,6 +4,7 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
@@ -84,10 +85,11 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     /** Brings the current tab back into view a while after the row was scrolled away from it. */
     private val returnToCurrentTab = Runnable { revealCurrentTab() }
 
-    private val surfaceColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainer)
+    private var surfaceColor = Color.BLACK
+    private val buttonsBackground = surfaceColor.toDrawable()
 
     /** The buttons and the other tabs' numbers. */
-    private val mutedColor = terminalControlColor(selected = false)
+    private var mutedColor = terminalControlColor(selected = false, backgroundColor = surfaceColor)
 
     /** The current tab's number and indicator. */
     private val currentColor = terminalControlColor(selected = true)
@@ -153,6 +155,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     /** Hidden while there is no current tab. */
     private val closeButton = context.terminalIconButton(R.drawable.ic_close, R.string.close_tab) { target.closeCurrent() }
+    private val menuButton = context.terminalIconButton(R.drawable.ic_more, R.string.more_options) { target.menu(it) }
 
     /**
      * Close, new session and menu over the row's end. Opaque but for the part the fade reaches into,
@@ -161,7 +164,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
      */
     private val buttons = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
-        background = InsetDrawable(surfaceColor.toDrawable(), dp(FADE_INTO_CLOSE_DP), 0, 0, 0)
+        background = InsetDrawable(buttonsBackground, dp(FADE_INTO_CLOSE_DP), 0, 0, 0)
         // The inset comes as padding with the background, which would widen the group to the
         // left by as much and keep the surface at the left of the close button
         setPadding(0, 0, 0, 0)
@@ -169,7 +172,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
         addView(context.terminalIconButton(R.drawable.ic_add, R.string.new_tab, prominent = true) { target.newTab() }, item())
-        addView(context.terminalIconButton(R.drawable.ic_more, R.string.more_options) { target.menu(it) }, item())
+        addView(menuButton, item())
     }
 
     // With gesture navigation, a slide from the screen's left edge over the tabs scrolls them
@@ -185,6 +188,22 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply { marginStart = dp(ITEM_DP) })
         addView(listButton, LayoutParams(dp(ITEM_DP), LayoutParams.MATCH_PARENT, Gravity.START))
         addView(buttons, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT, Gravity.END))
+    }
+
+    /** Matches the surface and ordinary controls' contrast to the terminal's background. */
+    fun setTerminalBackgroundColor(color: Int) {
+        if (surfaceColor == color) return
+        surfaceColor = color
+        setBackgroundColor(color)
+        buttonsBackground.color = color
+        mutedColor = terminalControlColor(selected = false, backgroundColor = color)
+        for (tab in rowTabs) {
+            if (tab.session !== current) tab.view.setTextColor(mutedColor)
+        }
+        val tint = terminalControlTint(color)
+        listButton.imageTintList = tint
+        closeButton.imageTintList = tint
+        menuButton.imageTintList = tint
     }
 
     /** [BAR_DP] tall, whatever the parent offers. */

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: 40 dp tonal extra-key rows and filled modifier/SYM states with preserved press backgrounds)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: terminal-matched outer and fixed-group backgrounds with tonal key labels and modifier/SYM states preserved)
 
 ## Responsibilities
 
@@ -38,6 +38,7 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
 ## Public entry points
 
 - `Target.key`, `text`, `notice`; `ctrl`, `alt`, `shift`, `modifiersUsed`.
+- `setTerminalBackgroundColor` updates the outer surface and fixed group's retained drawable.
 - Shared `FADE_DP`, `indicatorPaint`, `drawIndicator`, `indicatorBounds` serve `android/tabbar`.
 
 ## Data flow / lifecycle
@@ -82,8 +83,8 @@ remain `android/terminal`; terminal key encoding remains `android/vtview`.
   not again on release; other keys still act once on release. No key has a swipe or popup. Keys
   with a long press also answer an accessibility service's long click (the touch never reaches
   the view's own long-press detection).
-- Keys sit on colorSurfaceContainer with rounded tonal backgrounds. Ui.kt's `terminalControlColor`
-  supplies ordinary labels from on-surface-variant and active labels/indicators from
+- Keys sit on the displayed terminal background, initially black, with opaque rounded tonal fills.
+  Ordinary labels stay paired with those fills, while Ui.kt supplies active labels/indicators from
   on-primary-container; `terminalControlBackground` fills selected keys with primary-container.
 - CTRL, ALT and SHIFT: a tap turns them on for the next key (filled container) or off, a locked
   one too; a long press locks them on (filled container and the

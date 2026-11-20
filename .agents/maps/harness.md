@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: completed release checks and remaining structural coverage limits)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: signed release naming and verifier expectations for Appine 1.0.1 (2) and the four OpenRC assets)
 
 ## Responsibilities
 
@@ -123,9 +123,10 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   variables. The temporary key is removed even after failure; credentials never enter Gradle.
 - The release verifier requires a clean source checkout at the expected revision, pins the
   Appine certificate and a modern single-signer signature with SDK `apksigner verify`, and checks
-  manifest identity/SDK/all-files permission, source assets, bundled packages, the static browser,
+  manifest identity/version 1.0.1 (2)/SDK/all-files permission, source assets, bundled packages
+  (including four OpenRC APKs), the static browser,
   JNI exports and the shared-storage `Native.start` DEX descriptor, native dependencies and
-  16 KB ELF/ZIP alignment. `appine-release-<full SHA>` contains the final APK, checksum, source
+  16 KB ELF/ZIP alignment. `appine-release-<full SHA>` contains `appine-1.0.1-<short SHA>-release.apk`, checksum, source
   SHA, matching R8 mapping and JSON verification; a failed run uploads lint/verifier diagnostics.
   The release job has a 60-minute timeout, groups concurrency by source SHA without cancelling
   a running build, and never publishes a GitHub release.

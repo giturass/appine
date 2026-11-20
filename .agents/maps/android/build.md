@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: completed release packaging checks and remaining Android device coverage)
+> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: OpenRC assets and Android/Cargo release versions)
 
 ## Responsibilities
 
@@ -29,7 +29,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
   and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
   packages, null when any is missing), `bubblewrapPackages` (bubblewrap and libcap2, null when either
-  is missing), and `alpineBranch` (from the tarball's name, `edge` without one).
+  is missing), `openrcPackages` (the four new OpenRC packages), and `alpineBranch` (from the tarball's name, `edge` without one).
 - `BrowserAssetTask` builds the static guest browser client as a generated asset.
 
 ## Public entry points
@@ -87,7 +87,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
   since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
   with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
-  ncurses so either bundle installs independently), and bubblewrap/libcap2 under `bubblewrap/`
+  ncurses so either bundle installs independently), bubblewrap/libcap2 under `bubblewrap/`, and OpenRC, openrc-user, ifupdown-ng and bridge under `openrc/`
   (all by `byVersion`; `rootfsAsset` fails with "run
   scripts/fetch-rootfs first" when any is missing), checked-in `notices/`, and
   the terminal font (`fonts/`, `android/vtrender`); `BuildConfig.ALPINE_BRANCH` carries the
@@ -99,8 +99,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: Gradle's intermediate APK is signed with the debug key, versionCode 1 and versionName
-  1.0.0. `harness`'s release workflow builds and lints the requested source revision, then aligns
+- Release: Gradle's intermediate APK is signed with the debug key, versionCode 2 and versionName
+  1.0.1, matching the Cargo workspace version. `harness`'s release workflow builds and lints the requested source revision, then aligns
   and signs the distribution APK with the established Appine PKCS12 key through SDK `apksigner`.
   Passwords stay out of Gradle, and the workflow disables its configuration cache. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
@@ -123,7 +123,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
   from the tarball's `lib/apk/db/installed`, then the bundled packages' from their `.PKGINFO`, doas
   and bash's four and procps-ng's five additional packages in sections of their own (shared ncurses
-  counted only once), plus bubblewrap and libcap2, all counted in the entry's package count (28) and
+  counted only once), plus bubblewrap, libcap2 and the four OpenRC packages, all counted in the entry's package count (32) and
   licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
   texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0. `LicenseCatalog` (android/licenses)
@@ -177,7 +177,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 - The Alpine part takes the tarball `scripts/fetch-rootfs` prints last and the bundled packages
   it prints before it, picks packages whose licence (the tarball's `lib/apk/db/installed`, each
   package's `.PKGINFO`) contains `GPL` (LGPL included; so bash, readline, procps-ng/libproc2 and
-  libintl, bubblewrap and libcap2, not doas, ncurses, utmps-libs or skalibs-libs),
+  libintl, bubblewrap, libcap2 and bridge, not doas, ncurses, utmps-libs or skalibs-libs),
   downloads each origin's
   aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles

@@ -59,6 +59,9 @@ val procpsPackages: List<File>? = fetchedPackages(
 /** bubblewrap and libcap, installed offline independently of the login shell. */
 val bubblewrapPackages: List<File>? = fetchedPackages("bubblewrap", "libcap2")
 
+/** The remaining OpenRC packages. The first boot also uses libcap2 from the bubblewrap bundle. */
+val openrcPackages: List<File>? = fetchedPackages("openrc", "openrc-user", "ifupdown-ng", "bridge")
+
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
@@ -75,8 +78,8 @@ android {
         applicationId = "io.github.mthli.appine"
         minSdk = 30
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "ALPINE_BRANCH", "\"$alpineBranch\"")
     }
@@ -147,6 +150,7 @@ val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     bashPackages?.let { bash.from(it) }
     procpsPackages?.let { procps.from(it) }
     bubblewrapPackages?.let { bubblewrap.from(it) }
+    openrcPackages?.let { openrc.from(it) }
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -265,7 +269,7 @@ abstract class CargoNdkTask : DefaultTask() {
  * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), the
  * doas package (for the login account) as `doas.apk`, and bash's packages (the login shell of the
  * systems the app imports) under `bash/`, procps-ng with its libraries under `procps/`, and
- * bubblewrap with libcap under `bubblewrap/`.
+ * bubblewrap with libcap under `bubblewrap/`, and the first-boot packages under `openrc/`.
  */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
@@ -285,6 +289,9 @@ abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFiles
     abstract val bubblewrap: ConfigurableFileCollection
 
+    @get:InputFiles
+    abstract val openrc: ConfigurableFileCollection
+
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
@@ -299,11 +306,14 @@ abstract class RootfsAssetTask : DefaultTask() {
         val doasFile = doas.orNull?.asFile
             ?: throw GradleException("doas package not found: run scripts/fetch-rootfs first")
         doasFile.copyTo(File(out, "doas.apk"))
-        if (bash.isEmpty) throw GradleException("bash packages not found: run scripts/fetch-rootfs first")
-        for (apk in bash) apk.copyTo(File(out, "bash/${apk.name}"))
-        if (procps.isEmpty) throw GradleException("procps-ng packages not found: run scripts/fetch-rootfs first")
-        for (apk in procps) apk.copyTo(File(out, "procps/${apk.name}"))
-        if (bubblewrap.isEmpty) throw GradleException("bubblewrap packages not found: run scripts/fetch-rootfs first")
-        for (apk in bubblewrap) apk.copyTo(File(out, "bubblewrap/${apk.name}"))
+
+        fun copyBundle(packages: FileCollection, directory: String, label: String = directory) {
+            if (packages.isEmpty) throw GradleException("$label packages not found: run scripts/fetch-rootfs first")
+            for (apk in packages) apk.copyTo(out.resolve(directory).resolve(apk.name))
+        }
+        copyBundle(bash, "bash")
+        copyBundle(procps, "procps", "procps-ng")
+        copyBundle(bubblewrap, "bubblewrap")
+        copyBundle(openrc, "openrc", "OpenRC")
     }
 }

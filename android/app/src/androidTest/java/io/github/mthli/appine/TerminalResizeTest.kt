@@ -2,11 +2,13 @@ package io.github.mthli.appine
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.os.SystemClock
 import android.view.ContextThemeWrapper
 import androidx.core.graphics.createBitmap
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -20,6 +22,9 @@ class TerminalResizeTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
 
     private class Host : VtView.Host {
+        var backgroundColor = Color.BLACK
+            private set
+        override fun onBackgroundColor(color: Int) { backgroundColor = color }
         override fun onInput(data: ByteArray) {}
         override fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {}
         override fun onZoom(fontPx: Int) {}
@@ -31,7 +36,7 @@ class TerminalResizeTest {
         override fun onSearchCount(total: Int, selected: Int) {}
     }
 
-    private class Fixture(val view: VtView, val tab: Long) {
+    private class Fixture(val view: VtView, val tab: Long, val host: Host) {
         private val bitmaps = mutableListOf<Bitmap>()
         fun draw(): Bitmap = createBitmap(view.width, view.height).also {
             bitmaps.add(it)
@@ -64,10 +69,11 @@ class TerminalResizeTest {
                 val session = VtSession(1, ConsolePty(machine, "", "root"), machine, events)
                 // Supply the native terminal without starting the session's shell threads.
                 VtSession::class.java.getDeclaredField("tab").apply { isAccessible = true }.setLong(session, tab)
-                val view = VtView(ContextThemeWrapper(context, R.style.Theme_Appine_Terminal), Host())
+                val host = Host()
+                val view = VtView(ContextThemeWrapper(context, R.style.Theme_Appine_Terminal), host)
                 view.attach(session)
                 view.layout(0, 0, 480, 800)
-                val fixture = Fixture(view, tab)
+                val fixture = Fixture(view, tab, host)
                 try {
                     fixture.feed("\u001b[?25l" + (0..99).joinToString("\r\n") { "old row $it" })
                     fixture.test()
@@ -99,6 +105,32 @@ class TerminalResizeTest {
         assertTrue(previewMatches(before))
         view.layout(0, 0, 480, h - 1)
         assertTrue("A second layout within the same row must keep the preview", previewMatches(before))
+    }
+
+    @Test fun backgroundChangeRepaintsTheMarginOnTheFirstFrame() = withView {
+        val renderer = VtView::class.java.getDeclaredField("renderer").apply { isAccessible = true }.get(view) as VtRenderer
+        view.layout(0, 0, 480, renderer.cellHeight * 8 + 2)
+        draw()
+        feed("\u001b]11;#123456\u0007")
+        val color = Color.rgb(0x12, 0x34, 0x56)
+        assertEquals("The margin must use the newly accepted background", color, draw().getPixel(0, view.height - 1))
+        assertEquals(color, host.backgroundColor)
+        feed("\u001b]11;#000000\u0007")
+        assertEquals(Color.BLACK, draw().getPixel(0, view.height - 1))
+        assertEquals(Color.BLACK, host.backgroundColor)
+    }
+
+    @Test fun pendingResizeFramesKeepTheDisplayedBackground() = withView {
+        val before = draw()
+        view.layout(0, 0, 480, 400)
+        // Keep the parser away from ground after changing the color, until the redraw is ready.
+        feed("\u001b]11;#123456\u0007\u001b[?20")
+        assertTrue(previewMatches(before))
+        assertEquals("An undisplayed frame must not recolor the controls", Color.BLACK, host.backgroundColor)
+        feed("26l")
+        SystemClock.sleep(40)
+        draw()
+        assertEquals(Color.rgb(0x12, 0x34, 0x56), host.backgroundColor)
     }
 
     @Test fun splitSynchronizedOutputStaysPending() = withView {

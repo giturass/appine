@@ -51,11 +51,19 @@ internal fun Context.themeColor(attr: Int): Int = MaterialColors.getColor(this, 
 internal fun View.themeColor(attr: Int): Int = context.themeColor(attr)
 
 /** Selected controls use the text role paired with their filled primary container. */
-internal fun View.terminalControlColor(selected: Boolean): Int = if (selected) {
-    themeColor(com.google.android.material.R.attr.colorOnPrimaryContainer)
-} else {
-    themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
+internal fun View.terminalControlColor(selected: Boolean, backgroundColor: Int = Color.BLACK): Int {
+    if (selected) return themeColor(com.google.android.material.R.attr.colorOnPrimaryContainer)
+    val normal = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
+    if (ColorUtils.calculateContrast(normal, backgroundColor) >= 4.5) return normal
+    return if (ColorUtils.calculateContrast(Color.BLACK, backgroundColor) >=
+        ColorUtils.calculateContrast(Color.WHITE, backgroundColor)
+    ) Color.BLACK else Color.WHITE
 }
+
+internal fun View.terminalControlTint(backgroundColor: Int = Color.BLACK) = ColorStateList(
+    arrayOf(intArrayOf(android.R.attr.state_selected), intArrayOf()),
+    intArrayOf(terminalControlColor(selected = true), terminalControlColor(selected = false, backgroundColor = backgroundColor)),
+)
 
 /** Inset shapes leave space between controls without shrinking their touch targets. */
 internal fun View.terminalControlBackground(tonal: Boolean = false, prominent: Boolean = false): Drawable {
@@ -88,10 +96,7 @@ internal fun Context.terminalIconButton(
     imageTintList = if (prominent) {
         ColorStateList.valueOf(themeColor(com.google.android.material.R.attr.colorOnPrimary))
     } else {
-        ColorStateList(
-            arrayOf(intArrayOf(android.R.attr.state_selected), intArrayOf()),
-            intArrayOf(terminalControlColor(selected = true), terminalControlColor(selected = false)),
-        )
+        terminalControlTint()
     }
     scaleType = ImageView.ScaleType.CENTER_INSIDE
     background = terminalControlBackground(prominent = prominent)
