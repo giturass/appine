@@ -155,6 +155,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
 
     /** Hidden while there is no current tab. */
     private val closeButton = context.terminalIconButton(R.drawable.ic_close, R.string.close_tab) { target.closeCurrent() }
+    private val addButton = context.terminalIconButton(R.drawable.ic_add, R.string.new_tab) { target.newTab() }
     private val menuButton = context.terminalIconButton(R.drawable.ic_more, R.string.more_options) { target.menu(it) }
 
     /**
@@ -171,7 +172,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         isClickable = true
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
-        addView(context.terminalIconButton(R.drawable.ic_add, R.string.new_tab, prominent = true) { target.newTab() }, item())
+        addView(addButton, item())
         addView(menuButton, item())
     }
 
@@ -203,6 +204,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         val tint = terminalControlTint(color)
         listButton.imageTintList = tint
         closeButton.imageTintList = tint
+        addButton.imageTintList = tint
         menuButton.imageTintList = tint
     }
 

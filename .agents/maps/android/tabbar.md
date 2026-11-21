@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: terminal-matched bar and fixed-group backgrounds with ordinary label/icon contrast updates)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: transparent new-session icon with terminal-background contrast updates)
 
 ## Responsibilities
 
@@ -53,9 +53,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - One 48 dp row in any window, with square 48 dp tab/control bounds. The optional session-list icon,
   shown by default and controlled by Settings' Terminal switch, occupies the first 48 dp;
   scrolling tabs start to its right. Close (hidden without a current tab), new-session and
-  overflow controls reserve 144 dp at the end. New-session has a filled primary background
-  and opens a session while the kernel runs, in the current tab's directory: its console's
-  foreground group's, read from the kernel on the main thread as a spawn is; the home directory
+  overflow controls reserve 144 dp at the end. New-session shows only a plus icon with a
+  transparent idle background and opens a session while the kernel runs, in the current tab's
+  directory: its console's foreground group's, read from the kernel on the main thread as a spawn is; the home directory
   without a current tab or once its shell ended. The overflow menu offers:
   "Find", disabled with no current tab, "Clear screen", disabled without a current tab whose
   terminal exists or while it shows the alternate screen, "Reset terminal", disabled without such a
@@ -67,7 +67,8 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
   fades out over 32 dp ending 12 dp inside the close control, at its icon padding
   (the scroll view's right fading edge; the left edge does not fade).
 - The bar and fixed group's retained drawable follow the displayed terminal background, initially
-  black. `setTerminalBackgroundColor` updates inactive labels and ordinary icon tints for contrast.
+  black. `setTerminalBackgroundColor` updates inactive labels and ordinary icon tints, including
+  new-session, for contrast.
   Ui.kt's `terminalControlColor` retains on-surface-variant at 4.5:1 or chooses black/white;
   selected text/indicators use on-primary-container.
   `terminalControlBackground` supplies inset rounded containers and ripples; selected tabs and
@@ -233,6 +234,9 @@ helpers in `ExtraKeysView` belong to `android/keys`, and `Ui.kt`, strings/themes
 - Should a background tab's progress take another colour than the primary one?
 
 ## To verify
+
+- New-session's transparent idle background, press ripple and contrast after dark/light terminal
+  background changes still need device verification.
 
 - The 48 dp bar height and square controls passed source/layout review, CI debug/release
   assembly/lint and signed-APK verification for source
