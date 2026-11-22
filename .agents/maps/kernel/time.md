@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/time.md` for the paired decision history (not yet created; decisions from before the split are D11, D15, D19, D25, D54 and the periodic-check part of D30 in `.agents/decisions/kernel/process.md`; the fast-path and deadline-handover contracts remain D6 and D52 there).
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint raw ICMP tap references to kernel/rawicmp)
 
 ## Responsibilities
 
@@ -74,7 +76,8 @@ store, network, cgroup and I/O modules; it does not own their policies.
   again); expire interval timers, POSIX timers and CPU-time limits; run the OOM check (only with a
   memory limit or a cgroup `memory.max`), compare watched cgroup files, the translator code-view
   release, load-average sampling, deferred store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks,
-  AIO polls that signal eventfds (`kernel/aio`), DNS stub answers (`kernel/net`) and raw ICMP taps;
+  AIO polls that signal eventfds (`kernel/aio`), DNS stub answers (`kernel/net`) and raw ICMP taps
+  (`kernel/rawicmp`);
   then wait (BKL released) until the earliest deadline (timerfds of those AIO polls and of
   exclusive gates included), its event or the host fds of those checks and the clock watch. It
   listens on `OTHER` (or all channels while `O_ASYNC` files, exclusive gates or such AIO polls
@@ -121,7 +124,7 @@ store, network, cgroup and I/O modules; it does not own their policies.
 - `kernel/exec`: clears the thread group's POSIX timers at execve.
 - `kernel/poll`, `kernel/futex`, `kernel/ipc`: deadlines and clock-jump handling;
   `kernel/procfs`: load average; `kernel/oom`: stopping idle periodic checks.
-- `kernel/store`, `kernel/net`, `kernel/aio`, `kernel/poll`: wake the timer thread for new work.
+- `kernel/store`, `kernel/net`, `kernel/rawicmp`, `kernel/aio`, `kernel/poll`: wake the timer thread for new work.
 
 ### Outbound
 
@@ -131,7 +134,7 @@ store, network, cgroup and I/O modules; it does not own their policies.
   clock ids and absolute times; `hal`: clocks, `ClockWatch`, events and polling.
 - `kernel/oom`: memory limits and written code views; `kernel/cgroup`: change observation;
   `kernel/store`: deferred commits; `kernel/poll`: signal-driven I/O and exclusive gates;
-  `kernel/aio`: eventfd-signalling polls; `kernel/net`: DNS replies and raw ICMP taps.
+  `kernel/aio`: eventfd-signalling polls; `kernel/net`: DNS replies; `kernel/rawicmp`: raw ICMP taps.
 
 ## Invariants and gotchas
 

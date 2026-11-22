@@ -14,6 +14,7 @@ on:
       - "rust-toolchain.toml"
       - "scripts/fetch-rootfs"
       - "scripts/fetch-ghostty"
+      - "scripts/fetch-virglrenderer"
       - ".github/workflows/android.yml"
   pull_request:
     paths:
@@ -25,6 +26,7 @@ on:
       - "rust-toolchain.toml"
       - "scripts/fetch-rootfs"
       - "scripts/fetch-ghostty"
+      - "scripts/fetch-virglrenderer"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -74,7 +76,7 @@ jobs:
       - name: Install the NDK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "cmake;3.22.1"
           # The runner's preset ANDROID_NDK_ROOT points at another version; change both so cargo-ndk
           # does not warn
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
@@ -111,6 +113,14 @@ jobs:
 
       - name: Fetch libghostty-vt
         run: scripts/fetch-ghostty
+
+      - uses: actions/cache@v6
+        with:
+          path: target/virglrenderer
+          key: virglrenderer-${{ hashFiles('scripts/fetch-virglrenderer') }}
+
+      - name: Fetch Venus decoder
+        run: scripts/fetch-virglrenderer
 
       # The NDK's clang also compiles the C engine here, so clang-specific warnings show up too
       - name: Clippy for Android

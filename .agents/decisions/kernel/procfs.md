@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -56,12 +56,12 @@
 - **Watch out**: Freezing must not look like a stop signal: parents and wait must not see it, and interrupted syscalls restart after thaw; `Task::frozen` also means waiting for a vfork child, so a new reader must not take it for a freezer stop.
 - **Source**: rounds 164 (`164-cgroup-limits`), 165 (`165-cgroup-freeze`); b593172, 1d3d559
 
-### D9: kernel/procfs owns synthetic filesystem views and cgroup node adapters
-- **What**: kernel/procfs owns pseudo.rs and shared synthetic-node contracts, while cgroup tree policy, interface behavior and device BPF belong to kernel/cgroup.
-- **Why**: Synthetic filesystem views and the substantial cgroup policy implementation need separate maintenance boundaries.
-- **Tradeoffs**: Adapter and policy changes require both maps, and pre-split cgroup decisions remain here under their original tags; tracing implementation belongs to kernel/ptrace while procfs memory-file handling remains here.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a; d053be24; 60790c14; 39e55b4b
+### D9: kernel/procfs owns the synthetic-node framework, procfs, devpts/nsfs/mqueue and cgroup2 adapters
+- **What**: kernel/procfs owns the shared synthetic-node framework (`View`, `FileKind::Proc`, missing-path accounting), per-process and system-wide procfs, `/proc/sysvipc`, `/proc/<pid>/net`, devpts, nsfs, mqueue nodes and cgroup2 adapters, while cgroup policy and device BPF belong to `kernel/cgroup`, `/proc/sys` to `kernel/sysctl` and `/sys` to `kernel/sysfs`.
+- **Why**: `kernel/procfs.md` reached 38,953 B (84.5% of one read) while combining general procfs and devpts/nsfs/mqueue views with `/proc/sys` sysctls and `/sys`.
+- **Tradeoffs**: `pseudo.rs` is partitioned across three modules by variant/table/section, pre-split `kernel/cgroup`, `kernel/sysctl` and `kernel/sysfs` decisions remain here under their original tags, and tracing belongs to `kernel/ptrace`.
+- **Watch out**: Shared `View`, `stat`, `readdir`, `open_unwritable`, `pollable` and `missing_path` changes must stay synchronized across `kernel/procfs`, `kernel/sysctl` and `kernel/sysfs`, and open map bugs remain (per-thread fd views showing the leader's table, `task/<tid>` main-thread credential checks, `pagemap` following tid, non-advancing writes, partial change notifications, reader-namespace regeneration and missing `zoneinfo`/`pressure`/`kallsyms`).
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a; d053be24; 60790c14; 39e55b4b; e0719858
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -169,6 +169,14 @@
 - **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
 - **Source**: 45be9fae; 20137e4c; d053be24; 39e55b4b
 
+### D42: Synthetic sysfs publishes the conditional platform DRM render-node hierarchy
+
+- **What**: Synthetic sysfs conditionally exposes the DRM render-node device, subsystem link and uevent when a GPU renderer is enabled.
+- **Why**: Packaged `libdrm` traverses sysfs links to identify `/dev/dri/renderD128`.
+- **Tradeoffs**: Only the discovery paths required by the tested Alpine and Debian guests are implemented.
+- **Watch out**: Other `libdrm` versions may require additional sysfs attributes, and device numbers must agree with kernel/vfs D57.
+- **Source**: 87c7d9db
+
 ## Superseded
 
 - ~~Regenerated content uses the current reader's credentials, not the opener's (D1 in part, §8.2)~~ → replaced by **D25** in f6a82cc (2026-11-08)
@@ -179,3 +187,4 @@
 - ~~`may_read`'s access checks go by the target thread (D39 in part, 1be1142)~~ → corrected in f1212d8 (2026-11-11): they use the main thread's credentials (a bug in the map), and only **D40**'s `syscall` checks the thread
 - ~~D9 combined ownership of procfs, cgroup policy and device BPF~~ → replaced by **D9** in cf029f9a (2026-11-14)
 - ~~Comparing every observed cgroup file at every checkpoint under D38~~ → replaced by **kernel/cgroup D2** in 0f5c5132 (2026-11-17), preserving poll and inotify delivery.
+- ~~D9 combined ownership of /proc/sys sysctls and sysfs in kernel/procfs (cf029f9a)~~ → replaced by **D9**, kernel/sysctl **D1** and kernel/sysfs **D1** in e0719858 (2026-11-22).

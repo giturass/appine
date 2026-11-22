@@ -21,7 +21,7 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
 int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint32_t prot);
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot);
 
-/* Tier 1 translations never invalidate themselves: the kernel layer discards them from the code invalidation log, see the engine map */
+/* Tier 1 translations never invalidate themselves: the kernel layer discards them from the code invalidation log, see the engine/dbt map */
 void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 void appine_dbt_flush(struct appine_dbt *dbt);
 void appine_dbt_recheck(struct appine_dbt *dbt);  /* after exec: keep the translations, verify each block before it next runs */

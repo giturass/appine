@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: split native terminal ownership, JNI and emulator behavior into android/vtcore, retaining Kotlin sessions and consoles here)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
 
 ## Responsibilities
 
@@ -23,7 +23,8 @@ Root: `VtSession.kt` and `ConsolePty.kt` in
 
 Outside the module: `VtNative`, JNI, the pump implementation, terminal ownership and locks,
 protocol parsing, command timing, snapshots, reset semantics and compression (`android/vtcore`);
-view lifecycle and interaction (`android/vtview`), frame encoding and drawing (`android/vtrender`),
+view lifecycle, input and search (`android/vtview`), gestures/selection/scrolling
+(`android/vtgestures`), frame encoding and drawing (`android/vtrender`),
 the surrounding screen (`android/terminal`), session ownership and persistence policy
 (`android/service`), the kernel console (`kernel/tty`), kernel JNI (`android/native`), and the
 login script and prompt-mark producers (`android/setup`).

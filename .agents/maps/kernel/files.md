@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl and sysfs references to kernel/sysctl and kernel/sysfs)
 
 ## Responsibilities
 
@@ -34,7 +34,8 @@ syscalls, `getdents64`, `/dev` population and the `Device` numbers (`kernel/vfs`
 pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); store objects
 (`kernel/store`); socket I/O (`kernel/net`, `kernel/unix`); poll bookkeeping, eventfd and timerfd
 (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio`); loop devices
-(`kernel/loop`); terminals (`kernel/tty`); synthetic file content (`kernel/procfs`).
+(`kernel/loop`); terminals (`kernel/tty`); synthetic file content (`kernel/procfs`,
+`kernel/sysctl`, `kernel/sysfs`).
 
 ## Key types
 
@@ -160,8 +161,7 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
 - FUSE nodes are opened and created by `kernel/fuse` (the daemon's open and create); a file
   created that way is not checked again.
 - Pseudo nodes: nsfs writes `EPERM` first; permission from the synthetic stat, except `/proc/sys`
-  (the mode's bits for euid 0, group 0 or others; `net.*` owner bits for `CAP_NET_ADMIN` over the
-  network namespace's owner; `user.max_*` writable only with `CAP_SYS_RESOURCE`); `O_TRUNC` asks
+  (`kernel/sysctl`'s `test_perm` and `net.*`/`user.max_*` rules); `O_TRUNC` asks
   for write; the ptrace read check for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup`
   and `pagemap` (the process found through `pseudo::group_of`, so `/proc/<tid>` works; `mem` and
   `pagemap` of a gone thread `ESRCH`); `setgroups` writes also need `CAP_SYS_ADMIN` over the
@@ -333,6 +333,12 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
 
 ### Character devices
 
+- `syscall/gpu.rs` handles render node 226:128. Each open file description owns its context,
+  ring count and GEM handle table. Dup and fork share them. DRM version and capset queries precede
+  context initialization. Blob creation provides an opaque mmap offset, execbuffer captures the
+  command and referenced mappings before unlocking, and GEM close removes the guest handle.
+  Host operations use the `Renderer`, `Context` and `Mapping` interfaces in `gpu.rs`.
+
 - Opening dispatches by device number for store and overlay nodes anywhere and handle opens (device
   nodes in FUSE filesystems are `ENXIO`), after nodev (`EACCES`), permission and the cgroup BPF
   device filter: 5:0 and 5:1 the controlling terminal, 5:2 the ptmx of the devpts beside the node
@@ -378,7 +384,7 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   `kernel/loop`, and `kernel/fuse` (opens and I/O on
   FUSE files, flushes).
 - `kernel/cgroup` (device BPF checks, cgroup file-change observation and keys).
-- `kernel/procfs` (synthetic opens and content), `kernel/tty` (terminal opens and ioctls),
+- `kernel/procfs`, `kernel/sysctl`, `kernel/sysfs` (synthetic opens and content), `kernel/tty` (terminal opens and ioctls),
   `kernel/ipc` (mqueue objects), `kernel/poll` (eventfd and timerfd reads, fasync), `kernel/net`
   (socket I/O and ioctls), `kernel/unix` (files in flight).
 - `kernel/mm` for clones, unsharing and truncation: `writably_maps`, `maps_file`, `file_moving`,

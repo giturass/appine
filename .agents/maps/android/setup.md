@@ -1,11 +1,11 @@
 # android/setup Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/setup.md` for the paired decision history.
+> See `.agents/decisions/android/setup.md` for the paired decision history (it still holds the decisions on the Settings screen made before it was split out into `android/settings`).
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: one-time offline OpenRC setup on new and existing Alpine stores and About version 1.0.1 (2))
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: bash startup-file seeding and extracted settings ownership while preserving offline OpenRC setup)
 
 ## Responsibilities
 
@@ -21,22 +21,18 @@
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
-- the settings screen, which displays service state and forwards choices, plus shared privacy
-  and notification authorization actions, all-files access for shared storage and navigation to
-  system battery settings;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
-Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
+Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/install-openrc.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `android/app/src/main/assets/appine-gpu.sh`, `scripts/fetch-rootfs`.
 
-Outside the module: when imports, switches, restarts and logins happen, and the `settings`
-preferences (`android/service`); the import and `write_file`/`read_file` implementations
-(`kernel/store`, `kernel/vfs`); bundling the assets (`android/build`); the shared page layouts
-(`android/terminal`), the licences (`android/licenses`) and the authentication gate (`android/privacy`);
-what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`) and the Kotlin
-session consuming their state and events (`android/vt`).
+Outside the module: the settings screen (`android/settings`); when imports, switches, restarts and
+logins happen, and the `settings` preferences (`android/service`); the import and
+`write_file`/`read_file` implementations (`kernel/store`, `kernel/vfs`); bundling the assets
+(`android/build`); what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`,
+`android/vtgestures`) and the Kotlin session consuming their state and events (`android/vt`).
 
 ## Key types
 
@@ -51,19 +47,8 @@ session consuming their state and events (`android/vt`).
     `debian/dists/trixie/InRelease` over https.
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
-- Preferences: file `rootfs`, owned here (`distro`); the `settings`
-  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
-  `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`, `show_tab_list`),
-  which Settings shows through the service.
-- `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
-  `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
-  with android/licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
-  `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
-  `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (conditional notification and battery usage actions, running policy, privacy mode,
-  shared storage and file access), Terminal (CJK characters filling two
-  cells, the cursor's shape, whether it blinks, tab-list button visibility, the volume keys switching tabs), Debugging (execution
-  mode and diagnostic export, in all builds) and About (Telegram, project website, privacy policy, licenses, version).
+- Preferences: file `rootfs`, owned here (`distro`); the `settings` file is `android/service`'s
+  `Settings`, displayed and edited through `android/settings`.
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -79,8 +64,8 @@ session consuming their state and events (`android/vt`).
   profile only in zsh. Its anonymous function registers the hooks in local zsh emulation,
   preserving the caller's options. `Rootfs.writeProfile(context, store, distro)` writes all three
   companion files and then the profile.
-- Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
-  and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
+- Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`,
+  `sudo-installed` and `bash-startup-done` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
   `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), and `/run/appine-install.lock`.
 
@@ -88,15 +73,15 @@ session consuming their state and events (`android/vt`).
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
-  `updateProfile`; around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
+  `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
+  `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
   packages into `target/rootfs` by default; prints each package's path, then the tarball's last).
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
   directory; or `--refresh-rules`.
-- `SettingsActivity`, opened from the terminal's ⋮ menu (not exported).
 
 ## Data flow / lifecycle
 
@@ -156,15 +141,22 @@ session consuming their state and events (`android/vt`).
     `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
     missing); bash as the login shell (`useBash`): the bundled packages from the assets' `bash/`
     into `/var/cache/appine/bash/`, and, when there were any, root's `/etc/passwd` shell changed
-    from `/bin/sh` to `/bin/bash` (any other shell is kept). Systems imported before keep busybox
-    ash; accounts busybox's `adduser` makes later take the shell of `$SHELL` or of the account
-    running it, so from a root tab they get bash too; procps-ng and its six dependencies are
+    from `/bin/sh` to `/bin/bash` (any other shell is kept) and `ensureBashStartup` run so
+    `/etc/skel` and `/root` receive `.bash_profile` (sourcing `~/.bashrc`) and `.bashrc` (an
+    interactive guard leaving `PS1` and history unchanged) and `/var/lib/appine/bash-startup-done`
+    is recorded. Systems imported before keep busybox ash; accounts busybox's `adduser` makes
+    later take the shell of `$SHELL` or of the account running it (so from a root tab they get
+    bash too) and copy `/etc/skel`; procps-ng and its six dependencies are
     staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
     with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores do not receive these import-time files;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
 
 ### Before every start and boot
 
+- `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing, called before
+  kernel start only when Vulkan GPU is enabled. The launcher
+  finds the packaged Alpine or Debian Venus manifest and execs the supplied command with
+  `VK_DRIVER_FILES` set for that invocation.
 - `ensureBrowser` installs `xdg-open.sh` as `/usr/local/bin/xdg-open` (0755) on either distro.
   It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256.
   Before every kernel start it refreshes the static `/usr/local/libexec/appine-open-url` (0755)
@@ -181,7 +173,14 @@ session consuming their state and events (`android/vt`).
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`, rewritten at every start; a profile left exactly as an
+  `doas.apk` into `/var/cache/appine/`, rewritten at every start; on Alpine, `ensureBashStartup`
+  once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
+  and `/etc/skel/.bashrc` when missing and, for root and pre-existing regular accounts (UID
+  1000–65533) whose `/etc/passwd` shell is `/bin/bash` and whose non-root home directory already
+  exists, writes `.bash_profile` only if none of `.bash_profile`, `.bash_login` or `.profile`
+  (including symlinks) exists and writes `.bashrc` when missing, owned by each account (`uid:gid`,
+  0644), then writes the marker so later user deletions persist (missing or symlinked homes are
+  skipped without creating directories); a profile left exactly as an
   earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
   declare `cl=line`, or with ash's, bash's or zsh's marks in itself) replaced by the current one, with
   the mark files written before it (`/etc/bash/appine.sh` on Alpine stores, bash installed or
@@ -223,7 +222,6 @@ session consuming their state and events (`android/vt`).
   The tab bar still shows numbers; these titles are available through long presses and TalkBack.
   Existing shells retain their loaded hooks until a new shell starts or the full profile is
   reloaded. Sourcing ashrc alone into an already-marked old PS1 skips its existing-mark guard.
-
 - For the terminal's shell integration (android/vtcore) the profile has login shells mark their
   prompts with OSC 133:
   - bash: the profile sets the coloured PS1 and reads `appine.bashrc`, whose `__appine_prompt`
@@ -293,8 +291,8 @@ session consuming their state and events (`android/vt`).
 
 - `loginAccount`: `auto` is the regular account (UID 1000–65533, a shell other than empty,
   `nologin` or `false`) with the lowest UID, else root; `root`; or a named passwd entry, falling
-  back to root. `regularAccounts` lists the same accounts for Settings. `login.sh` picks the
-  account by the same rules, except that it does not require a numeric GID or all seven fields.
+  back to root. `regularAccounts` lists the same accounts for `android/settings`. `login.sh` picks
+  the account by the same rules, except that it does not require a numeric GID or all seven fields.
 - `login.sh` traps SIGINT, so Ctrl-C does not end the login but still interrupts the command
   running (normally apk or apt, skipping the install until the next login), chooses wheel, doas and
   `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), else sudo, sudo and
@@ -345,134 +343,26 @@ session consuming their state and events (`android/vt`).
     would otherwise fail and the tab close); package commands read from `/dev/null` so early typing
     reaches the shell.
 
-### Settings
-
-- The Android group starts with an Enable notifications action only while app notifications are
-  disabled, regardless of whether the terminal banner was dismissed. It uses android/terminal's
-  `NotificationPermission` helper and shared request history: request once on Android 13+, then
-  open system notification settings. The action checks privacy and works without service binding.
-  The fragment refreshes visibility when creating preferences, after permission results and on
-  resume, including return from system settings. Granting removes it; revoking restores it.
-- App battery usage follows notifications and precedes the screen-off policy. It opens the
-  system app details for this package. The row reads the system Doze exemption on creation and
-  resume, remains available after banner dismissal, and disappears when the package is exempt.
-- Shared storage access stays visible below privacy mode and above the external file-access
-  switch, without requiring a service binding. A tap checks `Privacy.locked` and opens
-  `ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION` with the package URI, falling back to
-  `ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION` and localized feedback if neither is available.
-  Its nonpersistent summary reads `Environment.isExternalStorageManager()` on creation and
-  resume, describing read/write at `/sdcard` and `/storage/emulated/0` when granted. Android
-  retains the permission state; the action writes no Appine preference.
-
-- Diagnostic export is independent of service binding and kernel readiness. Its protected dialog
-  offers Save to file or Share. Both call `Privacy.requestLogExport` before generating a ZIP;
-  privacy mode requires fresh authentication even when Settings is already unlocked.
-  Only the authorized callback starts `appine-export`. A stopped/replaced fragment or expired
-  authorization deletes its prepared result instead of handing it off.
-- Save stages its already-prepared ZIP in a fragment-scoped `PendingLogSave` ViewModel and then
-  launches `CreateDocument("application/zip")`. The mode and pending file reference survive
-  configuration recreation, never process death; the authority only covers this archive.
-  A picker result consumes the reference once. Cancellation or permanent owner destruction while
-  pending deletes the file; a valid destination transfers ownership to `appine-save-logs`, which
-  opens the source before `openOutputStream("wt")` and deletes the ZIP after success or failure.
-  Save files use `cache/diagnostic-saves`, isolated from share-cache pruning; startup attempts to
-  remove orphans from a dead process. The row stays disabled while preparing, pending or saving.
-- A consumed picker result calls `Privacy.deferNextUnlock` while the page is paused. Its next
-  gate resume can show the locked shield without a redundant automatic authentication prompt;
-  this never unlocks Settings or permits new exports. The already-authorized transfer may finish
-  while locked/backgrounded. Ordinary unlock cannot replay a cancelled or consumed save.
-  Share instead grants temporary read-only access through `Diagnostics` after its final check.
-  Failures restore the row and show a localized message. A provider failure may leave an empty or
-  incomplete destination; cancelling authentication occurs before the picker creates any document.
-- Privacy mode is an authenticated exception to service-owned changes: its nonpersistent switch asks before enabling, then calls the shared `Privacy` gate; disabling also authenticates. No setting changes on cancellation or failed/unavailable authentication. File access stays disabled while privacy is on, with a localized explanation; turning privacy off leaves file access off. Material dialogs use `showPrivate`, and restored choice dialogs use `Privacy.protect`.
-- Binding: the fragment's `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
-  renders, shows a pending notice and loads the regular accounts on a background thread, again
-  when the kernel is ready; account loads use the application context and a generation to discard
-  results after stopping or a newer load. `onSettingsChanged` renders; `onProgress`, `onRestarting` and
-  `onExitAll` finish the screen, so a switch, reset or restart goes back to the terminal, which
-  shows the progress.
-- Service-owned rows read the service's state and call it:
-  - distro: usable during a switch (it then cancels the download, after a confirmation) or when a
-    switch is possible, a start failure included; choosing another distro or Reset asks first;
-  - login account: whenever a store is installed and no switch runs, with a toast naming the
-    account new tabs log in as;
-  - reset: whenever a switch is possible;
-  - execution mode (tier, in all builds): while the kernel runs with no switch, a different tier
-    asking to restart; the summary names the current mode and Tier number, with a slower hint
-    for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
-  - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
-    description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
-  file access (outside privacy mode), CJK fill, cursor shape (Block, Bar or Underline, the summary
-    naming the current one), cursor blink, the volume keys switching tabs and showing the tab-list
-    button (all three on by default): usable at any time; the service gives every tab the new cursor values at once
-    (android/service), and the terminal reads the CJK, volume-key and tab-list visibility values itself
-    (android/terminal).
-- About starts with Telegram (`https://t.me/appinesh`), followed by the project website
-  (`https://github.com/mthli/appine`) and privacy policy (`https://appine.sh/privacy`).
-  All three use the shared `link` preference helper, show their URL
-  as the summary and open it with AndroidX `CustomTabsIntent`, without pinning a browser package.
-  Telegram uses a non-translatable brand label in every locale. A browser without Custom
-  Tabs can handle the same VIEW intent; no handler produces the shared `link_no_app` toast.
-  The licenses summary names GNU AGPL 3.0 or later; the full copyright, warranty disclaimer and
-  license text remain in the Appine notice on the license page.
-- About's final Version action shows `BuildConfig.VERSION_NAME` followed by `BuildConfig.VERSION_CODE`
-  in parentheses (`1.0.1 (2)`). It opens the HTTPS Google Play
-  details URL for `BuildConfig.APPLICATION_ID`, first restricted to `com.android.vending`, then
-  without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
-  The link can be built before publication, but the store listing is unavailable until published.
-- Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  notification authorization, battery usage, shared storage, diagnostic export, Telegram, project website,
-  privacy policy, licenses and version remain usable. All preferences have stable resource-name
-  keys and persistence disabled. Service-owned rows render service values and call its setters;
-  independent actions use their controllers or Android permission state, without writing a
-  second preference store. AndroidX manages row binding, disabled states and
-  accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
-- Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
-  builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
-  state, and Cancel, Back or an outside tap commits nothing. Distribution, reset, tier and notices
-  keep their explicit Material dialogs and confirmation flows. File access also asks on every enable,
-  warning about reading or copying sensitive home/system files; only Enable saves true, while
-  Cancel, Back, outside tap or recreation leaves it off. Disabling acts immediately through the service.
-- Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
-  (`DynamicColors`), edge to edge. The shared toolbar is at least 72 dp tall. Categories use
-  `settings_category.xml`; preferences use rounded tonal `settings_item.xml` rows of at least
-  80 dp, with leading icons, TitleMedium titles and BodyMedium summaries. Actions and list
-  choices have decorative chevrons; switches keep the Material widget. The RecyclerView has
-  no dividers, 16 dp side gutters, 8 dp top padding and 24 dp below the navigation inset.
-  A dark-mode or display size change recreates the screen (it handles neither `uiMode` nor
-  `density`), restoring the fragment, scroll position and an open login/running-policy/cursor
-  choice dialog, then rebinding and rendering. Other open dialogs are dropped. The activity
-  applies top and side insets; the list disables clipping to padding. Adapter state restoration
-  waits for the first service render and window insets, so initially empty summaries and
-  missing bottom padding cannot shift the saved scroll position.
-
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `TerminalService` (start, import, switch, reset, the mirror probe, per-start files, boot, the poll's
-  `dirsChanged`, login accounts), `Documents` (`loginAccount`, `installed`, `isReady`, `access`),
-  `ConsolePty` (runs `login.sh`), `MainActivity` (opens Settings), the instrumentation tests
-  (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`, `PREFER_OSCLOCK`).
+- `TerminalService` (`android/service`: start, import, switch, reset, the mirror probe, per-start
+  files, boot, the poll's `dirsChanged`, login accounts), `SettingsFragment` (`android/settings`:
+  `Distro`, `installed`, `regularAccounts`, `loginAccount`), `Documents` (`android/documents`:
+  `loginAccount`, `installed`, `isReady`, `access`), `ConsolePty` (`android/vt`: runs `login.sh`),
+  the instrumentation tests (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`,
+  `PREFER_OSCLOCK`).
 
 ### Outbound
 
-- android/terminal supplies the shared page, preference/category layouts, icons and tonal row resources.
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
-  symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
-  proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
-  `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
-  export authorization and dialog protection; Material Components and AndroidX (Settings),
-  including AndroidX Browser for Telegram, the project website and privacy policy; android/terminal's NotificationPermission
-  for shared authorization history and settings navigation, and BatteryOptimization for exemption status and app details;
-  Android's all-files access settings and `Environment` authorization state.
+  symlinks), `readFile` (null when missing), `spawn` and `waitFor` (`android/native`);
+  `HttpURLConnection` (system proxy); `BuildConfig` (Alpine branch); the bundled assets
+  (`android/build`).
 
 ## Invariants and gotchas
 
-- Settings must set the app bar's `liftOnScrollTargetViewId` to AndroidX Preference's
-  `recycler_view`: the list is nested inside the fragment container. Without that target,
-  Material's layout and nested-scroll callbacks inspect different views, so preference updates
-  can reset the app bar's lifted background even while the list remains scrolled.
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
   mirror write, the import (on `rootfs.tmp`) and the per-start files run without it.
@@ -495,17 +385,17 @@ session consuming their state and events (`android/vt`).
   `UNMARKED_PROFILE` by text, later ones by sha256 in `REPLACED_PROFILES`): changing `profile.sh`
   must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
   the version they have; `ashrc.sh`, `bashrc.sh` and `zshrc.sh` are written only with the profile,
-  so a change to any companion alone reaches no existing store (change `profile.sh` with it); and the motd is written only at import, so it is never updated.
+  so a change to any companion alone reaches no existing store (change `profile.sh` with it); and
+  the motd is written only at import, so it is never updated.
 - apk takes its database lock without waiting unless given `--wait` (which apk 3 accepts though
   its help does not list it): hence the install lock and the retry with `--wait`; a tab whose login
   waits for an apk the user runs shows only that line until the apk ends or Ctrl-C. apt 3's
   `DPkg::Lock::Timeout` covers dpkg's frontend lock but not the package lists' lock, which
   `apt-get update` takes, hence the retries there; apt shows its own wait only on a terminal. The
-  branch's mirrors keep only each package's latest build,
-  so a rebuild of a pinned package makes a fresh `scripts/fetch-rootfs` fail until it is pinned
-  anew.
+  branch's mirrors keep only each package's latest build, so a rebuild of a pinned package makes a
+  fresh `scripts/fetch-rootfs` fail until it is pinned anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
-  rows on a resize; android/vtcore): bash, busybox ash and zsh do.
+  rows on a resize; `android/vtcore`): bash, busybox ash and zsh do.
 - The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
   trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
 - `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
@@ -524,7 +414,6 @@ session consuming their state and events (`android/vt`).
   prompt text are not sanitized.
 - Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
   needs terminal-side or foreground-process detection to report commands that set no title.
-
 - **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
   (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
   than 256 changed directories between two polls stops recording the rest, and changes before the
@@ -541,64 +430,20 @@ session consuming their state and events (`android/vt`).
 
 ## To verify
 
-- The preference-row and shared-page redesign passed static source, XML and cached AndroidX/Material
-  API checks, CI debug/release assembly/lint and signed-APK verification for source
-  `bf32d596e7cfbd3b833f7b4eeccfcdaf04d79fc0`
-  ([Release](https://github.com/giturass/appine/actions/runs/44601366210),
-  [Android](https://github.com/giturass/appine/actions/runs/44601362739));
-  runtime layout, large fonts, TalkBack and scroll/dialog restoration with
-  the new styling remain unverified. Earlier API 34 checks below predate this redesign.
-
-- Shared-storage authorization, revocation, return-to-Settings summaries and vendor fallback
-  screens remain unverified on Android.
-
-- The zsh companion extraction passed host zsh checks in native and sh emulation: byte-identical
-  prompt/status/title output to the prior profile, repeated loading, existing-hook preservation,
-  theme-like hook ordering and caller-option restoration. BusyBox ash and Debian dash parse and
-  source the shared profile. Debug assembly and packaged-asset checks passed; the prior
-  stock-profile hash is registered for migration. Android device execution and end-to-end migration of this extraction remain unverified.
-
-- Browser defaults passed interactive `su -` checks for root and a regular user with Alpine
-  ash/bash and Debian dash/bash in container PTYs, including launcher invocation with an intact
-  URL, custom/empty values and a non-executable launcher. Debug assembly passed. The updated
-  profile and Codex authorization flow have not been retested on Android; existing stores receive
-  the change at kernel restart only when their old Appine profile is recognized and unedited.
-
-- Notification authorization passed debug assembly, lint and API 34 checks: visibility after
-  banner dismissal, first request, denial then system settings, and removal after granting in
-  system settings and returning or directly in the permission dialog. Android 11–12, vendor
-  settings and TalkBack remain unverified.
-
-- Two shell-title tests and two existing bash/ash prompt/login tests passed on API 34, including
-  bash command titles, pipelines, literal/control text, history fallback, status preservation and
-  hook reloads. Host PTYs covered bash 5.2 and zsh, including history exclusions, existing DEBUG
-  traps and single title emission after reload. Custom prompt frameworks, history changes in
-  later PROMPT_COMMAND entries and live upgrades of already-running shells remain limited.
-
-- Diagnostic export was exercised on API 34 with privacy off and with device credentials:
-  success, cancellation, wrong PIN, screen-off invalidation and no replay after unlock.
-  Save now authenticates before opening the picker: API 34 covered wrong PIN/cancellation before
-  picker launch, successful save to Downloads with ZIP integrity, cancelled-picker cleanup,
-  no repeat prompt on return while the shield stays locked, and orphan cleanup after process death.
-  Debug/release build and lint and thirteen diagnostic/privacy tests passed. Real biometric
-  hardware, cloud document providers and receiving the ZIP in third-party apps remain unverified.
-- File-access consent on physical devices; API 34 covered English/Chinese layout, cancellation,
-  Back/outside dismissal, recreation, enabling and immediate disabling; build and lint passed.
-- About's version row and Play Store navigation on a device, including web fallback, missing
-  handlers and returning to Settings; `assembleDebug` and `lintDebug` passed.
-- About's Telegram, project and privacy-policy links and return to Settings on a device,
-  including Custom Tabs, a browser without Custom Tabs and no URL handler; debug assembly
-  and lint passed for the policy entry, but no Android device was connected for navigation checks.
+- Alpine `.bash_profile`/`.bashrc` seeding on 16 KB-page devices and live `TerminalService`
+  upgrade cold starts (4 KB-page API 36 instrumentation tests passed).
+- Android device execution and end-to-end migration of the extracted `zshrc.sh` companion (host
+  zsh native/sh-emulation and ash/dash profile checks passed).
+- Browser defaults and Codex authorization flow on Android (host container PTY checks passed;
+  existing stores receive the profile update at restart only when unmodified).
+- Shell command titles with custom prompt frameworks, history changes in later `PROMPT_COMMAND`
+  entries and live upgrades of already-running shells.
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
   temporary rules files rely on it).
-- The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
-  26.04's bash 5.3; on Alpine in instrumentation tests, the first login's install and the
-  fallbacks included, and by closing a tab at its prompt; busybox ash's in an instrumentation test,
-  a `~/.profile` prompt and a nested ash included), and with a
-  `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
-- The profile's zsh marks in the app (tried only in a Docker container with Alpine's zsh 5.9 under
-  a pty: the marks, a theme-like hook setting PS1, redraws on resizes), and with a right prompt
-  (its cells follow B, so they count as input), a PS1 of several lines (rows after the first are
-  not marked as continuation rows), `prompt_percent` unset, or a prompt framework (oh-my-zsh,
+- The profile's bash marks in the app on Debian (tried only in a container with Ubuntu 26.04's
+  bash 5.3) and with a `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
+- The profile's zsh marks in the app (tried only in a container with Alpine's zsh 5.9) and with a
+  right prompt (its cells follow B, so they count as input), a multiline PS1 (rows after the first
+  are not marked as continuation rows), `prompt_percent` unset or a prompt framework (oh-my-zsh,
   powerlevel10k).

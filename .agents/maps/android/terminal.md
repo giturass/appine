@@ -1,16 +1,17 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and the retired `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtgestures`, `android/vtrender`, `android/licenses`, `android/tabbar`, `android/keys` and the retired `android/file-import`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: window-decor ordering before initial system-bar appearance)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream gesture ownership with retained Material controls and continuous terminal backgrounds)
 
 ## Responsibilities
 
 `android/terminal` coordinates the terminal screen around sessions (`android/vt`), native
-terminals (`android/vtcore`), interaction (`android/vtview`) and rendering (`android/vtrender`).
+terminals (`android/vtcore`), view lifecycle/input/search (`android/vtview`), gestures/selection/
+links (`android/vtgestures`) and rendering (`android/vtrender`).
 It owns activity lifecycle, choosing/closing tabs, shortcuts, search UI, link routing, clipboard
 questions, insets and IME animation, plus shared UI helpers, strings and themes.
 
@@ -21,7 +22,7 @@ and android/licenses' `layout/list_item.xml` and `values/ids.xml`.
 
 Controls are `android/tabbar` and `android/keys`. All MainActivity adapters, dialog handling,
 shared strings and themes remain here. `Theme.Appine` is Material 3 DayNight;
-`Theme.Appine.Terminal` inherits the fixed dark theme, with a black window and surface-container
+`Theme.Appine.Terminal` inherits the fixed dark theme, with a black window and transparent
 system bars. Shared green light/dark fallback roles support dynamic wallpaper colours from
 Android 12 on. Shared resources include `Widget.Appine.MorePopup`,
 `ThemeOverlay.Appine.CheckPopup` (framework checkbox without its own ripple), `page.xml`,
@@ -30,7 +31,8 @@ Android 12 on. Shared resources include `Widget.Appine.MorePopup`,
 preserve AndroidX's standard title, summary, icon and widget IDs. Shared rounded row backgrounds
 and decorative chevrons also serve the license list.
 
-Session ownership, saving, reports and event routing are `android/service`; build and notice
+Session ownership, saving and event routing are `android/service`; notifications, fault reports and
+diagnostics are `android/reports`; the Settings screen is `android/settings`; build and notice
 assets are `android/build`; authentication is `android/privacy`, notice UI `android/licenses`.
 
 ## Key types
@@ -95,7 +97,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   Android 11–12 keep following the system language. Locale changes use
   normal activity recreation and the existing service-current tab fallback below.
   All five locales include the shared-storage permission action's title, granted/required
-  summaries and missing-settings feedback; the action itself belongs to android/setup.
+  summaries and missing-settings feedback; the action itself belongs to android/settings.
 - `attachBaseContext` applies an override containing only `UI_MODE_NIGHT_YES`, before the window,
   dynamic colours or views read resources. The terminal's night-qualified resources therefore
   match its fixed dark theme; other configuration fields and other activities remain independent.
@@ -178,7 +180,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   permission or alter authorization history. The tab list hides both buttons from accessibility
   while covering the banner through the existing container-level policy.
 - `NotificationPermission` shares the authorization flow between the banner and Settings' Android
-  notification action (android/setup). It retains `requested_notifications` in the original
+  notification action (android/settings). It retains `requested_notifications` in the original
   `MainActivity` preference file, so requests from either page and prior versions share history.
   Startup and privacy unlock never request permission. Tapping either entry checks the privacy gate.
   On Android 13+, a first request uses the caller's activity-result launcher; a prior attempt
@@ -271,7 +273,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   With window focus it calls `TerminalLinks.openBrowser`; otherwise it returns false. Its Boolean
   acknowledges Android accepting the intent; the guest receives a failure when it is refused.
 - The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
-  link; which links count and which schemes open are android/vtview's). The activity delegates to
+  link; which links count and which schemes open are `android/vtgestures`'s). The activity delegates to
   `TerminalLinks.open`, which opens HTTP and HTTPS links with AndroidX Custom Tabs, without binding
   a browser package or session, and other
   non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
@@ -296,10 +298,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 - `TerminalService`: listener callbacks (`onProgress`, `onMachineReady`, `onSessionsChanged`,
   `onBell`, `onClipboardRead`, `onTabStatus`, `onSettingsChanged`, `onNotice`, `onRestarting`,
-  `onExitAll`) and the notification intent with `EXTRA_TAB`.
-- android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
-  `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
-- android/setup and android/licenses use the shared page frame, themes and view helpers;
+  `onExitAll`, `onOpenUrl`) and the notification intent with `EXTRA_TAB`.
+- android/vtview and android/vtgestures: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra
+  keys' `ctrl`, `alt`, `shift` and `modifiersUsed`, `onLink`, `onSearchCount`, `onBackgroundColor`).
+- android/settings and android/licenses use the shared page frame, themes and view helpers;
   Settings also uses the preference switch widget, NotificationPermission and BatteryOptimization. android/privacy uses the shared theme and helpers.
 - android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
 
@@ -360,7 +362,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   also disable `clipChildren` so translated keys can pass their bottom edges; the tab list is
   drawn after the column and stays above the keys wherever they overlap.
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
-  pages also recreate for dark mode (android/setup and android/licenses).
+  pages also recreate for dark mode (android/settings and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
   including delayed IME/paste callbacks; pausing cancels activity toasts and denies the open clipboard
   question. Dialogs use `showPrivate`.

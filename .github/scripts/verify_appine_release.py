@@ -24,9 +24,9 @@ READELF = os.environ.get("LLVM_READELF") or str(
     Path(NDK) / "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" if NDK else "llvm-readelf"
 )
 PAGE_SIZE = 16384
-PUBLIC_LIBRARIES = {"libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so", "libjnigraphics.so", "libz.so"}
+PUBLIC_LIBRARIES = {"libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so", "libjnigraphics.so", "libz.so", "libvulkan.so"}
 NATIVE_CLASS = "Lio/github/mthli/appine/Native;"
-SHARED_START_DESCRIPTOR = "(Ljava/lang/String;ILjava/lang/String;)J"
+SHARED_START_DESCRIPTOR = "(Ljava/lang/String;IZLjava/lang/String;)J"
 EXPECTED_SIGNER_SHA256 = "223f2f0b741fe49c53d0ff392f860d4430f6f23484e4e3014212abfc4f21faf7"
 
 
@@ -194,7 +194,7 @@ def verify_apk(path):
     manifest = command([AAPT2, "dump", "xmltree", str(path), "--file", "AndroidManifest.xml"], "manifest.txt")
     package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.M)
     require(package is not None, "Package metadata missing")
-    require(package.groups() == ("io.github.mthli.appine", "2", "1.0.1"), f"Unexpected package metadata: {package.groups()}")
+    require(package.groups() == ("io.github.mthli.appine", "3", "1.1.0"), f"Unexpected package metadata: {package.groups()}")
     require(re.search(r"^(?:minSdkVersion|sdkVersion):'30'$", badging, re.M) is not None, "Expected minSdk 30")
     require("targetSdkVersion:'37'" in badging, "Expected targetSdk 37")
     require("application-debuggable" not in badging, "Release APK must not be debuggable")

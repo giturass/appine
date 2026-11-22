@@ -48,13 +48,13 @@ class BrowserTest {
             Rootfs.ensureBrowser(context, bridge.configuration, store)
             assertEquals("custom", Native.readFile(store, "/usr/local/bin/xdg-open")!!.toString(Charsets.UTF_8))
             Native.writeFile(store, "/usr/local/bin/xdg-open", original, 493, true)
-            machine = Native.start(store, 1)
+            machine = Native.start(store, 1, false)
             test(machine, bridge, urls, accepting)
             ok(machine, "rm /usr/local/bin/xdg-open; ln -s /bin/true /usr/local/bin/xdg-open")
             Native.stop(machine)
             machine = 0
             Rootfs.ensureBrowser(context, bridge.configuration, store)
-            machine = Native.start(store, 1)
+            machine = Native.start(store, 1, false)
             ok(machine, "test \"$(readlink /usr/local/bin/xdg-open)\" = /bin/true")
         } finally {
             bridge.close()

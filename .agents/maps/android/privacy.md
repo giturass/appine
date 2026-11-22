@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: authentication shield hierarchy and button spacing)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: settings/report ownership with retained authentication shield and decorative lock)
 
 ## Responsibilities
 
@@ -20,8 +20,9 @@ Root: `Privacy.kt` and `NotificationActivity.kt` in
 Outside the module: shared strings, themes and `Ui.kt` (including the `showPrivate` wrapper)
 remain android/terminal's; application startup is android/native's; manifest and authentication dependency are
 android/build's, instrumentation tests belong to android/tests. Settings' controls and export handoff are
-android/setup's; preferences, notification redaction/routing and diagnostic archives are
-android/service's; provider denial and grant revocation are android/documents'. Call sites keep
+android/settings's; preferences and ongoing notification routing are android/service's;
+diagnostic archives and non-ongoing notification redaction are android/reports's;
+provider denial and grant revocation are android/documents'. Call sites keep
 their own last-moment input, clipboard, browser and export checks.
 
 ## Key types
@@ -78,16 +79,17 @@ their own last-moment input, clipboard, browser and export checks.
 - android/native: `MainApplication` installs the gate; android/build registers the action activity.
 - android/terminal: `MainActivity` and `TerminalLinks` check the gate; `Ui.showPrivate` registers
   dialogs before showing them; the activity resumes deferred work through `onPrivacyUnlocked`.
-- android/setup: Settings requests mode changes and fresh export authorization, rechecks it
-  before collection/handoff, protects restored dialogs and uses the decorative lock icon.
+- android/settings: Settings requests mode changes and fresh export authorization, rechecks it
+  before collection/handoff and protects restored dialogs and uses the decorative lock icon.
 - android/vtview: copy/paste access and preview dialogs. android/licenses' activities receive
   the same automatic lifecycle protection as every other FragmentActivity.
-- android/service: mode listeners, clipboard guards and private report-copy action intents.
+- android/service: mode listeners and clipboard guards; android/reports: private report-copy
+  action intents and non-ongoing notification redaction.
 
 ### Outbound
 
-- android/service: `Settings.privacyMode`/`setPrivacyMode` and `Notifications.copyReport`;
-  android/documents: `revokeAccess` and `rootsChanged` when mode changes.
+- android/service: `Settings.privacyMode`/`setPrivacyMode`; android/reports:
+  `Notifications.copyReport`; android/documents: `revokeAccess` and `rootsChanged` when mode changes.
 - android/terminal: shared localized strings, themes, `dp` and `themeColor` helpers.
 - AndroidX Biometric 1.1.0, FragmentActivity/ViewModel lifecycle, Android's device-lock and
   interactive-state checks, secure window flags and notification manager.

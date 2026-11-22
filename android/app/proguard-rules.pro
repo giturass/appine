@@ -7,3 +7,6 @@
 -keepclassmembers class io.github.mthli.appine.VtSession {
     public void on*(...);
 }
+
+-keep class io.github.mthli.appine.GpuService { *; }
+-keep class io.github.mthli.appine.GpuConnection { public void close(); }

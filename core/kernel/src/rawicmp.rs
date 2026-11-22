@@ -1,4 +1,4 @@
-//! The guest's raw ICMP sockets (the kernel/net map). Apps on Android have no `CAP_NET_RAW`, so a
+//! The guest's raw ICMP sockets (the kernel/rawicmp map). Apps on Android have no `CAP_NET_RAW`, so a
 //! guest raw ICMP socket is a ping socket on the host (which needs no privilege), and the
 //! differences between the two are made up for here:
 //!

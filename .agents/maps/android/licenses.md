@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: tonal license rows and reader toolbar hierarchy)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: settings entry ownership and virglrenderer notice inventory with retained tonal rows)
 
 ## Responsibilities
 
@@ -16,7 +16,7 @@ Root: `LicensesActivity.kt`, `LicenseActivity.kt` and `LicenseCatalog.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `layout/list_item.xml` and `values/ids.xml`
 (the license list and reader IDs) under `android/app/src/main/res/`.
 
-Outside the module: the About entry is android/setup's; the shared strings, themes, `page.xml`
+Outside the module: the About entry is android/settings's; the shared strings, themes, `page.xml`
 and `Ui.kt` are android/terminal's; authentication is android/privacy's; the notice assets,
 their CSS, reference license texts, dependency inventory, build and manifest remain android/build's;
 instrumentation tests belong to android/tests. This module consumes those assets without owning their upkeep.
@@ -41,11 +41,11 @@ instrumentation tests belong to android/tests. This module consumes those assets
 
 ### Catalog, navigation and reading
 
-- Settings' About group has a separate localized Project website action (android/setup); the
+- Settings' About group has a separate localized Project website action (android/settings); the
   license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
-  Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
+  Its final Version action is labeled "Version" / "版本号"; android/settings supplies the build
   version summary and Google Play navigation.
-- `notices/` is checked in (android/build): Appine, Fuchsia, libghostty-vt and its linked
+- `notices/` is checked in (android/build): Appine, Fuchsia, virglrenderer, libghostty-vt and its linked
   components, JetBrains Mono, Alpine and the bundled doas/bash/procps/bubblewrap packages with libcap2, Android
   libraries, Rust crates, SQLite and standalone license texts. Subtitles show the chosen
   license; Alpine shows a localized package count and "Multiple licenses", and SQLite "Public
@@ -77,7 +77,7 @@ instrumentation tests belong to android/tests. This module consumes those assets
 
 ### Inbound
 
-- android/setup: Settings' About action opens the list without requiring a running kernel.
+- android/settings: Settings' About action opens the list without requiring a running kernel.
 - android/build: bundled catalog and HTML assets and manifest registration; android/tests: `LicenseTest`.
 - android/privacy: automatic lifecycle protection installed on both activities.
 

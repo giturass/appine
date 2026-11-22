@@ -26,7 +26,7 @@ class ShellTitleTest {
     private fun withMachine(test: (Long) -> Unit) {
         val store = File(context.cacheDir, "tab-title-${System.nanoTime()}")
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             test(machine)
         } finally {

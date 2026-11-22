@@ -204,6 +204,11 @@
     <string name="restart_message">所有工作階段都會結束，系統將以新的執行模式重新啟動。</string>
     <string name="restart">重新啟動</string>
 
+    <string name="gpu_summary">實驗性功能，支援情況因裝置而異</string>
+    <string name="gpu_unavailable">目前裝置不支援</string>
+    <string name="gpu_enable_message">所有工作階段都會結束，系統將開啟實驗性 Vulkan GPU 並重新啟動。支援情況因裝置而異，可能發生異常。</string>
+    <string name="gpu_disable_message">所有工作階段都會結束，系統將關閉 Vulkan GPU 並重新啟動。</string>
+
     <!-- Diagnostic log export -->
     <string name="settings_export_logs">匯出診斷記錄</string>
     <string name="export_logs_summary">儲存或分享近期記錄和裝置資訊，以協助排查問題</string>

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (three source-research concerns and nine independently checked claims; static checks passed, external release and visual checks remain below)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: privacy-policy descriptions aligned with terminal file-import removal)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: settings/report ownership while retaining optional shared-storage privacy-policy facts)
 
 ## Responsibilities
 
@@ -29,7 +29,7 @@ asset adapted from the Android launcher foreground and colors.
 - Production is the Cloudflare Pages Direct Upload project `appine`, available at
   `https://appine.sh/` and `https://appine.pages.dev/`; the policy URL is `/privacy`.
 - Android Settings About opens `https://appine.sh/privacy` through its shared
-  Custom Tabs link action; the entry is implemented in `android/setup`.
+  Custom Tabs link action; the entry is implemented in `android/settings`.
 - The contact email link opens the visitor's mail handler for Matthew Lee at
   `matthewlee0725@gmail.com`; loading the page does not send email.
 
@@ -68,9 +68,11 @@ includes saving or sharing logs.
 ### Inbound
 
 - `android/build`: source/merged permissions, dependencies and backup exclusions.
-- `android/setup`: mirrors, system downloads, repository protocols and Settings.
+- `android/setup`: mirrors, system downloads and repository protocols.
+- `android/settings`: Settings screen links and diagnostic export UI.
 - `android/native`: guest shared-storage mount paths.
-- `android/service`: diagnostics, terminal restoration and background execution.
+- `android/service`: terminal restoration and background execution.
+- `android/reports`: local diagnostics retention, archive export and fault notifications.
 - `android/privacy`, `android/documents`, `android/terminal`:
   authentication, file grants and clipboard interactions.
 - Maintainer-supplied developer identity/contact and actual support-mail handling.

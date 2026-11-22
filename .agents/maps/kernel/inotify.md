@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: direct file and directory watch lookup for cgroup notifications)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint inotify sysctl references to kernel/sysctl)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@ Root: `core/kernel/src/syscall/inotify.rs`.
 Outside the module: where the hooks are called — the file syscalls and renames in `kernel/vfs`,
 opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
 `kernel/cgroup`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
-`/proc/sys/fs/inotify/*` and the fdinfo text's place (`kernel/procfs`); the Files app's change list
+`/proc/sys/fs/inotify/*` (`kernel/sysctl`) and the fdinfo text's place (`kernel/procfs`); the Files app's change list
 (`kernel/store`) and the machine's `store_changed`, which finds each kernel and takes its BKL
 (`kernel/process`); overlay node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 
@@ -125,7 +125,8 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
   `FIONREAD`.
 - `kernel/fuse`: hooks for FUSE namespace changes; `watched` in `in_use`.
 - `kernel/cgroup`: `kernfs_modified` for cgroup2 file changes.
-- `kernel/procfs`: the registry's limits behind `/proc/sys/fs/inotify/*`; the instance's fdinfo lines.
+- `kernel/sysctl`: the registry's limits behind `/proc/sys/fs/inotify/*`; `kernel/procfs`: the
+  instance's fdinfo lines.
 - `kernel/poll`: readiness (`ready`), the `queued` generation and the instance's wake object.
 - The machine (`kernel/process`): `store_changed` calling `host_change` for the Files app.
 - The dispatcher: the three syscalls.

@@ -1,11 +1,11 @@
 # kernel/net Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/net.md` for the paired decision history; it still holds the decisions on netlink sockets (now `kernel/netlink`) from before the split.
+> See `.agents/decisions/kernel/net.md` for the paired decision history; it still holds the decisions on netlink sockets (`kernel/netlink`), raw ICMP (`kernel/rawicmp`) and the routing table (`kernel/route`) from before their splits.
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: link the nftables evaluator split from kernel/netns)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: split raw ICMP into kernel/rawicmp and the routing table into kernel/route)
 
 ## Responsibilities
 
@@ -14,27 +14,26 @@ goes through:
 
 - TCP/UDP passthrough to host sockets, with blocking, timeouts, signals and a set of emulated
   options handled in the kernel layer;
-- raw ICMP and ICMPv6 sockets emulated on unprivileged host ping sockets, including traceroute's
-  ICMP errors;
-- the routing table, with the route and rule messages and `ip route get` answers that
-  `kernel/netlink` sends;
 - the DNS stub at `127.0.0.53:53`;
 - low-port mapping on the host and hiding it from the guest, and the hooks that hand
   initial-namespace sockets to the inbound forwarder;
-- traffic counters for interfaces and protocols, and the socket, protocol and route files of
-  `/proc/net`;
-- `SO_ORIGINAL_DST` records and `SO_MARK`.
+- traffic counters for interfaces and protocols, and the socket and protocol files of `/proc/net`;
+- `SO_ORIGINAL_DST` records and `SO_MARK`;
+- socket-syscall dispatch into `kernel/netlink`, `kernel/unix` and `kernel/rawicmp`, plus legacy
+  route ioctls (`SIOCADDRT`/`SIOCDELRT`).
 
 Root: `core/kernel/src/net.rs` (except its netlink sections), `syscall/net.rs` (except its
-`netlink_*` functions, its netlink section and the `Socket::Netlink` arms), `rawicmp.rs`,
-`route.rs`, `portmap.rs`, `traffic.rs`, `origdst.rs`.
+`netlink_*` functions, its netlink section, the `Socket::Netlink` arms, and `kernel/rawicmp`'s
+`raw_recv` and `take_errors`), `portmap.rs`, `traffic.rs`, `origdst.rs`.
 
-Outside the module: netlink sockets (`kernel/netlink`); network namespaces, address translation,
-virtual devices, nftables, namespace port registration and the inbound forwarder itself
-(`kernel/netns`); AF_UNIX sockets (`kernel/unix`); poll, epoll and readiness plumbing
-(`kernel/poll`); `/proc/net/dev`, `if_inet6`, sysfs and the procfs file structure
-(`kernel/procfs`); host socket wrappers and the host resolver (`hal`); waiting and the BKL
-(`kernel/process`); the app's network callbacks and listen notifications (`android`).
+Outside the module: raw ICMP emulation (`kernel/rawicmp`); the routing table (`kernel/route`);
+netlink sockets (`kernel/netlink`); network namespaces, address translation, virtual devices,
+namespace port registration and the inbound forwarder itself (`kernel/netns`); nftables rules and
+evaluation (`kernel/nft`); AF_UNIX sockets (`kernel/unix`); poll, epoll and readiness plumbing
+(`kernel/poll`); `/proc/net/dev`, `if_inet6` and procfs file structure (`kernel/procfs`),
+`/proc/sys/net` (`kernel/sysctl`) and `/sys/class/net` (`kernel/sysfs`); host socket wrappers and
+the host resolver (`hal`); waiting and the BKL (`kernel/process`); the app's network callbacks and
+listen notifications (`android/service`).
 
 ## Key types
 
@@ -48,17 +47,12 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `rd_shut` (the guest shut it down for reading); namespace state owned by `kernel/netns` (`net`,
   `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener`, `self_port`, `v6only`) and the forwarder
   handle `fwd`; `track` (nat state, seen peers, a blocked verdict, the claimed original
-  destination, `SO_MARK`); raw ICMP and tap state (`icmp`, `ttl_set`, `guest_recverr`,
-  `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a TCP socket's
-  classic BPF program the host refused, kept as given). Dropping it closes the host fd and removes
-  its namespace UDP port and listener.
+  destination, `SO_MARK`); raw ICMP and tap state used with `kernel/rawicmp` (`icmp`, `ttl_set`,
+  `guest_recverr`, `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a
+  TCP socket's classic BPF program the host refused, kept as given). Dropping it closes the host fd
+  and removes its namespace UDP port and listener.
 - `Message` (one recv result), `MsgHdr` (a guest msghdr read in), `Routed` (connect/sendto
   routing result: namespace map, nat, filter verdict, original destinations).
-- `route::Entry` — one route (`host` marks entries whose source the host chooses).
-- `RawIcmp` (per raw socket: family, last guest echo id, `ICMP_FILTER`, guest `IP_RECVTTL`,
-  `IP_PKTINFO` and `IP_RECVERR`, `IPV6_CHECKSUM`, its `Tap`), `Tap` (per-namespace aggregation
-  point on a host epoll: sources and receivers), `Source`, `Receiver` (data queue, byte count,
-  arrivals, error queue), `Item`/`ErrItem`; `Kernel::icmp_taps` (weak).
 - `PortMap` (kernel-wide: offset, `always_map`, entries keyed by `(namespace, protocol, guest
   port, IPv6-only)`, `by_host`, `released`, `reported`, listen events), `Lease` (refcount on an
   entry, released on drop), `ListenEvent` (comm, guest port, host port).
@@ -83,14 +77,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `getsockopt`, `shutdown`; read, write, readv and writev on sockets through `net::rw`
   (`read_bytes`, `write_bytes` and AF_UNIX splice through `net::recv`/`send` with flags 0);
   `net::ioctl`; `readiness`, `wake_objects`, `arrivals` for poll/epoll.
-- Routes: `route::{tables, merge, get, route_message, rule_messages, proc_route,
-  proc_ipv6_route, host_routes}` (`get`, `route_message` and `rule_messages` answer
-  `kernel/netlink`'s route and rule requests); `Machine::set_routes`.
 - DNS stub: `net::{is_stub, stub_addr, servfail}`, `deliver_dns` (timer thread),
   `hal::net::dns_query`, `vfs::ensure_resolv_conf`.
-- Raw ICMP: `tap_for`, `register`, `RawIcmp::{sent, setsockopt, getsockopt, present}`,
-  `udp_setsockopt`, `before_io`, `untap`, `dispatch`, `check_taps` (timer thread); `raw_recv`
-  and `take_errors` in `syscall/net.rs`.
 - Ports: `portmap::{bind, bind_any}`, `PortMap::{maps, host_port, guest_port, listened}`,
   `Machine::take_listens`; `map_dest` (private) and `unmap_addr` (also used by the `/proc/net`
   listings).
@@ -106,10 +94,11 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - `socket`: flags other than the type, `SOCK_NONBLOCK` and `SOCK_CLOEXEC` are `EINVAL`.
   AF_INET/AF_INET6: `SOCK_RAW` with a protocol 1..255 is `EPERM` unless it is ICMP (AF_INET) or
   ICMPv6 (AF_INET6) and the caller has `CAP_NET_RAW` over the network namespace's owner; raw ICMP
-  becomes a host ping socket (host `SOCK_DGRAM`) registered with its namespace's tap; every other
-  type/protocol (raw with protocol 0 or 256 and above included) goes to the host, which validates
-  it. The namespace is recorded only for a new namespace. AF_NETLINK goes to `kernel/netlink`,
-  AF_UNIX to `kernel/unix`. Other families (AF_PACKET, AF_VSOCK, …) `EAFNOSUPPORT`.
+  becomes a host ping socket (host `SOCK_DGRAM`) registered with `kernel/rawicmp`'s namespace tap;
+  every other type/protocol (raw with protocol 0 or 256 and above included) goes to the host, which
+  validates it. The namespace is recorded only for a new namespace. AF_NETLINK goes to
+  `kernel/netlink`, AF_UNIX to `kernel/unix`. Other families (AF_PACKET, AF_VSOCK, …)
+  `EAFNOSUPPORT`.
 - `socketpair` is AF_UNIX only: inet first creates the socket as Linux does (a type of
   `SOCK_MAX` or more `EINVAL`, one no inet protocol has `ESOCKTNOSUPPORT`, a protocol the type
   lacks `EPROTONOSUPPORT`, raw without `CAP_NET_RAW` `EPERM`), then `EOPNOTSUPP`; netlink
@@ -171,26 +160,27 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 ### Sending and receiving
 
 - send (sendto, sendmsg, write; sendmmsg one message at a time): AF_UNIX goes to `kernel/unix`,
-  netlink to `kernel/netlink`; DNS stub queries go to the stub (see below); a connected datagram
-  socket whose peer the filter blocked fails or drops; datagrams with an address go through
-  `route()` (`EPERM` or a silent drop from the filter; UDP to an unbound port in a new namespace is
-  dropped silently); TCP drops the guest address unless `MSG_FASTOPEN`; destinations are portmapped;
-  an `IP_PKTINFO`/`IPV6_PKTINFO` may be appended; the host gets the guest flags minus
-  `MSG_DONTWAIT`/`MSG_NOSIGNAL` (the host call always adds `MSG_NOSIGNAL`). Blocking stream sends
-  loop until done; `EAGAIN` waits (bounded by `SO_SNDTIMEO`, then `EAGAIN` or the partial count);
-  `EPIPE` after part of the data returns the partial count (the next call gets the error),
+  netlink to `kernel/netlink`; DNS stub queries go to the stub (see below); raw ICMP sockets and
+  tapped UDP sockets call into `kernel/rawicmp` (`before_io`, `sent`, `take_errors`); a connected
+  datagram socket whose peer the filter blocked fails or drops; datagrams with an address go
+  through `route()` (`EPERM` or a silent drop from the filter; UDP to an unbound port in a new
+  namespace is dropped silently); TCP drops the guest address unless `MSG_FASTOPEN`; destinations
+  are portmapped; an `IP_PKTINFO`/`IPV6_PKTINFO` may be appended; the host gets the guest flags
+  minus `MSG_DONTWAIT`/`MSG_NOSIGNAL` (the host call always adds `MSG_NOSIGNAL`). Blocking stream
+  sends loop until done; `EAGAIN` waits (bounded by `SO_SNDTIMEO`, then `EAGAIN` or the partial
+  count); `EPIPE` after part of the data returns the partial count (the next call gets the error),
   otherwise it raises `SIGPIPE` unless `MSG_NOSIGNAL`.
-- recv: AF_UNIX, netlink and raw ICMP go to their own code; queued stub answers come first;
-  `MSG_ERRQUEUE` never waits; the host gets the flags minus `MSG_DONTWAIT`/`MSG_WAITALL`; a socket
-  connected into a namespace (`vconn`) drops datagrams from anyone else; source addresses are
-  unmapped, translated and nat-reversed, and UDP peers recorded for the filter's replies; control
-  data is returned verbatim; `EAGAIN` checks the stub queue again, then waits (`SO_RCVTIMEO`,
-  `ERESTARTSYS` on signals). `MSG_TRUNC` on a stream discards the data the host returns without
-  copying any (a NULL buffer included) and reports its length, as `tcp_recvmsg` does, also with
-  `MSG_PEEK` and `MSG_WAITALL`. `MSG_WAITALL` on a stream reads until the length is complete,
-  waiting between pieces; nonblocking, the timeout, a signal (even under `SA_RESTART`), end of
-  file or a host error ends it with what was read, as Linux's `tcp_recvmsg` returns what it
-  copied.
+- recv: AF_UNIX, netlink and raw ICMP (`kernel/rawicmp`'s `raw_recv`) go to their own code; queued
+  stub answers come first; `MSG_ERRQUEUE` never waits; the host gets the flags minus
+  `MSG_DONTWAIT`/`MSG_WAITALL`; a socket connected into a namespace (`vconn`) drops datagrams from
+  anyone else; source addresses are unmapped, translated and nat-reversed, and UDP peers recorded
+  for the filter's replies; control data is returned verbatim; `EAGAIN` checks the stub queue
+  again, then waits (`SO_RCVTIMEO`, `ERESTARTSYS` on signals). `MSG_TRUNC` on a stream discards the
+  data the host returns without copying any (a NULL buffer included) and reports its length, as
+  `tcp_recvmsg` does, also with `MSG_PEEK` and `MSG_WAITALL`. `MSG_WAITALL` on a stream reads until
+  the length is complete, waiting between pieces; nonblocking, the timeout, a signal (even under
+  `SA_RESTART`), end of file or a host error ends it with what was read, as Linux's `tcp_recvmsg`
+  returns what it copied.
   `MSG_PEEK|MSG_WAITALL` peeks from the head each time and waits with the host socket's
   `SO_RCVLOWAT` raised to the length (restored afterwards); when the host fd was ready but the
   peek did not grow (end of file, a receive buffer that can never hold the length) it returns what
@@ -219,10 +209,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - `SO_RCVTIMEO_NEW`/`SO_SNDTIMEO_NEW` are taken as the old numbers for every socket kind (the same
   16-byte timeval on a 64-bit kernel).
 - Emulated on inet sockets, in this order: `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE` (need `CAP_NET_ADMIN`,
-  then become the plain options); raw ICMP's own options (`ICMP_FILTER`, `IP_RECVTTL`,
-  `IP_PKTINFO`, `IP_RECVERR`/`IPV6_RECVERR`, `IPV6_CHECKSUM` recorded only, other `SOL_RAW` names
-  `ENOPROTOOPT`); on UDP, `IP_TTL`/`IPV6_UNICAST_HOPS` recorded for the raw ICMP taps and still
-  passed to the host, and `IP_RECVERR`/`IPV6_RECVERR` intercepted while a tap watches the socket;
+  then become the plain options); raw ICMP's own options and UDP TTL/`IP_RECVERR` hooks dispatched
+  to `kernel/rawicmp`;
   `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`, checked in Linux 6.1.y's order (an optlen under
   4 `EINVAL`; `SO_ATTACH_FILTER` on a TCP socket without `CAP_NET_ADMIN` over the namespace owner
   `EPERM`, as Linux 5d39580f68e6; an optlen other than 16 `EINVAL`; a host filter locked with
@@ -238,11 +226,12 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   negative time zero (no waiting, `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read
   back as 0 like Linux's `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way);
   `IPV6_V6ONLY` in new namespaces (recorded). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR`
-  (pending ICMP errors first), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW` for raw sockets) and
-  recorded `IPV6_V6ONLY` itself, and `SO_GET_FILTER` the way Linux's `sk_get_filter` reads it,
-  from a kept program or else by asking the host: optlen is a count of 8-byte instructions (passed
-  to the host capped at `BPF_MAXINSNS`, 4096, which no attached program exceeds), 0 asks only for
-  the count, fewer than the program has is `EINVAL`, and optlen comes back as the program's count.
+  (pending ICMP errors first via `kernel/rawicmp`), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW`
+  for raw sockets) and recorded `IPV6_V6ONLY` itself, and `SO_GET_FILTER` the way Linux's
+  `sk_get_filter` reads it, from a kept program or else by asking the host: optlen is a count of
+  8-byte instructions (passed to the host capped at `BPF_MAXINSNS`, 4096, which no attached program
+  exceeds), 0 asks only for the count, fewer than the program has is `EINVAL`, and optlen comes
+  back as the program's count.
 - Everything else (including `SO_DETACH_FILTER` without a kept program, `SO_LOCK_FILTER`,
   `SO_PEERCRED`, `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`,
   `IP_TRANSPARENT`, `TCP_*`, and `SO_ATTACH_BPF` with its guest fd number) goes to the host and is
@@ -340,9 +329,9 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   statistics show zeros in new namespaces, while `CurrEstab` there counts that namespace's
   connections. Counters are plain fields under the BKL.
 - `/proc/net` files rendered here: the `tcp`, `udp`, `icmp`, `raw` listings (and their IPv6
-  versions, filtered to the reader's namespace), `sockstat`, `sockstat6`, `snmp`, `netstat`,
-  `arp`, `route` and `ipv6_route`; procfs renders `dev` and `if_inet6`, `kernel/unix` renders
-  `unix`.
+  versions, filtered to the reader's namespace), `sockstat`, `sockstat6`, `snmp`, `netstat` and
+  `arp`; `kernel/route` renders `route` and `ipv6_route`, `kernel/procfs` renders `dev` and
+  `if_inet6`, and `kernel/unix` renders `unix`.
 
 ### `SO_ORIGINAL_DST` and transparent proxying
 
@@ -357,77 +346,29 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   the accepted side answers the claimed address, or its own local address when tracking; otherwise
   `ENOENT`. No TPROXY: the nft `tproxy`/`TPROXY` names parse but never match.
 
-### Raw ICMP
-
-- A raw ICMP socket is a host ping socket with host `IP_RECVTTL`, `IP_PKTINFO` and `IP_RECVERR`
-  (or `IPV6_RECVERR`), registered with its namespace's `Tap` (created on demand; the timer thread
-  waits on every Tap's epoll fd and dispatches them all on each wake). Binding drops the port;
-  getsockname reports the protocol number; `SO_TYPE` reports `SOCK_RAW`. nftables nat and filters
-  do not apply to it; the namespace translation does.
-- Sending records the guest's echo id (one per socket, the last echo request of 8 bytes or more
-  sent, recorded even if the send fails) and passes the ICMP message to the host unchanged (no IP
-  header); the host enforces echo-only and rewrites the id. An ICMP error already recorded for the
-  socket fails the send; a host error that ICMP can cause makes it drain the socket and retry once.
-- UDP sockets that set a TTL are tapped lazily at their next send, recv or `SO_ERROR` when a raw
-  socket of the same family exists in the namespace and the guest has not enabled `IP_RECVERR`
-  itself: host `IP_RECVERR` is turned on and the fd becomes an error-only source; connected UDP
-  sockets sending elsewhere are reconnected on the host; the tap is removed when the guest turns
-  `IP_RECVERR` on, or at the next I/O once no raw socket is left.
-- Dispatch drains error queues (skipping non-ICMP entries) and rebuilds whole ICMP error messages
-  (quoted IP header, quoted UDP header or echo request with the guest id restored, checksums),
-  applies Linux's `sk_err`/`IP_RECVERR` rules (with `IP_RECVERR` every error is queued, at most
-  64; without it only hard errors from the connected peer set the socket error), then drains echo
-  replies, restoring an id that is some raw socket's host ident to that socket's last guest id.
-  Every live raw socket of the same family whose `ICMP_FILTER` passes gets a copy of replies and
-  errors (queue capped at 212992 bytes of ICMP data, overflow dropped).
-- Receiving prepends a synthesized IPv4 header (TTL from the host, protocol 1, translated
-  source, `IP_PKTINFO` destination, checksum) or returns ICMPv6 as is; `IP_PKTINFO`/`IP_TTL`
-  control messages only when enabled, other control messages only for what reached the socket's
-  own ping socket; `MSG_TRUNC`/`MSG_CTRUNC` as Linux; `MSG_ERRQUEUE` returns the socket's own
-  errors (`EAGAIN` at once when there are none). Readiness comes from the receiver queues
-  (`POLLOUT` always, `POLLERR` while errors are pending).
-
-### Routing table
-
-- Main table: the host's routes from `Machine::set_routes` (Android: the default network's
-  `LinkProperties.getRoutes()`, unicast only on Android 13 and later, IPv4 metric 0 and IPv6 1024
-  for the default route, 256 otherwise; an empty list on network loss, which leaves the main table
-  empty), else the host's `/proc/net/route` and `/proc/net/ipv6_route` (reject, local, multicast
-  and cache routes dropped; an empty file gives an empty table), else, when those cannot be read,
-  synthesized from interface addresses with a default route on the interface the host would use.
-  Local table: local, broadcast, loopback, IPv6 local and multicast entries derived from addresses
-  of interfaces that are up. Virtual-device routes are merged in; new namespaces have no host main
-  table.
-- `ip route get`: families other than IPv4 and IPv6, and `RTA_IIF`, are `EOPNOTSUPP`;
-  local-table hits are answered in process; virtual routes and new namespaces choose the source
-  themselves; otherwise the source is `RTA_SRC` or what the host chooses by connecting a UDP
-  socket, and the interface and gateway follow; a 464xlat fallback covers hosts with no main
-  route; `RTM_F_FIB_MATCH` returns the matched route with its own table, while other IPv4 answers
-  always name table main. Rules: IPv4 0/32766/32767, IPv6 0/32766, and the multicast routing
-  families' 32767. `kernel/netlink` sends these route, `ip route get` and rule messages.
-  `/proc/net/route` lists the IPv4 main table's unicast routes and `ipv6_route` the IPv6 main and
-  local tables.
-
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
 - The syscall dispatcher; `kernel/files` (read/write/ioctl on sockets), `kernel/vfs` (`Vfs::open`
-  writing `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`, sysfs counters); the machine
-  (timer thread `check_taps` and `deliver_dns`, `set_routes`, `take_listens`); `kernel/netns`
-  (forward targets); `kernel/netlink` (route and rule messages and `ip route get`, `SockOpts`, the
-  timeout parser, traffic counters for link statistics, `forward_all` after a ruleset change).
+  writing `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`) and `kernel/sysfs` (sysfs
+  interface counters); `kernel/time` (timer thread `deliver_dns`) and `kernel/process`
+  (`Machine::take_listens`); `kernel/netns` (forward targets); `kernel/netlink` (`SockOpts`, the
+  timeout parser, traffic counters for link statistics, `forward_all` after a ruleset change);
+  `kernel/rawicmp` (`InetSocket` fields, waits and msghdr helpers).
 
 ### Outbound
 
-- `appine_hal::net` (host sockets, `dns_query`, `interfaces`, `routes`, `source_for`, epoll
-  `Watch`); `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener
-  registration), `nft`, `netdev`, `forward`; `kernel/netlink` (netlink sockets dispatched there,
-  `rtnl_watched`/`rtnl_notify` around changing ioctls, `message` and `attr` for route messages);
-  `kernel/unix`; `kernel/nft` (NAT/conntrack presence and verdict types); credentials (`ns_capable`); `kernel/netns`'s `netdev::request` for the route
-  ioctls; the
-  kernel's waits (`wait_objects`, `unlocked`), wake objects; signals (`SIGPIPE`); the kernel log;
-  the table of unimplemented paths; the test hooks (`kernel/process`, host-refused TCP filters).
+- `appine_hal::net` (host sockets, `dns_query`, `interfaces`, `source_for`);
+- `kernel/rawicmp` (raw ICMP socket emulation, taps, options, receive and error draining);
+- `kernel/route` (host route lookups used for traffic default-interface resolution);
+- `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener registration,
+  `netdev::request` for the route ioctls, `forward`); `kernel/netlink` (netlink sockets dispatched
+  there, `rtnl_watched`/`rtnl_notify` around changing ioctls); `kernel/unix`; `kernel/nft`
+  (NAT/conntrack presence and verdict types);
+- credentials (`ns_capable`); the kernel's waits (`wait_objects`, `unlocked`), wake objects;
+  signals (`SIGPIPE`); the kernel log; the table of unimplemented paths; the test hooks
+  (`kernel/bug`, host-refused TCP filters).
 
 ## Invariants and gotchas
 
@@ -443,10 +384,9 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   holding the BKL, hanging every guest process. bind rewrites the family to `AF_INET` first.
 - The portmap key has no address, so binds of one guest port share one host port and the host
   decides their conflicts, except that IPv6-only binds in new namespaces get their own.
-- The raw ICMP id rewrite assumes one echo id per raw socket (the last one sent).
 - A `MSG_PEEK|MSG_WAITALL` wait changes the host socket's `SO_RCVLOWAT` while the BKL is released,
   so another thread polling the same socket meanwhile sees the raised low-water mark.
-- `dispatch` of the raw ICMP taps must run with no socket borrowed.
+- Raw ICMP tap dispatch must run with no socket borrowed (`kernel/rawicmp`).
 - Options passed to the host meet the host kernel's rules, which change with the device's kernel:
   a host with Linux 5d39580f68e6 (in 6.1.y since June 2026) refuses `SO_ATTACH_FILTER` on a TCP
   socket without `CAP_NET_ADMIN`, which the app never has, so such programs live in `filter` and
@@ -465,30 +405,19 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **`ip route get` with `iif` is `EOPNOTSUPP`:** Linux 6.1 answers input-route lookups
-  (`RTA_IIF`).
 - **`/proc/net/snmp` departs from the namespace's state:** `Forwarding` is always 2 although each
   namespace has `ip_forward` (Linux shows 1 when it is on), and MPTCP sockets are left out of the
   Tcp counters and `CurrEstab`, where Linux counts their subflows.
-- **Raw ICMP keeps one echo id per socket:** every reply to a socket's ping ident is rewritten to
-  the last id that socket sent, so programs using several ids on one socket (liboping) see them
-  collapse; the queue cap ignores `SO_RCVBUF` and drops silently.
-- **New-namespace loopback statistics leak the initial namespace's:** sysfs `lo/statistics/*` in a
-  new network namespace reads the initial namespace's counters for `lo` (and `tx_queue_len` the
-  host's real value), while `/proc/net/dev` and netlink show zeros (and 1000) there.
+- **New-namespace loopback statistics leak the initial namespace's:** sysfs `lo/statistics/*`
+  (`kernel/sysfs`) in a new network namespace reads the initial namespace's counters for `lo` (and
+  `tx_queue_len` the host's real value), while `/proc/net/dev` and netlink show zeros (and 1000)
+  there.
 - **A wildcard connect from a bound IPv4 socket reports the loopback:** connecting to `0.0.0.0`
   gives getpeername `127.0.0.1` even when the socket is bound to an address of its own, which
   Linux's route lookup would take instead.
-- **A raw ICMP socket shut down for reading still waits in recv:** the aggregation point's receive
-  path does not look at the read shutdown, so a blocking recv with nothing queued sleeps until a
-  reply, a timeout or a signal, where Linux's `skb_recv_datagram` returns 0 at once (and wakes
-  receivers already waiting); only internet datagram sockets on host sockets return 0.
 - **Odd destinations reach the host unchecked:** sendto hands a guest address the layer does not
   understand to the host socket as is, so the host kernel's own checks answer instead of Linux
   6.1's; under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux says `EINVAL`.
-- **A raw socket cannot be bound to another address:** Linux's `raw_bind` lets a raw socket be
-  bound any number of times; the host ping socket that emulates a raw ICMP socket refuses a second
-  bind, so binding it again succeeds only for the address it already has (`EINVAL` otherwise).
 
 ## Open questions
 
@@ -499,8 +428,7 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 ## To verify
 
 - Host behaviour for passed-through options (`SO_PRIORITY`, `IP_TRANSPARENT`, `SO_PEERCRED` on
-  inet) and that the host ping socket rewrites the id, rejects non-echo types and refuses a second
-  bind.
+  inet).
 - `SO_ORIGINAL_DST` for a DNAT whose target is in the initial namespace (Linux answers the
   pre-DNAT address; here the forwarder records nothing).
 - On a real phone, that other apps can reach guest services on loopback (the design expected it

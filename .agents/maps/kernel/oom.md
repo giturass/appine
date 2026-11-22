@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write and host-backing references to kernel/cow and kernel/hostmem)
 
 ## Responsibilities
 
@@ -23,7 +23,8 @@ Root: `core/kernel/src/oom.rs`; in `mm.rs` the resident-memory measures (`reside
 `cow_shared`, `pagemap`, `stack_bytes`, `resident_pages`, `peak_resident_pages`, `resident_split`,
 `Usage`) and `Mm::release`; process_mrelease's syscall in `syscall/mem.rs`.
 
-Outside the module: VMAs, host backing and copy-on-write, which the measures read (`kernel/mm`);
+Outside the module: VMAs (`kernel/mm`), host backing and `UNMAPPING` (`kernel/hostmem`), and
+copy-on-write sets and loans (`kernel/cow`), which the measures read;
 the timer thread that runs the check and the stop/resume of periodic checks (`kernel/time`);
 the cgroup tree, its memory files and controller (`kernel/cgroup`); the procfs files that print the
 measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kernel/process`).
@@ -114,8 +115,8 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
   then calls `resume_checks` at the top of each run-loop iteration, which signals the timer thread
   if the flag was set; with all these accesses SeqCst a waking thread is never missed (the
   code-view release and load-average sampling stop the same way).
-- An over-limit round still measures but is skipped while `UNMAPPING` (`kernel/mm`'s pending host
-  releases) is nonzero or the last victim, picked under 1 s ago, still has threads; otherwise it
+- An over-limit round still measures but is skipped while `UNMAPPING` (`kernel/hostmem`'s pending
+  host releases) is nonzero or the last victim, picked under 1 s ago, still has threads; otherwise it
   records a `max` event and calls `out_of_memory`. Lowering a child's `memory.max` below its usage
   calls `out_of_memory` once at once, without a `max` event or the `UNMAPPING` check.
 - `select` considers every process except tgid 1 (the built-in init), `oom_score_adj` -1000,
@@ -180,12 +181,13 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 ### Outbound
 
-- `kernel/mm`: VMAs, CoW sets and loans, `FileMaps`, `UNMAPPING`, `shmem_like`; `shootdown`
-  (`kernel/mmu`) for borrowed pages a release re-points.
+- `kernel/mm`: VMAs and `shmem_like`; `kernel/cow`: CoW sets and loans; `kernel/hostmem`:
+  `FileMaps`, `UNMAPPING`, `HostRegion` flags; `shootdown` (`kernel/mmu`) for borrowed pages a
+  release re-points.
 - `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`, `mincore` and pagemap
-  reads), `appine_engine` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
+  reads), `engine/dbt` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
   `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
-  and kill reports (`bug::record_kill`).
+  and kill reports (`bug::record_kill`, `kernel/bug`).
 
 ## Invariants and gotchas
 

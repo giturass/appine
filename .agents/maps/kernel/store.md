@@ -291,7 +291,7 @@ provider and rootfs installation UI (`android`).
 
 - rusqlite with bundled SQLite (WAL hook, checkpoints); `appine_hal` (`open_at`, `stat_at`,
   `chmod_at`, `unlink_at`, times, `flock`, `map_file`, `fsync`, `syncfs`, `sync_file_range`,
-  `statvfs`); the `tar` and `flate2` crates; `kernel::bkl_holder`; `bug::catch`.
+  `statvfs`); the `tar` and `flate2` crates; `kernel::bkl_holder`; `bug::catch` (`kernel/bug`).
 
 ## Invariants and gotchas
 

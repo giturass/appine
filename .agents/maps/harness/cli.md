@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: both-tier host shared-storage integration and concurrent path checks)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: joined Android DNS preloading and root-owned shared-storage fixtures)
 
 ## Responsibilities
 
@@ -49,6 +49,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
   continuing with a message if it cannot, and `SIGWINCH` resizes the guest console); `--pty`
   forces one (24×80 unless both are terminals), `--no-pty` gives the guest the host's stdio.
   Through the PTY, guest stdout and stderr both reach fd 1.
+- On Android, a recognized interactive shell with a PTY starts the system DNS loader in a
+  background thread (joined before exit). Command and script invocations load it on demand. Set
+  `APPINE_PRELOAD_ANDROID_DNS=0` to disable preloading.
 - The kernel's `run` starts a machine, opens the console, boots by inittab with `--init`, spawns
   the program and bridges the terminal; afterwards it shuts down by inittab (`--init`; a reboot
   request is only a shutdown) or kills everything, then joins the bridge.
@@ -103,6 +106,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
   freestanding aarch64 C executable with direct syscalls, built with the host C driver.
   Missing Alpine skips unless `APPINE_REQUIRE_ROOTFS=1`; this suite
   does not exercise Android's settings UI or all-files grant.
+  Store-side fixture writes explicitly use uid/gid 0, retaining root ownership through the
+  kernel's ownership-aware `write_file` API.
 
 ## Dependencies (inbound / outbound)
 
@@ -114,7 +119,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
 ### Outbound
 
 - `appine_kernel` provides run/options/reports, Machine, store import and sync.
-- `hal` provides RawMode, isatty, SIGWINCH and stop notifiers.
+- `hal` provides RawMode, isatty, SIGWINCH and stop notifiers, and `net::preload_android_resolver`
+  on Android.
 - `harness` supplies `appine-bench` as a dev-dependency and development container/CI.
 - `android/setup` fetches rootfs artifacts; guest builds use cc/musl-gcc.
 

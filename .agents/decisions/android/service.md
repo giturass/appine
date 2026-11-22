@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -13,6 +13,14 @@
 - **D13** — Preference writes use the androidx.core edit extension with asynchronous apply, as required by the lint build. (4c1a3ce)
 - **D17** — Before every kernel start, including existing stores, call Rootfs.ensureContainersConfig after ensureNetworkConfig, write only a missing configuration, and fail startup if the store write fails. (0eb9e19)
 - **D20** — The poll worker passes the same changed directories to Documents and Rootfs, ignores refresh failures and can delay the NOPASSWD refresh by a poll while the refresh process counts toward the service exit check. (d03c9b6)
+
+> Full text of D10, D15, D16, D22, D30: `git show c4db5db249c93e2e122d88ef60153f67c94a1f62:.agents/decisions/android/service.md`
+
+- **D10** — Every build honors the saved execution tier (default Tier 1), `setTier` persists changes and restarts the kernel, bug reports keep Tier numbers, and a Tier 0 preference saved by an earlier debug build applies in release builds (62a8c07; cf4f5e20; 20137e4c; d053be24; 39e55b4b)
+- **D15** — Copied bug reports open with `Appine <version> (<code>, <build type>)`, while the `[appine]` in-tab tag before restore, kill and tmux notices stays lowercase and must change with `android/setup` D16 if ever capitalized (3f04bf5; 77d7f36)
+- **D16** — Without a ready store, `startOrImport` (shared by `onCreate` and post-Exit-all restart) resumes `Rootfs.importing(this)` with the existing Alpine fallback on download/import failure, needing network again if a resumed Debian tarball left cache (237d663; 6560af6)
+- **D22** — `cursor_style` and `cursor_blink` live in `settings` preferences; `setCursorStyle` and `setCursorBlink` update every live session under its lock on the main thread and notify listeners, while unstarted sessions store values until started (77d7f36)
+- **D30** — `show_tab_list` defaults to true in `Settings` and notifies activity listeners through service setters, so direct `Settings` writes bypass listener notification (5c49c5a7; 39e55b4b)
 
 ## Active (full detail)
 
@@ -58,11 +66,11 @@
 - **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216; f61072f3; d053be24; 39e55b4b
 
 ### D7: The service is a module of its own, split from the app by responsibility
-- **What**: android/service holds `TerminalService.kt`, `BrowserBridge.kt`, `Notifications.kt`, `Settings.kt`, `Tabs.kt` and `Diagnostics.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
-- **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
-- **Tradeoffs**: The code stays in one Gradle module, with kernel lifecycle in kernel/boot, sessions in android/vt, native mechanisms in android/vtcore, interaction in android/vtview and rendering in android/vtrender; tab rendering belongs to android/tabbar while session ownership remains here.
-- **Watch out**: A shell's kill report can reach a tab opened within the next poll that took the freed console number (open in the map); the switch-after-failed-start crash, notifications posted after `onDestroy` and reports sent to ended tabs, recorded by the full refresh d9e1f0c, were fixed in 6560af6 (D8, D9, D16).
-- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23); 8e211142; 9015b244; c7309c0c, 8a17e4a9, 81f60bef; d053be24; 60790c14; 39e55b4b
+- **What**: android/service holds `TerminalService.kt`, `BrowserBridge.kt`, `Settings.kt` and `Tabs.kt` (keeping ongoing foreground notification id 1 and routing decisions), while `Notifications.kt` and `Diagnostics.kt` belong to `android/reports` and the remaining app areas stay in their responsibility-based modules.
+- **Why**: `android/service.md` reached 41,395 B (89.8% of one read) while mixing foreground-service lifecycle with notification rendering and independent diagnostic retention.
+- **Tradeoffs**: Notification-policy changes touching both routing in `TerminalService` and formatting in `Notifications` span two maps, pre-split report/diagnostic decisions remain here, and sibling responsibilities stay in `kernel/boot`, `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender` and `android/tabbar`.
+- **Watch out**: Ongoing notification id 1 in `TerminalService` must stay disjoint from `android/reports`'s notification ID ranges, and a shell's kill report can still reach a newly opened tab that reused the freed console number before the next poll.
+- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23); 8e211142; 9015b244; c7309c0c, 8a17e4a9, 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
 - **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`; `releaseSessions` centralizes detach/onDestroy release, notification removal and clearing `sessions` and `unshown`.
@@ -77,13 +85,6 @@
 - **Tradeoffs**: An exit during a distro replacement still imports the chosen distro first (and waits for a long import), a kill shown in a background tab now also notifies, and after a failed start the service and its notification stay without a UI while a switch downloads.
 - **Watch out**: Every new path that ends `starting` or `transitioning` must check `exiting` (a map invariant), every new way of posting notification 1 must go through `updateNotification`, and kill notification ids from a new service instance can still collide with old ones after wrapping.
 - **Source**: 89ad551; 6560af6 (a switch's completion crashing a destroyed service, recorded in d9e1f0c)
-
-### D10: Every build honors the saved execution tier
-- **What**: All builds read the saved tier with Tier 1 as the default, and `setTier` saves a changed choice and restarts the kernel while bug reports retain Tier numbers.
-- **Why**: Release users need the same execution-mode control exposed by Settings.
-- **Tradeoffs**: Tier 0 persists across launches until changed.
-- **Watch out**: A Tier 0 preference saved by an earlier debug installation now applies in release builds.
-- **Source**: 62a8c07; cf4f5e20; 20137e4c; d053be24; 39e55b4b
 
 ### D11: Display settings the terminal needs before binding live in the service's `settings` file
 - **What**: `Settings` keeps `fill_wide` defaulting off and `volume_keys_switch_tabs` defaulting on, preserves saved values, and exposes plain reads while service setters save and notify listeners; MainActivity rereads fill_wide on start and volume behavior on each press.
@@ -106,20 +107,6 @@
 - **Watch out**: Low-memory kills are told apart only where `isLowMemoryKillReportSupported`; low memory, background resources and ANR were not triggered in testing, and the Chinese strings were not seen on a device; retained diagnostic evidence is now collected separately under D29.
 - **Source**: a1f47cc; c7309c0c; d053be24; 39e55b4b
 
-### D15: Bug reports name the app Appine; the in-tab tag stays `[appine]`
-- **What**: The copied report's first line is "Appine <version> (<code>, <build type>)", while the "[appine]" tag before restore notices, kill reports and the notice that tmux control mode was detached (android/terminal D49) stays lowercase, as a source tag like "sudo:".
-- **Why**: The report opened with the product name in lowercase.
-- **Tradeoffs**: A notice can read "[appine] ... because Appine crashed", mixing both casings in one line.
-- **Watch out**: Capitalising the tag means changing TerminalService's two `showMessage` calls together with the setup module's "appine:" prefixes (android/setup D16).
-- **Source**: 3f04bf5 (with android/terminal D28); 77d7f36 (the tmux notice)
-
-### D16: A launch without a ready store resumes the import of the recorded distro
-- **What**: Without a ready store `startOrImport`, shared by `onCreate` and the restart that finishes Exit all, calls `start(Rootfs.importing(this))`, the distro the interrupted import recorded (android/setup D17), and the existing fallback to Alpine with `switch_failed` covers a resumed import that cannot download or import.
-- **Why**: The service imported Alpine whenever no store was ready, so a switch interrupted by a kill silently became Alpine, and `finishExit` restarted with `start(null)`, which never imports.
-- **Tradeoffs**: A resumed Debian import needs the network again when its tarball is gone from the cache.
-- **Watch out**: None known.
-- **Source**: 237d663; 6560af6
-
 ### D18: A long BKL hold is reported in a notification while it lasts
 - **What**: The 2 s poll first calls `Native.bklStall` (android/native D18) on the main thread; a new stall of the current kernel posts notification 4, "Appine's kernel is stuck", with its seconds and "Copy report", and once it has ended a notification still showing becomes "was stuck" with the total and the kernel log record in its report, without alerting again, while a dismissed one stays dismissed.
 - **Why**: A stuck kernel left the user with frozen tabs and no explanation or report to send.
@@ -140,13 +127,6 @@
 - **Tradeoffs**: Statuses, finished commands, bells and OSC 9/777 share one notification per tab and replace each other; no setting turns command notices off, and their text cannot name the command; the record's app name is never shown.
 - **Watch out**: CLIs that send both OSC 9 and 7501 for one event alert twice, the withdrawal relies on every other path that posts the tab's notification clearing `statusNotified` first, and command notices depend on each shell’s prompt integration (android/setup D20 and android/vt D5–D7).
 - **Source**: 22c8ab0, 5256ae2; a7d8c9f5; a809c5a8; 7aa817af (prompt integration)
-
-### D22: The service keeps the cursor settings and gives them to every session
-- **What**: `cursor_style` (Ghostty's names block, bar and underline) and `cursor_blink` live in the `settings` preferences; `setCursorStyle` and `setCursorBlink` save them and call `cursorChanged`, which sets every session's values and tells listeners, and `createSession` gives each new or restored session the current ones (android/terminal D47).
-- **Why**: The cursor setting must reach every tab, background and restored ones included, which a static read by `MainActivity` for the shown view, as for `fill_wide` (D11), would not.
-- **Tradeoffs**: A change sets every tab's terminal under its lock on the main thread.
-- **Watch out**: A session not started yet only stores the values until its terminal exists.
-- **Source**: 77d7f36
 
 ### D23: Notifications and settings live in classes of their own; the service keeps the decisions
 - **What**: `Notifications(service)` owns the channels, every notification id but the ongoing one (1), the stall, crash, boot-failure, listen and kill notifications with the bug report and its "copy report" action (the service hands it the intent), and each tab's notification with the bell throttle, status de-duplication and stall state, while the service still decides what is told (the tab in front, a kill shown in its tab); `Settings` is an object over the `settings` preferences with getters, plain setters and `clearLogin`, whose values the service's getters delegate to and its setters write before acting, with file_access replacing the old system_documents contract (D27); saving tabs and switching distros stay in the service, coupled to its start and worker.
@@ -203,14 +183,6 @@
 - **Watch out**: Process death can lose final logcat messages, vendor traces vary, and retained messages can contain names and paths.
 - **Source**: c7309c0c; d053be24; 39e55b4b
 
-### D30: Tab-list visibility is a persistent service setting
-
-- **What**: show_tab_list defaults to true, persists in shared settings and notifies activity listeners through service setters.
-- **Why**: The visibility choice must survive activity and process recreation.
-- **Tradeoffs**: The service stores a display preference that it does not consume.
-- **Watch out**: Direct settings writes bypass listener notification.
-- **Source**: 5c49c5a7; 39e55b4b
-
 ### D31: The ongoing notification puts a startup failure reason in the body
 
 - **What**: Ordinarily the title names the current state and the body names the running policy, but a non-private startup failure shows Cannot start above the error in both body layouts.
@@ -218,6 +190,30 @@
 - **Tradeoffs**: A public startup error displaces the policy text, while privacy mode shows the privacy title and policy even on failure.
 - **Watch out**: Preserve exit and progress precedence and check long text and vendor layouts on devices.
 - **Source**: c7e338a5, c97b00bf
+
+### D32: Vulkan GPU mode is persisted default-off and controls per-start launcher setup and diagnostics
+
+- **What**: `Settings` stores `gpu` (default false), `TerminalService` exposes `gpu`, `gpuAvailable` and `setGpu`, calls `Rootfs.ensureGpuCommand` only when `gpu` is true, clears `gpuAvailable` in `detach` and `onDestroy`, and appends `, Vulkan GPU` to `Diagnostics.environment` (reused by `Notifications.bugReport`).
+- **Why**: The service must avoid installing the GPU launcher or probing `:venus` unless opted in, track live renderer availability per kernel and report GPU mode in diagnostics.
+- **Tradeoffs**: Disabling the toggle leaves any previously installed `/usr/local/bin/appine-gpu` in the rootfs, a running kernel requires restart to change GPU mode, and future launcher revisions need an upgrade path.
+- **Watch out**: Direct `Settings` writes bypassing `TerminalService` will not trigger a restart until the next kernel launch.
+- **Source**: 9cafc90b, b605a0a3
+
+### D33: First-boot OpenRC setup publishes the kernel atomically while upgrade failures open a repair terminal
+
+- **What**: On first-boot OpenRC setup, `TerminalService` transfers the kernel handle, browser endpoint and boot state together after setup while keeping ordinary boots asynchronous, and on existing-store upgrade failures surfaces the error while carrying boot state forward so `inittab` runs once and a repair terminal opens (keeping import-time errors fatal).
+- **Why**: Publishing the kernel handle early let tabs race OpenRC setup, while aborting startup on an existing-store migration error locked users out of repairing their system.
+- **Tradeoffs**: The first tab waits for `inittab` during initial setup, and services may be unavailable in a repair session.
+- **Watch out**: Exits during startup must release the browser endpoint and shut down the right kernel, and a persistent migration error recurs at startup until repaired.
+- **Source**: d0ff9a31, 7e85e8dc
+
+### D34: Startup invokes one-time Alpine bash startup seeding before `Native.start`
+
+- **What**: `TerminalService.start` calls `Rootfs.ensureBashStartup(this)` alongside the other per-start rootfs helpers before starting the kernel, relying on its per-store marker for fast no-ops on subsequent starts and Debian.
+- **Why**: Existing Alpine stores imported before bash startup seeding need one-time `.bash_profile`/`.bashrc` creation without resetting the rootfs.
+- **Tradeoffs**: Adds one store marker check on Alpine startup and treats seeding I/O errors as startup failures like adjacent `ensure*` helpers.
+- **Watch out**: An unexpected I/O failure writing `/etc/skel` or `/var/lib/appine/bash-startup-done` on a modified store can block startup until repaired.
+- **Source**: 9f3e93ed
 
 ## Superseded
 
@@ -235,3 +231,5 @@
 - ~~No exemption request anywhere in the app under D3~~ → narrowed by **android/terminal D69** in 7a931d97 (2026-11-16, implicit cross-module change).
 - ~~The generic privacy body under D28~~ → replaced by **D28 and D31** in c7e338a5 (2026-11-17).
 - ~~Always showing the policy body for a non-private startup failure in c7e338a5~~ → replaced by **D31** in c97b00bf (2026-11-17, recovered headingless block).
+- ~~Unconditionally calling `Rootfs.ensureGpuCommand` during every per-start guest setup in 9cafc90b~~ → narrowed by **D32** in b605a0a3 (2026-11-21, implicit refinement).
+- ~~D7 combined ownership of TerminalService, Notifications.kt and Diagnostics.kt (12c4afa, 0553229, c7309c0c)~~ → replaced by **D7** and android/reports **D1** in e4d7bbe5 (2026-11-22).

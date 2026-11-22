@@ -21,7 +21,7 @@ SKIP="$SKIP:Openat2Test.BeneathRaceWithRename:Openat2Test.InRootRaceWithRename"
 # kernel/vfs: anonymous pipes and sockets cannot change owner
 SKIP="$SKIP:ChownTest.FchownPipeFileSucceeds:ChownTest.FchownPipeFileFails"
 M=MountTest
-# kernel/procfs: sysfs has no /sys/kernel
+# kernel/sysfs: sysfs has no /sys/kernel
 SKIP="$SKIP:$M.LockedMountStopsOverlayOfSysfs"
 SKIP="$SKIP:$M.UserNamespaceSysfsMountRevealingLockedMount"
 # kernel/vfs D7: fsopen and fsmount are ENOSYS (these skip themselves on Appine); kernel/vfs: atime

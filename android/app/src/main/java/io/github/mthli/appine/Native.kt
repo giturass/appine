@@ -37,10 +37,21 @@ internal object Native {
     @Throws(IOException::class)
     external fun syncRootfs(store: String)
 
-    /** Writes a file in the store; with [overwrite] false, an existing file is left alone. */
+    /**
+     * Writes a file in the store; with [overwrite] false, an existing file is left alone. New files
+     * are owned by [uid] and [gid].
+     */
     @JvmStatic
     @Throws(IOException::class)
-    external fun writeFile(store: String, path: String, data: ByteArray, mode: Int, overwrite: Boolean)
+    external fun writeFile(
+        store: String,
+        path: String,
+        data: ByteArray,
+        mode: Int,
+        overwrite: Boolean,
+        uid: Int = 0,
+        gid: Int = 0,
+    )
 
     /** Reads a regular file in the store (null when missing); also works while the kernel runs. */
     @JvmStatic
@@ -133,8 +144,8 @@ internal object Native {
     external fun browseWritten(store: String, top: String, path: String)
 
     /**
-     * Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT. [sharedStorage] is mounted
-     * at /storage/emulated/0 and /sdcard; null disables it for isolated tests.
+     * Starts the kernel; [tier] 0 is the interpreter, 1 is the DBT; [gpu] probes the Venus renderer.
+     * [sharedStorage] is mounted at /storage/emulated/0 and /sdcard; null disables it for isolated tests.
      */
     @JvmStatic
     @Throws(IOException::class)
@@ -142,8 +153,13 @@ internal object Native {
     external fun start(
         store: String,
         tier: Int,
+        gpu: Boolean = false,
         sharedStorage: String? = Environment.getExternalStorageDirectory().absolutePath,
     ): Long
+
+    /** Whether the running kernel registered a host GPU renderer. */
+    @JvmStatic
+    external fun hasGpu(machine: Long): Boolean
 
     /**
      * Boots by `/etc/inittab` (the kernel/process map; OpenRC on Alpine): blocks until the sysinit

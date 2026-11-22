@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtcore"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-22 (HEAD = e0719858)
 >
 > Decisions made before android/vtcore was split from android/vt retain their `android/vt` tags in `.agents/decisions/android/vt.md`: D1, D3, D4 and the parsing side of D5–D7; earlier `android/terminal` decisions remain in `.agents/decisions/android/terminal.md`: D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49.
 
@@ -23,3 +23,11 @@
 - **Tradeoffs**: Settling adds a short delay without postponing resize or SIGWINCH.
 - **Watch out**: Quiet time is a heuristic and later delayed output can follow an apparently settled burst.
 - **Source**: 2e73a06a; 39e55b4b
+
+### D3: Oversized vtcore map sections are condensed in place rather than splitting `vt.c` further
+
+- **What**: `android/vtcore.md` condenses `Key types`, unused `libghostty-vt` API catalogs, `Invariants and gotchas` and the repeated `tmux -CC` note by role without dropping verified facts, reducing it from 42,862 B to 33,861 B (73.5% of one read) with 26.1% baseline drift.
+- **Why**: The map reached 93.0% of the single-read budget while `vt.c` was already partitioned across four modules.
+- **Tradeoffs**: Individual `AppineVt` struct fields and unused `libghostty-vt` C API symbols are summarized by role instead of enumerated exhaustively.
+- **Watch out**: Further growth pushing the map past 80% would make extracting scrollback compression and snapshot state into a separate module necessary.
+- **Source**: e0719858

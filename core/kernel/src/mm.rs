@@ -1,6 +1,8 @@
 //! Guest address spaces (the kernel/mm map: `.agents/maps/kernel/mm.md`): a VMA table plus a
 //! soft-MMU page table. Filling entries, keeping threads consistent and code groups are described
-//! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map.
+//! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map,
+//! fork and copy-on-write by the kernel/cow map, and host backing and deferred release by the
+//! kernel/hostmem map.
 //!
 //! Every VMA points at a piece of host memory (an anonymous or a file mapping), and several VMAs
 //! can share one piece (after munmap/mprotect splits them, or shared mappings after fork). Host
@@ -19,7 +21,7 @@
 //! [`CodeLog`] and the code generation is bumped; each thread invalidates translations page by
 //! page over the ranges it missed.
 //!
-//! On fork, private anonymous memory is copy-on-write (the kernel/mm map), other private mappings
+//! On fork, private anonymous memory is copy-on-write (the kernel/cow map), other private mappings
 //! are copied, and shared mappings are shared with the child. Copy-on-write is per page: pages
 //! written before fork are not copied; the page tables of parent and child both point at the
 //! parent's host page, without write permission. The side whose VMA holds the host page is its
@@ -514,6 +516,10 @@ pub struct Mm {
     /// Which register set Tier 1 uses when translating this program, chosen per program at
     /// execve (Go gets a different one).
     pub dbt_regs: appine_engine::DbtRegs,
+    /// Known libc memop entry PCs discovered in unmodified read-only executable mappings.
+    pub memops: Vec<appine_engine::DbtMemop>,
+    /// `memops` changed and must be pushed to the active `DbtSpace` at the next [`Mm::sync`].
+    memops_dirty: bool,
     /// Load address of the vDSO (signal handlers return to the sigreturn trampoline in it by
     /// default).
     pub vdso: u64,
@@ -588,6 +594,8 @@ impl Mm {
             lock_onfault: false,
             exe: None,
             dbt_regs: appine_engine::DbtRegs::Default,
+            memops: Vec::new(),
+            memops_dirty: false,
             vdso: 0,
             vdso_svc: false,
             code: (0, 0),
@@ -661,8 +669,11 @@ impl Mm {
             base: host,
             len: data as usize,
             anonymous: None,
+            used_start: AtomicUsize::new(0),
+            used_end: AtomicUsize::new(0),
             reserved: false,
             foreign: true,
+            gpu: None,
         });
         self.insert(
             start,
@@ -731,7 +742,7 @@ impl Mm {
         if !self.is_free(start, len) {
             return Err(Errno::EEXIST);
         }
-        let (region, base) = Self::new_anonymous(reserve.max(len), false)?;
+        let (region, base) = Self::new_anonymous_reserved(reserve.max(len))?;
         // SAFETY: this host memory is at least len bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
         let rw = prot::READ | prot::WRITE;
@@ -812,6 +823,8 @@ impl Mm {
                 tag: self.code_tag,
                 seen: Mutex::new(self.code_generation.load(Ordering::SeqCst)),
             }));
+            self.memops_dirty = true;
+            self.sync_memops();
         }
         self.code_space.clone()
     }
@@ -895,6 +908,7 @@ impl Mm {
             members: Cell::new(1),
             ranges: RefCell::new(layout),
             claims: RefCell::new(private.iter().map(|&(s, e)| (tag, s, e)).collect()),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         });
@@ -911,6 +925,58 @@ impl Mm {
         self.code_ranges.push((start, len));
     }
 
+    /// Drops any recorded memop entry whose PC falls in an invalidated range or no longer lies in
+    /// an unmodified read-only executable mapping.
+    pub(crate) fn prune_memops(&mut self, invalidated: &[(u64, u64)]) {
+        let before = self.memops.len();
+        self.memops.retain(|m| {
+            let hit = invalidated
+                .iter()
+                .any(|&(s, len)| m.pc >= s && m.pc - s < len);
+            if hit {
+                return false;
+            }
+            let Some((&s, v)) = self.vmas.range(..=m.pc).next_back() else {
+                return false;
+            };
+            m.pc < s + v.len
+                && (v.prot & prot::EXEC) != 0
+                && (v.prot & prot::WRITE) == 0
+                && v.backing != Backing::Shared
+                && !v.written.get()
+        });
+        if self.memops.len() != before {
+            self.memops_dirty = true;
+        }
+    }
+
+    /// Publishes discovered memop entry PCs to the active `DbtSpace`. In a `CodeGroup`, only PCs
+    /// inside the group's admitted shared ranges are merged so one member's private mappings cannot
+    /// affect another member.
+    fn sync_memops(&mut self) {
+        if !std::mem::take(&mut self.memops_dirty) {
+            return;
+        }
+        if let Some(group) = &self.code_group {
+            let ranges = group.ranges.borrow();
+            let mut gops = group.memops.borrow_mut();
+            let before = gops.len();
+            for &m in &self.memops {
+                let in_group = ranges
+                    .iter()
+                    .any(|r| m.pc >= r.start && m.pc - r.start < r.len);
+                if in_group && !gops.iter().any(|existing| existing.pc == m.pc) {
+                    gops.push(m);
+                }
+            }
+            if gops.len() != before {
+                group.space.set_memops(&gops);
+            }
+        } else if let Some(cs) = &self.code_space {
+            cs.space.set_memops(&self.memops);
+        }
+    }
+
     /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
     /// unmapped host memory; when only code must be invalidated, it only records the ranges and
     /// bumps the generation.
@@ -918,8 +984,13 @@ impl Mm {
     /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
     /// re-entering guest code.
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
+        let exec_changed = self.exec_changed;
         self.check_code_group();
         let code = std::mem::take(&mut self.code_ranges);
+        if !self.memops.is_empty() && (!code.is_empty() || exec_changed) {
+            self.prune_memops(&code);
+        }
+        self.sync_memops();
         let dirty = std::mem::take(&mut self.dirty);
         if !dirty && code.is_empty() {
             return;
@@ -980,6 +1051,7 @@ impl Mm {
             // invalidate those blocks and keep only the ones consistent with its mappings
             group.closed.set(true);
             group.space.retire_outside(&group.consistent(&layout));
+            self.memops_dirty = true;
             return;
         }
         group.members.set(group.members.get() - 1);
@@ -1265,6 +1337,7 @@ impl Mm {
         // SAFETY: at least grow bytes below v.host belong to the same host memory, and no other
         // mapping uses them
         let host = unsafe { NonNull::new_unchecked(v.host.as_ptr().sub(grow as usize)) };
+        v.region.note_used(host, grow as usize);
         // The bottom of the stack grows back after being unmapped: what was written before must
         // read as zero again
         unsafe { discard_host(host, grow as usize) };
@@ -1287,7 +1360,7 @@ impl Mm {
     fn new_stack_chunk(&mut self, page: u64, grow: u64, reserve: u64, above: u64) -> bool {
         let template = self.vmas[&above].clone();
         let Ok((region, base)) =
-            Self::new_anonymous(reserve, false).or_else(|_| Self::new_anonymous(grow, false))
+            Self::new_anonymous_reserved(reserve).or_else(|_| Self::new_anonymous_reserved(grow))
         else {
             return false;
         };
@@ -1621,22 +1694,46 @@ impl Mm {
         self.map(addr, len, prot, flags, file, Some(fill))
     }
 
-    fn map(
+    /// Maps a range owned by the GPU backend directly into the guest page table.
+    pub(crate) fn mmap_gpu(
         &mut self,
         addr: u64,
         len: u64,
         prot: u32,
         flags: u32,
-        file: Option<(i32, u64, bool)>,
-        fill: Option<Rc<Fill>>,
+        mapping: Arc<dyn crate::gpu::Mapping>,
     ) -> Result<u64, Errno> {
-        let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
-        let shared = flags & 3 == flags::MAP_SHARED;
-        if !shared && flags & 3 != flags::MAP_PRIVATE {
+        let len = page_up(len).filter(|&n| n != 0).ok_or(Errno::EINVAL)?;
+        if len > mapping.size() as u64
+            || !mapping
+                .base()
+                .as_ptr()
+                .addr()
+                .is_multiple_of(PAGE_SIZE as usize)
+        {
             return Err(Errno::EINVAL);
         }
+        let start = self.mapping_address(addr, len, flags)?;
+        let host = mapping.base();
+        let region = Arc::new(HostRegion {
+            base: host,
+            len: len as usize,
+            anonymous: None,
+            used_start: AtomicUsize::new(0),
+            used_end: AtomicUsize::new(0),
+            reserved: false,
+            foreign: false,
+            gpu: Some(mapping),
+        });
+        self.insert(start, len, len, prot, Backing::Shared, true, region, host)?;
+        self.deny_exec(start, len);
+        self.note_shared_maps(false);
+        Ok(start)
+    }
+
+    fn mapping_address(&mut self, addr: u64, len: u64, flags: u32) -> Result<u64, Errno> {
         let fixed = flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0;
-        let start = if fixed {
+        Ok(if fixed {
             if !addr.is_multiple_of(PAGE_SIZE)
                 || addr.checked_add(len).is_none_or(|e| e > 1 << VA_BITS)
             {
@@ -1660,7 +1757,24 @@ impl Mm {
             } else {
                 self.find_free(len).ok_or(Errno::ENOMEM)?
             }
-        };
+        })
+    }
+
+    fn map(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+        file: Option<(i32, u64, bool)>,
+        fill: Option<Rc<Fill>>,
+    ) -> Result<u64, Errno> {
+        let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        let shared = flags & 3 == flags::MAP_SHARED;
+        if !shared && flags & 3 != flags::MAP_PRIVATE {
+            return Err(Errno::EINVAL);
+        }
+        let start = self.mapping_address(addr, len, flags)?;
 
         let st = file.and_then(|(fd, ..)| appine_hal::fstat(fd).ok());
         let file_id = st
@@ -1675,6 +1789,16 @@ impl Mm {
             }
             (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
             _ => None,
+        };
+        #[allow(clippy::unnecessary_cast)]
+        let bundled_libc = if !shared && prot & prot::EXEC != 0 && prot & prot::WRITE == 0 {
+            file.zip(file_id).zip(content).and_then(
+                |(((fd, _, _), (dev, ino, _)), (ctime, size))| {
+                    crate::loader::bundled_libc(fd, (dev as u64, ino as u64, ctime, size))
+                },
+            )
+        } else {
+            None
         };
         // The host mapping is shared with other address spaces (FileMaps)
         let mut cached = false;
@@ -1708,32 +1832,35 @@ impl Mm {
                     Backing::PrivateFile
                 };
                 // A read-only private mapping with a trusted version: all address spaces share one
-                // host mapping (FileMaps)
-                let key = st
-                    .as_ref()
-                    .zip(content)
-                    .filter(|_| !shared && prot & prot::WRITE == 0)
-                    .map(|(s, (ctime, size))| {
-                        #[allow(clippy::unnecessary_cast)]
-                        let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
-                        [dev, ino, offset, len, ctime, size]
-                    });
+                // host mapping (FileMaps). Verified bundled musl maps its immutable memfd snapshot
+                // under the snapshot's own (dev, ino) so it never aliases unverified mappings of
+                // the original file.
+                let key = if let Some(libc) = &bundled_libc {
+                    let (dev, ino) = libc.snapshot_id();
+                    Some([dev, ino, offset, len, 0, libc.size()])
+                } else {
+                    st.as_ref()
+                        .zip(content)
+                        .filter(|_| !shared && prot & prot::WRITE == 0)
+                        .map(|(s, (ctime, size))| {
+                            #[allow(clippy::unnecessary_cast)]
+                            let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
+                            [dev, ino, offset, len, ctime, size]
+                        })
+                };
                 if let Some((region, host)) = key.as_ref().and_then(|k| self.files.get(k)) {
                     cached = true;
                     (backing, true, region, host)
                 } else {
-                    let m = match key {
-                        Some(_) => appine_hal::map_file_read_only(fd, offset, host_len),
-                        None => appine_hal::map_file(fd, offset, host_len, shared, writable),
+                    let m = match (&bundled_libc, key) {
+                        (Some(libc), _) => libc.map(offset, host_len),
+                        (None, Some(_)) => appine_hal::map_file_read_only(fd, offset, host_len),
+                        (None, None) => {
+                            appine_hal::map_file(fd, offset, host_len, shared, writable)
+                        }
                     }
                     .map_err(Errno)?;
-                    let region = Arc::new(HostRegion {
-                        base: m.base,
-                        len: m.len,
-                        anonymous: None,
-                        reserved: false,
-                        foreign: false,
-                    });
+                    let region = HostRegion::file(m.base, m.len);
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
                         cached = true;
@@ -1763,7 +1890,8 @@ impl Mm {
             _ => None,
         };
         self.insert(start, len, file_len, prot, backing, may_write, region, host)?;
-        self.fills |= fill.is_some();
+        let has_fill = fill.is_some();
+        self.fills |= has_fill;
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_id = file_id;
         v.content = content;
@@ -1773,6 +1901,11 @@ impl Mm {
         v.fill = fill;
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
+        }
+        if let (Some(libc), Some((_, offset, _))) = (bundled_libc, file) {
+            let before = self.memops.len();
+            libc.register(offset, start, len, &mut self.memops);
+            self.memops_dirty |= self.memops.len() != before;
         }
         Ok(start)
     }
@@ -2048,7 +2181,7 @@ impl Mm {
             }
             self.munmap(dst, new_len)?;
         }
-        if v.backing != Backing::Shared || v.foreign() {
+        if v.backing != Backing::Shared || v.foreign() || v.region.gpu.is_some() {
             return Err(Errno::EINVAL);
         }
         let dst = match fixed {
@@ -2089,7 +2222,7 @@ impl Mm {
         len: u64,
         file: Option<i32>,
     ) -> Result<Vma, Errno> {
-        if template.foreign() {
+        if template.foreign() || template.region.gpu.is_some() {
             return Err(Errno::EFAULT);
         }
         // (host memory, host address, fd kept for a shared mapping, bytes with file contents)
@@ -2109,13 +2242,7 @@ impl Mm {
                 let raw = std::os::fd::AsRawFd::as_raw_fd(&**fd);
                 let m = appine_hal::map_file(raw, file_offset, host_len, true, template.may_write)
                     .map_err(Errno)?;
-                let region = Arc::new(HostRegion {
-                    base: m.base,
-                    len: m.len,
-                    anonymous: None,
-                    reserved: false,
-                    foreign: false,
-                });
+                let region = HostRegion::file(m.base, m.len);
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
             }
@@ -2127,13 +2254,7 @@ impl Mm {
                 let file_offset = template.file_id.map_or(0, |(_, _, o)| o) + offset;
                 let m =
                     appine_hal::map_file(fd, file_offset, host_len, false, true).map_err(Errno)?;
-                let region = Arc::new(HostRegion {
-                    base: m.base,
-                    len: m.len,
-                    anonymous: None,
-                    reserved: false,
-                    foreign: false,
-                });
+                let region = HostRegion::file(m.base, m.len);
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }
             _ => {
@@ -2182,13 +2303,7 @@ impl Mm {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let shared = v.backing == Backing::Shared;
         let m = appine_hal::map_file(fill.fd(), offset, host_len, shared, false).map_err(Errno)?;
-        let region = Arc::new(HostRegion {
-            base: m.base,
-            len: m.len,
-            anonymous: None,
-            reserved: false,
-            foreign: false,
-        });
+        let region = HostRegion::file(m.base, m.len);
         Ok((region, m.ptr))
     }
 
@@ -2334,7 +2449,7 @@ impl Mm {
         if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
             return false;
         }
-        let Ok((region, host)) = Self::new_anonymous(HEAP_RESERVE, false) else {
+        let Ok((region, host)) = Self::new_anonymous_reserved(HEAP_RESERVE) else {
             return false;
         };
         self.insert(
@@ -2380,6 +2495,7 @@ impl Mm {
         // SAFETY: [lo, lo + hi) is inside this private anonymous memory and no other mapping uses
         // it
         let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
+        v.region.note_used(host, hi);
         // Grown again after shrinking: what was written before must read as zero again
         unsafe { discard_host(host, hi) };
         if Self::map_pages(&mut self.mmu, end, host, grow, heap, false).is_err() {
@@ -2660,7 +2776,7 @@ impl Mm {
                 .filter(move |(s, v)| *s + v.len > addr)
         };
         for (_, v) in overlapping() {
-            if v.locked || v.backing == Backing::Anonymous {
+            if v.locked || v.backing == Backing::Anonymous || v.region.gpu.is_some() {
                 return Err(Errno::EINVAL);
             }
             if v.backing != Backing::Shared || !v.may_write {
@@ -3149,6 +3265,7 @@ impl Mm {
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
         child.dbt_regs = self.dbt_regs;
+        child.memops = self.memops.clone();
         child.mmap_top = self.mmap_top;
         child.fills = self.fills;
         child.start_stack = self.start_stack;
@@ -3245,10 +3362,10 @@ impl Mm {
                 let (region, host) = if let Some(piece) = carved.remove(&start) {
                     piece
                 } else if heap {
-                    spare::anonymous(HEAP_RESERVE)?
+                    spare::anonymous_reserved(HEAP_RESERVE)?
                 } else if below > 0 {
                     // The host memory reserved below the stack is kept as well
-                    let (region, base) = spare::anonymous(below + v.len)?;
+                    let (region, base) = spare::anonymous_reserved(below + v.len)?;
                     // SAFETY: this host memory has below + v.len bytes
                     let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(below as usize)) };
                     (region, host)
@@ -4196,21 +4313,27 @@ impl Mm {
     /// `PROT_NONE` ones are not. V8 reserves 8 GB of `PROT_NONE` for every wasm memory, which
     /// would fail outright on hosts with little memory if it were accounted.
     fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        Self::new_anonymous_with(len, reserve, true)
+    }
+
+    /// Like [`Mm::new_anonymous`] with `MAP_NORESERVE`, for oversized address-space reservations
+    /// (stacks, heap) that only map a small slice up front: starts with an empty used range so
+    /// [`recycled::put`] discards only the slice ever mapped or grown into.
+    fn new_anonymous_reserved(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        Self::new_anonymous_with(len, false, false)
+    }
+
+    fn new_anonymous_with(
+        len: u64,
+        reserve: bool,
+        full: bool,
+    ) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let base = match recycled::take(host_len, reserve) {
             Some(base) => base,
             None => appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?,
         };
-        Ok((
-            Arc::new(HostRegion {
-                base,
-                len: host_len,
-                anonymous: Some(reserve),
-                reserved: false,
-                foreign: false,
-            }),
-            base,
-        ))
+        Ok((HostRegion::anonymous(base, host_len, reserve, full), base))
     }
 
     /// Maps a piece of host memory at `[start, start + len)`; the caller guarantees the range is
@@ -4230,6 +4353,7 @@ impl Mm {
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
         self.room_for(1)?;
+        region.note_used(host, file_len as usize);
         let file = backing != Backing::Anonymous;
         Self::map_pages(&mut self.mmu, start, host, file_len, prot, file)?;
         self.exec_changed |= prot & prot::EXEC != 0;
@@ -4274,6 +4398,7 @@ impl Mm {
     /// [`Mm::insert_vma`] without the `vm.max_map_count` check, for a VMA that moves rather than
     /// adds one.
     fn place_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
+        v.region.note_used(v.host, v.file_len as usize);
         let file = v.backing != Backing::Anonymous;
         Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
         self.exec_changed |= v.prot & prot::EXEC != 0;
@@ -4617,6 +4742,8 @@ pub struct CodeGroup {
     ranges: RefCell<Vec<appine_engine::DbtSource>>,
     /// Executable memory private to a member, `(tag, start, end)` ([`CodeGroup::admit`]).
     claims: RefCell<Vec<(u16, u64, u64)>>,
+    /// Known libc memop entry PCs inside `ranges` published to `space`.
+    memops: RefCell<Vec<appine_engine::DbtMemop>>,
     /// No longer accepts new members.
     closed: Cell<bool>,
     /// Has had more than one member: blocks outside the registered ranges have been invalidated.
@@ -4841,7 +4968,7 @@ struct Cow {
     borrowed: BTreeMap<u64, Borrowed>,
 }
 
-/// Copy-on-write (module docs, the kernel/mm map). Done through shared borrows: when the kernel
+/// Copy-on-write (module docs, the kernel/cow map). Done through shared borrows: when the kernel
 /// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
 /// borrowers' page tables.
 impl Mm {
@@ -5443,14 +5570,48 @@ struct HostRegion {
     /// Private anonymous memory ([`Mm::new_anonymous`], [`spare`]) and whether it is
     /// commit-accounted: kept for reuse when returned ([`recycled`]).
     anonymous: Option<bool>,
+    /// Sub-range `[used_start, used_end)` (byte offsets from `base`) of a private anonymous region
+    /// that was exposed to any VMA. Oversized reservations (stacks, heaps) start empty (`len..0`)
+    /// and widen monotonically on mapping or in-place growth so [`recycled::put`] discards only
+    /// what could have been touched.
+    used_start: AtomicUsize,
+    used_end: AtomicUsize,
     /// No host memory ([`HostRegion::reserved`]).
     reserved: bool,
     /// Host memory the kernel layer does not own and only reads: the host's vvar page
     /// ([`Mm::map_vvar`]). Never unmapped or reused, and not counted as anyone's memory.
     foreign: bool,
+    gpu: Option<Arc<dyn crate::gpu::Mapping>>,
 }
 
 impl HostRegion {
+    fn anonymous(base: NonNull<u8>, len: usize, reserve: bool, full: bool) -> Arc<HostRegion> {
+        let (used_start, used_end) = if full { (0, len) } else { (len, 0) };
+        Arc::new(HostRegion {
+            base,
+            len,
+            anonymous: Some(reserve),
+            used_start: AtomicUsize::new(used_start),
+            used_end: AtomicUsize::new(used_end),
+            reserved: false,
+            foreign: false,
+            gpu: None,
+        })
+    }
+
+    fn file(base: NonNull<u8>, len: usize) -> Arc<HostRegion> {
+        Arc::new(HostRegion {
+            base,
+            len,
+            anonymous: None,
+            used_start: AtomicUsize::new(0),
+            used_end: AtomicUsize::new(0),
+            reserved: false,
+            foreign: false,
+            gpu: None,
+        })
+    }
+
     /// A private anonymous mapping that has been `PROT_NONE` and empty since it was created takes
     /// neither host memory nor host address space. All guest processes live in one host process,
     /// and on devices whose host user address space is only 39 bits (512 GB; every 4K-page GKI
@@ -5463,9 +5624,35 @@ impl HostRegion {
             base: NonNull::new(RESERVED_HOST as *mut u8).unwrap(),
             len: 0,
             anonymous: None,
+            used_start: AtomicUsize::new(0),
+            used_end: AtomicUsize::new(0),
             reserved: true,
             foreign: false,
+            gpu: None,
         })
+    }
+
+    /// Records that `[host, host + len)` inside this region may be accessed.
+    fn note_used(&self, host: NonNull<u8>, len: usize) {
+        if self.anonymous.is_none() || len == 0 {
+            return;
+        }
+        let start = (host.as_ptr() as usize)
+            .checked_sub(self.base.as_ptr() as usize)
+            .expect("host pointer before region base");
+        let end = start.checked_add(len).expect("host slice overflow");
+        debug_assert!(end <= self.len);
+        self.used_start.fetch_min(start, Ordering::Relaxed);
+        self.used_end
+            .fetch_max(end.min(self.len), Ordering::Relaxed);
+    }
+
+    /// Returns the tracked `[start, end)` byte offsets inside this region, or `(0, 0)` when
+    /// nothing was exposed.
+    fn used_range(&mut self) -> (usize, usize) {
+        let start = *self.used_start.get_mut();
+        let end = *self.used_end.get_mut();
+        if start < end { (start, end) } else { (0, 0) }
     }
 }
 
@@ -5475,19 +5662,22 @@ unsafe impl Sync for HostRegion {}
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        if self.reserved || self.foreign {
+        if self.reserved || self.foreign || self.gpu.is_some() {
             return;
         }
         let (base, len, anonymous) = (self.base, self.len, self.anonymous);
         if let Some(reserve) = anonymous {
-            let deferred = UNMAPPED
-                .with_borrow_mut(|u| u.as_mut().map(|u| u.anonymous.push((base, len, reserve))));
+            let (used_start, used_end) = self.used_range();
+            let deferred = UNMAPPED.with_borrow_mut(|u| {
+                u.as_mut()
+                    .map(|u| u.anonymous.push((base, len, reserve, used_start, used_end)))
+            });
             if deferred.is_some() {
                 UNMAPPING.fetch_add(len, Ordering::Relaxed);
             } else {
                 // SAFETY: this private anonymous host memory belongs to this HostRegion and is no
                 // longer used by anyone
-                unsafe { recycled::put(base, len, reserve) }
+                unsafe { recycled::put(base, len, reserve, used_start, used_end) }
             }
             return;
         }
@@ -5677,6 +5867,15 @@ pub(crate) mod spare {
     /// `len` bytes of zeroed anonymous host memory, not commit-accounted (`MAP_NORESERVE`): a piece
     /// mapped in advance if there is one, otherwise mapped on the spot.
     pub(super) fn anonymous(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        anonymous_with(len, true)
+    }
+
+    /// Like [`anonymous`], starting with an empty used range for oversized stack/heap reservations.
+    pub(super) fn anonymous_reserved(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        anonymous_with(len, false)
+    }
+
+    fn anonymous_with(len: u64, full: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let found = {
             let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5705,16 +5904,7 @@ pub(crate) mod spare {
             Some(base) => base,
             None => appine_hal::map_anonymous(host_len, false).map_err(|_| Errno::ENOMEM)?,
         };
-        Ok((
-            Arc::new(HostRegion {
-                base,
-                len: host_len,
-                anonymous: Some(false),
-                reserved: false,
-                foreign: false,
-            }),
-            base,
-        ))
+        Ok((HostRegion::anonymous(base, host_len, false, full), base))
     }
 
     /// Replaces the pieces used. Called after the BKL is released.
@@ -5751,8 +5941,8 @@ struct Unmapped {
     /// Host memory: (start, length).
     regions: Vec<(NonNull<u8>, usize)>,
     /// Private anonymous host memory kept for reuse ([`recycled`]): (start, length,
-    /// commit-accounted).
-    anonymous: Vec<(NonNull<u8>, usize, bool)>,
+    /// commit-accounted, used start, used end).
+    anonymous: Vec<(NonNull<u8>, usize, bool, usize, usize)>,
     /// Page tables of destroyed address spaces: freeing the intermediate tables one by one takes
     /// several microseconds.
     mmus: Vec<Mmu>,
@@ -5793,11 +5983,11 @@ pub(crate) fn release_unmapped() {
     };
     // Free the page tables first, then return the host memory they point at
     drop(mmus);
-    let reused: usize = anonymous.iter().map(|&(_, len, _)| len).sum();
-    for (base, len, reserve) in anonymous {
+    let reused: usize = anonymous.iter().map(|&(_, len, _, _, _)| len).sum();
+    for (base, len, reserve, used_start, used_end) in anonymous {
         // SAFETY: private anonymous host memory recorded when its HostRegion was dropped, and no
         // longer used by anyone
-        unsafe { recycled::put(base, len, reserve) };
+        unsafe { recycled::put(base, len, reserve, used_start, used_end) };
     }
     UNMAPPING.fetch_sub(reused, Ordering::Release);
     if list.is_empty() {
@@ -5838,6 +6028,11 @@ mod recycled {
     const MAX_BYTES: usize = 256 << 20;
     /// The most ranges kept per size.
     const MAX_EACH: usize = 32;
+    /// Strict upper bound on the host-page-aligned discard span accepted for reuse: below one 2 MB
+    /// arm64 4K-page PMD so `MADV_DONTNEED` never zaps a full PMD (which triggers a Linux
+    /// 6.18-7.x arm64 minor page-fault livelock on subsequent reuse when empty PTE tables are
+    /// reclaimed). Regions whose used span reaches this limit are unmapped instead of recycled.
+    pub(super) const MAX_DISCARD: usize = 2 << 20;
 
     struct Cache {
         /// (length, commit-accounted) → starts.
@@ -5858,14 +6053,33 @@ mod recycled {
         NonNull::new(base as *mut u8)
     }
 
-    /// Returns a piece of private anonymous host memory: discards its contents and keeps it for
-    /// reuse, or returns it to the host when it cannot be kept.
+    /// Returns a piece of private anonymous host memory: discards its used sub-range
+    /// `[used_start, used_end)` and keeps it for reuse when that discard stays below
+    /// [`MAX_DISCARD`], or returns it to the host otherwise.
     ///
     /// # Safety
     ///
-    /// The host memory was allocated by [`appine_hal::map_anonymous`] and nobody uses it any more.
-    pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
-        {
+    /// The host memory was allocated by [`appine_hal::map_anonymous`], nobody uses it any more,
+    /// and no byte outside `[used_start, used_end)` was modified since it was zeroed.
+    pub(super) unsafe fn put(
+        base: NonNull<u8>,
+        len: usize,
+        reserve: bool,
+        used_start: usize,
+        used_end: usize,
+    ) {
+        let page = appine_hal::page_size();
+        let (discard_start, host_discard_len) = if used_start < used_end {
+            let end = used_end.min(len);
+            let start = used_start.min(end) & !(page - 1);
+            let host_len = end
+                .checked_next_multiple_of(page)
+                .map_or(usize::MAX, |host_end| host_end - start);
+            (start, host_len)
+        } else {
+            (0, 0)
+        };
+        if host_discard_len < MAX_DISCARD {
             let mut cache = CACHE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5875,9 +6089,14 @@ mod recycled {
             });
             let list = c.free.entry((len, reserve)).or_default();
             if c.bytes + len <= MAX_BYTES && list.len() < MAX_EACH {
-                // SAFETY: guaranteed by the caller; after discarding it reads as zero, like a new
-                // mapping
-                if unsafe { appine_hal::discard(base, len) }.is_ok() {
+                // SAFETY: guaranteed by the caller; `base` and `discard_start` are aligned to host
+                // pages and `[discard_start, discard_start + host_discard_len)` covers every
+                // exposed byte within the host-aligned mapping. After discarding it reads as zero,
+                // like a new mapping.
+                let ok = host_discard_len == 0
+                    || unsafe { appine_hal::discard(base.add(discard_start), host_discard_len) }
+                        .is_ok();
+                if ok {
                     list.push(base.as_ptr() as usize);
                     c.bytes += len;
                     return;
@@ -6038,6 +6257,7 @@ mod tests {
             members: Cell::new(1),
             ranges: RefCell::new(vec![src(lib, 0x22000, 5, 0)]),
             claims: RefCell::new(Vec::new()),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
@@ -6098,6 +6318,7 @@ mod tests {
             members: Cell::new(1),
             ranges: RefCell::new(vec![src(lib, 0x10000, 5)]),
             claims: RefCell::new(vec![(1, 0x9000_0000, 0x9010_0000)]),
+            memops: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
@@ -7583,5 +7804,210 @@ mod tests {
         // The child keeps MAP_NORESERVE too
         let child = mm.fork().unwrap();
         assert!(child.borrow().vmas[&(base + 4 * mb)].noreserve);
+    }
+
+    #[test]
+    fn memops_pruned_on_unmap_mprotect_and_write_force() {
+        let mut mm = Mm::new();
+        let base = 0x2000_0000;
+        let rx = prot::READ | prot::EXEC;
+        mm.map_anonymous(base, 3 * PAGE_SIZE, rx).unwrap();
+        let pc0 = base + 0x100;
+        let pc1 = base + PAGE_SIZE + 0x100;
+        let pc2 = base + 2 * PAGE_SIZE + 0x100;
+        mm.memops = vec![
+            appine_engine::DbtMemop {
+                pc: pc0,
+                kind: appine_engine::MEMOP_MEMCPY,
+                reserved: 0,
+            },
+            appine_engine::DbtMemop {
+                pc: pc1,
+                kind: appine_engine::MEMOP_MEMSET,
+                reserved: 0,
+            },
+            appine_engine::DbtMemop {
+                pc: pc2,
+                kind: appine_engine::MEMOP_MEMMOVE,
+                reserved: 0,
+            },
+        ];
+        let cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        let sync = Arc::new(TaskSync {
+            in_guest: std::sync::atomic::AtomicBool::new(false),
+            kicker: cpu.kicker(),
+            entry: crate::task::KernelEntry::default(),
+        });
+        // Removing EXEC on page 0 prunes pc0.
+        mm.mprotect(base, PAGE_SIZE, prot::READ).unwrap();
+        mm.sync(&sync);
+        assert_eq!(
+            mm.memops.iter().map(|m| m.pc).collect::<Vec<_>>(),
+            vec![pc1, pc2]
+        );
+
+        // Unmapping page 1 prunes pc1.
+        mm.munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        mm.sync(&sync);
+        assert_eq!(
+            mm.memops.iter().map(|m| m.pc).collect::<Vec<_>>(),
+            vec![pc2]
+        );
+
+        // Forcing a write (ptrace breakpoint) into page 2 prunes pc2.
+        mm.write_force(pc2, &0xd420_0000u32.to_le_bytes(), &sync)
+            .unwrap();
+        assert!(mm.memops.is_empty());
+    }
+
+    #[test]
+    fn recycled_stack_tracks_used_range_and_zeroes_on_reuse() {
+        let reserve = (3 << 20) + 5 * PAGE_SIZE;
+        let initial = 33 * PAGE_SIZE;
+        let grow = 4 * PAGE_SIZE;
+
+        let first_base = {
+            let mut mm = Mm::new();
+            mm.map_stack(initial, reserve).unwrap();
+            let start = STACK_TOP - initial;
+            {
+                let v = &mm.vmas[&start];
+                assert_eq!(
+                    v.region.used_start.load(Ordering::Relaxed),
+                    (reserve - initial) as usize
+                );
+                assert_eq!(v.region.used_end.load(Ordering::Relaxed), reserve as usize);
+            }
+            mm.write_kernel(STACK_TOP - 16, &[0x5a; 16]).unwrap();
+            mm.write_kernel(start, &[0xa5; 16]).unwrap();
+
+            let grown_start = start - grow;
+            assert!(mm.grow_down(grown_start, reserve));
+            {
+                let v = &mm.vmas[&grown_start];
+                assert_eq!(
+                    v.region.used_start.load(Ordering::Relaxed),
+                    (reserve - initial - grow) as usize
+                );
+                assert_eq!(v.region.used_end.load(Ordering::Relaxed), reserve as usize);
+            }
+            mm.write_kernel(grown_start, &[0x3c; 16]).unwrap();
+            mm.vmas[&grown_start].region.base.as_ptr() as usize
+        };
+
+        let mut mm2 = Mm::new();
+        let total = initial + grow;
+        mm2.map_stack(total, reserve).unwrap();
+        let start = STACK_TOP - total;
+        assert_eq!(mm2.vmas[&start].region.base.as_ptr() as usize, first_base);
+        let mut buf = [0xffu8; 16];
+        mm2.read(UserSlice::new(STACK_TOP - 16, 16), &mut buf)
+            .unwrap();
+        assert_eq!(buf, [0; 16]);
+        mm2.read(UserSlice::new(STACK_TOP - initial, 16), &mut buf)
+            .unwrap();
+        assert_eq!(buf, [0; 16]);
+        mm2.read(UserSlice::new(start, 16), &mut buf).unwrap();
+        assert_eq!(buf, [0; 16]);
+    }
+
+    #[test]
+    fn recycled_unmaps_regions_at_or_above_max_discard() {
+        // An oversized stack that actually grows to MAX_DISCARD is unmapped instead of recycled.
+        let reserve = (3 << 20) + 7 * PAGE_SIZE;
+        let initial = 33 * PAGE_SIZE;
+        {
+            let mut mm = Mm::new();
+            mm.map_stack(initial, reserve).unwrap();
+            let target = STACK_TOP - recycled::MAX_DISCARD as u64;
+            assert!(mm.grow_down(target, reserve));
+            let v = &mm.vmas[&target];
+            assert_eq!(
+                v.region.used_end.load(Ordering::Relaxed)
+                    - v.region.used_start.load(Ordering::Relaxed),
+                recycled::MAX_DISCARD
+            );
+        }
+        assert!(recycled::take(reserve as usize, false).is_none());
+
+        // An ordinary anonymous mapping of >= MAX_DISCARD is also unmapped rather than recycled.
+        let large = recycled::MAX_DISCARD as u64 + 9 * PAGE_SIZE;
+        {
+            let mut mm = Mm::new();
+            mm.map_anonymous(0x2000_0000, large, RW).unwrap();
+        }
+        assert!(recycled::take(large as usize, true).is_none());
+    }
+
+    #[test]
+    fn fork_and_brk_track_used_range_on_reserved_regions() {
+        let mut parent = Mm::new();
+        let stack_len = 33 * PAGE_SIZE;
+        parent.map_stack(stack_len, STACK_SIZE).unwrap();
+        parent.set_brk(0x50_0000);
+        assert_eq!(parent.brk(0x50_2000, false), 0x50_2000);
+        assert_eq!(parent.brk(0x50_5000, false), 0x50_5000);
+
+        let stack_start = STACK_TOP - stack_len;
+        let heap_len = 0x5000usize;
+        assert_eq!(
+            parent.vmas[&stack_start]
+                .region
+                .used_start
+                .load(Ordering::Relaxed),
+            (STACK_SIZE - stack_len) as usize
+        );
+        assert_eq!(
+            parent.vmas[&stack_start]
+                .region
+                .used_end
+                .load(Ordering::Relaxed),
+            STACK_SIZE as usize
+        );
+        assert_eq!(
+            parent.vmas[&0x50_0000]
+                .region
+                .used_start
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            parent.vmas[&0x50_0000]
+                .region
+                .used_end
+                .load(Ordering::Relaxed),
+            heap_len
+        );
+
+        let child = parent.fork().unwrap();
+        let child = child.borrow();
+        assert_eq!(
+            child.vmas[&stack_start]
+                .region
+                .used_start
+                .load(Ordering::Relaxed),
+            (STACK_SIZE - stack_len) as usize
+        );
+        assert_eq!(
+            child.vmas[&stack_start]
+                .region
+                .used_end
+                .load(Ordering::Relaxed),
+            STACK_SIZE as usize
+        );
+        assert_eq!(
+            child.vmas[&0x50_0000]
+                .region
+                .used_start
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            child.vmas[&0x50_0000]
+                .region
+                .used_end
+                .load(Ordering::Relaxed),
+            heap_len
+        );
     }
 }

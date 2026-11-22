@@ -120,6 +120,10 @@ impl Drop for Forwarder {
 struct Shared {
     state: Mutex<State>,
     event: std::sync::OnceLock<appine_hal::Event>,
+    /// Host tid of the forwarding thread, for tests measuring its CPU time without scanning other
+    /// threads that may exit concurrently.
+    #[cfg(test)]
+    tid: std::sync::OnceLock<i32>,
 }
 
 #[derive(Default)]
@@ -206,6 +210,8 @@ struct Relay {
 
 /// The forwarding thread.
 fn run(shared: &Shared) {
+    #[cfg(test)]
+    let _ = shared.tid.set(appine_hal::gettid());
     let event = shared.event.get().expect("event before thread");
     let mut ports: HashMap<u64, (i32, Target)> = HashMap::new();
     let mut conns: Vec<Conn> = Vec::new();
@@ -755,18 +761,12 @@ mod tests {
         appine_hal::net::close(held);
     }
 
-    /// CPU time (clock ticks) of the forwarding threads of this process, on Linux hosts.
-    fn forward_ticks() -> Option<u64> {
-        let mut total = 0;
-        for task in std::fs::read_dir("/proc/self/task").ok()? {
-            let stat = std::fs::read_to_string(task.ok()?.path().join("stat")).ok()?;
-            let (name, rest) = stat.split_once(") ")?;
-            if name.ends_with("(forward") {
-                let f: Vec<&str> = rest.split(' ').collect();
-                total += f[11].parse::<u64>().ok()? + f[12].parse::<u64>().ok()?;
-            }
-        }
-        Some(total)
+    /// CPU time (clock ticks) of host thread `tid` of this process, on Linux hosts.
+    fn thread_ticks(tid: i32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let (_, rest) = stat.rsplit_once(") ")?;
+        let f: Vec<&str> = rest.split(' ').collect();
+        Some(f[11].parse::<u64>().ok()? + f[12].parse::<u64>().ok()?)
     }
 
     /// A connection whose client half-closed and then reset is closed toward the destination at
@@ -803,14 +803,15 @@ mod tests {
         assert_eq!(appine_hal::read(s, &mut buf), Ok(1));
         wait(s, POLLIN);
         assert_eq!(appine_hal::read(s, &mut buf), Ok(0));
+        let tid = *f.shared.tid.get().expect("forwarding thread started");
         let idle = |what: &str| {
             std::thread::sleep(Duration::from_millis(100));
-            if let Some(before) = forward_ticks() {
+            if let Some(before) = thread_ticks(tid) {
                 std::thread::sleep(Duration::from_millis(500));
-                let used = forward_ticks().unwrap() - before;
+                let used = thread_ticks(tid).unwrap() - before;
                 assert!(
                     used < 10,
-                    "{what}: the forwarding threads used {used} ticks in 0.5 s"
+                    "{what}: the forwarding thread used {used} ticks in 0.5 s"
                 );
             }
         };

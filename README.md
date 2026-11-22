@@ -73,7 +73,7 @@ The Linux command-line runner uses the same engine and kernel.
 
 ### Build the Android app
 
-Install JDK 17 or later, Android SDK Platform 37, NDK 29.0.14206865, Rust
+Install JDK 17 or later, Android SDK Platform 37, NDK 29.0.14206865, SDK CMake 3.22.1, Python 3, patch, Rust
 with rustup, and Zig 0.17.0.
 
 From the repository root, fetch the build inputs and install a debug build on a
@@ -84,6 +84,7 @@ rustup target add aarch64-linux-android
 cargo install cargo-ndk --locked
 scripts/fetch-rootfs
 scripts/fetch-ghostty
+scripts/fetch-virglrenderer
 cd android
 ./gradlew installDebug
 ```
@@ -245,7 +246,7 @@ Appine is licensed under the [GNU Affero General Public License, version 3 or la
 Parts of the terminal line discipline in `core/kernel/src/tty.rs` are adapted
 from Fuchsia's Starnix and retain [The Fuchsia Authors' BSD-style license](android/licenses/fuchsia-LICENSE).
 
-The app includes separate notices for libghostty-vt and its dependencies,
+The app includes separate notices for virglrenderer, libghostty-vt and its dependencies,
 JetBrains Mono, Alpine Linux packages, Android libraries, and Rust crates.
 Read them in **Settings → Open source licenses** or browse the
 [bundled notices](android/app/src/main/assets/notices).

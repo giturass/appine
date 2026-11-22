@@ -50,7 +50,7 @@ class MachineTest {
         machines.forEach(Native::stop)
     }
 
-    private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier).also { machines.add(it) }
+    private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier, false).also { machines.add(it) }
 
     private fun withAlpineStore(name: String, test: (String) -> Unit) {
         val store = File(context.cacheDir, name)
@@ -64,7 +64,7 @@ class MachineTest {
     }
 
     private fun <T> withMachine(store: String, test: (Long) -> T): T {
-        val machine = Native.start(store, 1)
+        val machine = Native.start(store, 1, false)
         return try {
             test(machine)
         } finally {
@@ -425,7 +425,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-bash")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             assertEquals("" to 0, sh(machine, "mv /var/cache/appine/bash /var/cache/appine/bash.off"))
             val fallback = plain(login(machine, "echo shell=\$0\nexit\n", ConsolePty.LOGIN_ROOT))
@@ -449,6 +449,127 @@ class MachineTest {
             assertTrue(out, out.contains("\u001b]133;A;cl=line;appine_lf=output\u0007"))
             assertTrue(out, text.contains(":/home/bob:/bin/bash\n"))
             assertTrue(out, text.contains("\nbundle-gone\n") && text.contains("\nin-world\n"))
+
+            // New Alpine imports seed ~/.bash_profile and ~/.bashrc for root and /etc/skel, so
+            // interactive login shells load ~/.bashrc while non-interactive login shells skip it.
+            assertEquals(
+                "" to 0,
+                sh(
+                    machine,
+                    "echo 'export APPINE_ROOT_RC=from-root' >> /root/.bashrc && " +
+                        "echo 'export APPINE_BOB_RC=from-bob' >> /home/bob/.bashrc",
+                ),
+            )
+            val rootRc = plain(login(machine, "echo root_rc=\$APPINE_ROOT_RC\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(rootRc, rootRc.contains("\nroot_rc=from-root\n"))
+            val nonInteractive = run(
+                machine, "/bin/bash", "bash", "-lc", "echo nonint_rc=\${APPINE_ROOT_RC:-unset}",
+            )
+            assertEquals(nonInteractive.first, 0, nonInteractive.second)
+            assertTrue(nonInteractive.first, nonInteractive.first.contains("nonint_rc=unset"))
+            val bobOwner = checkedShell(machine, "stat -c '%U:%G' /home/bob/.bash_profile /home/bob/.bashrc")
+            assertEquals("bob:bob\nbob:bob", bobOwner.trim())
+            val bobRc = plain(login(machine, "echo bob_rc=\$APPINE_BOB_RC\nexit\n", "bob"))
+            assertTrue(bobRc, bobRc.contains("\nbob_rc=from-bob\n"))
+        } finally {
+            Native.stop(machine)
+            store.deleteRecursively()
+        }
+    }
+
+    /**
+     * Existing Alpine stores receive `.bash_profile` and `.bashrc` once in `/etc/skel` and in the
+     * existing homes of root and regular `/bin/bash` accounts (owned by each account) without
+     * overwriting existing files, shadowing `.profile` or `.bash_login`, creating missing home
+     * directories, or recreating files deleted later.
+     */
+    @Test
+    fun existingAlpineStoresSeedBashStartupFilesOnce() {
+        val store = File(context.cacheDir, "store-bash-startup")
+        store.deleteRecursively()
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        val machine = Native.start(store.path, 1, false)
+        try {
+            // Install bash first so we can exercise an upgraded regular user's login end to end.
+            val installed = plain(login(machine, "echo ready=\$BASH_VERSION\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(installed, installed.contains("\nready=5."))
+
+            // Simulate an older Alpine bash store before /etc/skel existed, with:
+            // - root having a custom ~/.bashrc and no ~/.bash_profile;
+            // - alice (bash, existing home) having a custom ~/.bashrc and no ~/.bash_profile;
+            // - carol (bash, missing home);
+            // - dave (bash, existing home with symlinked ~/.profile);
+            // - erin (/bin/sh, existing home).
+            checkedShell(
+                machine,
+                "rm -rf /var/lib/appine/bash-startup-done /etc/skel /root/.bash_profile /root/.bashrc && " +
+                    "printf 'export CUSTOM_RC=kept\\n' > /root/.bashrc && " +
+                    "adduser -D -s /bin/bash alice && " +
+                    "printf 'export ALICE_RC=from-alice\\n' > /home/alice/.bashrc && " +
+                    "chown alice:alice /home/alice/.bashrc && " +
+                    "adduser -D -H -s /bin/bash carol && " +
+                    "adduser -D -s /bin/bash dave && " +
+                    "printf 'export DAVE_PROFILE=1\\n' > /home/dave/.profile-target && " +
+                    "ln -s /home/dave/.profile-target /home/dave/.profile && " +
+                    "adduser -D -s /bin/sh erin",
+            )
+            Rootfs.ensureBashStartup(store.path)
+            assertEquals("export CUSTOM_RC=kept\n", String(Native.readFile(store.path, "/root/.bashrc")!!))
+            assertTrue(String(Native.readFile(store.path, "/root/.bash_profile")!!).contains(". ~/.bashrc"))
+            assertTrue(String(Native.readFile(store.path, "/etc/skel/.bash_profile")!!).contains(". ~/.bashrc"))
+            assertTrue(String(Native.readFile(store.path, "/etc/skel/.bashrc")!!).contains("case \$- in"))
+
+            // Existing regular bash account alice gets ~/.bash_profile owned by alice:alice while
+            // keeping her ~/.bashrc, and logging in as alice loads it.
+            assertEquals("export ALICE_RC=from-alice\n", String(Native.readFile(store.path, "/home/alice/.bashrc")!!))
+            assertTrue(String(Native.readFile(store.path, "/home/alice/.bash_profile")!!).contains(". ~/.bashrc"))
+            assertEquals(
+                "alice:alice",
+                checkedShell(machine, "stat -c '%U:%G' /home/alice/.bash_profile").trim(),
+            )
+            val aliceLogin = plain(login(machine, "echo alice_rc=\$ALICE_RC\nexit\n", "alice"))
+            assertTrue(aliceLogin, aliceLogin.contains("\nalice_rc=from-alice\n"))
+
+            // Missing home (carol), symlinked .profile (dave), and /bin/sh account (erin).
+            assertEquals("missing", checkedShell(machine, "[ -e /home/carol ] && echo exists || echo missing").trim())
+            assertEquals(null, Native.readFile(store.path, "/home/dave/.bash_profile"))
+            assertTrue(Native.readFile(store.path, "/home/dave/.bashrc") != null)
+            assertEquals(
+                "dave:dave",
+                checkedShell(machine, "stat -c '%U:%G' /home/dave/.bashrc").trim(),
+            )
+            assertEquals(null, Native.readFile(store.path, "/home/erin/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/home/erin/.bashrc"))
+
+            // Deleting seeded files persists across subsequent starts.
+            checkedShell(machine, "rm -f /root/.bash_profile /home/alice/.bash_profile /etc/skel/.bashrc")
+            Rootfs.ensureBashStartup(store.path)
+            assertEquals(null, Native.readFile(store.path, "/root/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/home/alice/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/etc/skel/.bashrc"))
+
+            // An existing ~/.profile (including a symlink) on root must not be shadowed by ~/.bash_profile.
+            checkedShell(
+                machine,
+                "rm -rf /var/lib/appine/bash-startup-done /root/.bash_profile /root/.bashrc && " +
+                    "printf 'export FROM_PROFILE=1\\n' > /root/.profile-target && " +
+                    "ln -s /root/.profile-target /root/.profile",
+            )
+            Rootfs.ensureBashStartup(store.path)
+            assertEquals(null, Native.readFile(store.path, "/root/.bash_profile"))
+            assertTrue(Native.readFile(store.path, "/root/.bashrc") != null)
+
+            // A pre-bash Alpine store (root on /bin/sh) seeds /etc/skel only, leaving /root untouched.
+            checkedShell(
+                machine,
+                "rm -rf /var/lib/appine/bash-startup-done /etc/skel /root/.profile /root/.profile-target /root/.bashrc && " +
+                    "sed -i '1s|:/bin/bash\$|:/bin/sh|' /etc/passwd",
+            )
+            Rootfs.ensureBashStartup(store.path)
+            assertTrue(Native.readFile(store.path, "/etc/skel/.bash_profile") != null)
+            assertTrue(Native.readFile(store.path, "/etc/skel/.bashrc") != null)
+            assertEquals(null, Native.readFile(store.path, "/root/.bash_profile"))
+            assertEquals(null, Native.readFile(store.path, "/root/.bashrc"))
         } finally {
             Native.stop(machine)
             store.deleteRecursively()
@@ -461,7 +582,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-procps")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             // Keep ash as the login shell and omit a required library for the first attempt.
             assertEquals(0, sh(machine,
@@ -605,7 +726,7 @@ class MachineTest {
         val store = File(context.cacheDir, "store-bubblewrap")
         store.deleteRecursively()
         Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         try {
             // No repositories or other bundles: bubblewrap must carry its own dependencies.
             assertEquals(0, sh(machine,
@@ -1041,7 +1162,7 @@ class MachineTest {
             val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
             store.deleteRecursively()
             Rootfs.prepare(context, distro, store = store)
-            val machine = Native.start(store.path, 1)
+            val machine = Native.start(store.path, 1, false)
             try {
                 val out = login(
                     machine,
@@ -1127,7 +1248,7 @@ class MachineTest {
     }
 
     /**
-     * The guest's routing table (the kernel/net map): the app cannot read the host's
+     * The guest's routing table (the kernel/route map): the app cannot read the host's
      * `/proc/net/route`; until the default network's `LinkProperties` are handed in, the table is
      * synthesised from the interfaces' addresses (the default route has no gateway), and afterwards
      * it has a gateway; the host chooses the source address of `ip route get`.

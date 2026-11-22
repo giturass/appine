@@ -1,0 +1,71 @@
+--- a/vkr_device.c
++++ b/vkr_device.c
+@@ -324,8 +324,6 @@
+          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
+    }
+
+-   mtx_destroy(&dev->object_mutex);
+-
+    if (!list_is_empty(&dev->objects)) {
+       list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
+          vkr_device_object_destroy(ctx, dev, obj);
+@@ -339,6 +337,7 @@
+       free(sync);
+    }
+
++   mtx_destroy(&dev->object_mutex);
+    mtx_destroy(&dev->free_sync_mutex);
+
+    if (destroy_vk || ctx->on_worker_thread)
+--- a/vkr_context.c
++++ b/vkr_context.c
+@@ -528,7 +528,7 @@
+
+    struct timespec ts;
+    int ret = thrd_busy;
+-   assert(ctx->ring_monitor.started);
++   mtx_lock(&ctx->ring_monitor.mutex);
+    while (ctx->ring_monitor.started) {
+       /* only notify at the configured rate, not faster. */
+       if (ret == thrd_busy) {
+@@ -542,9 +542,7 @@
+       } else if (ret)
+          break;
+
+-      mtx_lock(&ctx->ring_monitor.mutex);
+       if ((ret = clock_gettime(CLOCK_REALTIME, &ts))) {
+-         mtx_unlock(&ctx->ring_monitor.mutex);
+          break;
+       }
+
+@@ -552,8 +550,8 @@
+       ts = timespec_add(
+          ts, (struct timespec){ period_us / 1000000, (period_us % 1000000) * 1000 });
+       ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex, &ts);
+-      mtx_unlock(&ctx->ring_monitor.mutex);
+-   }
++   }
++   mtx_unlock(&ctx->ring_monitor.mutex);
+
+    return ret;
+ }
+@@ -604,6 +602,9 @@
+ void
+ vkr_context_destroy(struct vkr_context *ctx)
+ {
++   if (ctx->ring_monitor.started)
++      vkr_context_ring_monitor_fini(ctx);
++
+    /* TODO Move the entire teardown process to a separate thread so that the main thread
+     * cannot get blocked by the vkDeviceWaitIdle upon device destruction.
+     */
+@@ -614,9 +615,6 @@
+    mtx_destroy(&ctx->ring_mutex);
+
+    vkr_context_wait_ring_fini(ctx);
+-
+-   if (ctx->ring_monitor.started)
+-      vkr_context_ring_monitor_fini(ctx);
+
+    if (ctx->instance) {
+       vkr_log("destroying context %d (%s) with a valid instance", ctx->ctx_id,

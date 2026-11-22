@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: host shared-storage mounts and preserved /sdcard aliases)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream sysfs/sysctl ownership with retained shared-storage mounts and aliases)
 
 ## Responsibilities
 
@@ -37,8 +37,8 @@ Outside the module:
 - `kernel/overlay`: overlayfs instances, their options and the overlay node sweep, though the
   option parsing and the sweep sit in `syscall/mount.rs`.
 - `kernel/fuse`: FUSE connections and their mount options.
-- `kernel/procfs`: the content of procfs, sysfs and devpts, cgroup2 node adapters, the mountinfo
-  text and the `fs.mount-max` sysctl file.
+- `kernel/procfs`: the content of procfs and devpts, cgroup2 node adapters and the mountinfo text;
+  `kernel/sysctl`: the `fs.mount-max` sysctl file; `kernel/sysfs`: sysfs content and `CGROUP_POINT`.
 - `kernel/cgroup`: the cgroup tree and cgroup2 interface-file policy.
 - `kernel/ns`: the namespace mechanism and its counts (`max_mnt_namespaces`), clone and
   unshare, and setns's dispatch and checks.
@@ -318,8 +318,8 @@ Outside the module:
   attached to an opened mounts or mountinfo file for poll.
 - `kernel/procfs`:
   - mountinfo and mounts (`mounts_from`, `sb_options`, `type_of`, `root_path`, `sb_flags`);
-  - procfs instances' pid namespaces;
-  - the `fs.mount-max` sysctl (`Kernel::mount_max`).
+  - procfs instances' pid namespaces.
+- `kernel/sysctl`: the `fs.mount-max` sysctl (`Kernel::mount_max`).
 - `kernel/tty`: devpts instance options.
 - `kernel/ipc`: `mq_dev`.
 - `kernel/fuse`: `mount_nodes` for its node sweep, `is_point_in`.
@@ -337,8 +337,8 @@ Outside the module:
 - `kernel/overlay`: new overlayfs instances (`new_overlay`).
 - `kernel/loop`: loop devices' backing files (`Loops::backing_files`).
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.
-- `kernel/procfs`: the `Pseudo` views of mounted synthetic filesystems, and the pid namespace of a
-  procfs instance.
+- `kernel/procfs` and `kernel/sysfs`: the `Pseudo` views of mounted synthetic filesystems
+  (`CGROUP_POINT`), and the pid namespace of a procfs instance.
 - `kernel/ns`: namespace pins and counts (`nsproxy`'s `NsRef`/`Counted`, `max_mnt_namespaces`).
 - `kernel/process`:
   - `Kernel::mount_max`;

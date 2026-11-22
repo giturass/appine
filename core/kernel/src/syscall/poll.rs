@@ -1400,6 +1400,7 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
 /// The current readiness of an open file: (events already known, host fd to ask).
 fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
     match &f.kind {
+        FileKind::GpuFence(fd) => (0, Some(std::os::fd::AsRawFd::as_raw_fd(fd))),
         FileKind::Host(fd) => (0, Some(*fd)),
         FileKind::Socket(s) => super::net::readiness(&s.borrow()),
         FileKind::Pipe(end) => {
@@ -1539,6 +1540,7 @@ fn took_change(f: &OpenFile, ev: i16) {
 /// The host fd behind an open file (host stdio, TCP/UDP sockets).
 fn host_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
+        FileKind::GpuFence(fd) => Some(std::os::fd::AsRawFd::as_raw_fd(fd)),
         FileKind::Host(fd) => Some(*fd),
         FileKind::Socket(s) => match &*s.borrow() {
             // Messages received by a raw ICMP socket are in the tap's queue (crate::rawicmp);

@@ -116,6 +116,8 @@ pub(crate) fn file_kind(kind: &FileKind) -> &'static str {
         FileKind::Host(_) => "host file",
         FileKind::Regular { .. } | FileKind::Fuse(_) => REGULAR,
         FileKind::FuseDev(_) => "/dev/fuse",
+        FileKind::Render { .. } => "virtio_gpu",
+        FileKind::GpuFence(_) => "GPU fence",
         FileKind::Directory { .. } => DIRECTORY,
         FileKind::Path(_) => "O_PATH file",
         FileKind::Pipe(_) => "pipe",

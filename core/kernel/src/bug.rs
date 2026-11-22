@@ -1,4 +1,4 @@
-//! Bugs of the kernel layer and the engine themselves (the kernel/process map, design doc §12
+//! Bugs of the kernel layer and the engine themselves (the kernel/bug map, design doc §12
 //! item 5).
 //!
 //! When a guest program hits such a bug, only that guest process is ended, and the other sessions

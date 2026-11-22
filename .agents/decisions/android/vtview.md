@@ -2,18 +2,18 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtview"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-22 (HEAD = e0719858)
 >
 > Decisions on the terminal view made before android/vtview was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48.
 
 ## Active
 
-### D1: android/vtview owns view lifecycle and interaction
-- **What**: android/vtview owns VtView, VtKeys and native input, paste, mouse/focus, selection, links, prompt-tap and search sections, retaining frame-consumer contracts while rendering lives in android/vtrender.
-- **Why**: Interaction and rendering had identifiable boundaries but shared an oversized map.
-- **Tradeoffs**: VtView orchestration and overlays stay here, sessions in android/vt and JNI, terminal locking and prompt parsing in android/vtcore.
-- **Watch out**: Preserve full-frame requests, overscan, image lifetimes and search coordination, and do not move native interaction sections into vtcore.
-- **Source**: d42013d (files since added by 49e8b08, D3); 9015b244, 81f60bef; d053be24; 39e55b4b
+### D1: android/vtview owns view lifecycle, frames, input, IME, paste, focus and search
+- **What**: android/vtview owns `VtKeys.kt`, `VtView.kt`'s lifecycle, grid sizing, frame orchestration, height-shrink preview, cursor/password timers, input/IME, paste, focus, search and `jumpToPrompt`, and `vt.c`'s `Input`, `Paste`, `appine_vt_focus` and `Search` sections, while touch/mouse gestures, scrolling, selection, links and prompt taps belong to `android/vtgestures` and rendering to `android/vtrender`.
+- **Why**: `android/vtview.md` reached 44,516 B (overflowing one read with line numbers), with gestures and selection alone taking 15.6 KB.
+- **Tradeoffs**: `VtView.kt` is shared across `android/vtview` and `android/vtgestures`, pre-split gesture/rendering decisions stay here, sessions stay in `android/vt`, and native terminal state/JNI stay in `android/vtcore`.
+- **Watch out**: Keep frame-header mode/scroll/selection fields, full-frame requests, image lifetimes, search coordination and resize-preview dismissal aligned across `android/vtview`, `android/vtgestures` and `android/vtrender`.
+- **Source**: d42013d (files since added by 49e8b08, D3); 9015b244, 81f60bef; d053be24; 39e55b4b; 02dfe2ec
 
 ### D2: The view drops its image bitmaps while its window is hidden
 - **What**: `onWindowVisibilityChanged` calls `dropImages` when the window is not visible, and the next frame finds the placements' pictures missing, copies them from libghostty-vt and asks for a full frame, while the backing bitmap keeps showing the rows already painted.
@@ -95,3 +95,4 @@
 
 ## Superseded
 - ~~D1 ownership of frame encoding, mirrors, drawing, images, glyphs and fonts~~ → replaced by **D1** in 9015b244 (2026-11-14)
+- ~~D1 ownership of touch/mouse gestures, scrolling, selection, links and prompt taps (d42013d, 9015b244)~~ → replaced by **D1** and android/vtgestures **D1** in 02dfe2ec (2026-11-22)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -64,12 +64,12 @@
 - **Watch out**: Register the record before releasing the BKL so the peer cannot accept first.
 - **Source**: round 180 (`180-original-dst`)
 
-### D9: kernel/net covers internet sockets and the socket syscalls; netlink sockets are kernel/netlink
-- **What**: kernel/net covers `net.rs` and `syscall/net.rs` except their netlink sections, `netlink_*` functions and `Socket::Netlink` arms, raw ICMP, the routing table (`route.rs`, with the route and rule messages and `ip route get` that netlink sends), the port map, traffic counters, `/proc/net`'s socket, protocol and route files, the DNS stub and `SO_ORIGINAL_DST`, with host socket wrappers in hal, the namespace hooks described from kernel/netns's side and netlink sockets in kernel/netlink.
-- **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits, and by 2026-11-11 more than half the map postdated its verification and its full refresh reached 48.8 KB, near one Read, with netlink a subsystem of its own.
-- **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources, socket dispatch, the changing ioctls and route messages read two maps, and decisions on netlink sockets made before the split keep their kernel/net tags here (D3, D24, D26 and the netlink halves of D19 and D23, listed in kernel/netlink's preamble); nftables rules and evaluation belong to kernel/nft while socket verdict application remains here.
-- **Watch out**: Changing socket ioctls must run between kernel/netlink's `rtnl_watched` and `rtnl_notify` (a map invariant), and bugs open in the map include an error after part of a `MSG_WAITALL` read being lost, option passthrough with host semantics, one echo id per raw ICMP socket, raw ICMP sockets that cannot be rebound or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split); 52dcc177; 211a5867; 20137e4c; d053be24; 60790c14; 39e55b4b
+### D9: kernel/net covers internet sockets and socket syscalls; netlink, raw ICMP and routes are split out
+- **What**: kernel/net covers `net.rs` (excluding netlink), `syscall/net.rs` (excluding netlink and `raw_recv`/`take_errors`), `portmap.rs`, `traffic.rs` and `origdst.rs` (keeping portmap and legacy route ioctls), while netlink sockets belong to `kernel/netlink`, raw ICMP to `kernel/rawicmp` and routing tables to `kernel/route`.
+- **Why**: `kernel/net.md` reached 38,523 B (83.6% of one read) while mixing TCP/UDP socket passthrough with standalone raw ICMP emulation and routing-table synthesis.
+- **Tradeoffs**: Changes spanning socket dispatch and netlink, raw ICMP or route lookups consult two maps, pre-split child decisions remain here (referenced by `kernel/netlink`, `kernel/rawicmp` and `kernel/route`), and nftables rules/evaluation stay in `kernel/nft`.
+- **Watch out**: Socket option, send/recv, readiness and traffic default-route hooks must stay aligned with `kernel/rawicmp` and `kernel/route`, changing socket ioctls must run between `kernel/netlink`'s `rtnl_watched` and `rtnl_notify`, and open socket bugs remain in the map (`MSG_WAITALL` post-partial error loss, host option semantics, unchecked odd `sendto` destinations and initial-namespace loopback counters).
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split); 52dcc177; 211a5867; 20137e4c; d053be24; 60790c14; 39e55b4b; e0719858
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -209,3 +209,4 @@
 
 - ~~DNS stub queries are resolved synchronously in the sending thread (rounds 06, 07)~~ → replaced by **D5** in fe4bb2b (2026-11-05)
 - ~~Internet and netlink sockets are one kernel/net module (D9, c3df5d3)~~ → replaced by **D9** and kernel/netlink **D1** in 0c1b416 (2026-11-11)
+- ~~D9 combined ownership of raw ICMP and routing tables in kernel/net (0c1b416)~~ → replaced by **D9**, kernel/rawicmp **D1** and kernel/route **D1** in e0719858 (2026-11-22)

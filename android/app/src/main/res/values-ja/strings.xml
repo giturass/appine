@@ -204,6 +204,11 @@
     <string name="restart_message">すべてのセッションが終了し、新しい実行モードでシステムが再起動します。</string>
     <string name="restart">再起動</string>
 
+    <string name="gpu_summary">実験的機能です。対応状況は端末によって異なります</string>
+    <string name="gpu_unavailable">この端末では利用できません</string>
+    <string name="gpu_enable_message">すべてのセッションが終了し、実験的な Vulkan GPU を有効にしてシステムが再起動します。対応状況は端末によって異なり、エラーが発生する場合があります。</string>
+    <string name="gpu_disable_message">すべてのセッションが終了し、Vulkan GPU を無効にしてシステムが再起動します。</string>
+
     <!-- Diagnostic log export -->
     <string name="settings_export_logs">診断ログをエクスポート</string>
     <string name="export_logs_summary">最近のログと端末情報を保存または共有して問題の調査に活用</string>

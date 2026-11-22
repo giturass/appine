@@ -1,0 +1,360 @@
+--- a/vkr_device.c
++++ b/vkr_device.c
+@@ -130,6 +130,7 @@
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
++   ext_count++; /* Appine exports ordinary buffer allocations as Android BLOBs. */
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
+@@ -143,6 +144,7 @@
+          exts[i] = args->pCreateInfo->ppEnabledExtensionNames[i];
+ 
+       ext_count = args->pCreateInfo->enabledExtensionCount;
++      exts[ext_count++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+       if (physical_dev->KHR_external_memory_fd)
+          exts[ext_count++] = "VK_KHR_external_memory_fd";
+       if (physical_dev->EXT_external_memory_dma_buf)
+--- a/vkr_buffer.c
++++ b/vkr_buffer.c
+@@ -37,6 +37,16 @@
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
++   VkBufferCreateInfo info = *args->pCreateInfo;
++   VkExternalMemoryBufferCreateInfo external = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++      .pNext = info.pNext,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++   };
++   if (!vkr_find_struct(info.pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO)) {
++      info.pNext = &external;
++      args->pCreateInfo = &info;
++   }
+    vkr_buffer_create_and_add(dispatch->data, args);
+ }
+ 
+--- a/vkr_device_memory.h
++++ b/vkr_device_memory.h
+@@ -15,6 +15,8 @@
+ 
+    struct vkr_device *device;
+ 
++   bool android_blob;
++   struct appine_allocator *appine_allocator;
+    bool might_export;
+ 
+    uint32_t property_flags;
+--- a/vkr_device_memory.c
++++ b/vkr_device_memory.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "vkr_device_memory.h"
++#include "android_blob.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+@@ -281,7 +282,30 @@
+    int udmabuf_fd = -1;
+    void *gbm_bo = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   const bool android_blob = !res_info && !might_export &&
++      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++      !vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
++   if (ctx->appine_allocator && (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !android_blob) {
++      /* Only ordinary allocations have coherent CPU backing in this mode. */
++      if (local_import_info.fd >= 0)
++         close(local_import_info.fd);
++      args->ret = VK_ERROR_FEATURE_NOT_PRESENT;
++      return;
++   }
++   if (android_blob) {
++      const uint64_t page = getpagesize();
++      if (!alloc_info->allocationSize || alloc_info->allocationSize > UINT32_MAX - page) {
++         args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         return;
++      }
++      alloc_info->allocationSize = align(alloc_info->allocationSize, page);
++      local_export_info = (VkExportMemoryAllocateInfo){
++         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++         .pNext = alloc_info->pNext,
++         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++      };
++      alloc_info->pNext = &local_export_info;
++   } else if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+        * dma_buf fd export support, we must use gbm bo import path instead of forcing
+@@ -365,7 +389,40 @@
+          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
+    }
+
+-   struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
++   struct vkr_device_memory *mem;
++   if (android_blob && ctx->appine_allocator) {
++      struct appine_allocator *allocator = ctx->appine_allocator;
++      if (mem_type_index != allocator->route.gpu_type ||
++          memcmp(physical_dev->id_properties.deviceUUID, allocator->route.uuid, VK_UUID_SIZE)) {
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
++      mem = vkr_context_alloc_object(ctx, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY, args->pMemory);
++      if (!mem) {
++         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++         return;
++      }
++      struct AHardwareBuffer *buffer = appine_request_blob(allocator, mem->base.id, alloc_info->allocationSize);
++      if (!buffer) {
++         free(mem);
++         args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         return;
++      }
++      /* The mapper exports the payload. This logical device only imports it. */
++      alloc_info->pNext = local_export_info.pNext;
++      vn_replace_vkAllocateMemory_args_handle(args);
++      args->ret = appine_import_blob(dev->base.handle.device, buffer, mem_type_index,
++                                     alloc_info, &mem->base.handle.device_memory);
++      if (args->ret != VK_SUCCESS) {
++         appine_release_blob(allocator, mem->base.id);
++         free(mem);
++         return;
++      }
++      mem->appine_allocator = allocator;
++      vkr_device_add_object(ctx, dev, &mem->base);
++   } else {
++      mem = vkr_device_memory_create_and_add(ctx, args);
++   }
+    if (!mem) {
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
+@@ -375,6 +432,7 @@
+    }
+ 
+    mem->device = dev;
++   mem->android_blob = android_blob;
+    mem->might_export = might_export;
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+@@ -488,6 +546,8 @@
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
++   if (mem->appine_allocator)
++      appine_release_blob(mem->appine_allocator, mem->base.id);
+    if (mem->gbm_bo)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+@@ -523,6 +583,37 @@
+       /* XXX guessed */
+       map_info = (coherent && cached) ? VIRGL_RENDERER_MAP_CACHE_CACHED
+                                       : VIRGL_RENDERER_MAP_CACHE_WC;
++   }
++
++   if (mem->android_blob) {
++      if (blob_size > mem->allocation_size ||
++          (blob_flags & (VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE | VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE)))
++         return false;
++      if (mem->appine_allocator) {
++         *out_blob = (struct virgl_context_blob){
++            .type = VIRGL_RESOURCE_OPAQUE_HANDLE,
++            .u.fd = -1,
++            .map_info = map_info,
++         };
++         mem->exported = true;
++         return true;
++      }
++      const int fd = appine_export_android_blob(mem->device->base.handle.device,
++                                                 mem->base.handle.device_memory);
++      if (fd < 0)
++         return false;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_FD_OPAQUE,
++         .u.fd = fd,
++         .map_info = map_info,
++         .vulkan_info = {
++            .allocation_size = mem->allocation_size,
++            .memory_type_index = mem->memory_type_index,
++         },
++      };
++      memcpy(out_blob->vulkan_info.device_uuid, mem->device->physical_device->id_properties.deviceUUID, VK_UUID_SIZE);
++      mem->exported = true;
++      return true;
+    }
+ 
+    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
+--- a/vkr_context.c
++++ b/vkr_context.c
+@@ -332,6 +332,7 @@
+    if (mem->might_export) {
+       res_fd = os_dupfd_cloexec(blob.u.fd);
+       if (res_fd < 0) {
++         mem->exported = false;
+          close(blob.u.fd);
+          return false;
+       }
+@@ -341,7 +342,9 @@
+                                              NULL)) {
+       if (res_fd >= 0)
+          close(res_fd);
+-      close(blob.u.fd);
++      if (blob.u.fd >= 0)
++         close(blob.u.fd);
++      mem->exported = false;
+       return false;
+    }
+
+--- a/vkr_physical_device.c
++++ b/vkr_physical_device.c
+@@ -4,6 +4,7 @@
+  */
+
+ #include "vkr_physical_device.h"
++#include "android_blob.h"
+
+ #include "venus-protocol/vn_protocol_renderer_device.h"
+
+@@ -99,7 +100,7 @@
+ }
+
+ static VkResult
+-vkr_instance_enumerate_physical_devices(struct vkr_instance *instance)
++vkr_instance_enumerate_physical_devices(struct vkr_instance *instance, const struct appine_allocator *allocator)
+ {
+    if (instance->physical_device_count)
+       return VK_SUCCESS;
+@@ -124,6 +125,29 @@
+       free(physical_devs);
+       free(handles);
+       return result;
++   }
++
++   if (allocator) {
++      /* One CPU mapper and one probed GPU back this context. */
++      PFN_vkGetPhysicalDeviceProperties2 get = (PFN_vkGetPhysicalDeviceProperties2)
++         instance->get_proc_addr(instance->base.handle.instance, "vkGetPhysicalDeviceProperties2");
++      uint32_t i = 0;
++      for (; get && i < count; i++) {
++         VkPhysicalDeviceIDProperties id = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++         VkPhysicalDeviceProperties2 props = {
++            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id,
++         };
++         get(handles[i], &props);
++         if (!memcmp(id.deviceUUID, allocator->route.uuid, VK_UUID_SIZE))
++            break;
++      }
++      if (!get || i == count) {
++         free(physical_devs);
++         free(handles);
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++      handles[0] = handles[i];
++      count = 1;
+    }
+
+    instance->physical_device_count = count;
+@@ -164,12 +188,35 @@
+ }
+
+ static void
+-vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_dev)
++vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_dev,
++                                           const struct appine_allocator *allocator)
+ {
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
+    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
++
++   /* The guest sees the CPU mapping properties at the index used for GPU binding. */
++   if (allocator) {
++      VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
++      const struct gpu_route *route = &allocator->route;
++      VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++      VkMemoryPropertyFlags cpu = route->cpu_type < props->memoryTypeCount ?
++         props->memoryTypes[route->cpu_type].propertyFlags & host : 0;
++      for (uint32_t i = 0; i < props->memoryTypeCount; i++)
++         props->memoryTypes[i].propertyFlags &= ~host;
++      if (!memcmp(route->uuid, physical_dev->id_properties.deviceUUID, VK_UUID_SIZE) &&
++          route->gpu_type < props->memoryTypeCount)
++         props->memoryTypes[route->gpu_type].propertyFlags |= cpu;
++   }
++   /* CPU mappings share a coherent allocation. */
++   for (uint32_t i = 0; i < physical_dev->memory_properties.memoryTypeCount; i++) {
++      VkMemoryType *type = &physical_dev->memory_properties.memoryTypes[i];
++      if (!(type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++         type->propertyFlags &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++   }
+ 
+    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
+     * assume any VkDeviceMemory with the memory type can be made external and
+@@ -355,7 +402,7 @@
+       return;
+    }
+
+-   args->ret = vkr_instance_enumerate_physical_devices(instance);
++   args->ret = vkr_instance_enumerate_physical_devices(instance, ctx->appine_allocator);
+    if (args->ret != VK_SUCCESS)
+       return;
+
+@@ -405,8 +452,8 @@
+       physical_dev->api_version =
+          MIN2(physical_dev->properties.apiVersion, instance->api_version);
+       vkr_physical_device_init_extensions(physical_dev);
+-      vkr_physical_device_init_memory_properties(physical_dev);
+       vkr_physical_device_init_id_properties(physical_dev);
++      vkr_physical_device_init_memory_properties(physical_dev, ctx->appine_allocator);
+       vkr_physical_device_init_queue_family_properties(physical_dev);
+
+       list_inithead(&physical_dev->devices);
+@@ -442,11 +489,27 @@
+       return;
+    }
+
+-   args->ret = vkr_instance_enumerate_physical_devices(instance);
++   args->ret = vkr_instance_enumerate_physical_devices(instance, ctx->appine_allocator);
+    if (args->ret != VK_SUCCESS)
+       return;
+
+    VkPhysicalDeviceGroupProperties *orig_props = args->pPhysicalDeviceGroupProperties;
++   if (ctx->appine_allocator) {
++      if (!orig_props) {
++         *args->pPhysicalDeviceGroupCount = 1;
++      } else if (!*args->pPhysicalDeviceGroupCount) {
++         args->ret = VK_INCOMPLETE;
++      } else if (instance->physical_devices[0]) {
++         *args->pPhysicalDeviceGroupCount = 1;
++         orig_props->physicalDeviceCount = 1;
++         orig_props->subsetAllocation = VK_FALSE;
++         vkr_cs_handle_store_id((void **)&orig_props->physicalDevices[0],
++                                instance->physical_devices[0]->base.id, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
++      } else {
++         args->ret = VK_ERROR_INITIALIZATION_FAILED;
++      }
++      return;
++   }
+    if (orig_props) {
+       args->pPhysicalDeviceGroupProperties =
+          calloc(*args->pPhysicalDeviceGroupCount, sizeof(*orig_props));
+@@ -686,6 +749,7 @@
+       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
+       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
+                                              args->pMemoryProperties);
++      args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+    }
+ }
+ 
+--- a/vkr_context.h
++++ b/vkr_context.h
+@@ -45,6 +45,7 @@
+
+ struct vkr_context {
+    uint32_t ctx_id;
++   struct appine_allocator *appine_allocator;
+    vkr_renderer_retire_fence_callback_type retire_fence;
+
+    char *debug_name;

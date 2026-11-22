@@ -1,4 +1,4 @@
-//! The routing table (the kernel/net map): netlink's `RTM_GETROUTE` (`ip route`, `ip route get`)
+//! The routing table (the kernel/route map): netlink's `RTM_GETROUTE` (`ip route`, `ip route get`)
 //! and `RTM_GETRULE` (`ip rule`), `/proc/net/route` and `/proc/net/ipv6_route`.
 //!
 //! Since Android 10 apps cannot read the host's `/proc/net`, and with targetSdk ≥ 30 they cannot

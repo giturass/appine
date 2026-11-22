@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fetch the Venus decoder used by the Android host. Build scripts run offline.
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+out=${1:-"$root/target/virglrenderer"}
+name=virglrenderer-1.3.0
+digest=065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3
+mkdir -p "$out"
+work=$(mktemp -d "$out/.fetch.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+if ! echo "$digest  $out/$name.tar.gz" | shasum -a 256 -c --status 2>/dev/null; then
+    curl --fail --location --retry 3 "https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/$name.tar.gz" -o "$work/$name.tar.gz"
+    echo "$digest  $work/$name.tar.gz" | shasum -a 256 -c
+    mv "$work/$name.tar.gz" "$out/"
+fi
+# Unpack whenever a key source file is missing (e.g. rust-cache strips files from target/ while
+# leaving empty directories behind).
+if [ ! -f "$out/$name/src/venus/vkr_renderer.c" ]; then
+    tar xzf "$out/$name.tar.gz" -C "$work"
+    rm -rf "$out/$name"
+    mv "$work/$name" "$out/"
+fi
+echo "fetch-virglrenderer: $out/$name"

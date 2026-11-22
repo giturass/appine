@@ -204,6 +204,11 @@
     <string name="restart_message">모든 세션이 종료되고 새 실행 모드로 시스템이 다시 시작됩니다.</string>
     <string name="restart">다시 시작</string>
 
+    <string name="gpu_summary">실험적 기능이며 기기에 따라 지원 여부가 다릅니다</string>
+    <string name="gpu_unavailable">이 기기에서는 지원되지 않습니다</string>
+    <string name="gpu_enable_message">모든 세션이 종료되고 실험적 Vulkan GPU를 켜고 시스템이 다시 시작됩니다. 기기에 따라 지원 여부가 다르며 오류가 발생할 수 있습니다.</string>
+    <string name="gpu_disable_message">모든 세션이 종료되고 Vulkan GPU를 끄고 시스템이 다시 시작됩니다.</string>
+
     <!-- Diagnostic log export -->
     <string name="settings_export_logs">진단 로그 내보내기</string>
     <string name="export_logs_summary">최근 로그와 기기 정보를 저장하거나 공유하여 문제 해결에 활용</string>

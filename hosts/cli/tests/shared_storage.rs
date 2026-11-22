@@ -306,8 +306,16 @@ fn shared_storage_can_appear_later_and_preserves_an_existing_sdcard_directory() 
         let Some(root) = TestRoot::new("late-root") else {
             return;
         };
-        appine_kernel::write_file(&root.store, "/sdcard/local.txt", b"preserved", 0o644, false)
-            .unwrap();
+        appine_kernel::write_file(
+            &root.store,
+            "/sdcard/local.txt",
+            b"preserved",
+            0o644,
+            false,
+            0,
+            0,
+        )
+        .unwrap();
         let machine = root.start(tier);
         machine.mount_shared_storage(&root.shared).unwrap();
         assert_eq!(
@@ -521,6 +529,8 @@ __attribute__((noreturn)) void _start(void) {
         &fs::read(binary).unwrap(),
         0o755,
         false,
+        0,
+        0,
     )
     .unwrap();
 }

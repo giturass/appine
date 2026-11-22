@@ -1,5 +1,6 @@
 //! Socket syscalls (the kernel/net map; the `netlink_*` functions, the netlink section and the
-//! `Socket::Netlink` arms are the kernel/netlink map).
+//! `Socket::Netlink` arms are the kernel/netlink map; `raw_recv` and `take_errors` are the
+//! kernel/rawicmp map).
 //!
 //! Host sockets are nonblocking; on EAGAIN a blocking guest call waits for the host fd to become
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and

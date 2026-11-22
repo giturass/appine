@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -126,3 +126,10 @@
 - **Tradeoffs**: Sharing is whole-file, so the first change copies everything; reads never update a held file's atime; a deleted held file that was open keeps its share until boot; a close the provider never reports keeps its object out of sharing until the process ends; an older build opening a store with shares reads the wrong objects.
 - **Watch out**: Nothing may write a held file's object in place, `drop_object` trusts without a query that no row uses a plain file's number, numbers used as objects must keep their rows at boot, browse callers must report every close through `written` with the path they opened, and a Files app write that unshares a file leaves the running kernel's shared mappings on the old object (a map bug).
 - **Source**: df6ee70, 1f99a1c
+
+### D18: `appine_kernel::write_file` accepts explicit new-file `uid` and `gid`
+- **What**: `appine_kernel::write_file` takes `uid: u32` and `gid: u32` parameters and delegates to `vfs::write_file_owned`.
+- **Why**: The host-facing store wrapper must expose new-file ownership to JNI callers seeding regular guest accounts.
+- **Tradeoffs**: Changes the Rust crate's `write_file` signature (currently used only by `hosts/android`).
+- **Watch out**: Any future host caller outside `hosts/android` must pass explicit ownership IDs.
+- **Source**: 125f3d00

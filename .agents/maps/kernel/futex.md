@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write references to kernel/cow)
 
 ## Responsibilities
 
@@ -24,8 +24,8 @@ Root: `core/kernel/src/futex.rs`; in `syscall/misc.rs` the futex handlers (`fute
 
 Outside the module: the BKL, the waiting primitives, restart blocks and the fast path's record and
 deadline hand-over (`kernel/process`); thread exit and execve, which call the robust-list and PI
-hand-overs (`kernel/process`, `kernel/exec`); translating guest addresses and breaking
-copy-on-write (`kernel/mm`); counting unimplemented commands (`kernel/signal`).
+hand-overs (`kernel/process`, `kernel/exec`); translating guest addresses (`kernel/mm`) and
+breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/signal`).
 
 ## Key types
 
@@ -112,7 +112,7 @@ copy-on-write (`kernel/mm`); counting unimplemented commands (`kernel/signal`).
 
 - `kernel/process`: `Shared`'s futex lock and queue, wait events, restart blocks and the task
   table for PI owners; `kernel/time`: `Expiry` deadlines and clock-jump handling.
-- `kernel/mm`: `futex_key`, `translate`, `cow_break`; `kernel/mmu`: `fault_in`.
+- `kernel/mm`: `futex_key`, `translate`; `kernel/cow`: `cow_break`; `kernel/mmu`: `fault_in`.
 - `kernel/ns`: owner tids as their pid namespace sees them; `kernel/signal`: counting
   unimplemented commands (`stub`).
 

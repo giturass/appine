@@ -207,6 +207,12 @@
     <string name="restart_message">All sessions end and the system restarts with the new execution mode.</string>
     <string name="restart">Restart</string>
 
+    <string name="settings_gpu" translatable="false">Vulkan GPU</string>
+    <string name="gpu_summary">Experimental; compatibility varies by device</string>
+    <string name="gpu_unavailable">Unavailable on this device</string>
+    <string name="gpu_enable_message">All sessions end and the system restarts with experimental Vulkan GPU enabled. Compatibility varies by device and may cause errors.</string>
+    <string name="gpu_disable_message">All sessions end and the system restarts with Vulkan GPU disabled.</string>
+
     <!-- Diagnostic log export -->
     <string name="settings_export_logs">Export diagnostic logs</string>
     <string name="export_logs_summary">Save or share recent logs and device information to help troubleshoot problems</string>

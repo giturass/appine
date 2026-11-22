@@ -1,0 +1,35 @@
+#!/bin/sh
+# Build a disposable ARM64 guest fixture with distribution packages and the GPU survey.
+set -eu
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
+case ${1:-} in
+    alpine) image=alpine:3.24 ;;
+    debian) image=debian:trixie ;;
+    *) echo "Usage: $0 alpine|debian output.tgz" >&2; exit 2 ;;
+esac
+out=${2:?missing output tarball}
+src=$("$repo/scripts/fetch-virglrenderer" | sed -n 's/^fetch-virglrenderer: //p')
+# Older libdrm-dev packages ship headers predating the blob ioctl used by their own Mesa.
+id=$(docker create --platform linux/arm64 -v "$repo/tests/survey/gpu:/gpu:ro" \
+    -v "$src/src/drm/drm-uapi:/uapi:ro" "$image" sh -ec '
+        if [ -f /etc/alpine-release ]; then
+            apk add --no-cache build-base glslang vulkan-headers vulkan-loader-dev vulkan-tools mesa-vulkan-virtio mesa-vulkan-swrast
+            adduser -D -u 1000 gpu
+        else
+            apt-get update
+            apt-get install -y --no-install-recommends gcc libc6-dev glslang-tools libvulkan-dev vulkan-tools mesa-vulkan-drivers
+            useradd -m -u 1000 gpu
+        fi
+        cd /tmp
+        glslangValidator -V /gpu/transform.comp --vn transform_spv -o transform.h
+        cc -std=c11 -O2 -Wall -Wextra -Werror -I. /gpu/compute.c -lvulkan -o compute
+        cc -O2 -Wall -Wextra -Werror -I/uapi /gpu/lifetime.c -o lifetime
+    ')
+tmp=$(mktemp "$out.XXXXXX")
+trap 'docker rm -f "$id" >/dev/null; rm -f "$tmp" "$tmp.gz"' EXIT
+docker start -a "$id"
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$id")" = 0 ]
+# POSIX sh pipelines cannot report an export failure; keep the two stages separate.
+docker export "$id" > "$tmp"
+gzip -c "$tmp" > "$tmp.gz"
+mv "$tmp.gz" "$out"

@@ -47,7 +47,8 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * The terminal view on libghostty-vt (the android/vtview map): draws the [VtSession] attached to
+ * The terminal view on libghostty-vt (the android/vtview map; gestures, scrolling, selection and
+ * links in the android/vtgestures map): draws the [VtSession] attached to
  * it with JetBrains Mono on a fixed cell grid. Sessions belong to [TerminalService] and keep
  * parsing output while no view shows them; [attach] switches the view to another tab.
  *

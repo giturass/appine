@@ -56,7 +56,7 @@ class TerminalInputTest {
         val tar = File(root, "rootfs.tgz")
         context.assets.open("rootfs.tgz").use { input -> tar.outputStream().use(input::copyTo) }
         Native.importRootfs(File(root, "store").path, tar.path)
-        val machine = Native.start(File(root, "store").path, 1)
+        val machine = Native.start(File(root, "store").path, 1, false)
         val console = Native.openConsole(machine, 24, 80)
         val tab = VtNative.create(machine, console, 80, 24, 8, 16)
         try {

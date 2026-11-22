@@ -16,6 +16,7 @@ pub mod errno;
 mod fd;
 mod forward;
 mod futex;
+pub mod gpu;
 mod inittab;
 mod ipc;
 mod itimer;
@@ -101,17 +102,20 @@ pub fn sync_store(store: &Path) -> Result<(), Errno> {
 }
 
 /// Writes a file in the inode store (for the host to prepare configuration files, such as
-/// `/etc/profile.d/appine.sh` on first start); `path` is a guest path. See [`vfs::write_file`].
+/// `/etc/profile.d/appine.sh` on first start); `path` is a guest path, and new files belong to
+/// `uid` and `gid`. See [`vfs::write_file_owned`].
 pub fn write_file(
     store: &Path,
     path: &str,
     data: &[u8],
     mode: u32,
     overwrite: bool,
+    uid: u32,
+    gid: u32,
 ) -> Result<(), Errno> {
     bug::host_call("write_file", || {
         let store = Store::open(store, &[])?;
-        vfs::write_file(&store, path.as_bytes(), data, mode, overwrite)
+        vfs::write_file_owned(&store, path.as_bytes(), data, mode, overwrite, uid, gid)
     })
     .unwrap_or(Err(Errno::EIO))
 }

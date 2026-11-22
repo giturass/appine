@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: split kernel/nft into separate maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint route, sysctl and sysfs references to kernel/route, kernel/sysctl and kernel/sysfs)
 
 ## Responsibilities
 
@@ -22,11 +22,12 @@ provides:
 
 Root: `core/kernel/src/netns.rs`, `netdev.rs`, `forward.rs`, `netconf.rs`.
 
-Outside the module: the socket syscalls that call into it, host interfaces, routes and low-port
-mapping in the initial namespace (`kernel/net`); netlink socket mechanics (`kernel/netlink`);
-nftables rulesets, requests and expression evaluation (`kernel/nft`, `nft.rs`);
-creating and entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net` and sysfs
-file structure (`kernel/procfs`); host sockets (`hal`).
+Outside the module: the socket syscalls that call into it, host interfaces and low-port
+mapping in the initial namespace (`kernel/net`); routing tables (`kernel/route`); netlink socket
+mechanics (`kernel/netlink`); nftables rulesets, requests and expression evaluation (`kernel/nft`,
+`nft.rs`); creating and entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net`
+(`kernel/procfs`), `/proc/sys/net` (`kernel/sysctl`) and `/sys/class/net` (`kernel/sysfs`); host
+sockets (`hal`).
 
 ## Key types
 
@@ -218,13 +219,13 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 - `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, forward targets,
   `SO_ORIGINAL_DST`, `SIOCADDRT`/`SIOCDELRT` through `netdev::request`); `kernel/netlink`
   (device configuration); `kernel/ns` (clone/unshare/setns
-  create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`, `/sys/class/net`);
-  the machine (the forwarder per kernel).
+  create and enter namespaces); `kernel/procfs` (`/proc/net`), `kernel/sysctl` (`/proc/sys/net`),
+  `kernel/sysfs` (`/sys/class/net`); the machine (the forwarder per kernel).
 
 ### Outbound
 
-- `appine_hal::net` (host sockets, host interfaces, poll, dup, events); `kernel/net`'s portmap
-  and routes (`route::merge`, `attrs`); `kernel/netlink`'s encoding (`message`, `attr`,
+- `appine_hal::net` (host sockets, host interfaces, poll, dup, events); `kernel/net`'s portmap;
+  `kernel/route` (`route::merge`, `attrs`); `kernel/netlink`'s encoding (`message`, `attr`,
   `configure_host_link`); credentials (`ns_capable`); the kernel
   log; `std::thread` for the forwarder.
 - `kernel/nft` owns each namespace's ruleset; this module builds packets and selects hooks,

@@ -18,6 +18,7 @@ internal enum class RunPolicy(val value: String, val label: Int, val summary: In
 internal object Settings {
     private const val PREFS = "settings"
     private const val KEY_TIER = "tier"
+    private const val KEY_GPU = "gpu"
     private const val KEY_LOGIN = "login"
     private const val KEY_KEEP_AWAKE = "keep_awake"
     private const val KEY_RUN_POLICY = "run_policy"
@@ -44,6 +45,14 @@ internal object Settings {
     fun tier(context: Context): Int = prefs(context).getInt(KEY_TIER, 1)
 
     fun setTier(context: Context, value: Int) = prefs(context).edit { putInt(KEY_TIER, value) }
+
+    /**
+     * Whether to probe and expose the experimental Vulkan GPU renderer (off by default, effective
+     * at the next kernel start).
+     */
+    fun gpu(context: Context): Boolean = prefs(context).getBoolean(KEY_GPU, false)
+
+    fun setGpu(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_GPU, on) }
 
     /**
      * The login account of new tabs (the android/setup map): [ConsolePty.LOGIN_AUTO],

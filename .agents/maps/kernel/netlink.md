@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint routing-table references to kernel/route)
 
 ## Responsibilities
 
@@ -28,8 +28,8 @@ netlink section (`netlink_send`, `rtnl_watched`, `CHANGING_IOCTLS`, `rtnl_notify
 and the `Socket::Netlink` arms of the socket calls.
 
 Outside the module: the socket syscalls' dispatch, the generic `SOL_SOCKET` options (`SockOpts`),
-the routing table with its route and rule messages and `ip route get` (`route.rs`), traffic
-counters, the timeout parser and the ioctls that changing ioctls wrap (`kernel/net`); the device
+traffic counters, the timeout parser and the ioctls that changing ioctls wrap (`kernel/net`); the
+routing table with its route and rule messages and `ip route get` (`kernel/route`); the device
 layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`kernel/ipc`); readiness plumbing
 (`kernel/poll`). `net.rs`'s unit-test module, which also tests netlink, stays with `kernel/net`.
 
@@ -57,7 +57,7 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   socket ioctls), `KernelHost::{snapshots, changed_since, configure}`, `Snapshot::{take,
   changes}`.
 - Helpers other modules use: `configure_host_link` (`kernel/netns`'s device layer), `message`
-  and `attr` (the device layer, namespace routes and `kernel/net`'s routing table).
+  and `attr` (the device layer, namespace routes and `kernel/route`).
 
 ## Data flow / lifecycle
 
@@ -132,7 +132,7 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   only on `NLM_F_ACK`.
 - Queries: link dumps (filtered by master and kind), single links by index or name (`EINVAL`,
   `ENODEV`), address dumps (per family, IPv4 first), route dumps (per family) and `ip route get`
-  (both built by `kernel/net`'s routing table), rule dumps (one datagram; `EAFNOSUPPORT` for a
+  (both built by `kernel/route`), rule dumps (one datagram; `EAFNOSUPPORT` for a
   family without rules), nsid (by pid or fd), neighbour dumps (empty) and single neighbour gets
   (`ENOENT`); others `EOPNOTSUPP`; control messages are acked only on `NLM_F_ACK`.
 - Link, address and route dumps are packed into datagrams of at most 3776 bytes (Linux's
@@ -166,15 +166,15 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `rtnl_notify`.
 - `kernel/netns`: the device layer calls `configure_host_link` and builds netlink messages with
   `message` and `attr`; `kernel/nft` uses the same encoding for ruleset replies.
-- `kernel/net`: `route.rs` encodes route messages with `message` and `attr`.
+- `kernel/route`: `route.rs` encodes route messages with `message` and `attr`.
 - `kernel/ipc`: mq_notify queues `SIGEV_THREAD` cookies on a netlink socket.
 - `kernel/poll` through `kernel/net`'s readiness.
 
 ### Outbound
 
-- `kernel/net`: the routing table's `route_message`, `get` and `rule_messages`, `SockOpts`, the
-  timeout parser, traffic counters for link statistics, and the inbound forwarding hooks
-  (`forward_all`) after an initial-namespace ruleset change.
+- `kernel/net`: `SockOpts`, the timeout parser, traffic counters for link statistics, and the
+  inbound forwarding hooks (`forward_all`) after an initial-namespace ruleset change.
+- `kernel/route`: `route_message`, `get` and `rule_messages`.
 - `kernel/netns`: `netdev::{request, base, views, tables, interfaces, nsid, nsid_alloc}`.
 - `kernel/nft`: `nft::handle`.
 - `appine_hal::net` (`interfaces` through `getifaddrs`, `tx_queue_len`); credentials

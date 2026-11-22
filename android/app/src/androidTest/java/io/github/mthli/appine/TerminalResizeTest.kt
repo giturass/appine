@@ -58,7 +58,7 @@ class TerminalResizeTest {
         context.assets.open("rootfs.tgz").use { input -> tar.outputStream().use(input::copyTo) }
         val store = File(root, "store")
         Native.importRootfs(store.path, tar.path)
-        val machine = Native.start(store.path, 1)
+        val machine = Native.start(store.path, 1, false)
         val console = Native.openConsole(machine, 24, 80)
         val tab = VtNative.create(machine, console, 80, 24, 8, 16)
         try {

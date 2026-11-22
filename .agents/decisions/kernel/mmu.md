@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mmu"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-21 (HEAD = 125f3d00)
 >
 > Soft-MMU decisions made before kernel/mmu was split from kernel/mm keep their `kernel/mm` tags and live in `.agents/decisions/kernel/mm.md`: D1, D13, D16, D39 and the page-table half of D4.
 
@@ -30,3 +30,19 @@
 - **Tradeoffs**: Aliases with different top bytes compete for a slot, and raw write-only mappings take the Tier 0 store path.
 - **Watch out**: Check endpoints and watchpoints before access and use untagged addresses for exclusive monitors and instruction-cache invalidation.
 - **Source**: 8bc0e63b
+
+### D4: `CodeGroup` tracks admitted shared memops separately from per-process `Mm::memops`
+
+- **What**: `CodeGroup::memops` tracks admitted shared memops restricted to `group.ranges`, merged during `Mm::sync` and `Mm::code_space`, and marks `memops_dirty` when a sole member leaves a closed group so its `DbtSpace` switches back to `Mm::memops`.
+- **Why**: Pushing one member's `Mm::memops` onto a shared `DbtSpace` overwrote peers' registrations and could expose private mappings across members.
+- **Tradeoffs**: Memops in private executable mappings of a `CodeGroup` member are not accelerated until that member leaves the group.
+- **Watch out**: Like `CodeGroup::ranges`, `CodeGroup::memops` grows monotonically while shared; members remapping conflicting code at those addresses still leave the group via `check_code_group`.
+- **Source**: 9b3b6860
+
+### D5: Memop entry points register only for executable mappings of the verified bundled libc snapshot
+
+- **What**: `mm.rs` maps the shared in-process SHA-256-verified bundled libc snapshot and registers Tier 1 memop entry points only for executable mappings of that snapshot.
+- **Why**: The executable mapping must execute the exact bytes that passed SHA-256 verification rather than a mutable original file.
+- **Tradeoffs**: Maintains one shared in-process snapshot of the bundled libc (shared via `FileMaps` per kernel/mm D47).
+- **Watch out**: Preserve translation invalidation whenever executable mappings change.
+- **Source**: 6b59a1b4

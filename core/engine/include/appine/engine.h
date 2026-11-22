@@ -310,7 +310,7 @@ int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
                             size_t off_tlb, size_t off_v);
 
-/* ---- Tier 1: a same-ISA pass-through DBT (the engine map) ---- */
+/* ---- Tier 1: a same-ISA pass-through DBT (the engine/dbt map) ---- */
 
 struct appine_dbt;
 
@@ -386,6 +386,33 @@ struct appine_dbt_source {
  * mappings the translations come from, at most APPINE_DBT_SOURCES ranges */
 #define APPINE_DBT_SOURCES 64
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+
+/*
+ * Known libc memory primitives accelerated by Tier 1: same-page calls use in-cache helpers with
+ * inline TLB checks (n >= 32 B for memset/memcpy/memmove, n >= 8 B for memcmp, first page for
+ * memchr), while cross-page or cold-TLB large calls (n >= 128 B in guest X2) fall back to a
+ * page-validated host libc call. Tiny operations stay inline in translated guest code, and any
+ * watchpoint or missing page permission falls back to guest execution with precise faults.
+ */
+enum appine_memop_kind {
+    APPINE_MEMOP_NONE = 0,
+    APPINE_MEMOP_MEMCPY = 1,
+    APPINE_MEMOP_MEMSET = 2,
+    APPINE_MEMOP_MEMMOVE = 3,
+    APPINE_MEMOP_MEMCMP = 4,
+    APPINE_MEMOP_MEMCHR = 5,
+    APPINE_MEMOP_STRNCMP = 6,
+};
+
+#define APPINE_DBT_MEMOPS 32
+struct appine_dbt_memop {
+    uint64_t pc;
+    uint32_t kind;
+    uint32_t reserved;
+};
+/* Replaces the registered memop entry PCs on this instance (at most APPINE_DBT_MEMOPS) and retires
+ * any existing translation at a PC whose registration changed. Other threads may be running. */
+void appine_dbt_set_memops(struct appine_dbt *dbt, const struct appine_dbt_memop *ops, size_t n);
 /*
  * Before an instance taken from the pool first runs in a new address space: blocks in mappings of
  * the new address space that are exactly the same as the recorded ones need not be checked block

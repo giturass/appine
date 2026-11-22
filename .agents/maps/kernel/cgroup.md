@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-17 (targeted verification only since the full mapping; latest change: directory watches follow controller files added after registration)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint unprivileged_bpf_disabled sysctl and sysfs mount-point references to kernel/sysctl and kernel/sysfs)
 
 ## Responsibilities
 
@@ -52,7 +52,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 - One global tree; the root (id 1, owned by root, 0755) looks like a docker container's root
   under a cgroup namespace with cpuset, cpu, memory and pids available. cgroup2 is mounted
-  read-write at boot on sysfs's `fs/cgroup` (options `nsdelegate,memory_recursiveprot`); any
+  read-write at boot on sysfs's `fs/cgroup` (`kernel/sysfs`, options `nsdelegate,memory_recursiveprot`); any
   mount needs `CAP_SYS_ADMIN` over the owner of the caller's cgroup namespace and is rooted at
   that namespace's root. A directory holds its children plus the core files and those of the
   controllers its parent enables (the root: all available ones).
@@ -195,7 +195,7 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - `kernel/oom`: `Usage` for shared memory counted once, the root limit and measurement,
   memory events and immediate OOM handling after lowering `memory.max`.
 - `kernel/files`: BPF program fds and cgroup target fds; `kernel/procfs`: the target fd's
-  `PseudoNode::Cgroup` and the `unprivileged_bpf_disabled` sysctl; guest memory access for
+  `PseudoNode::Cgroup`; `kernel/sysctl`: the `unprivileged_bpf_disabled` sysctl; guest memory access for
   bpf(2) attributes and program data.
 - `kernel/inotify`: watched keys and `kernfs_modified`; `kernel/signal`: kernel log messages.
 

@@ -16,8 +16,6 @@ import android.icu.util.Measure
 import android.icu.util.MeasureUnit
 import android.os.Build
 import android.os.LocaleList
-import android.system.Os
-import android.system.OsConstants
 import android.widget.Toast
 import io.github.mthli.appine.Notifications.Companion.BELL_NOTIFY_MS
 import io.github.mthli.appine.Notifications.Companion.COMMAND_NOTIFY_MS
@@ -198,12 +196,7 @@ internal class Notifications(private val service: TerminalService) {
      * U+001E: what the workload asked for that Appine lacks).
      */
     private fun bugReport(report: String, log: String, stubs: String = ""): String = buildString {
-        appendLine("Appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
-        appendLine(
-            "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
-                    "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}",
-        )
-        appendLine("${Rootfs.installed(service)?.label ?: "unknown distribution"}, Tier ${Settings.tier(service)}")
+        append(Diagnostics.environment(service))
         append(report)
         if (log.isNotEmpty()) {
             append("\n\nKernel log:\n")

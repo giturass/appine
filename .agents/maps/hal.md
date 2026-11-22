@@ -69,7 +69,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
   `setsockopt`, `getsockopt`, `get_filter`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
-  `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`.
+  `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`, `preload_android_resolver` (Android).
 
 ## Data flow / lifecycle
 
@@ -167,8 +167,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `routes()` parses host `/proc/net/route` and `/proc/net/ipv6_route` (`None` when unreadable, as on
   Android), dropping reject/anycast/cache/local and multicast routes; `source_for(dst)` connects a
   UDP socket and reads its local address; `tx_queue_len` reads sysfs.
-- `dns_query`: on Android `android_res_nsend` on the default network (linked against libandroid,
-  API 29), up to 30 s, then cancel and `ETIMEDOUT`; the answer is returned whatever its rcode. On
+- `dns_query`: on Android `android_res_nsend` on the default network (API 29), up to 30 s,
+  then cancel and `ETIMEDOUT`; the answer is returned whatever its rcode. The first query and the
+  interactive CLI preload share one resolver initialized from libandroid. On
   Linux hosts up to three servers from `/etc/resolv.conf`, UDP with one 3 s deadline per server
   (answers with another ID do not extend it) and ID check, TCP retry on truncation
   (length-prefixed, one deadline), `EHOSTUNREACH` without servers; a failed server moves on to
@@ -179,11 +180,12 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 ### Inbound
 
 - `core/kernel` throughout (mm, store, VFS, syscalls, timer thread, forwarder, raw ICMP, terminal,
-  procfs, OOM); `hosts/cli` (`RawMode`, `sigwinch_notifier`, `isatty`, tests).
+  procfs, OOM); `hosts/cli` (`RawMode`, `sigwinch_notifier`, `stop_notifier`, `isatty`,
+  `net::preload_android_resolver` on Android, tests).
 
 ### Outbound
 
-- `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` on Android (DNS),
+- `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` loaded dynamically on Android (DNS),
   host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/vmstat`,
   `/proc/swaps`, `/proc/net/route*`,
   `/proc/self/task/*`, `/sys/devices/system/cpu`, `/sys/class/net`, `/etc/resolv.conf`), Rust std

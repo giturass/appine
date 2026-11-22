@@ -100,6 +100,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private var accountLoad = 0
 
     private lateinit var tier: Preference
+    private lateinit var gpu: SwitchPreferenceCompat
     private lateinit var export: Preference
     private var exporting = false
     private var exportGeneration = 0
@@ -161,6 +162,16 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             Toast.makeText(requireContext(), getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
         }
         tier = action(R.string.settings_tier) { onTier() }
+        gpu = SwitchPreferenceCompat(requireContext()).configure(R.string.settings_gpu).apply {
+            widgetLayoutResource = R.layout.preference_switch
+            setOnPreferenceChangeListener { _, value ->
+                val s = service ?: return@setOnPreferenceChangeListener false
+                if (s.machine == 0L || s.switching != null) return@setOnPreferenceChangeListener false
+                confirmGpu(value as Boolean)
+                // Only the service's restart changes the saved value and switch state.
+                false
+            }
+        }
         export = action(R.string.settings_export_logs) {
             chooseLogExport()
         }.apply {
@@ -220,7 +231,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, notifications, batteryUsage, runPolicy, privacy, sharedStorage, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, tabList, volumeKeys)
-        group(R.string.settings_group_debug, tier, export)
+        group(R.string.settings_group_debug, tier, gpu, export)
         group(R.string.settings_group_about, telegram, project, privacyPolicy, licenses, version)
         render()
     }
@@ -409,7 +420,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             R.string.settings_cursor_style, R.string.settings_cursor_blink -> R.drawable.ic_settings_cursor
             R.string.settings_show_tab_list -> R.drawable.ic_settings_tabs
             R.string.settings_volume_keys -> R.drawable.ic_settings_volume
-            R.string.settings_tier -> R.drawable.ic_settings_debug
+            R.string.settings_tier, R.string.settings_gpu -> R.drawable.ic_settings_debug
             R.string.settings_export_logs -> R.drawable.ic_settings_export
             R.string.settings_licenses -> R.drawable.ic_settings_license
             R.string.settings_telegram, R.string.settings_project, R.string.settings_version -> R.drawable.ic_settings_link
@@ -533,7 +544,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess, privacy,
+            for (row in listOf(distro, reset, account, tier, gpu, runPolicy, fileAccess, privacy,
                 fillWide, cursorStyle, cursorBlink, volumeKeys, tabList)) row.isEnabled = false
             return
         }
@@ -553,6 +564,8 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         // store
         reset.set(getString(R.string.reset_summary), s.canSwitch)
         tier.set(getString(if (s.tier == 0) R.string.tier_0_summary else R.string.tier_1_summary), idle)
+        val gpuSummary = if (running && s.gpu && !s.gpuAvailable) R.string.gpu_unavailable else R.string.gpu_summary
+        gpu.set(getString(gpuSummary), idle, s.gpu)
         account.entries = (listOf(getString(R.string.login_auto_choice), ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
         account.entryValues = (listOf(ConsolePty.LOGIN_AUTO, ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
         account.value = s.login
@@ -706,9 +719,17 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             .showPrivate()
     }
 
+    private fun confirmGpu(enabled: Boolean) {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.restart_title)
+            .setMessage(if (enabled) R.string.gpu_enable_message else R.string.gpu_disable_message)
+            .setPositiveButton(R.string.restart) { _, _ -> service?.setGpu(enabled) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .showPrivate()
+    }
+
     private fun onVersion() {
-        val intent = Intent(Intent.ACTION_VIEW,
-            "https://play.google.com/store/apps/details?id=${BuildConfig.APPLICATION_ID}".toUri())
+        val intent = Intent(Intent.ACTION_VIEW, PLAY_STORE_URL.toUri())
         try {
             startActivity(intent.setPackage("com.android.vending"))
         } catch (e: ActivityNotFoundException) {
@@ -724,6 +745,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         private const val TELEGRAM_URL = "https://t.me/appinesh"
         private const val PROJECT_URL = "https://github.com/mthli/appine"
         private const val PRIVACY_POLICY_URL = "https://appine.sh/privacy"
+        private const val PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=io.github.mthli.appine"
         private const val CHOICE_DIALOG = "settings.choice"
 
         /** The cursor shapes offered, in order, and their names. */

@@ -156,6 +156,22 @@ pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
     })
 }
 
+/// Registers the render node only in this machine's boot devtmpfs.
+pub(crate) fn populate_gpu(store: &Store, dev: Ino) -> Result<(), Errno> {
+    store.transaction(|s| {
+        let dri = s.mkdir(dev, b"dri", 0o755, 0, 0)?;
+        s.mknod(
+            dri,
+            b"renderD128",
+            mode::S_IFCHR | 0o666,
+            rdev(226, 128),
+            0,
+            0,
+        )?;
+        Ok(())
+    })
+}
+
 /// The character device for a device node's inode.
 pub fn open(store: &Store, ino: Ino) -> Result<Device, Errno> {
     Device::from_rdev(store.stat(ino)?.rdev)

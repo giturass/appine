@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
@@ -215,6 +215,30 @@
 - **Tradeoffs**: Large send can agree without exercising the fix, route tests omit unsupported unreachable/host routes, and the in-flight DNS cap lacks an independent test.
 - **Watch out**: Shutdown/accept cases rely on 300/200 ms scheduling and the queue case waits 1.5 s, which can hide undelivered answers on slow runners.
 - **Source**: 211a5867, 29e59fd3, 4e01f78b, 73127176; 20137e4c; d053be24; 39e55b4b
+
+### D42: Mobile GPU probes and guest fixtures isolate host driver limits from guest integration
+
+- **What**: A standalone Android instrumentation APK (including `cpu-export-blob` with a 1,024-word GPU copy readback) and shader/C guest compute fixtures verify host Vulkan sharing independently of the guest runtime.
+- **Why**: Hardware capability and cross-device buffer coherency failures must be distinguishable from guest integration defects.
+- **Tradeoffs**: Building fixtures requires ARM64 containers and distribution packages, and standalone runs exercise one small buffer on one device at a time.
+- **Watch out**: Package versions can drift between fixture builds, and device firmware updates can change available import memory types.
+- **Source**: 87c7d9db, e94c49df
+
+### D43: Mobile GPU compute and llama.cpp surveys verify output correctness before throughput
+
+- **What**: Compute and `llama.cpp` surveys in `docs/mobile-gpu.md` run matched multi-run and reversed-order passes (five fresh Tier 1 stores for compute medians/ranges; Q4_0 models at 4 threads, 128 prompt and 32 generated tokens across three repeats with per-invocation restarts on Vulkan failure), show text correctness checks before throughput, and run matched native Android CPU/Vulkan controls to isolate Appine and Venus from vendor drivers.
+- **Why**: Completed Vulkan benchmarks can report high throughput while producing wrong text, and guest logs alone cannot separate Appine/Venus bugs from vendor shader or driver defects.
+- **Tradeoffs**: Fixed configurations cover specific workload shapes, default-first ordering warms guests for `appine-gpu`, workaround throughput needs separate measurement, and published S25 Ultra Vulkan rates reflect configurations that failed text checks.
+- **Watch out**: Warm-up, run order and thermal throttling affect timing comparisons, and the underlying PowerVR and Adreno shader/driver defects remain open.
+- **Source**: f968cd03, d6affc8b, 69be5b52, e08e3271, 975ab76b, 9d6e04fe, 1a4b3cd1, 1157df2d
+
+### D44: CI caches `target/virglrenderer` separately after `rust-cache`
+
+- **What**: The Android workflow caches `target/virglrenderer` with `actions/cache@v6` keyed by `virglrenderer-${{ hashFiles('scripts/fetch-virglrenderer') }}` immediately after `Swatinem/rust-cache@v2` and before fetching the Venus decoder.
+- **Why**: Without its own cache after `rust-cache`, `target/virglrenderer` was re-downloaded from GitLab on every run and exposed to `rust-cache` target-cleaning leftovers on cache hits.
+- **Tradeoffs**: Adds a separate GitHub Actions cache entry alongside the rootfs and libghostty-vt caches.
+- **Watch out**: `actions/cache@v6` saves only on a primary-key miss when the job succeeds, so a broken cached tree persists until the fetch script changes or the cache is deleted.
+- **Source**: 87f1094f
 
 ## Superseded
 

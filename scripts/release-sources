@@ -59,6 +59,11 @@ tar -czf "$out/appine-$rev-vendor.tar.gz" -C "$work" vendor
 rm -rf "$work/vendor"
 echo "$out/appine-$rev-vendor.tar.gz"
 
+# The Android build applies the decoder patches from the Appine source archive.
+venus=$("$root/scripts/fetch-virglrenderer" | sed -n 's/^fetch-virglrenderer: //p')
+cp "$venus.tar.gz" "$out/"
+echo "$out/$(basename "$venus").tar.gz"
+
 # ---- libghostty-vt: the source release and its Zig packages, both as published ----
 src=$("$root/scripts/fetch-ghostty" | sed -n 's/^fetch-ghostty: //p')
 for tarball in "$src.tar.gz" "$src-deps.tar.gz"; do

@@ -1,11 +1,11 @@
 # android/vtrender Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/vtrender.md` for the paired decision history (not yet created; pre-split decisions remain D1–D3 and the rendering part of D5 in `.agents/decisions/android/vtview.md`, and D5, D9, D16, D17, D32 and the frame/rendering parts of D7, D30, D36, D41 and D46–D48 in `.agents/decisions/android/terminal.md`).
+> See `.agents/decisions/android/vtrender.md` for the paired decision history (pre-split decisions remain D1–D3 and the rendering part of D5 in `.agents/decisions/android/vtview.md`, and D5, D9, D16, D17, D32 and the frame/rendering parts of D7, D30, D36, D41 and D46–D48 in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: output-pending flag covers unsettled or incomplete resize output and synchronized holds)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: gesture ownership and same-draw clearing with the accepted frame background)
 
 ## Responsibilities
 
@@ -18,11 +18,12 @@ Root: `VtFrame.kt`, `VtScreen.kt`, `VtRenderer.kt`, `VtImages.kt` and `VtGlyphs.
 frame-format specification and Frames section of `hosts/android/src/vt.c` (including frame-driven
 search progress, viewport match encoding and Kitty image extraction).
 
-Outside the module: all of `VtView`, its frame orchestration, redraw and cursor/password timers,
-interaction overlays, input, selection, scrolling and search requests (`android/vtview`); terminal
-creation, state ownership, PNG decoding, synchronized-output hold lifecycle, cursor defaults,
-resize, the JNI functions and locking (`android/vtcore`). The flow below describes the view's duties
-as a caller as well as rendering; it does not transfer those lifecycle methods here.
+Outside the module: `VtView` frame orchestration, redraw and cursor/password timers, input and
+search requests (`android/vtview`); touch/mouse gestures, selection handles/overlays and pixel
+scrolling (`android/vtgestures`); terminal creation, state ownership, PNG decoding,
+synchronized-output hold lifecycle, cursor defaults, resize, the JNI functions and locking
+(`android/vtcore`). The flow below describes the view's duties as a caller as well as rendering;
+it does not transfer those lifecycle methods here.
 
 ## Key types
 
@@ -68,8 +69,8 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
   iterator, which is right while nothing above the viewport is asked for), with the same cells,
   dirty flag and selection columns as the others but no search marks (they come once it is in the
-  viewport). The view then draws the grid up to a row higher (`scrollPx`, android/vtview's Gestures
-  and selection), so as much of that row shows at the bottom as is hidden of the first.
+  viewport). The view then draws the grid up to a row higher (`scrollPx`, `android/vtgestures`'s
+  Scrolling and flings), so as much of that row shows at the bottom as is hidden of the first.
 - Images (the Kitty graphics protocol): libghostty-vt stores what programs send (PNG decoded at
   once with Wuffs, which libghostty-vt.a links, into straight-alpha RGBA; larger than the storage
   refused) and its render state lists what to draw: per placement the image, a source rectangle,
@@ -114,7 +115,7 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
   the advance of "水" (the system's CJK fallback, one em, so 1.2 with JetBrains Mono; a font's own
   ideograph when it has one), at least 1, or 1 with the setting off.
-- `onDraw` fills the view with the default background, applies the frame, draws the bitmap
+- `onDraw` applies the frame, fills the view with its accepted default background, then draws the bitmap
   clipped to the grid's whole cells (the margin below keeps the background) and shifted up by
   `scrollPx`, then the cursor and the composing text translated by it, then the handles (whose
   places subtract it). Applying a frame repaints each row it brings into the bitmap under a
@@ -179,9 +180,10 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
 - android/vtcore: terminal and render-state ownership, `VtNative.frame`/`image`, the frame buffer's
   lifetime, cursor-style constants, PNG decoding and image storage/trimming; libjnigraphics copies
   pixels into Android bitmaps through that module's JNI.
-- android/vtview: query, selection and viewport changes are reflected in frames. Frame capture
-  advances its search and calls the Selection section's `viewport_ref` and `screen_point` helpers
-  to encode highlights; the view consumes count/pending fields and schedules further frames.
+- android/vtview and android/vtgestures: query, selection and viewport changes are reflected in
+  frames. Frame capture advances search (`android/vtview`) and calls `android/vtgestures`'s
+  Selection section helpers (`viewport_ref`, `screen_point`) to encode highlights; `android/vtview`
+  consumes count/pending fields and schedules further frames.
 - libghostty-vt: render state, overscan, rows/cells, Kitty placements and animation, viewport search
   matches; Android Canvas/Bitmap and fonts. JetBrains Mono 2.304 (variable, upright and italic) is
   bundled, with system fallback for other glyphs (Noto Sans CJK on AOSP images).
@@ -208,8 +210,9 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
 - Capture and consume frames on the main thread. android/vtcore holds the tab lock during native
   capture; the direct buffer remains valid until the next frame call, so it is read after unlocking.
 - `VtView` remains the owner of full-frame requests and repaint scheduling. Changing the frame
-  format or its view consumers requires checking both this map and android/vtview; search queries,
-  selection and scrolling use the same terminal state through android/vtcore's lock.
+  format or its view consumers requires checking this map, `android/vtview` and
+  `android/vtgestures`; search queries, selection and scrolling use the same terminal state
+  through `android/vtcore`'s lock.
 
 ## Confirmed bugs / technical debt
 

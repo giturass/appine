@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -55,12 +55,12 @@
 - **Watch out**: `translate` does not break CoW, so kernel code writing through it must break CoW or fault the page in first, as the robust-futex death path now does.
 - **Source**: round 26 (`26-fork-cow`); e4d3386
 
-### D18: kernel/mm is guest memory above the soft-MMU; the soft-MMU and the OOM killer are modules of their own
-- **What**: kernel/mm covers `mm.rs` (except the soft-MMU's consistency and entry-filling methods and the resident-memory measures), `syscall/mem.rs` (except process_mrelease), `uaccess.rs` (`UserSlice`) and the run loop's page-fault branch, while the page table, software TLB, shootdowns and code groups are kernel/mmu's and the measures, OOM killer and process_mrelease kernel/oom's, so the engine module stops at instruction execution.
-- **Why**: The retired design doc's §5 was the only current-state description of guest memory and had drifted from the code, and by 2026-11-11 the map (69.6 KB) could not be read in one Read while the soft-MMU and the OOM killer sit below and above the VMA code most mm changes do not touch.
-- **Tradeoffs**: Copy-on-write and FUSE mappings stay because they run through mprotect, mremap, madvise and fork; the fault order stays here though its `fault_in` step is kernel/mmu's; boundaries inside `mm.rs` exist only in the registry's wording; decisions made before the split keep their kernel/mm tags here (listed in the kernel/mmu and kernel/oom preambles), cgroup files belong to kernel/cgroup, procfs views to kernel/procfs and the timer worker to kernel/time; vDSO image construction belongs to kernel/vdso while memory mapping remains here.
-- **Watch out**: Bugs still open in the map include ignored `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`, past-EOF faults ignoring permissions, approximated Linux VMA boundaries, mlock succeeding on inaccessible ranges, ranges with gaps failing as a whole, stale addresses after mremap moves a SysV segment or the vDSO and FUSE short reads taken as whole windows, and a VMA change must still record what kernel/mmu's `sync` acts on; module documentation points to `.agents/maps/kernel/mm.md`, so future directory moves must update it.
-- **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479); 36083476; 20137e4c; cf029f9a; 8a17e4a9; d053be24; 60790c14; 39e55b4b
+### D18: kernel/mm covers VMA semantics and memory syscalls, with soft-MMU, OOM, CoW and host backing split out
+- **What**: kernel/mm covers address-space VMA semantics, layout, `[vvar]`/vDSO mapping, memory syscalls (`syscall/mem.rs` except `process_mrelease`), FUSE `Fill`, fault order, `uaccess.rs`, file EOF/truncation/moves and maps/core-dump views, while the soft-MMU belongs to `kernel/mmu`, memory accounting and OOM to `kernel/oom`, fork/copy-on-write to `kernel/cow` and host backing to `kernel/hostmem`.
+- **Why**: After accumulating FUSE `Fill`, `[vvar]`, `MADV_DONTNEED` private-file revert, `MADV_REMOVE`, `mremap` edge cases, GPU mappings and `FileMaps` musl sharing, `kernel/mm.md` reached 48,272 B (104.8% of one read).
+- **Tradeoffs**: VMA mutations that settle CoW or allocate/discard host regions cross into `kernel/cow` and `kernel/hostmem`, section boundaries inside `mm.rs` live in `.agents/MODULES.md`, and pre-split decisions stay here (referenced by ID in `kernel/mmu`, `kernel/oom`, `kernel/cow` and `kernel/hostmem`).
+- **Watch out**: VMA paths must preserve `kernel/cow`'s no-in-place-write rules, `kernel/hostmem`'s `RESERVED_HOST`, foreign/GPU and deferred-unmap contracts and `kernel/mmu`'s `sync` tracking, alongside open map bugs (ignored `MADV_DONTNEED_LOCKED`/`MADV_POPULATE_*`, past-EOF fault permissions, approximated VMA boundaries, inaccessible `mlock`, whole-range gap failures, stale `mremap` SysV/vDSO addresses and FUSE short reads).
+- **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479); 36083476; 20137e4c; cf029f9a; 8a17e4a9; d053be24; 60790c14; 39e55b4b; 610d623f
 
 ### D22: Linux VMA boundaries are computed over unmerged pieces
 - **What**: `same_vma` decides which adjacent pieces form one Linux VMA (contents source, backing, protection, flags, grows-down and an `anon` identity that fork renews per parent VMA) for maps, mremap's one-VMA rule and `PROT_GROWSDOWN`; mprotect follows `do_mprotect_pkey`; a guard gap below grows-down VMAs and `MMAP_MIN_ADDR` (32768) bound placement; and failed kernel accesses grow stacks.
@@ -195,6 +195,27 @@
 - **Watch out**: The OOM check now sorts every member's spans each round, bounded by its 20-times-the-measurement interval, and a new kind of shared host memory with distinct host addresses per process would count once per process again.
 - **Source**: 1d3d559
 
+### D45: GPU mappings retain coherent renderer storage in shared VMAs
+- **What**: Guest GPU mappings keep the coherent renderer backing in a shared VMA across fork, VMA splits and TLB invalidation, so closing a GEM handle leaves live guest mappings intact.
+- **Why**: Packaged Vulkan drivers expect mapped GPU buffers to outlive closing their GEM handles without copying guest buffers.
+- **Tradeoffs**: GPU mappings require alignment and cannot grow or be executable.
+- **Watch out**: Real 16 KiB-page hardware still needs GPU mapping coverage.
+- **Source**: 87c7d9db
+
+### D46: `Mm::memops` tracks read-only executable file mappings and prunes centrally in `Mm::sync`
+- **What**: `Mm` stores discovered `DbtMemop` entries across fork, scans only read-only, non-FUSE, versioned `Backing::PrivateFile` executable mappings in `Mm::map` (later narrowed to the verified bundled musl snapshot by kernel/exec D2 and kernel/mmu D5), marks `memops_dirty`, and prunes `Mm::memops` centrally in `Mm::sync` whenever executable ranges are invalidated or lose read-only exec status (including `write_force`).
+- **Why**: Runtime-mapped shared libraries need memop registration in `Mm::map`, while direct unpruned pushes left stale memop entries after `munmap`, `mprotect`, `mremap`, `write_force` breakpoints or `ic ivau`.
+- **Tradeoffs**: Newly mapped memops activate at `Mm::sync` (syscall exit) rather than mid-syscall.
+- **Watch out**: Internal callers of `Mm::map` that skip `Mm::sync` do not publish new memops until the next `sync` or `code_space` creation.
+- **Source**: f2690b02, 9b3b6860
+
+### D47: Verified bundled musl snapshots share host mappings through `FileMaps`
+- **What**: `BundledLibc` records its memfd snapshot's `(st_dev, st_ino)` at creation and `Mm::map` keys `FileMaps` by `[snap_dev, snap_ino, offset, len, 0, size]` so dynamic Alpine processes share host mappings of the verified snapshot.
+- **Why**: Bypassing `FileMaps` forced every dynamic Alpine process to create and unmap its own host `mmap`, fault host page tables separately and lose single-counted shared host-address accounting.
+- **Tradeoffs**: Adds one `fstat` at one-time snapshot creation and holds one `FileMaps` slot per distinct mapped slice until memory trim.
+- **Watch out**: Relies on the global `OnceLock<Arc<BundledLibc>>` keeping the snapshot memfd open so its `(st_dev, st_ino)` cannot be reused.
+- **Source**: c8f01dbf
+
 ## Superseded
 
 - ~~Adjacent VMAs joined only for display in maps and in fork's commit estimate (D7 in part, rounds 17, 18)~~ → replaced by **D22** in e03c0cc (2026-11-07)
@@ -202,3 +223,6 @@
 - ~~process_mrelease stays `ENOSYS` until earlyoom and oom_score make it worth doing (b141001 in part)~~ → replaced by **D35** in 39ea702 (2026-11-08)
 - ~~FUSE mappings copy the whole range into a memfd at mmap (c008749)~~ → replaced by **D40** in 3957a03 (2026-11-09)
 - ~~Guest memory, with the page table, software TLB and OOM killer, is one kernel/mm module (D18, cd53f35)~~ → replaced by **D18** in 44a21b7 (2026-11-11)
+- ~~Direct unpruned `Mm::map` memop registration in f2690b02~~ → replaced by **D46** in 9b3b6860 (2026-11-21).
+- ~~Bypassing `FileMaps` for `bundled_libc` mappings in 6b59a1b4~~ → replaced by **D47** in c8f01dbf (2026-11-21, cross-module predecessor tagged under kernel/mmu and kernel/exec).
+- ~~D18 ownership of fork/copy-on-write and host backing in kernel/mm (cd53f35, 44a21b7)~~ → replaced by **D18**, kernel/cow **D1** and kernel/hostmem **D1** in 610d623f (2026-11-22).

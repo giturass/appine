@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/files"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-21 (HEAD = 125f3d00)
 >
 > Decisions on open files made before kernel/files was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D5, D11, D17, D22, D24, D26, D27, D29, D33, D34, D41, D44, D45, the owner half of D25, the `open_pseudo` half of D19 and the file I/O halves of D36 and D37; the pre-split fd reservation decision is D55.
 
@@ -47,3 +47,11 @@
 - **Tradeoffs**: The replacement paths share an additional helper.
 - **Watch out**: Future fd replacement paths must use the same target-context close.
 - **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b
+
+### D6: Render-node open descriptions carry per-open virtio-gpu context state
+
+- **What**: `gpu.rs` and `syscall/gpu.rs` provide the virtio-gpu render ioctl subset with per-open context state, guest resource handles and capability reporting on the open file description.
+- **Why**: Packaged Mesa Venus expects standard virtio-gpu render ioctls without modifying the guest driver.
+- **Tradeoffs**: PRIME and kernel syncobj ioctls stay outside the implemented subset.
+- **Watch out**: Future Mesa versions may issue additional render ioctls.
+- **Source**: 87c7d9db

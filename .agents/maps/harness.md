@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: signed release naming and verifier expectations for Appine 1.0.1 (2) and the four OpenRC assets)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream sharded CI and Appine 1.1.0 signed releases with GPU inputs and updated JNI checks)
 
 ## Responsibilities
 
@@ -18,7 +18,7 @@ The command-line front end, cargo integration tests and guest programs are `harn
 differential cases and Starnix/gVisor builders are `harness/diff`. Instruction lockstep tests
 remain `engine`, crate unit tests their respective modules, Android instrumentation `android/tests`,
 Android builds `android/build`, rootfs fetching `android/setup`, kernel run/console handling
-`kernel/boot`/`kernel/tty`, and kernel bug hooks `kernel/process`.
+`kernel/boot`/`kernel/tty`, and kernel bug hooks `kernel/bug`.
 
 ## Key types
 
@@ -78,6 +78,10 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 
 ### Survey and crash
 
+- `tests/survey/gpu/` contains the native Vulkan Android instrumentation probe and an ARM64
+  distribution fixture builder. The compute sample checks each shader result and reports stage timings.
+  The DRM lifetime sample exercises shared mapping access after GEM close, fd close and fork.
+
 - `survey` keeps a store with 36 packages (network needed to build it; one whose creation did not
   finish, marked by `<store>.partial`, is made again; a store is never re-provisioned when the
   package list changes) and uses a prebuilt `appine-run` (`APPINE_RUN`, else the
@@ -108,39 +112,50 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs
   and `cargo test --workspace` with the require switches.
 - `android.yml`, on pushes and pull requests that change `core/`, `hosts/android/`, `android/`,
-  the Cargo files or the rootfs and Ghostty scripts (or on demand), on x86_64 (`ubuntu-24.04`,
-  for aapt2): NDK 29.0.14206865, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
-  ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with
-  `target/ghostty` and Zig's global cache cached by the script's hash), then cargo-ndk clippy at
+  the Cargo files or the rootfs, Ghostty and virglrenderer fetch scripts (or on demand), on x86_64 (`ubuntu-24.04`,
+  for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
+  ziglang.org, checked against a pinned sha256), `scripts/fetch-ghostty` (with
+  `target/ghostty` and Zig's global cache cached by the script's hash) and `scripts/fetch-virglrenderer`
+  (with `target/virglrenderer` cached by the script's hash), then cargo-ndk clippy at
   API level 30, `assembleDebug lintDebug`, the APK as an artifact. Both quick workflows cancel a
   run in progress when the same branch is pushed again.
 - `release.yml`, manual only on x86_64: validates the requested full commit SHA, checks out
   workflow tools and the source separately in the current repository, confirms the source
-  revision, installs the same Rust/NDK/Zig inputs plus SDK build-tools 36.0.0, then runs
+  revision, installs the same Rust/NDK/Zig inputs plus SDK build-tools 36.0.0 and CMake 3.22.1, fetches and separately
+  caches virglrenderer after the Rust cache, then runs
   `assembleRelease lintRelease` with no daemon or configuration cache. It decodes the established
   Appine PKCS12 key under `RUNNER_TEMP`, aligns the intermediate APK with `zipalign -P 16`, and
   signs with `apksigner` using the four `APPINE_RELEASE_*` repository secrets through environment
   variables. The temporary key is removed even after failure; credentials never enter Gradle.
 - The release verifier requires a clean source checkout at the expected revision, pins the
   Appine certificate and a modern single-signer signature with SDK `apksigner verify`, and checks
-  manifest identity/version 1.0.1 (2)/SDK/all-files permission, source assets, bundled packages
+  manifest identity/version 1.1.0 (3)/SDK/all-files permission, source assets, bundled packages
   (including four OpenRC APKs), the static browser,
-  JNI exports and the shared-storage `Native.start` DEX descriptor, native dependencies and
-  16 KB ELF/ZIP alignment. `appine-release-<full SHA>` contains `appine-1.0.1-<short SHA>-release.apk`, checksum, source
+  JNI exports and the GPU/shared-storage `Native.start` DEX descriptor
+  `(Ljava/lang/String;IZLjava/lang/String;)J`, public native dependencies including `libvulkan.so`, and
+  16 KB ELF/ZIP alignment. `appine-release-<full SHA>` contains `appine-1.1.0-<short SHA>-release.apk`, checksum, source
   SHA, matching R8 mapping and JSON verification; a failed run uploads lint/verifier diagnostics.
   The release job has a 60-minute timeout, groups concurrency by source SHA without cancelling
   a running build, and never publishes a GitHub release.
 - `full.yml`, nightly at 18:00 UTC on develop when its tip was committed in the last 25 hours, on
-  pushes to master and on demand: the network test, a lockstep run of 200,000 iterations,
-  `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
-  `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the hash of the script,
-  `tests/gvisor` and its program list), both caches restored and saved in steps of their own so
-  that a build is saved even when a later step fails, a release build of `appine-run`,
-  `scripts/difftest -R` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
-  runner every 10 s, `target/difftest` deleted before and after, so every run imports the store and
-  installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
-  samples uploaded as the `difftest` artifact whatever the result), and the engine tests built
-  with clang. The quick and full workflows have no timeout, and `full.yml` has no concurrency group.
+  pushes to master and on demand, splits its work after the `changed` gate into three parallel
+  paths on `ubuntu-24.04-arm`:
+  - `build`: restores/builds/saves `scripts/build-starnix-tests` (keyed on the script and
+    `tests/starnix/compat`) and `scripts/build-gvisor-tests` (keyed on the script, `tests/gvisor`
+    and its program list) in separate restore/save steps so misses persist even if a later step
+    fails, exports both cache keys, builds release `appine-run`, and uploads it as the
+    `appine-run` artifact (`retention-days: 7`, `overwrite: true`).
+  - `checks`: runs in parallel with `build` and `difftest` — the network test, a 200,000-iteration
+    lockstep run, and the engine/lockstep tests built with clang.
+  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): five independent single-lane
+    shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) that partition
+    `tests/diff/*.sh` deterministically without installing Rust. Each shard downloads and
+    `chmod +x`s `appine-run`, restores `target/rootfs` and (if needed) its suite cache with the
+    builder script as fallback, opens `ping_group_range`, runs `scripts/difftest -R` on its slice
+    with 10 s `vmstat` logging (`target/vmstat.log`), and uploads
+    `difftest-<shard>-attempt-<run_attempt>` (`*.appine.err`, `failed/`, `vmstat.log`) on
+    `always()`.
+  The quick and full workflows set no timeout, and `full.yml` has no concurrency group.
 - Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes,
   the performance probe (`appine-bench`).
 
@@ -174,13 +189,22 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   guest `timeout`; only killing `appine-run` ends it.
 - GitHub runs scheduled workflows only from the default branch (master): the nightly `full.yml`
   uses master's copy of the workflow while checking out develop.
-- `full.yml` must build release `appine-run` itself before the differential tests: no other step
-  there makes it (cargo test builds debug, lockstep builds only `appine-lockstep`), and difftest
-  never builds one.
+- `full.yml`'s `build` job must build release `appine-run` and pass it to the `difftest` shards
+  via artifact (`chmod +x` after download, since `actions/download-artifact` strips execute bits):
+  no other job builds it (`checks` builds debug tests and `appine-lockstep`), and difftest never
+  builds one.
 - CI's clang step relies on the runner image's clang; CI installs only llvm and musl-tools.
 - Release signing must preserve the backed-up Appine key and the verifier's certificate pin.
   The verifier also pins package version/SDKs and the shared-storage JNI descriptor; update those
   checks together with their corresponding source contracts.
+
+- `Swatinem/rust-cache@v2` caches all of `target/` and cleans non-Cargo files before saving, which can leave empty subdirectories behind; fetched asset trees under `target/` need their own `actions/cache` step after `rust-cache` and sentinel-file checks rather than bare directory-existence checks.
+
+## Confirmed bugs / technical debt
+
+- On Pixel 11 Pro, Alpine llama.cpp b9564 selects incompatible matrix-multiply and Flash Attention tiles for the PowerVR GPU's 128-lane subgroups. Full offload with `-fa off -ub 16` passed both surveyed Qwen2.5 prompts. The native driver also signals zero-batch submission fences early. The [device survey](../../docs/mobile-gpu.md#powervr-correctness) records the independent controls.
+- On Galaxy S23 firmware `S9110ZCS8FZJ1`, llama.cpp b9564 reproduces the Adreno 740 shader link failure during warm-up in both Alpine and native Android. Native runs identify `quantize_q8_1_x4` for both surveyed Qwen2.5 models. The guest logs do not name the shader. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
+- On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, Alpine llama.cpp b9564 completes full Vulkan offload on Adreno 830 but produces incorrect text for both surveyed Qwen2.5 prompts. The cause remains open. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
 
 ## Open questions
 
@@ -194,3 +218,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 - Device installation, all-files authorization/revocation and installed-app shared-storage
   access remain outside the release verifier's structural coverage, including execution on
   16 KB-page devices.
+- Release APK assembly, native Venus/Ghostty linking, R8 and Gradle lint remain unverified for
+  the combined GPU/shared-storage startup; local Kotlin/resource checks do not cover them.
+- Strict Clippy with the pinned Rust 1.90 requires CI verification. Local Rust 1.100 stops on
+  `clippy::chunks_exact_to_as_chunks` in unchanged `core/hal/src/lib.rs`.

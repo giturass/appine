@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: optional host shared-storage attachment before guest boot and spawn)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: optional renderer startup alongside pre-boot host shared-storage attachment)
 
 ## Responsibilities
 
@@ -22,10 +22,11 @@ The `INIT` constant in `kernel.rs` belongs here. The boot/power fields (`init_ha
 whose process tables also remain there.
 
 Outside the module: task creation and execution, general exit/reaping (including orphan
-adoption), the BKL, the watchdog, host wait helpers, process statistics and the remaining
-`Machine` methods (`kernel/process`); the timer thread's work (`kernel/time`); the ELF loader
-(`kernel/exec`); signal syscall dispatch and permission checks (`kernel/signal`); guest pid
-namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel/tty`).
+adoption), the BKL, host wait helpers, process statistics and the remaining `Machine` methods
+(`kernel/process`); bug containment, kill reports and the BKL watchdog (`kernel/bug`); the timer
+thread's work (`kernel/time`); the ELF loader (`kernel/exec`); signal syscall dispatch and
+permission checks (`kernel/signal`); guest pid namespace creation (`kernel/ns`); console and
+terminal bridge behaviour (`kernel/tty`).
 
 ## Key types
 
@@ -50,6 +51,9 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 ## Data flow / lifecycle
 
 ### Machine start and host spawn
+
+- `Machine::start_with_renderer` passes the optional renderer to the kernel and its presence to
+  `Vfs::open_with_gpu` during store setup. Existing `Machine::start` callers pass no renderer.
 
 - `Machine::start` creates PID 1, the timer thread and the BKL watchdog; a contained panic is
   an internal error. Options configure the store, memory and low-port policy, with
@@ -117,12 +121,12 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 ### Outbound
 
 - `kernel/process`: `Kernel`/`Shared`, BKL, task creation and group tables, waited statuses,
-  wake channels, `bug::host_call`, watchdog and statistics.
+  wake channels and statistics; `kernel/bug`: `bug::host_call` and the BKL watchdog.
 - `kernel/time`: timer worker lifetime; `kernel/exec`: program loading; `kernel/tty`: console
   attachment/detachment and the CLI bridge; `kernel/signal`: shutdown and host-stop signals.
 - `kernel/vfs`, `kernel/store`: opening the store, reading inittab, boot log and final sync;
-  `kernel/oom` and `kernel/net`: initial limit and port-map options; `engine`: tier availability
-  and fault guard; `hal`: host fd limit, events and stop-pipe polling.
+  `kernel/oom` and `kernel/net`: initial limit and port-map options; `engine` (fault guard) and
+  `engine/dbt` (tier availability); `hal`: host fd limit, events and stop-pipe polling.
 - `kernel/mount`, `kernel/fuse`: optional host shared-storage attachment and its lazy server.
 
 ## Invariants and gotchas
@@ -132,8 +136,8 @@ namespace creation (`kernel/ns`); console and terminal bridge behaviour (`kernel
 - Host spawn registers its group, init child and watched slot only after `task::start`
   succeeds. The guest thread cannot run until the BKL is released; returned creation errors
   detach the console and leave no registrations.
-- The timer thread and watchdog use the parent's BKL/containment contracts; boot does not
-  duplicate their policies. Watchdog stop remains last in machine drop.
+- The timer thread and watchdog use `kernel/process`'s BKL and `kernel/bug`'s containment
+  contracts; boot does not duplicate their policies. Watchdog stop remains last in machine drop.
 - Inittab reads hold the BKL, including during shutdown when guest processes may still run.
 
 ## Open questions

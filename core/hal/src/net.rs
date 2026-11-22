@@ -436,6 +436,62 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
 
 // ---- DNS ----
 
+#[cfg(target_os = "android")]
+type AndroidResNsend = unsafe extern "C" fn(u64, *const u8, usize, u32) -> i32;
+#[cfg(target_os = "android")]
+type AndroidResNresult = unsafe extern "C" fn(i32, *mut i32, *mut u8, usize) -> i32;
+#[cfg(target_os = "android")]
+type AndroidResCancel = unsafe extern "C" fn(i32);
+
+#[cfg(target_os = "android")]
+struct AndroidResolver {
+    send: AndroidResNsend,
+    result: AndroidResNresult,
+    cancel: AndroidResCancel,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidResolver {
+    fn load() -> Result<Self, i32> {
+        // Keep libandroid and its graphics/runtime dependencies out of CLI startup.
+        // A successful load keeps the handle open for the lifetime of the cached pointers.
+        unsafe {
+            let handle = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if handle.is_null() {
+                return Err(libc::ENOSYS);
+            }
+            let send = libc::dlsym(handle, c"android_res_nsend".as_ptr());
+            let result = libc::dlsym(handle, c"android_res_nresult".as_ptr());
+            let cancel = libc::dlsym(handle, c"android_res_cancel".as_ptr());
+            if send.is_null() || result.is_null() || cancel.is_null() {
+                libc::dlclose(handle);
+                return Err(libc::ENOSYS);
+            }
+            // These public NDK symbols use the C signatures declared above.
+            Ok(Self {
+                send: std::mem::transmute::<*mut libc::c_void, AndroidResNsend>(send),
+                result: std::mem::transmute::<*mut libc::c_void, AndroidResNresult>(result),
+                cancel: std::mem::transmute::<*mut libc::c_void, AndroidResCancel>(cancel),
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_resolver() -> Result<&'static AndroidResolver, i32> {
+    static RESOLVER: std::sync::OnceLock<Result<AndroidResolver, i32>> = std::sync::OnceLock::new();
+    RESOLVER
+        .get_or_init(AndroidResolver::load)
+        .as_ref()
+        .map_err(|&err| err)
+}
+
+#[cfg(target_os = "android")]
+/// Load the same system resolver that DNS queries use, without sending a query.
+pub fn preload_android_resolver() -> Result<(), i32> {
+    android_resolver().map(|_| ())
+}
+
 /// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
 /// stub in the kernel/net map).
 ///
@@ -444,18 +500,13 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
 /// in turn. It blocks, so the caller must not hold locks.
 #[cfg(target_os = "android")]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
-    #[link(name = "android")]
-    unsafe extern "C" {
-        fn android_res_nsend(network: u64, msg: *const u8, len: usize, flags: u32) -> i32;
-        fn android_res_nresult(fd: i32, rcode: *mut i32, answer: *mut u8, len: usize) -> i32;
-        fn android_res_cancel(fd: i32);
-    }
     /// `NETWORK_UNSPECIFIED`: the system's default network.
     const DEFAULT_NETWORK: u64 = 0;
     if query.len() < 12 {
         return Err(libc::EINVAL);
     }
-    let fd = unsafe { android_res_nsend(DEFAULT_NETWORK, query.as_ptr(), query.len(), 0) };
+    let resolver = android_resolver()?;
+    let fd = unsafe { (resolver.send)(DEFAULT_NETWORK, query.as_ptr(), query.len(), 0) };
     if fd < 0 {
         return Err(-fd);
     }
@@ -464,12 +515,12 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     let mut pfd = [(fd, libc::POLLIN, 0)];
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     if !matches!(poll_until(&mut pfd, deadline), Ok(1)) {
-        unsafe { android_res_cancel(fd) };
+        unsafe { (resolver.cancel)(fd) };
         return Err(libc::ETIMEDOUT);
     }
     let mut answer = vec![0u8; 65535];
     let mut rcode = 0;
-    let n = unsafe { android_res_nresult(fd, &mut rcode, answer.as_mut_ptr(), answer.len()) };
+    let n = unsafe { (resolver.result)(fd, &mut rcode, answer.as_mut_ptr(), answer.len()) };
     if n < 0 {
         return Err(-n);
     }

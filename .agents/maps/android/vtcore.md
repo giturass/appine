@@ -1,11 +1,11 @@
 # android/vtcore Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/vtcore.md` for the paired decision history (not yet created; pre-split decisions D1, D3, D4 and the parsing side of D5–D7 stay in `.agents/decisions/android/vt.md`; earlier terminal implementation decisions D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 stay in `.agents/decisions/android/terminal.md`).
+> See `.agents/decisions/android/vtcore.md` for the paired decision history (pre-split decisions D1, D3, D4 and the parsing side of D5–D7 stay in `.agents/decisions/android/vt.md`; earlier terminal implementation decisions D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: condense verbose type field lists, unused API catalog and repeated invariants while keeping all verified facts)
 
 ## Responsibilities
 
@@ -20,51 +20,35 @@
 
 Root: `VtNative.kt` in `android/app/src/main/java/io/github/mthli/appine/`,
 `hosts/android/src/vt.rs`, and `hosts/android/src/vt.c` except its frame-format specification
-and Frames section (android/vtrender) and its Input, Paste, Mouse and focus, Selection, Links,
-Taps on the prompt and Search sections (android/vtview).
+and Frames section (`android/vtrender`), its Input, Paste, `appine_vt_focus` (in Mouse and focus)
+and Search sections (`android/vtview`), and `appine_vt_mouse` (in Mouse and focus) plus its
+Selection, Links and Taps on the prompt sections (`android/vtgestures`).
 
 Outside the module: Kotlin sessions and console/login lifecycle (`android/vt`); session ownership,
 save files, notifications and memory policy (`android/service`); the screen (`android/terminal`);
-view interactions (`android/vtview`); frame encoding and drawing (`android/vtrender`);
+view lifecycle, input and search (`android/vtview`); touch/mouse gestures, scrolling, selection,
+links and prompt taps (`android/vtgestures`); frame encoding and drawing (`android/vtrender`);
 the host console (`kernel/tty`); `guarded!` and the kernel handle table (`android/native`), build/linking (`android/build`); the shell hooks producing prompt marks (`android/setup`).
 
 ## Key types
 
-- `VtNative` — 48 `@JvmStatic external` functions on the native library, and libghostty-vt's
-  cursor styles (`CURSOR_BAR`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`, and for frames `CURSOR_HOLLOW`
-  and vt.c's `CURSOR_LOCK`), selection gesture behaviours
-  (`GESTURE_WORD`, `GESTURE_LINE`) and selection adjustments (`ADJUST_*`), passed to vt.c as raw
-  values, so they must match libghostty-vt's headers.
-- In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
-  mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
-  tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
-  `AppineVt`, freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into
-  `Effects` (with the `StatusReport`s decoded from vt.c's queue, the clipboard reads, the last
-  command finished: its exit code when reported and how long it ran, and whether tmux's control
-  mode, which vt.c detached, ended); the
-  compression schedule `COMPRESS` (a `Due` per tab: when to look at it next and when it was
-  scheduled), served by the `vt-compress` thread (`compressor`).
-- In `vt.c`: `AppineVt`, one per terminal: the terminal, its render state, key and mouse encoders,
-  the grid and cell pixel sizes; reply, frame and scratch buffers and one text buffer shared by
-  title, copy, link and transcript; the title-changed flag, the synchronized-output hold and
-  `password_input` (the cursor then a lock), and `resize_pending` with `resize_output_at` (output
-  after a grid resize has not settled); the selection gesture, shared by touch and mouse (with
-  reusable events: an untimed press and a drag for a finger, a timed press and a release for a
-  mouse), and the tracked anchor of a handle's drag; the last reported mouse cell; the effects
-  since they were last taken (bells, the last clipboard write, notification and progress report,
-  every program status report queued in a byte layout vt.rs reads, the clipboard reads with the
-  clipboard last named, the last command finished, `tmux_detached`), handed out as
-  `AppineVtEffects`; command timing (`command_start`, `was_at_prompt`); the OSC string the output
-  is in (its first 64 bytes and length) and the DCS string (first 5 bytes, header, length, and
-  `tmux_control`); `prompt_click` (how a tap on the input moves the shell's cursor, as the primary
-  screen's last prompt start declared); the search (a `GhosttySearch`, scratch for the viewport's
-  and all matches and their rows, each viewport cell's mark this frame and as last sent); the cell
-  of an output a long press found, tracked for Select output; the compression state (a pass
-  scheduled, the activity token last seen, `compress_touched`); whether the last transcript
-  (`transcribed`) and snapshot are still current; and the render state's image list
-  (`Placement`) with its generation. Process-wide, installed into libghostty-vt's sys interface
-  with the first terminal (`install_sys`): the PNG decoder and the log callback (`on_log`), which
-  with `on_unknown_sequence` shares a limit of 20 lines a second across all tabs (`log_allowed`).
+- `VtNative` — 48 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
+  cursor style (`CURSOR_*`), selection gesture (`GESTURE_*`) and adjustment (`ADJUST_*`) constants
+  that must match libghostty-vt's headers.
+- In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, `dirty` flag) in
+  monotonically keyed `TABS` (handles from 1, never reused); `TermGuard` (releases the tab lock and
+  schedules compression when work remains); `Term` (owns `AppineVt`, freed on drop); `RawEffects`
+  (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport` queue, clipboard
+  reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab) served by `vt-compress`
+  (`compressor`).
+- In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal, render
+  state, key/mouse encoders, grid/cell geometry, shared reply/frame/scratch/text buffers, resize
+  settle and synchronized-output/password flags, selection-gesture and search scratch, queued
+  `AppineVtEffects`, OSC/DCS prefix scanners and `tmux_control` state, command-timing and
+  `prompt_click` state, compression/transcript/snapshot dirty flags, and the render state's
+  `Placement` list with its generation. Process-wide (`install_sys`, installed with the first
+  terminal): the Wuffs PNG decoder and `on_log` (sharing a 20 lines/s rate limit with
+  `on_unknown_sequence`, `log_allowed`).
 
 ## Public entry points
 
@@ -313,8 +297,9 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   resize, messages and clear/reset. The session closes the console to end a pump read.
 - android/service: `VtNative.compressAll` and `dropImages` on its worker; `Tabs` reads
   `VtNative.version` for snapshot compatibility.
-- android/vtview: `VtNative` frame, input, selection, links, prompt taps and search functions
-  using the attached session's handle. The JNI calls take the terminal lock before entering
+- android/vtview: `VtNative` frame, password, key/paste/focus, prompt-jump and search functions
+  using the attached session's handle; android/vtgestures: `VtNative` mouse, scroll, selection,
+  output, copy, link and prompt-tap functions. The JNI calls take the terminal lock before entering
   vt.c's interaction sections.
 - android/vtrender: `VtImages` uses `VtNative.image`; frame and image calls enter its native
   Frames section through this module's JNI under the tab lock.
@@ -324,165 +309,83 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 - android/vt through `VtSession.on*` callbacks on the pump thread; the session marshals events
   to the main thread and owns clipboard responses and progress/status lifetime. android/setup
   provides the prompt marks whose parsing is described here.
-- android/vtview and android/vtrender own the excluded vt.c sections; their implementations
-  share `AppineVt` and obey this module's lock, buffer and compression contracts.
-- libghostty-vt 1.0.0, Ghostty's terminal library released apart from the app (the terminal
-  state and its full reset, the default cursor's shape and blinking, writes that stop at OSC and
-  DCS strings' starts and ends, render state with one overscan row, key and mouse encoders, paste,
-  focus encoding, selection gestures (a finger's untimed word and line presses and drags; a
-  mouse's timed clicks with their count, cell, word, line and output behaviours, rectangle drags,
-  releases, dragged flag and anchor), word selection and selection containment (right-click),
-  output derivation and keyboard adjustment, search with the list of all its matches, plain-text
-  formatting, title and width,
-  progress and program status reports, semantic
-  prompts (cursor at a prompt, scrolling by prompts, the OSC 133 callback, rows' and cells' marks
-  read through grid references), the full reset callback, unimplemented OSC and
-  APC strings, its log, scrollback compression, snapshots with continuation tracking, Kitty
-  graphics with their render-state image list and animation), and the Wuffs PNG decoder it
-  carries, linked into
-  `libappine.so` (`android/build`); the system's libjnigraphics (bitmap locking for images'
-  pixels, used by android/vtrender); `Machine::read_console_run`,
-  `write_console`, `resize_console`, `console_foreground` and `console_password_input`
-  (kernel/tty) and the
-  bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly.
-- Of libghostty-vt's C API, the terminal has no use for: the parsers that work without a terminal
-  (OSC, SGR); key and mouse events' getters; `wasm_*`, `type_json`, `ghostty_version` and
-  `build_info` but its version string; the formatter's extras; the cursor's SGR style; colour
-  string parsing and the X11 names; iterating Kitty placements directly; decoding a snapshot in
-  steps and exporting its unfinished sequence; key events' composing flag and the macOS
-  Option-as-Alt option, the one `set_from_terminal` does not copy; the standalone encoders the
-  terminal's own handling replaces (`paste_encode`, `paste_is_safe`, `size_report_encode`,
-  `mode_report_encode`, `color_scheme_report_encode`); the hollow block cursor style; setting the
-  title or directory by hand. Defaults that suit it stay unset: resizing pulls rows back from the
-  scrollback (right for a console that keeps no screen of its own), APC strings' size limits and
-  getrandom. OSC 7 (and OSC 9 or 1337 directories) is left unwired: Ghostty takes a directory only
-  from the local host, and for a local shell the kernel's foreground directory, which new tabs use,
-  says as much.
+- android/vtview, android/vtgestures and android/vtrender own the excluded vt.c sections; their
+  implementations share `AppineVt` and obey this module's lock, buffer and compression contracts.
+- libghostty-vt 1.0.0 and its bundled Wuffs PNG decoder linked into `libappine.so` (`android/build`),
+  providing terminal state, render state with one overscan row, input/selection/search/formatter
+  APIs, OSC 133 semantic prompts, progress/status callbacks, scrollback compression, snapshots with
+  continuation tracking and Kitty graphics; `libjnigraphics` (used by android/vtrender);
+  `Machine::{read_console_run, write_console, resize_console, console_foreground,
+  console_password_input}` (`kernel/tty`); `android/native`'s `guarded!`, handle table and string
+  helpers.
+- Deliberately unused libghostty-vt C surfaces: standalone parsers/encoders superseded by terminal
+  handling, WASM/JSON helpers, X11 colour names, stepped snapshot decoding, macOS Option-as-Alt,
+  hollow cursor style, manual title/directory setters, and OSC 7 directory hooks (local shells use
+  the kernel's foreground cwd). Defaults kept unset: resize pulling scrollback rows, APC limits and
+  `getrandom`.
 
 ## Invariants and gotchas
 
-- A kill report opens its room with line feeds before moving back up, so the cursor's line moves
-  down with the cursor; this needs the parser at ground, which the CAN ensures. A program that died
-  in the middle of a UTF-8 sequence leaves a U+FFFD at its last output position: the CAN ends the
-  sequence and the decoder replaces it. The report's cursor save overwrites one the program had
-  saved.
-- A tab refers to its kernel by handle and looks it up for each call: the pump once per read,
-  holding it through the blocking read and the reply write and dropping it before calling into
-  Java; each resize; like the `Native` functions. `Native.stop` and `shutdown` remove the handle
-  and end the processes, and the store is closed when the last `Arc<Machine>` goes, so a tab
-  holding one would keep the old store open after a reboot, tier change or distro switch, and the
-  next kernel would start without the boot cleanup. The service releases its tabs (closing their
-  consoles) before shutting the kernel down, so the pump's read returns first.
-- The pump stays in native code for the tab's whole life, so JNI local references it makes for
-  each event (the clipboard text, a notification's strings) must be deleted after the call, or
-  they pile up in its frame.
-- `AppineVtEffects` (vt.c) and `RawEffects` (vt.rs) are one layout and change together, as the
-  frame format does (vt.c's comments name vt.rs's `Effects` for it).
-- A restored terminal is a new one (the decoder makes it): the userdata and callbacks are not in a
-  snapshot, nor are the Kitty storage limit (a decoder option), the media, the Glyph Protocol,
-  the continuation limit (the unfinished sequence's bytes are), the terminfo name and the
-  clipboard-write and unknown-sequence limits;
-  the snapshot carries the scrollback limits, default colours, default modes (2027's) and cursor
-  defaults and whether the cursor follows them (older snapshots a steady cursor). vt.c sets every
-  option on it as on a new terminal, after `settle` (whose DECSTR makes the cursor follow its
-  defaults again), and the session then sets the user's cursor, so the app's values win.
-- libghostty-vt's clipboard-read callback must answer before it returns, which happens on the pump
-  thread under the tab's lock: asking the user there would block every frame (the main thread
-  takes the same lock). OSC 52 reads are therefore found by vt.c and answered later through the
-  tab's writer, and OSC 5522 reads, which only the callback can serve, stay refused.
-- vt.c's OSC and DCS tracking (`osc_open`, `dcs_open` and `tmux_control`) follows only what goes
-  through `appine_vt_feed`. App writes that cancel a program's string with CAN (`write_own`) clear
-  it (a tmux control string so cut is never reported as detached); any other write into the
-  terminal that could end or start such a string must too, or a later string's start is misread.
-  Text the app prints (`VtNative.print`) goes through the tracking, but its replies are dropped,
-  so it cannot detach tmux.
-- The tmux detach rests on tmux taking a lone carriage return in control mode as an empty line,
-  which detaches it (tmux 3.5a and 3.7c do); the reply goes out once per string. Should a program
-  ever start and end such a string within one read, the carriage return still reaches whatever
-  reads the console next (an empty line at a shell's prompt).
-- Continuation tracking keeps at most 64 KiB of an unfinished sequence: a snapshot taken while
-  output stops inside a longer one (an OSC 52 write, a large Kitty transmission) fails, and that
-  save leaves the tab without a snapshot until the terminal changes.
-- libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock (recovered when
-  poisoned); the frame buffer is written only by `frame`, which only the main thread calls, so the
-  main thread reads it after the lock is released. vt.c's text buffer is shared by title, copy,
-  link and transcript, so each result is turned into a Java string under the lock (the end of a
-  compression pass frees it when large).
-- Compression is scheduled only when a `TermGuard` is released, so every call into vt.c that can
-  make work must lock through `Tab::term`; the compressor and `compressAll` lock the mutex
-  directly because they make none (through the guard, a step would schedule its own pass). A tab's
-  lock is taken before the schedule's, never after: the compressor lets the schedule's lock go
-  before a step.
-- libghostty-vt's compression activity token does not change when a read restores compressed
-  pages, so a vt.c function that reads beyond the viewport (the formatter, select all, grid
-  references above or below it) must set `compress_touched`, or what it restored stays
-  uncompressed until other activity. A vt.c function that writes into the terminal must clear
-  `transcribed`, or saves keep the old transcript.
-- Compression gives page memory back with `MADV_DONTNEED` on ranges aligned to Zig's minimum page
-  size (4 KiB), which a 16 KB-page kernel rounds up. That stays harmless because every terminal
-  page, pooled or not, is a mapping of its own from Zig's page allocator, so the rounding never
-  reaches another page; a libghostty-vt that packed pages into shared mappings would break it.
-- Since Ghostty 1.4's libghostty-vt, `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself, not
-  its address (older code passing `&ptr` crashes in the reply callback).
-- The `get` and `set` functions take `void *` values, so a value of the wrong type compiles: 1.0
-  changed some (a cell's graphemes come in a `GhosttyCodepointBuffer`, a Kitty image's pixels in a
-  `GhosttyString`), and an upgrade must check every key's documented type, not only what fails to
-  compile.
-- Without a DA reply, programs that probe for it (vim, tmux) wait for a timeout, so `vt.c` answers
-  DA1 (132 columns, selective erase, ANSI colour, and clipboard access, 52, which Ghostty lists
-  whenever clipboard writes are allowed and programs check before using OSC 52), DA2 (VT220), DA3
-  and XTVERSION ("appine") and reports a dark colour scheme. XTGETTCAP answers `TN` with the name
-  vt.c sets, and every other capability from libghostty-vt's built-in table of Ghostty's own entry,
-  not from `xterm-256color`'s.
-- Command timing's at-prompt state (`was_at_prompt`) changes only in `appine_vt_feed`, which the
-  app's own printed text also goes through; clearing, resetting, messages and resizes leave it.
-  With an edited profile's older ash marks (input ends with its line, OSC 133;I, and no
-  `appine_lf=output`), output of a background job while the shell waits
-  at its prompt starts the timing, so the next command's time is counted from then; the current
-  ash marks, bash and zsh are not affected. libghostty-vt is built ReleaseFast, so its log emits info and
-  above, of which `on_log` passes warnings and errors; the log is installed when the first
-  terminal is wrapped, after it was created or restored, so what that first decode and settle
-  would log goes nowhere.
-- Without default foreground and background colours libghostty-vt treats them as unset: OSC 10
-  and 11 queries go unanswered, reverse video (DECSCNM) swaps nothing, and a colour set with OSC 10
-  or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
-  answers the foreground. A full reset (RIS) resets the palette but keeps colours set with OSC 10,
-  11 and 12, as Ghostty does.
-- libghostty-vt leaves the Glyph Protocol off (since 1.0; the copy in Ghostty 1.4.0 turned it on
-  and answered `fmt=glyf` to its query), and the C API gives no access to registered glyphs; vt.c
-  turns it off at create all the same. A full reset
-  keeps that setting, the Kitty storage limit and the allowed media (the alternate screen takes
-  the primary's), so they stay as set. Its Kitty media default is data in the escape sequences
-  only; vt.c sets it again so a library change cannot open the file media, whose paths would be
-  the app's own files rather than the guest's.
-- As built for an app (`-Demit-lib-vt`), libghostty-vt has no PNG decoder unless one is installed
-  (`ghostty_sys_set`, process-wide), though libghostty-vt.a contains Wuffs: vt.c's decoder calls
-  Wuffs's C functions in the archive, compiling against the header from the release's Zig
-  packages.
-  Without it, PNG images (`f=100`, what most programs send) fail with `EINVAL`.
-- Erasing below the cursor (ED 0, what busybox's `clear` sends) leaves images in place, as in
-  Ghostty and kitty; ED 2 and 3 delete the visible ones (and the scrollback's).
-- With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
-  emoji sequences; they can turn mode 2027 off.
-- libghostty-vt's C terminal starts with a scrollback byte limit of 10,000 bytes (the default of
-  its `Terminal.Options`, not Ghostty's 50 MB `scrollback-limit-bytes`), raised to its minimum of
-  the active area's pages plus one, so a line limit alone keeps about two pages. The byte and line
-  limits both apply, the first reached pruning whole 400 KiB pages; a page holds fewer rows the
-  wider the terminal (about 1,000 at 45 columns, 580 at 80, 190 at 250).
-- With prompt marks, every resize while the cursor is at a prompt (the keyboard showing or hiding
-  is one) clears the prompt's rows, from its first row down, for the shell to redraw them on
-  SIGWINCH (bash's marks ask for the last row only, `redraw=last`, as readline redraws). busybox
-  ash, bash and zsh redraw on every resize, rows only included; a shell given the marks that did not
-  would lose its prompt and typed input until the next one.
-- Text the app prints does not consume the title-changed flag, so a title it sets is reported at
-  the pump's next read; a notification cut at 4 KiB can split a UTF-8 sequence, which vt.rs decodes
-  lossily.
-- android/vt applies user cursor defaults after create/restore, sends the form feed requested
-  by clear/reset, and releases sessions before kernel shutdown. Its clipboard responses are
-  asynchronous; native callbacks must not wait for the main thread.
-- Snapshot files are version-gated by android/service's `Tabs`; one from another libghostty-vt
-  version falls back to the transcript. The session keeps the last transcript and snapshot file
-  when native saving returns null.
+- A kill report opens room with line feeds after CAN-resetting to `VT_GROUND` (leaving U+FFFD if a
+  program died mid-UTF-8) and overwrites any program-saved cursor.
+- A tab looks up its kernel by handle per call (dropping `Arc<Machine>` before Java callbacks) so
+  stale tabs cannot keep an old store open across reboot, tier change or distro switch; the service
+  releases tabs before kernel shutdown.
+- The pump stays in native code for the tab's whole life, so JNI local references created per event
+  must be deleted immediately.
+- `AppineVtEffects` (vt.c) and `RawEffects` (vt.rs) share one layout and must change together, as
+  the frame format does.
+- Restoring creates a fresh terminal: callbacks, Kitty storage/media limits, Glyph Protocol,
+  continuation limit, terminfo name and clipboard/unknown-sequence limits are not in the snapshot
+  and must be re-applied after `settle` (before `VtNative.setCursor`); `settle`'s DECSTR resets the
+  cursor to its defaults.
+- libghostty-vt is not thread-safe: every `vt.c` call holds the tab lock (recovered if poisoned),
+  so callbacks must never block on the main thread (hence async OSC 52 reads and refused OSC 5522
+  reads). `frame` writes the frame buffer only on the main thread; the shared text buffer (title,
+  copy, link, transcript) is copied to a Java string under the lock.
+- Compression schedules only when `TermGuard` drops, so mutating calls must lock via `Tab::term`,
+  while `compressor`/`compressAll` lock the mutex directly to avoid self-rescheduling. Lock order:
+  tab lock before `COMPRESS` lock, never reversed.
+- Because libghostty-vt's activity token ignores read-triggered decompression, any `vt.c` path
+  reading beyond the viewport must set `compress_touched`; any path mutating terminal state must
+  clear `transcribed`.
+- `vt.c`'s OSC/DCS tracking (`osc_open`, `dcs_open`, `tmux_control`) follows only `appine_vt_feed`:
+  `write_own` clears it after CAN (cutting a tmux control string without reporting detach), and any
+  other direct terminal write must do the same. `VtNative.print` drops replies so it cannot detach
+  tmux; a tmux `1000p` string that opens and closes in one read still sends its CR to the console
+  (detach relies on tmux 3.5a/3.7c treating a lone CR as an empty line).
+- Continuation tracking caps unfinished sequences at 64 KiB; saving mid-sequence beyond that fails
+  until the terminal changes.
+- Compression uses `MADV_DONTNEED` at 4 KiB alignment (rounded up on 16 KB kernels), safe only
+  because Zig's page allocator gives every terminal page its own mapping.
+- `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself (not `&ptr`), and `get`/`set` take
+  untyped `void *` values, so libghostty-vt upgrades must re-check every key's documented C type.
+- `vt.c` answers DA1 (132 cols, selective erase, ANSI colour, clipboard 52), DA2 (VT220), DA3,
+  XTVERSION (`"appine"`) and dark colour scheme so probing tools (vim, tmux) do not time out;
+  XTGETTCAP answers `TN` with `xterm-256color` and all other capabilities from libghostty-vt's
+  built-in Ghostty entry.
+- `was_at_prompt` updates only in `appine_vt_feed` (clear/reset/message/resize leave it); edited
+  profiles using older ash OSC 133;I marks without `appine_lf=output` can start timing on
+  background-job output at the prompt. ReleaseFast logs warnings/errors via `on_log`, installed
+  after the first terminal is created/restored, so first-restore decode/settle logs are dropped.
+- Default foreground/background colours must be set or OSC 10/11 queries go unanswered, DECSCNM
+  swaps nothing and OSC 10/11 overrides miss render state; with them, OSC 12 falls back to
+  foreground, and RIS resets the palette while keeping OSC 10/11/12 colours.
+- `vt.c` explicitly disables the Glyph Protocol and restricts Kitty media to direct escape data at
+  create (both persist across RIS and copy to the alternate screen) so library defaults cannot
+  expose host files; Wuffs PNG decoding must be installed via `ghostty_sys_set` or `f=100` fails
+  with `EINVAL`. ED 0 leaves images; ED 2/3 delete them.
+- Mode 2027 (grapheme clustering) can disagree with `wcwidth`-only programs on emoji unless disabled;
+  libghostty-vt's C terminal starts at a 10,000-byte scrollback default (raised to active pages + 1),
+  so both the 10,000-line and 10 MiB limits must be set (pruning whole 400 KiB pages: ~1,000 rows
+  at 45 cols, ~580 at 80, ~190 at 250).
+- Prompt marks make every resize at a prompt clear the prompt rows (bash's `redraw=last` clears
+  only the last row) expecting the shell to redraw on SIGWINCH; shells that do not redraw lose
+  visible input until the next prompt.
+- `VtNative.print` does not consume `title_changed` (reported on the next pump read); 4 KiB
+  notification truncation can split UTF-8 (decoded lossily in `vt.rs`).
+- `android/vt` applies cursor defaults, sends clear/reset form feeds and releases sessions before
+  shutdown; `android/service`'s `Tabs` version-gates snapshots and retains the last file on null.
 
 ## Confirmed bugs / technical debt
 
@@ -504,15 +407,12 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, marked `GHOSTTY_PASTE_SOURCE_TEXT`, or they would become paste
   events).
 - **More of libghostty-vt left unused**:
-  - the rest: VT or HTML formatting with colours and OSC 8 links (transcripts are plain text); the
-    memory usage and the VT processing-error flag; the OSC 133 event's command line and error text;
-    KAM (mode 2), ignored as Ghostty ignores it by default;
-  - out of reach in the C API: the terminal's visibility (mode 2033 reports every tab as visible)
-    and the password-input flag (vt.c keeps its own); Kitty drag and drop (OSC 72, a callback only
-    in the Zig API); OSC 66, OSC 99 and hierarchical contexts, parsed but not acted on; tmux control
-    mode, left out with Oniguruma when libghostty-vt is built for apps, so `ESC P 1000 p` would be
-    swallowed as an unknown DCS: vt.c detaches tmux as it starts (Console output and effects), and `tmux -CC`
-    gets no windows or tabs as iTerm2 gives it.
+  - VT/HTML formatting with colours and OSC 8 links (transcripts are plain text); memory usage and
+    the VT processing-error flag; OSC 133 command line and error text; KAM (mode 2).
+  - Out of reach in the C API: terminal visibility (mode 2033 reports every tab visible), native
+    password-input flag, Kitty drag-and-drop (OSC 72), OSC 66/99/hierarchical contexts, and tmux
+    control-mode parsing (built without Oniguruma; `vt.c` detaches `tmux -CC` instead of providing
+    iTerm2-style windows/tabs).
 
 ## Open questions
 

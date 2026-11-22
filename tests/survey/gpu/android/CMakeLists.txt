@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(gpuprobe C)
+set(gpu "${CMAKE_CURRENT_SOURCE_DIR}/../../../../hosts/android/gpu")
+add_library(gpuprobe SHARED probe.c "${gpu}/probe.c")
+target_include_directories(gpuprobe PRIVATE "${gpu}")
+target_compile_options(gpuprobe PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(gpuprobe PRIVATE vulkan android)

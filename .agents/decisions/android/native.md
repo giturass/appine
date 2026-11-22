@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -13,6 +13,14 @@
 - **D11** — parse_route skips non-ASCII hex fields rather than byte-slicing into a panic, and D15 now turns a JNI panic into a failure result rather than aborting the app (09188ec, 39e55b4b)
 - **D17** — takeKills appends cleaned Bug::stubs paths joined by U+001E for service reports, representing only paths observed at death, and MachineTest does not check the field (99b4216 (with android/service D6), 39e55b4b)
 - **D18** — Native.bklStall reads the latest watchdog stall without taking the BKL, returns the tab-delimited id/seconds/report/end record or null under guarded!, and its format must stay aligned with TerminalService.reportStall (64a6107 (with android/service D18), 39e55b4b)
+
+> Full text of D7, D13, D14, D21, D22: `git show c4db5db249c93e2e122d88ef60153f67c94a1f62:.agents/decisions/android/native.md`
+
+- **D7** — `com.google.android.material:material:1.14.0` stays a direct version-catalog dependency with AppCompat, `androidx.activity` and CoordinatorLayout transitive, and upgrades must manually review static notices without an allow-list check (55be399; ef7a803; bd580227; d053be24; 39e55b4b)
+- **D13** — Fuchsia Starnix's BSD license ships in the static catalog backed by `android/licenses` and checked by `LicenseTest`, so changes to Starnix-derived `tty.rs` code must update the static notice manually (f2d3264; bd580227; d053be24; 39e55b4b)
+- **D14** — Static Appine notices and catalog entries use capitalized `Appine` (while asset IDs/paths stay lowercase), and instrumentation asserts `Welcome to Appine` and the `Appine` component lookup (3f04bf5; bd580227; d053be24; 39e55b4b)
+- **D21** — Static catalog subtitles keep license names and qualifiers without descriptive suffixes across locales, leaving descriptions and Appine's source URL in details (d35669e1; 20137e4c; bd580227; d053be24; 39e55b4b)
+- **D22** — `androidx.preference:preference:1.2.1` is a direct non-KTX catalog dependency whose upgrades must stay compatible with Material/AppCompat and pass notice and lint checks (f8822b8b; 20137e4c; bd580227; d053be24; 39e55b4b)
 
 ## Active (full detail)
 
@@ -57,13 +65,6 @@
 - **Watch out**: A global cache that ever held a package archive (such as `~/.cache/zig`) makes Zig 0.17 panic with "reached unreachable code", so the build must keep its own; an upgrade can change the C API silently, need a newer Zig or add linked components the notices miss (list libghostty-vt.a's objects again); build.rs reruns only on vt.c, the source's `LIB_VERSION` and `build.zig.zon` and its environment variables, not when pkg/wuffs's `.zon` changes; the notices test now expects libghostty-vt and translate-c titles, while shared app state or stale emulator stores can still break login tests.
 - **Source**: 394aecf, b38d29c, 8811c32, 172be7c; a1367531; 20137e4c; d053be24; 39e55b4b
 
-### D7: Material Components remains a direct catalog dependency
-- **What**: com.google.android.material:material:1.14.0 stays in the version catalog, while its license and transitive attributions are maintained in static notices (D24).
-- **Why**: Material 3 controls require a direct dependency and matching packaged attribution.
-- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout arrive transitively, and versions and notices require manual maintenance.
-- **Watch out**: Dependency upgrades no longer trigger a license allow-list failure, so resolved components must be reviewed explicitly.
-- **Source**: 55be399; ef7a803 (catalog); bd580227; d053be24; 39e55b4b
-
 ### D8: Instrumentation tests cover oversized downloads, homeless accounts and repeated reads of saved tabs
 - **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test (its tabs built without names since 7c35183) reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
 - **Why**: The fetch cap, homes of `/` and keeping the killed-run marker had no device-side coverage, and the saved-tabs test still expected the marker to be deleted.
@@ -92,20 +93,6 @@
 - **Watch out**: Newest fetched artifacts can differ from release pins; preserve failure/retry, concurrent offline login, independent-install, user-removal and sandbox tests, with full source-archive and 16 KB-page validation still outstanding.
 - **Source**: b014e84; 7aa817af; 410ef192; 20137e4c; bd580227, 0815b3e4; d053be24; 39e55b4b
 
-### D13: Fuchsia Starnix's licence ships with the app
-- **What**: The Fuchsia Starnix line-discipline entry in the static catalog is backed by the upstream reference license in android/licenses and checked by isolated LicenseTest coverage.
-- **Why**: libappine.so contains line-discipline code adapted from Starnix, and its BSD licence requires the notice in the materials shipped with the binary.
-- **Tradeoffs**: The repository retains duplicate reference license copies and manually maintained attribution.
-- **Watch out**: Changes to Starnix-derived code or tty.rs attribution require updating the static notice, not a removed Gradle generator.
-- **Source**: f2d3264; bd580227; d053be24; 39e55b4b
-
-### D14: The notices and tests name the app Appine
-- **What**: The static Appine notice and catalog use the capitalized product name, and instrumentation still expects Welcome to Appine and looks up the Appine component.
-- **Why**: The licence screen listed the app as "appine", and its AGPL notice began with the lowercase name.
-- **Tradeoffs**: Asset identifiers and paths remain lowercase.
-- **Watch out**: New static documents must preserve product-name capitalization and matching catalog lookup IDs.
-- **Source**: 3f04bf5 (with android/terminal D28); bd580227; d053be24; 39e55b4b
-
 ### D15: Every JNI function catches panics
 - **What**: `guarded!(name, [throws env,] fallback, { body })` runs each JNI body in `catch_unwind` with its parameters moved in; a panic logs "internal error in <function>" after the hook's message and returns a failure value (-1 for console I/O and int results, -9 from waitFor, 0 from processes and takePower, null for objects, nothing for unit), and the 17 functions Kotlin declares `@Throws` also throw `IOException` unless an exception is pending; the `VtNative` functions use it without throwing (android/terminal D35).
 - **Why**: The JNI layer had no `catch_unwind`, so a panic in an unwrapped kernel-layer method or in the bridge itself aborted the whole app (D5's Watch out, an open question in the map).
@@ -133,22 +120,6 @@
 - **Tradeoffs**: The script is still long, its task classes stay untestable outside a build, and AGP's version sits apart from the catalog.
 - **Watch out**: Task classes must not capture script-level members, and static notice maintenance now replaces build-time discovery (D24).
 - **Source**: ef7a803; bd580227; d053be24; 39e55b4b
-
-### D21: License subtitles keep license names without descriptive suffixes
-
-- **What**: Static catalog summaries retain license names and qualifiers without descriptive suffixes, while the Appine notice preserves copyright, warranty and complete license text.
-- **Why**: Descriptions added unnecessary text beside the license names.
-- **Tradeoffs**: Descriptions and Appine’s source URL remain in details rather than list subtitles.
-- **Watch out**: Catalog changes must preserve the editorial rule in both locales; reader behavior belongs to android/licenses.
-- **Source**: d35669e1; 20137e4c; bd580227; d053be24; 39e55b4b
-
-### D22: AndroidX Preference is a direct non-KTX dependency
-
-- **What**: The version catalog declares androidx.preference:preference:1.2.1 and the app uses it with attribution maintained in the static notices.
-- **Why**: Settings now directly uses AndroidX Preference classes.
-- **Tradeoffs**: The runtime gains a dependency without needing preference-ktx.
-- **Watch out**: Upgrades must stay compatible with Material/AppCompat and pass notice and lint checks.
-- **Source**: f8822b8b; 20137e4c; bd580227; d053be24; 39e55b4b
 
 ### D23: JNI exposes one guarded guest-CPU aggregate for the screen-off policy
 
@@ -229,6 +200,30 @@
 - **Tradeoffs**: The existing version is retained and tests require Android instrumentation.
 - **Watch out**: Real IME/vendor behavior remains unproven and upgrades must update static notices; build and test ownership now belongs to android/build and android/tests.
 - **Source**: 34348eda; 39e55b4b
+
+### D33: A private app-UID `:venus` service probes both BLOB sharing directions
+
+- **What**: `GpuService` runs in a private app-UID `:venus` process that probes GPU-export and CPU-export coherent BLOB sharing as needed and uses per-context IPC (including an allocator worker and socket for CPU export and GPU-only import on Mali).
+- **Why**: Adreno on Galaxy S23 requires dedicated opaque-fd resources and rejects isolated UIDs, while Mali on Pixel 8 maps coherent type 0 on CPU but permits reimport only as type 1.
+- **Tradeoffs**: Requires decoder patches, per-context IPC, and an allocator worker and socket for each CPU-export context.
+- **Watch out**: Vendor memory-type compatibility and coherency vary by device and firmware, and physical 16 KiB hardware still needs validation.
+- **Source**: 87c7d9db, e94c49df
+
+### D34: `Native.start` gates `:venus` probing on an explicit flag and awaits delayed binds
+
+- **What**: `Native.start(store, tier, gpu)` skips `gpu::renderer` when `gpu` is false, records `has_gpu` in `MACHINES` for `Native.hasGpu`, and `GpuService.connect` binds with `BIND_AUTO_CREATE | BIND_IMPORTANT`, transfers the socket fd at most once via `AtomicReference`, waits up to 3 s when `bindService` returns false, and calls `connection.close()` (including `unbindService`) on failure.
+- **Why**: Disabling GPU must skip all `:venus` binding and Vulkan probing, while enabling must report whether probing succeeded and survive OEM-delayed service binds.
+- **Tradeoffs**: A genuine non-throwing `bindService` failure waits up to 3 s before falling back to no renderer.
+- **Watch out**: OEM schedulers delaying `:venus` beyond 3 s will still miss the probe on that startup.
+- **Source**: b605a0a3
+
+### D35: `Native.writeFile` accepts default zero `uid` and `gid` parameters
+
+- **What**: `Java_io_github_mthli_appine_Native_writeFile` and `Native.writeFile` add `uid: Int = 0, gid: Int = 0` so existing 5-argument Kotlin call sites remain source-compatible under one JNI symbol while callers can create user-owned files.
+- **Why**: `Rootfs` needs to create user-owned `.bash_profile` and `.bashrc` files in pre-existing regular users' home directories before kernel start.
+- **Tradeoffs**: Relies on Kotlin's synthetic `$default` helper rather than a Java-visible 5-argument overload.
+- **Watch out**: Negative `uid`/`gid` values convert via `as u32`, so callers must validate non-negative IDs.
+- **Source**: 125f3d00
 
 ## Superseded
 

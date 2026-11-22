@@ -115,6 +115,13 @@ pub enum FileKind {
         /// The loop device and this open of it (only for [`Device::Loop`]).
         block: Option<crate::syscall::LoopOpen>,
     },
+    /// A virtio-gpu render node. Duplicated descriptors share this context and handle table.
+    Render {
+        ino: Ino,
+        file: Rc<crate::syscall::RenderFile>,
+    },
+    /// A pollable, read-only GPU completion notification.
+    GpuFence(std::os::fd::OwnedFd),
     /// The master or slave side of a PTY.
     Pty(PtyEnd),
     /// A socket.
@@ -393,6 +400,8 @@ impl OpenFile {
             | FileKind::SeccompNotify(_)
             | FileKind::Bpf(_)
             | FileKind::MessageQueue(_) => None,
+            FileKind::Render { ino, .. } => Some(Node::Store(self.mnt, *ino)),
+            FileKind::GpuFence(_) => None,
             FileKind::FuseDev(d) => d.ino.map(|ino| Node::Store(self.mnt, ino)),
             FileKind::Fuse(h) => Some(Node::Fuse(self.mnt, h.id)),
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {

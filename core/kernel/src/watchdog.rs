@@ -1,4 +1,4 @@
-//! The BKL watchdog (the kernel/process map): a host thread that never takes the BKL and reports
+//! The BKL watchdog (the kernel/bug map): a host thread that never takes the BKL and reports
 //! a hold of it that lasts too long. While one thread holds the BKL, every other guest thread
 //! stops at its next kernel entry, so a hold that does not end (a loop in kernel code, a host call
 //! that blocks with the lock held) freezes every guest process and the app's tabs, and the app's
@@ -16,16 +16,17 @@
 //!   kept for the host ([`crate::Machine::stall`]), and the app shows it in a notification with
 //!   the bug report;
 //! - when the hold ends: a KERN_ERR record in the kernel log naming the process and how long the
-//!   hold lasted, also kept for the host. Writing the record takes the BKL, so a short-lived
-//!   thread writes it: the next holder may keep the BKL just as long, and the watchdog must go on
-//!   looking meanwhile.
+//!   hold lasted, also kept for the host. Writing the record takes the BKL, so it is queued for a
+//!   single on-demand thread (`bkl-watchdog-log`) that drains queued records in order: the next
+//!   holder may keep the BKL just as long, and the watchdog must go on looking meanwhile.
 //!
 //! Durations count from the first look that saw the hold, so they are right to within one look
 //! (2 s by default). Nothing is ended: a hold cannot be interrupted, and one that ends leaves the
 //! kernel as consistent as any other.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -94,10 +95,19 @@ struct Seen {
     reported: Option<(u64, String)>,
 }
 
+/// Ended-stall records waiting for the BKL so they reach the kernel log in order.
+#[derive(Default)]
+struct PendingLog {
+    lines: VecDeque<String>,
+    /// Whether a `bkl-watchdog-log` thread is draining `lines`.
+    running: bool,
+}
+
 /// The watchdog's thread, until `stop` is set.
 fn watch(shared: &Arc<Shared>, stop: &AtomicBool, threshold: Duration) {
     let look = threshold / 5;
     let mut seen: Option<Seen> = None;
+    let pending = Arc::new(Mutex::new(PendingLog::default()));
     loop {
         // Waking early (unpark, or spuriously) only means one more look
         std::thread::park_timeout(look);
@@ -120,7 +130,7 @@ fn watch(shared: &Arc<Shared>, stop: &AtomicBool, threshold: Duration) {
         if let Some(s) = seen.take()
             && let Some((id, host)) = s.reported
         {
-            ended(shared, id, &s.sample, &host, now - s.since);
+            ended(shared, &pending, id, &s.sample, &host, now - s.since);
         }
         seen = sample.map(|sample| Seen {
             sample,
@@ -159,9 +169,17 @@ fn report(shared: &Shared, s: &HoldSample, held: Duration) -> (u64, String) {
     (id, name)
 }
 
-/// The reported hold has ended after `held`: tells stderr and the host at once, and starts a
-/// thread that records it in the kernel log once it gets the BKL.
-fn ended(shared: &Arc<Shared>, id: u64, s: &HoldSample, host: &str, held: Duration) {
+/// The reported hold has ended after `held`: tells stderr and the host at once, and queues the
+/// record for a single `bkl-watchdog-log` thread so consecutive stalls reach the kernel log in
+/// order once it gets the BKL.
+fn ended(
+    shared: &Arc<Shared>,
+    pending: &Arc<Mutex<PendingLog>>,
+    id: u64,
+    s: &HoldSample,
+    host: &str,
+    held: Duration,
+) {
     let secs = held.as_secs();
     let line = match holder(s) {
         Some(guest) => format!(
@@ -175,20 +193,60 @@ fn ended(shared: &Arc<Shared>, id: u64, s: &HoldSample, host: &str, held: Durati
         stall.secs = secs;
         stall.ended = Some(line.clone());
     });
-    // When the thread cannot start, only the kernel log goes without the record
-    let shared = shared.clone();
-    let _ = std::thread::Builder::new()
+    enqueue_log(shared, pending, line);
+}
+
+/// Pushes `line` onto `pending` and starts the single `bkl-watchdog-log` drainer if none is
+/// running. When the thread cannot start, only the kernel log goes without the record.
+fn enqueue_log(shared: &Arc<Shared>, pending: &Arc<Mutex<PendingLog>>, line: String) {
+    let spawn = {
+        let mut q = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        q.lines.push_back(line);
+        let start = !q.running;
+        if start {
+            q.running = true;
+        }
+        start
+    };
+    if !spawn {
+        return;
+    }
+    let thread_shared = shared.clone();
+    let thread_pending = pending.clone();
+    if std::thread::Builder::new()
         .name("bkl-watchdog-log".into())
-        .spawn(move || {
-            let k = shared.lock();
-            let logged = crate::bug::catch(|| {
+        .spawn(move || drain_log(&thread_shared, &thread_pending))
+        .is_err()
+    {
+        let mut q = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        q.lines.clear();
+        q.running = false;
+    }
+}
+
+/// Drains `pending` into the kernel log in FIFO order under the BKL, exiting once empty.
+fn drain_log(shared: &Shared, pending: &Mutex<PendingLog>) {
+    loop {
+        let k = shared.lock();
+        let lines = {
+            let mut q = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut q.lines)
+        };
+        let logged = crate::bug::catch(|| {
+            for line in &lines {
                 crate::klog::printk(&k.klog, crate::klog::level::ERR, format_args!("{line}"));
-            });
-            drop(k);
-            if logged.is_none() {
-                crate::bug::report(format_args!("kernel panic in the BKL watchdog"));
             }
         });
+        drop(k);
+        if logged.is_none() {
+            crate::bug::report(format_args!("kernel panic in the BKL watchdog"));
+        }
+        let mut q = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.lines.is_empty() {
+            q.running = false;
+            return;
+        }
+    }
 }
 
 /// The guest thread holding the BKL, as `pid 120 (git), thread 121`; None when the holder runs

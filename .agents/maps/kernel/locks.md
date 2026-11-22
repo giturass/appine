@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/locks.md` for the paired decision history (decisions from before the split are D12, D43 and the lock-range half of D25 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint lease-break-time sysctl reference to kernel/sysctl)
 
 ## Responsibilities
 
@@ -83,7 +85,8 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 - `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens and truncation
   (`break_leases`), the last reference to an open file.
-- `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; the `lease-break-time` sysctl.
+- `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; `kernel/sysctl`: the `lease-break-time`
+  sysctl.
 - `kernel/overlay` and `kernel/fuse`: the nodes whose keys locks use.
 
 ### Outbound

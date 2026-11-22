@@ -175,6 +175,7 @@ pub(crate) struct Kernel {
     /// ended is recorded once it ends.
     pub watched: BTreeMap<Tid, Option<ExitStatus>>,
     /// Root filesystem; without it the guest sees no filesystem at all.
+    pub gpu: Option<Arc<dyn crate::gpu::Renderer>>,
     pub vfs: Option<Rc<crate::vfs::Vfs>>,
     /// The Machine is shutting down: the timer thread exits.
     pub shutting_down: bool,
@@ -364,6 +365,7 @@ impl Kernel {
             held_reapers: Vec::new(),
             tier,
             watched: BTreeMap::new(),
+            gpu: None,
             vfs: None,
             shutting_down: false,
             dbt_stats: None,

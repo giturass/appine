@@ -11,7 +11,7 @@ SKIP="AioWriteTest.WriteCompletesAfterSubmittingProcessExits"
 # ENOTTY)
 SKIP="$SKIP:FcntlTest.NoatimePermission"
 SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
-# kernel/procfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
+# kernel/sysfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
 # kernel/vfs: umount ignores mappings
 SKIP="$SKIP:MountTest.BusyWithMmap"

@@ -10,6 +10,8 @@ mod bpf;
 mod cred;
 pub(crate) mod fast;
 mod fs;
+mod gpu;
+pub(crate) use gpu::RenderFile;
 mod fuse;
 pub(crate) use fuse::{fill, flush_at_exit};
 mod inotify;

@@ -282,10 +282,11 @@ internal object Rootfs {
      * Makes bash the login shell of a system imported from Alpine instead of busybox ash: puts the
      * packages bundled with the app (bash and the libraries it needs that the minirootfs lacks) into
      * `/var/cache/appine/bash/`, from which the login script installs them offline at the first
-     * login (using `/bin/sh` until they are installed), and has root's entry in `/etc/passwd` name
-     * `/bin/bash`. Accounts made later with busybox's `adduser` get bash too, as it gives them the
-     * shell of the account running it (`$SHELL`, which the login script sets). Systems imported
-     * before keep their shells.
+     * login (using `/bin/sh` until they are installed), has root's entry in `/etc/passwd` name
+     * `/bin/bash`, and seeds `/etc/skel` and `/root` with `.bash_profile` and `.bashrc` so login
+     * shells (`bash -l`) read `~/.bashrc`. Accounts made later with busybox's `adduser` get bash
+     * too, as it gives them the shell of the account running it (`$SHELL`, which the login script
+     * sets), and copy `/etc/skel`. Systems imported before keep their shells.
      */
     @Throws(IOException::class)
     private fun useBash(context: Context, store: String) {
@@ -300,6 +301,7 @@ internal object Rootfs {
             }
         }
         write(store, "/etc/passwd", lines.joinToString("\n"))
+        ensureBashStartup(store)
     }
 
     /**
@@ -338,14 +340,108 @@ internal object Rootfs {
 if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 """
 
+    private const val BASH_STARTUP_DONE = "/var/lib/appine/bash-startup-done"
+
+    /**
+     * `/etc/skel/.bash_profile` and `/root/.bash_profile` on Alpine: bash login shells (`bash -l`,
+     * which Appine's tabs start) do not read `~/.bashrc` on their own, so source it here.
+     */
+    private const val BASH_PROFILE = """# Written by Appine for login bash shells.
+if [ -f ~/.bashrc ] && [ -r ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+"""
+
+    /**
+     * `/etc/skel/.bashrc` and `/root/.bashrc` on Alpine: interactive guard so user additions do not
+     * run in non-interactive login shells (`bash -lc`), while leaving `PS1` and history settings to
+     * `/etc/profile.d/appine.sh` and `/etc/bash/bashrc`.
+     */
+    private const val BASHRC = """# Written by Appine for interactive bash shells.
+case ${'$'}- in
+    *i*) ;;
+    *) return ;;
+esac
+"""
+
+    /**
+     * Seeds Alpine's user-level bash startup files once per store so login shells (`bash -l`) read
+     * `~/.bashrc`: writes `/etc/skel/.bash_profile` and `/etc/skel/.bashrc` (copied by `adduser`
+     * for accounts created later) and, for root and pre-existing regular accounts (UID 1000–65533)
+     * whose login shell is `/bin/bash` and whose home directory exists, writes copies owned by each
+     * account without overwriting existing files or shadowing an existing `~/.profile` or
+     * `~/.bash_login`. Records completion so later deletions persist.
+     */
+    @Throws(IOException::class)
+    fun ensureBashStartup(context: Context) {
+        if (installed(context) != Distro.ALPINE) return
+        ensureBashStartup(store(context).path)
+    }
+
+    /** Seeds Alpine's bash startup files in [store] once (used at import and by tests). */
+    @Throws(IOException::class)
+    fun ensureBashStartup(store: String) {
+        if (Native.readFile(store, BASH_STARTUP_DONE) != null) return
+        write(store, "/etc/skel/.bash_profile", BASH_PROFILE, overwrite = false)
+        write(store, "/etc/skel/.bashrc", BASHRC, overwrite = false)
+        for ((account, shell) in accounts(store)) {
+            if (shell != "/bin/bash" || account.gid < 0) continue
+            if (account.name == ConsolePty.LOGIN_ROOT || account.uid in 1000..65533) {
+                seedBashHome(store, account)
+            }
+        }
+        write(store, BASH_STARTUP_DONE, "")
+    }
+
+    private fun seedBashHome(store: String, account: Account) {
+        val home = account.home.trimEnd('/')
+        if (!home.startsWith("/") || home.isEmpty()) return
+        // Do not create missing home directories as root; symlinks are rejected below by `exists`.
+        if (!hasNonRegularEntry(store, home)) return
+        val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
+            .any { exists(store, "$home/$it") }
+        if (!hasLoginFile) {
+            write(store, "$home/.bash_profile", BASH_PROFILE, overwrite = false, uid = account.uid, gid = account.gid)
+        }
+        if (!exists(store, "$home/.bashrc")) {
+            write(store, "$home/.bashrc", BASHRC, overwrite = false, uid = account.uid, gid = account.gid)
+        }
+    }
+
+    private fun hasNonRegularEntry(store: String, path: String): Boolean = try {
+        Native.readFile(store, path)
+        false
+    } catch (_: IOException) {
+        true
+    }
+
+    private fun exists(store: String, path: String): Boolean = try {
+        Native.readFile(store, path) != null
+    } catch (_: IOException) {
+        // Non-regular entries (such as symlinks) or non-directory parents must not be overwritten.
+        true
+    }
+
     private fun asset(context: Context, name: String): String =
         context.assets.open(name).bufferedReader().use { it.readText() }
 
-    private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
-        write(store, path, text.toByteArray(), overwrite)
+    private fun write(
+        store: String,
+        path: String,
+        text: String,
+        overwrite: Boolean = true,
+        uid: Int = 0,
+        gid: Int = 0,
+    ) = write(store, path, text.toByteArray(), overwrite, uid, gid)
 
-    private fun write(store: String, path: String, data: ByteArray, overwrite: Boolean = true) =
-        Native.writeFile(store, path, data, 420 /* 0644 */, overwrite)
+    private fun write(
+        store: String,
+        path: String,
+        data: ByteArray,
+        overwrite: Boolean = true,
+        uid: Int = 0,
+        gid: Int = 0,
+    ) = Native.writeFile(store, path, data, 420 /* 0644 */, overwrite, uid, gid)
 
     /** Makes renames and deletions in directory [dir] durable. */
     private fun syncDir(dir: File) {
@@ -494,18 +590,27 @@ if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 netns = "host"
 """
 
+    /** Installs the per-command Venus launcher on new and existing stores. */
+    @Throws(IOException::class)
+    fun ensureGpuCommand(context: Context, store: String = store(context).path) =
+        installExecutable(context, store, "appine-gpu.sh", "/usr/local/bin/appine-gpu", overwrite = false)
+
     /** Refreshes the bridge before kernel start, preserving user-provided local launchers. */
     @Throws(IOException::class)
     fun ensureBrowser(context: Context, configuration: String, store: String = store(context).path) {
-        val binary = context.assets.open("appine-open-url").use { it.readBytes() }
-        Native.writeFile(store, "/usr/local/libexec/appine-open-url", binary, 493 /* 0755 */, true)
+        installExecutable(context, store, "appine-open-url", "/usr/local/libexec/appine-open-url", overwrite = true)
         Native.writeFile(store, BrowserBridge.CONFIG_PATH, configuration.toByteArray(), 420 /* 0644 */, true)
         val path = "/usr/local/bin/xdg-open"
         val old = try { Native.readFile(store, path) } catch (_: IOException) { null }
         // Replace the previous Appine OSC helper, but leave a user's own launcher alone.
         val replace = old != null && hex(MessageDigest.getInstance("SHA-256").digest(old)) ==
             "abaf8d811e48df794b931f2fd5876e255c2c430464081e0d9fe880b80a3a1d76"
-        Native.writeFile(store, path, asset(context, "xdg-open.sh").toByteArray(), 493 /* 0755 */, replace)
+        installExecutable(context, store, "xdg-open.sh", path, overwrite = replace)
+    }
+
+    private fun installExecutable(context: Context, store: String, assetName: String, path: String, overwrite: Boolean) {
+        val bytes = context.assets.open(assetName).use { it.readBytes() }
+        Native.writeFile(store, path, bytes, 493 /* 0755 */, overwrite)
     }
 
     /**
@@ -708,8 +813,10 @@ netns = "host"
     }.sortedBy { it.uid }
 
     /** The accounts in `/etc/passwd`, empty when it cannot be read. */
-    private fun accounts(context: Context): List<Pair<Account, String>> {
-        val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
+    private fun accounts(context: Context): List<Pair<Account, String>> = accounts(store(context).path)
+
+    private fun accounts(store: String): List<Pair<Account, String>> {
+        val passwd = runCatching { Native.readFile(store, "/etc/passwd") }.getOrNull()
             ?: return emptyList()
         return String(passwd).lines().mapNotNull { line ->
             val f = line.split(':')

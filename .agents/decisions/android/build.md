@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/build"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-21 (HEAD = 125f3d00)
 >
 > Decisions on android/build made before it was split from android/native keep their `android/native` tags and live in `.agents/decisions/android/native.md`: D2–D7, D10, D12–D14, D20–D22, D24–D26, D28 and the dependency portion of D32.
 
@@ -50,12 +50,45 @@
 
 ### D6: Cargo and Android use the same release version
 
-- **What**: Set the shared Cargo version and all seven lockfile package entries to Android 1.0.0, and ignore local android/app/release exports.
-- **Why**: Native version labels should identify the same release as the APK and local exports should stay out of Git.
-- **Tradeoffs**: Cargo and Gradle version declarations require manual synchronization.
+- **What**: Keep the shared Cargo version and lockfile package entries synchronized with Android's release version (bumped to 1.0.1 and `versionCode 2`), and ignore local `android/app/release` exports.
+- **Why**: Native version labels should identify the same Appine release as the APK while keeping local exports out of Git.
+- **Tradeoffs**: Cargo and Gradle still declare versions separately and require manual synchronization.
 - **Watch out**: Check both declarations and the lockfile when preparing a release.
-- **Source**: 295fbe95
+- **Source**: 295fbe95, 3a7019eb
+
+### D7: The pinned virglrenderer Venus decoder is verified, patched separately and built with CMake
+
+- **What**: `scripts/fetch-virglrenderer` verifies the pinned virglrenderer 1.3.0 archive and re-extracts after clearing stale directories whenever `src/venus/vkr_renderer.c` is missing, CMake applies `android-blob.patch` and `venus-teardown.patch` as separate ordered inputs for debug and release APKs, and static notices and release sources include it.
+- **Why**: Debug and release APKs need reproducible Venus builds, independent patch tracking for blob allocation versus teardown, and recovery from partial trees left by `rust-cache` target cleaning.
+- **Tradeoffs**: Adds build prerequisites, tracks two separate patches tied to virglrenderer 1.3.0, and relies on `src/venus/vkr_renderer.c` rather than verifying every extracted file.
+- **Watch out**: Upgrading virglrenderer requires checking patch compatibility, attribution and the `vkr_renderer.c` layout check, and a partially corrupted tree containing that file will not trigger re-extraction.
+- **Source**: 87c7d9db, e94c49df, 87f1094f
+
+### D8: New Alpine installs package pinned offline OpenRC packages
+
+- **What**: Pin four Alpine OpenRC packages, share the staged `libcap2` package with bubblewrap, and include their licenses and source origins in the Alpine notice.
+- **Why**: First launch must set up OpenRC offline with verifiable packages and matching distribution attribution.
+- **Tradeoffs**: The four package downloads add 460,050 bytes to the bundled assets.
+- **Watch out**: Package revisions removed from Alpine mirrors require refreshed pins and updated notices.
+- **Source**: d0ff9a31
+
+### D9: The Venus renderer target optimizes independently for size
+
+- **What**: Set `-Oz` and `-flto=full` as private compile options on `appine_venus` in `hosts/android/gpu/CMakeLists.txt`.
+- **Why**: The Venus decoder can shrink independently of the CPU engine and kernel without penalizing their build flags.
+- **Tradeoffs**: Full LTO shifts GPU code generation into the final link.
+- **Watch out**: Device performance with the size-optimized renderer has not been measured.
+- **Source**: b37ad74a
+
+### D10: Debug APKs coexist with release via a `.debug` ID and soft yellow icon outline
+
+- **What**: Set `applicationIdSuffix = ".debug"` in `buildTypes.debug` (keeping `namespace` at `io.github.mthli.appine`, provider authorities on `${applicationId}` and the shared `Appine` label) and override `ic_foreground_stroke_color` to `#F5DF4D` in debug resources.
+- **Why**: Debug builds need a separate package ID and a harmonious visual cue so they can be installed alongside release builds.
+- **Tradeoffs**: The softer yellow has slightly less contrast against the white icon body, and Android themed/monochrome icons render without the colored stroke while sharing the `Appine` label.
+- **Watch out**: Side-by-side device installation, instrumentation under `io.github.mthli.appine.debug` and launcher icon rendering remain unverified on device.
+- **Source**: 1afcffbc, 8ab3b92b
 
 ## Superseded
 
 - ~~One --release Cargo profile for every APK in android/native D2~~ → replaced by **D5** in 7b3e57c5 (2026-11-17).
+- ~~Material Yellow A700 (`#FFD600`) debug icon stroke in 1afcffbc~~ → replaced by **D10** in 8ab3b92b (2026-11-21).

@@ -6,6 +6,8 @@ import android.app.Application
 class MainApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        if (getProcessName() == "$packageName:venus") return
+        GpuService.app = this
         Privacy.install(this)
         Diagnostics.install(this)
     }

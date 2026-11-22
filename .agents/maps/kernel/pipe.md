@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: which files splice at either end, shared with sendfile, so /dev/full cannot be written and /dev/null cannot be read)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint pipe-max-size sysctl references to kernel/sysctl)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@ commands, `pipe_read`, `pipe_write` and `broken_pipe`, and the splice block from
 Outside the module: fd tables, open files and the read, write and vectored paths that reach pipes
 (`kernel/files`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
 (`kernel/poll`); `/dev/fuse` and AF_UNIX sockets as splice ends (`kernel/fuse`, `kernel/unix`); the
-`pipe-max-size` sysctl (`kernel/procfs`).
+`pipe-max-size` sysctl (`kernel/sysctl`).
 
 ## Key types
 
@@ -102,7 +102,7 @@ Outside the module: fd tables, open files and the read, write and vectored paths
 ### Outbound
 
 - `kernel/files` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
-  `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/procfs`
+  `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/sysctl`
   (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`).
 
 ## Invariants and gotchas

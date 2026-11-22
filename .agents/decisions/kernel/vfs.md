@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
@@ -228,6 +228,22 @@
 - **Tradeoffs**: Each parent traversal under a non-root bind walks the store’s parent chain.
 - **Watch out**: Deep bind trees pay for the walk, and previously accepted unmapped owner options now fail with EINVAL.
 - **Source**: 01bfd882; 20137e4c; d053be24; 39e55b4b
+
+### D57: GPU-enabled machines populate `/dev/dri/renderD128` in boot devtmpfs
+
+- **What**: Boot devtmpfs conditionally creates `dri/renderD128` as character device `226:128` with mode `0666` when a machine starts with a GPU renderer.
+- **Why**: Ordinary guest users need a discoverable render node without baking a static device node into the rootfs.
+- **Tradeoffs**: Device-node presence follows machine startup configuration.
+- **Watch out**: The device number must stay aligned with kernel/procfs D42's synthetic sysfs identity.
+- **Source**: 87c7d9db
+
+### D58: `vfs::write_file_owned` sets new-file ownership while `vfs::write_file` remains a root wrapper
+
+- **What**: Add `vfs::write_file_owned` passing `uid` and `gid` to `store.create_file`, and delegate `vfs::write_file` to it with `0, 0` so existing kernel callers stay unchanged.
+- **Why**: Host-side configuration seeding for regular guest accounts needs newly created files owned by the target `uid` and `gid` rather than root.
+- **Tradeoffs**: Missing parent directories created by `write_file_owned` still belong to root (`0755`), so callers targeting non-root trees must verify parent existence first.
+- **Watch out**: Future callers passing non-zero `uid`/`gid` into a missing parent tree could unexpectedly create root-owned parent directories.
+- **Source**: 125f3d00
 
 ## Superseded
 

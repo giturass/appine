@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/poll.md` for the paired decision history (timerfd's decisions from before it moved here are D23 and the timerfd halves of D16 and D41 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
+>
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint raw ICMP and sysfs references to kernel/rawicmp and kernel/sysfs)
 
 ## Responsibilities
 
@@ -20,7 +22,7 @@ Root: `core/kernel/src/syscall/poll.rs` and `syscall/timerfd.rs` (the `EventFd` 
 lives in `fd.rs`, a `kernel/files` file).
 
 Outside the module: the wait mechanism, wake objects and the BKL (`kernel/process`);
-the timer thread (`kernel/time`); per-kind readiness of sockets (`kernel/net`, `kernel/netlink`, `kernel/unix`),
+the timer thread (`kernel/time`); per-kind readiness of sockets (`kernel/net`, `kernel/rawicmp`, `kernel/netlink`, `kernel/unix`),
 terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
 (`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
 entry points and the read paths (`kernel/files`); clock bases, `Expiry` and the wall-clock jump
@@ -67,6 +69,10 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ### The readiness contract
 
+- `GpuFence` carries the host read end of a completion pipe. Poll and epoll monitor it through
+  the same host-fd wait path as sockets. A retirement byte signals completion. Closing the writer
+  before retirement reports hangup without readable data.
+
 - `readiness(file)` is one `match` over `FileKind` returning known events and an optional host fd.
   Host stdio and ordinary inet sockets supply an fd. Queued DNS answers on an untapped UDP socket
   supply guest bits alone. A tapped UDP socket can supply both guest bits and its host fd. Other
@@ -79,7 +85,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   connection's reader object); synthetic files with change notifications (`fd::ProcEvent`:
   mounts and mountinfo `POLLIN|POLLRDNORM`, sysfs and cgroup2 files readable and writable, both
   plus `POLLERR|POLLPRI` while changed, their counter as wake object and read arrival,
-  `kernel/procfs` and `kernel/cgroup`); `O_PATH` files `POLLNVAL`; everything else (regular files,
+  `kernel/procfs`, `kernel/sysfs` and `kernel/cgroup`); `O_PATH` files `POLLNVAL`; everything else (regular files,
   directories, other devices, other synthetic files, bpf) is always readable and writable. A report of `POLLPRI` or
   `POLLERR` from mounts or mountinfo, by ppoll, pselect6 or epoll, takes the change in
   (`took_change`, as `mounts_poll` does). The bits are each Linux

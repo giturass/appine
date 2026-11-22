@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b)
+> Last distilled: 2026-11-22 (HEAD = e0719858)
 
 ## Active
 
@@ -49,11 +49,11 @@
 - **Source**: 248d79f
 
 ### D7: Maps that outgrow one Read are split along subsystems with files of their own
-- **What**: A subsystem with files and a Linux counterpart of its own becomes a module when its map no longer fits one Read (FUSE and mounts out of vfs; then the terminal into terminal, vt and vtview, execve, namespaces and futexes out of process, inotify, AIO, loop devices, overlayfs, locks, pipes and xattrs out of vfs with timerfd joining kernel/poll, and the soft-MMU and the OOM killer out of mm, followed by netlink out of net, open files out of vfs, privacy/licenses out of terminal, rendering out of vtview, cgroups/device BPF out of procfs, time/boot out of process and native terminal state out of vt, then ptrace/vDSO out of signal, nftables out of netns, tabbar/keys/file-import out of terminal, build/tests out of native and CLI/diff out of harness), aiming at about 45 KB per map, and decisions made before a split keep their old tags in the old snapshot, listed by ID in the new map's See line and the new snapshot's preamble, as kernel/mount D2 does.
-- **Why**: FUSE is a self-contained subsystem of about 3,500 lines, the vfs map reached 1426 lines, and by 2026-11-11 the mm, vfs, process and terminal maps had passed one Read; moving pre-split decisions into the new snapshots would not last, since a later distill of the old module mines their tags back.
-- **Tradeoffs**: The registry has grown to 57 modules, boundaries run inside shared files (`vfs/mod.rs`, `syscall/fs.rs`, `syscall/mount.rs`, `syscall/proc.rs`, `syscall/misc.rs`, `syscall/fast.rs`, `mm.rs`, `vt.c`), and a new module's history is spread over its own snapshot and its parent's.
-- **Watch out**: Maps split near the target grow back past one Read (vt and vtview reached 45–49 KB within a day of their split), and inherited-ID lists need separate map maintenance when parent decisions change; a split preserves the parent verification baseline and does not constitute an independent full verification.
-- **Source**: c008749, d2b1dc3, b320f8e; 5d18308 (made the general rule); 67d40c70 (netlink split); ce193253 (open-file split); 20137e4c; 81f60bef; 9c6c51a7; 9015b244, cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b
+- **What**: Oversized maps are split along clean file or contiguous-section boundaries—or condensed in place when a file is already heavily partitioned (`android/vtcore`)—to stay below 80% of the 46,080 B single-read budget (adding `android/settings`, `android/reports`, `engine/dbt`, `kernel/bug`, `kernel/cow`, `kernel/hostmem`, `android/vtgestures` [registered in `02dfe2ec` without a `knowledge-loop` tag], `kernel/rawicmp`, `kernel/route`, `kernel/sysctl` and `kernel/sysfs` after the earlier splits), while pre-split decisions keep their parent tags and live in the parent snapshot referenced by ID on child `See` lines and snapshot preambles.
+- **Why**: Maps near or past 46,080 B truncate on a single read (especially with line numbers), and moving pre-split decisions into child snapshots would not survive the next parent distill.
+- **Tradeoffs**: The registry has grown to 68 structural modules (plus `knowledge-loop`), boundaries run inside shared files (`vfs/mod.rs`, `syscall/fs.rs`, `syscall/mount.rs`, `syscall/proc.rs`, `syscall/misc.rs`, `syscall/fast.rs`, `syscall/mod.rs`, `syscall/net.rs`, `kernel.rs`, `machine.rs`, `mm.rs`, `pseudo.rs`, `engine.h`, `core/engine/src/lib.rs`, `VtView.kt`, `vt.c`), and cross-boundary edits consult multiple maps and parent/child snapshots.
+- **Watch out**: Inherited decision ID lists on child `See` lines and cross-module pointers need coordinated updates during future distills and refreshes, and a split preserves the parent `Verified` baseline rather than performing an independent full audit.
+- **Source**: c008749, d2b1dc3, b320f8e; 5d18308 (made the general rule); 67d40c70 (netlink split); ce193253 (open-file split); 20137e4c; 81f60bef; 9c6c51a7; 9015b244, cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5; 610d623f; e0719858
 
 ### D8: Agent guidance and module knowledge use shared repository paths
 
@@ -87,6 +87,22 @@
 - **Watch out**: Use the original compiler, workload and run conditions when comparing measurements.
 - **Source**: 426949bb
 
+### D12: Mobile GPU design evidence and hardware acceptance criteria live in `docs/mobile-gpu.md`
+
+- **What**: Record the candidate Venus architecture, distribution package evidence, hardware validation plan and device survey results in standalone English `docs/mobile-gpu.md`.
+- **Why**: Implementation and cross-device GPU evaluation need package evidence and acceptance criteria preserved together in the repository rather than chat.
+- **Tradeoffs**: Package and source references describe the specific versions examined.
+- **Watch out**: Android driver memory mapping and vendor shader defects can limit device coverage and must stay tied to tested hardware.
+- **Source**: ab1c4a7e
+
+### D13: Mobile GPU sources belong to existing module owners rather than a dedicated GPU module
+
+- **What**: Assign mobile GPU implementation, build and test sources across the existing kernel, Android and harness modules in `.agents/MODULES.md` and record measured hardware limits in their maps.
+- **Why**: GPU support integrates into boot, open files, mm, poll, procfs, vfs, native, build, tests and harness rather than forming an isolated subsystem.
+- **Tradeoffs**: Changing the device contract can touch several module maps.
+- **Watch out**: Hardware capability claims in maps must track only the devices actually tested.
+- **Source**: 87c7d9db
+
 ## Superseded
 
 - ~~`errno.rs`, `uaccess.rs`, `debug.rs`, `bug.rs` and `syscall/mod.rs` have no module (D4's watch-out, 4140c75)~~ → replaced by **D4** in d2b1dc3 (2026-11-10)
@@ -95,3 +111,4 @@
 - ~~AGENTS.override.md selection retained in 83a79ec0~~ → replaced by **D9** in fee21cbd (2026-11-15)
 - ~~Host-selection wording, fixed explorer/followup_task assumptions and the direct-verification fallback in fee21cbd/36083476~~ → replaced by **D9** in 82dba168 (2026-11-15)
 - ~~Explicit-name-only invocation for commit-context in 82dba168~~ → replaced by **D9** in 5aa15a10 (2026-11-15)
+- ~~Aiming at ~45 KB per map in D7~~ → refined to below 80% of the 46,080 B single-read budget by **D7** in e4d7bbe5, 610d623f and e0719858 (2026-11-22, implicit refinement)

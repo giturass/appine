@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose AIO claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint aio sysctl references to kernel/sysctl)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 (`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
 (`kernel/poll`); thread groups and exit (`kernel/process`); the timer thread (`kernel/time`); execve
 (`kernel/exec`); the context page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr`
-(`kernel/procfs`).
+(`kernel/sysctl`).
 
 ## Key types
 
@@ -114,7 +114,7 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 - `kernel/process`: release at the thread group's exit.
 - `kernel/time`: the timer thread's `check_aio_polls`.
 - `kernel/exec`: release at execve.
-- `kernel/procfs`: `fs.aio-nr` and `fs.aio-max-nr`.
+- `kernel/sysctl`: `fs.aio-nr` and `fs.aio-max-nr`.
 
 ### Outbound
 

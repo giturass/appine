@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: fresh main-activity launch and system-bar controller regression)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU and bash-account coverage alongside retained activity, resize-background and tab-list regressions)
 
 ## Responsibilities
 
@@ -34,6 +34,19 @@ debug variant, manifest and network-security configuration belong to `android/bu
   window decor and system-bar controller during `onCreate`, preventing reuse through `singleTask`.
   It follows normal service startup and should run on a disposable debug installation; the case
   has compiled but has not executed on a device.
+
+- `GpuTest.disabledByDefault` verifies `Settings.gpu` defaults false and `Native.start(..., gpu = false)`
+  reports `Native.hasGpu == false` with absent `/dev/dri/renderD128` and `/sys/dev/char/226:128`.
+  `GpuTest.toggleRestartsKernel` drives `SettingsActivity` and `TerminalService` end to end: cancellation
+  leaves the kernel untouched, confirming enable restarts the kernel with `appine-gpu` and matching
+  render-node/summary/diagnostics state, and confirming disable restarts without `/dev/dri/renderD128`
+  and reclaims Venus mappings and workers.
+  `GpuTest.distributionVenus` takes `gpuDistro=alpine|debian` and a survey rootfs in app cache.
+  It imports a temporary store, installs the guest GPU launcher, starts with `gpu = true` (asserting `Native.hasGpu`), checks default discovery of
+  both Venus and llvmpipe, and verifies Venus-only compute through the launcher, mapping lifetime,
+  concurrent exit and restart, and checks for retained mappings, allocation threads and retirement threads.
+  `unsupportedDriver` uses the bundled rootfs with `gpuUnsupported=true` and `gpu = true` to check `Native.hasGpu == false` and absent device paths.
+  Other instrumentation tests pass `gpu = false` to `Native.start`.
 
 - `TabListTest` checks session identity across removal/rebinding, a bounded, scrollable 50-tab list
   and preserved editor focus during opening/scrolling/dismissal. Row height, scrolling increments
@@ -88,7 +101,12 @@ debug variant, manifest and network-security configuration belong to `android/bu
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
   prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
   new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
-  install, the `/bin/sh` fallback, bash's marks and nested shells'). `newSystemsInstallProcpsOffline`
+  install, the `/bin/sh` fallback, bash's marks and nested shells', root and `adduser`-copied
+  `.bash_profile`/`.bashrc` loading and ownership, and non-interactive `bash -lc` skipping
+  `.bashrc`), and one-time Alpine bash startup seeding (`existingAlpineStoresSeedBashStartupFilesOnce`:
+  existing root and regular-account `.bashrc` preservation, account ownership and login loading,
+  missing-home safety, deletion persistence, symlinked `.profile` non-shadowing, and `/bin/sh`
+  accounts/stores). `newSystemsInstallProcpsOffline`
   uses its own store and ash, omits a dependency to check failure/retry, retries in two concurrent
   logins without repositories, runs ps/top/free/vmstat/uptime/pgrep, and checks that user removal
   persists. `newSystemsInstallBubblewrapOffline` similarly uses its own store without bash/procps

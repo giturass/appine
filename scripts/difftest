@@ -156,9 +156,17 @@ if [ ! -d "$store" ]; then
     }
     echo "creating $store"
     appine --rootfs "$store" --import "$tarball" >/dev/null
-    linux "$run --tier 1 --rootfs $store --env $env_path"' \
+    attempt=1
+    while ! linux "$run --tier 1 --rootfs $store --env $env_path"' \
         ${http_proxy:+--env http_proxy=$http_proxy} ${https_proxy:+--env https_proxy=$https_proxy} \
-        -- /bin/sh -c "apk add -q '"$packages"'"'
+        -- /bin/sh -c "apk add -q '"$packages"'"'; do
+        if [ "$attempt" -ge 3 ]; then
+            exit 1
+        fi
+        echo "difftest: apk add failed (attempt $attempt/3), retrying..." >&2
+        attempt=$((attempt + 1))
+        sleep 5
+    done
     rebuild=1
 fi
 # Checking only that the directory exists is not enough: a store whose install failed midway, or

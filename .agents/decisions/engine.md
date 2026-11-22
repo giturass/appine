@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -134,12 +134,12 @@
 - **Watch out**: Jump-cache entries are not cleared and rely on forwarders.
 - **Source**: rounds 11 (`11-m8-jvm`), 24 (`24-shared-translation`), 35 (`35-jit`); 16914003
 
-### D19: The engine module is `core/engine` without the page table and TLB fill
-- **What**: engine covers instruction execution, translation, CPU features, the fault guard, C/Rust bindings and `tests/lockstep`, while page tables and TLB fill/flush belong to kernel/mmu; the translator points readers to `.agents/maps/engine.md`.
-- **Why**: The retired design doc's §4 was the only current-state description of the CPU engine and had drifted from the source (precise state, indirect-branch lookup, flush triggers, feature gating).
-- **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section; host-vDSO CPU-feature dependencies belong to kernel/vdso.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them Tier 0 losing pending `ic ivau` on guest page 0 (the Tier 1 dispatcher now handles it directly), conditional-branch relinking racing a new thread and unallocated ID registers reading 0 where Linux delivers `SIGILL`.
-- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c; d053be24; 60790c14; 39e55b4b; 8bc0e63b
+### D19: The engine module covers Tier 0 execution, CPU state, features and the fault guard
+- **What**: engine covers the Tier 0 interpreter, native stubs, CPU state contract, CPU features, the host fault guard, shared C/Rust bindings and `tests/lockstep`, while page tables and TLB fill/flush belong to `kernel/mmu` and Tier 1 translation to `engine/dbt`.
+- **Why**: The combined engine map reached 37,942 B (82.3% of one read) and kept growing with Tier 1 optimizations while mixing Tier 0 interpretation with the Tier 1 DBT.
+- **Tradeoffs**: Changes to `struct appine_cpu` layout, shared instruction whitelists or fault-guard lock registration touch both `engine` and `engine/dbt` maps, pre-split Tier 1 decisions remain here, and host-vDSO CPU-feature dependencies belong to `kernel/vdso`.
+- **Watch out**: Both tiers must keep identical instruction whitelists and immediate-offset fields before the TLB in `struct appine_cpu`, and bugs still open in the map include Tier 0 losing pending `ic ivau` on guest page 0 and unallocated ID registers reading 0 where Linux delivers `SIGILL`.
+- **Source**: f9edf81 (bug list since updated by e5922b1, 6d1d9c0 and b43ff37); 44a21b (MMU split); 36083476; 20137e4c; d053be24; 60790c14; 39e55b4b; 8bc0e63b; e4d7bbe5
 
 ### D20: Engine files read in the order their code runs
 - **What**: lib.rs is sectioned into the page table, CPU state and exits, Tier 1 and process-wide calls (`Cpu::reset` after `tlb_flush`, as at execve); in tests a helper used by one test follows it and shared helpers follow all tests; lockstep's class functions follow the `CLASSES` table and its runner goes from its types through `run` and `run_class` to the helpers in call order.
@@ -200,6 +200,25 @@
 - **Watch out**: Page zero needs its own path because zero is the empty pending-page sentinel.
 - **Source**: 8bc0e63b
 
+### D28: Tier 1 accelerates six length-gated libc memops through an atomic table and install-time check
+
+- **What**: Tier 1 emits an inline NZCV-preserving `x2 >= 128` gate (`ubfx + cbnz`) for registered `memcpy`, `memset`, `memmove`, `memcmp`, `memchr` and `strncmp` entry PCs via an atomically published sorted `memop_table`, rechecks the observed kind under the DBT lock before installing untagged blocks, bypasses global templates, retires affected PCs on update and before `DbtSpace` pooling, ignores private tagged code-group blocks, untags TBI pointers with NULL checks in `exec_memop`, pops matching shadow return-stack entries on return and falls back to guest code on watchpoints or missing permissions.
+- **Why**: Tight libc memory loops paid per-iteration soft-TLB checks in Tier 1, while earlier unconditional string hooks regressed short-string workloads 2.9x and unsynchronized mutable/templated registrations caused stale-block and cross-process races.
+- **Tradeoffs**: Unbounded `strlen`, `strchr` and `strcmp` stay in guest code, small calls (< 128 B) pay two entry instructions, memop entry blocks (~6–12 per process) skip global templates, and each untagged block install performs one table lookup.
+- **Watch out**: Keep the install-time kind check before code publication, note that a concurrent `munmap` mid-`memmove` falls back after partial writes (matching a hardware race), and a full code cache during `set_memops` triggers a full flush.
+- **Source**: aad49bdd, dc43dc57, 9b3b6860, 39db4760
+
+### D29: Concurrent memop-registration races are tested in Cargo integration tests
+
+- **What**: `memops_concurrent_set_memops_keeps_translations_consistent` in `core/engine/tests/dbt.rs` replaces the standalone `core/engine/tests/memop_update.c` by racing worker translations against `set_memops` and `flush` across 64 rounds and 16 PCs and asserting post-race cache consistency.
+- **Why**: The standalone C test included `../src/c/dbt.c` directly and was neither compiled nor executed by `cargo test` or CI, inviting silent bit-rot.
+- **Tradeoffs**: Trades deterministic white-box single-step interleaving for a stochastic multi-threaded test that runs on every `cargo test` and CI build.
+- **Watch out**: Very rare interleavings may not fire on every single run despite repeated concurrent rounds.
+- **Source**: c8f01dbf
+
 ## Superseded
 
 - ~~Every FPCR write exits to Tier 0 in 16914003~~ → narrowed by **D25** in 8bc0e63b (2026-11-17).
+- ~~Unconditional `strlen`/`strchr`/`strcmp` dispatch and unsynchronized `d->memops` storage in aad49bdd and dc43dc57~~ → replaced by **D28** in 9b3b6860 (2026-11-21).
+- ~~Standalone C test `core/engine/tests/memop_update.c` in 39db4760~~ → replaced by **D29** in c8f01dbf (2026-11-21, implicit refinement).
+- ~~Combined Tier 0 and Tier 1 ownership in engine (D19, f9edf81)~~ → replaced by **D19** and engine/dbt **D1** in e4d7bbe5 (2026-11-22).

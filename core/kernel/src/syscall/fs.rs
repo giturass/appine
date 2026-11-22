@@ -1385,6 +1385,10 @@ fn open_store(
                 let (fs, m) = devpts_beside(vfs, beside)?;
                 tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
             }
+            r if r == rdev(226, 128) => FileKind::Render {
+                ino,
+                file: super::gpu::open(cx)?,
+            },
             crate::vfs::fuse::DEV_RDEV => {
                 FileKind::FuseDev(crate::vfs::fuse::DevFile::new(cred, ino))
             }
@@ -2171,6 +2175,15 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
     let file = io_file(cx, fd)?;
+    if request >> 8 & 0xff == b'd' as u32 {
+        let render = match &file.borrow().kind {
+            FileKind::Render { file, .. } => Some(file.clone()),
+            _ => None,
+        };
+        if let Some(render) = render {
+            return super::gpu::ioctl(cx, &render, request, arg);
+        }
+    }
     match request {
         FIOCLEX | FIONCLEX => {
             return cx.fds_mut().set_cloexec(fd, request == FIOCLEX).map(|()| 0);
@@ -5120,6 +5133,7 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             block: Some(open), ..
         } => return super::loopdev::seek(&open.dev, pos, offset, whence),
         // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
+        FileKind::Render { .. } | FileKind::GpuFence(_) => return Err(Errno::ESPIPE),
         FileKind::Device { .. } => return Ok(0),
         FileKind::Directory { entries, node, .. } => {
             // Where SEEK_END and SEEK_DATA/SEEK_HOLE count from: store directories stand in for

@@ -121,9 +121,9 @@ class TerminalService : Service() {
         fun onNotice() {}
 
         /**
-         * About to restart: the guest's `reboot`, or the execution tier changed
-         * in Settings. All sessions have ended; the kernel shuts down and starts again (followed by
-         * [onMachineReady]).
+         * About to restart: the guest's `reboot`, or the execution tier or Vulkan GPU setting
+         * changed in Settings. All sessions have ended; the kernel shuts down and starts again
+         * (followed by [onMachineReady]).
          */
         fun onRestarting() {}
 
@@ -253,6 +253,10 @@ class TerminalService : Service() {
 
     /** The kernel handle, 0 before the start. */
     var machine = 0L
+        private set
+
+    /** Whether the running kernel registered a host GPU renderer. */
+    var gpuAvailable = false
         private set
 
     /** Why the start failed. */
@@ -415,7 +419,7 @@ class TerminalService : Service() {
     private val saveSoon = Runnable { saveTabs() }
 
     /**
-     * The default network's routes go to the guest (the kernel/net map): since Android 10 apps
+     * The default network's routes go to the guest (the kernel/route map): since Android 10 apps
      * cannot read the host's routing table, and the guest's `ip route` and `/proc/net/route` rely
      * on this. Callbacks come on system threads and are handed to [worker] to run in order.
      */
@@ -537,11 +541,12 @@ class TerminalService : Service() {
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
     private class StartedKernel(
-        val handle: Long, val browser: BrowserBridge, val booted: Boolean, val setupError: String?,
+        val handle: Long, val browser: BrowserBridge, val booted: Boolean, val gpuAvailable: Boolean,
+        val setupError: String?,
     )
 
     /** Owns the new handle and browser endpoint until both can be handed to the main thread. */
-    private fun startKernel(tier: Int, importing: Boolean): StartedKernel {
+    private fun startKernel(tier: Int, gpu: Boolean, importing: Boolean): StartedKernel {
         val browser = BrowserBridge { url ->
             machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
         }
@@ -551,14 +556,15 @@ class TerminalService : Service() {
             Rootfs.updateProfile(this)
             val store = Rootfs.store(this).path
             // Exclude DocumentsProvider opens while the kernel opens the store.
-            handle = Rootfs.access.write { Native.start(store, tier) }
+            handle = Rootfs.access.write { Native.start(store, tier, gpu) }
+            val gpuAvailable = gpu && Native.hasGpu(handle)
             var setupError: String? = null
             val booted = Rootfs.installed(this) == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
                 if (importing) throw e
                 Log.w(TAG, "OpenRC setup will retry at the next start", e)
                 setupError = e.message ?: e.toString()
             }
-            return StartedKernel(handle, browser, booted, setupError)
+            return StartedKernel(handle, browser, booted, gpuAvailable, setupError)
         } catch (e: Throwable) {
             browser.close()
             if (handle != 0L) Native.stop(handle)
@@ -576,6 +582,7 @@ class TerminalService : Service() {
         updateWakeLock()
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
         val tier = tier
+        val gpu = gpu
         thread(name = "appine-start") {
             val result = runCatching {
                 if (distro != null) {
@@ -588,7 +595,9 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
-                startKernel(tier, importing = distro != null)
+                Rootfs.ensureBashStartup(this)
+                if (gpu) Rootfs.ensureGpuCommand(this)
+                startKernel(tier, gpu, importing = distro != null)
             }
             main.post {
                 starting = false
@@ -620,6 +629,7 @@ class TerminalService : Service() {
         val m = kernel.handle
         browserBridge = kernel.browser
         machine = m
+        gpuAvailable = kernel.gpuAvailable
         booting = true
         guestActivity.reset(SystemClock.elapsedRealtime())
         progress = null
@@ -1085,6 +1095,15 @@ class TerminalService : Service() {
         restart()
     }
 
+    val gpu: Boolean get() = Settings.gpu(this)
+
+    /** The experimental Vulkan GPU toggle was changed in Settings: record it and restart the kernel. */
+    fun setGpu(on: Boolean) {
+        if (on == gpu) return
+        Settings.setGpu(this, on)
+        restart()
+    }
+
     private fun settingsChanged() {
         updateNotification()
         each { it.onSettingsChanged() }
@@ -1183,7 +1202,7 @@ class TerminalService : Service() {
     }
 
     /**
-     * Restart (the guest's `reboot`, or the execution tier changed in Settings):
+     * Restart (the guest's `reboot`, or the execution tier or Vulkan GPU changed in Settings):
      * shut down, then start a new kernel (after which the Activity opens new sessions).
      */
     private fun restart() {
@@ -1264,6 +1283,7 @@ class TerminalService : Service() {
             watchingNetwork = false
         }
         machine = 0
+        gpuAvailable = false
         booting = false
         updateWakeLock()
         main.removeCallbacks(poll)
@@ -1303,6 +1323,7 @@ class TerminalService : Service() {
         releaseSessions()
         val m = machine
         machine = 0
+        gpuAvailable = false
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }

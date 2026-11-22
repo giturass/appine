@@ -5,27 +5,29 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: pre-login OpenRC probe, installation and boot calls on appine-start, retaining the shared-storage start contract)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU-aware handles and four-argument start contract with pre-registration shared-storage mounting)
 
 ## Responsibilities
 
 `android/native` connects the Kotlin app to the Rust kernel: the kernel handle table, JNI
-entry points, error and panic handling, stderr to logcat, and the guest browser client.
+entry points, error and panic handling, stderr to logcat, the guest browser client and the Venus renderer.
 
 Root: `hosts/android/src/lib.rs`, `hosts/android/open-url.c`,
-`android/app/src/main/java/io/github/mthli/appine/Native.kt` and `MainApplication.kt`.
+`hosts/android/src/gpu.rs`, the native sources, Android buffer patch and Venus teardown patch in `hosts/android/gpu/`, and the Kotlin
+files `Native.kt`, `GpuService.kt` and `MainApplication.kt`.
 
 The build, manifests, assets and release packaging are `android/build`; instrumentation is
 `android/tests`. `Machine` lifecycle belongs to `kernel/boot`, process API to `kernel/process`
 and store calls to `kernel/store`. Terminal shim/JNI ownership remains `android/vtcore`,
-with view and rendering portions in `android/vtview` and `android/vtrender`.
+with view, gesture and rendering portions in `android/vtview`, `android/vtgestures` and
+`android/vtrender`.
 
 ## Key types
 
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
-  and never reused in a process) to `Arc<Machine>`; a poisoned lock is recovered. `vt.rs` looks
-  kernels up in the same table.
-- `Native` — `internal object` with 37 `@JvmStatic external` functions, 17 of them
+  and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
+  kernels up in the same table through `machine(handle)`.
+- `Native` — `internal object` with 38 `@JvmStatic external` functions, 17 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -38,11 +40,12 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
   `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
-- Kernel: `start(store, tier, sharedStorage)` (the nullable third argument defaults to
-  `Environment.getExternalStorageDirectory().absolutePath`; null disables mounting for isolated
-  callers; 1 = Tier 1, else Tier 0; the kernel starts with
+- Kernel: `start(store, tier, gpu, sharedStorage)` (GPU probing defaults to false; the nullable
+  fourth argument defaults to `Environment.getExternalStorageDirectory().absolutePath`,
+  and null disables mounting for isolated callers; 1 = Tier 1, else Tier 0; `gpu = true`
+  probes `:venus` and attaches its renderer when supported; false avoids binding; the kernel starts with
   `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports;
-  0 and an `IOException("cannot start: …")` on failure), `boot`, `setRoutes`, `takeListens`,
+  0 and an `IOException("cannot start: …")` on failure), `hasGpu(machine)` (whether the registered handle has a host GPU renderer; false if stopped or panicked; does not take the BKL), `boot`, `setRoutes`, `takeListens`,
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
   `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
   into spaces, or null; it does not take the BKL), `takePower`, `processes`, `guestCpuTime`
@@ -57,11 +60,21 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Handles
 
+- When `Native.start` receives `gpu = true`, the nonexported `:venus` service probes the hardware under the app UID. `GpuService.connect` binds with `BIND_AUTO_CREATE | BIND_IMPORTANT`, transfers the socket descriptor at most once via an `AtomicReference`, awaits up to 3 s for `onServiceConnected` when OEM schedulers (such as Samsung `FreecessController` during activity switches) return false from `bindService` while delivering the binding asynchronously, and calls `close()` (including `unbindService`) on failure. On success
+  `Native.start` supplies an Android renderer to the machine and records `has_gpu = true`; when `gpu = false`, `:venus` is not bound and `has_gpu` is false. Each DRM context uses a seqpacket
+  connection to a service thread. The application normally imports coherent Android Hardware Buffers on its
+  mapping device. If that probe fails, a second two-device copy tests CPU export. On success the machine
+  process maps the original coherent allocation and sends its AHB to the service on a per-context allocation
+  socket. The decoder exposes the probed GPU with the CPU mapping flags at the GPU import index.
+  Pending exports are keyed by Venus memory ID until DRM blob creation takes the mapping, Vulkan frees it,
+  or the context disconnects. A retirement thread holds submitted buffers through their fence and handles
+  memory release and Binder unbinding. Context teardown waits for the GPU in the service process.
+
 - `start` parses the nullable shared-storage path inside `guarded!`, builds `MachineOptions`
-  (tier, exception trace), starts a `Machine`, mounts the supplied path at `/storage/emulated/0`
+  (tier, exception trace), starts a renderer-aware `Machine`, mounts the supplied path at `/storage/emulated/0`
   and `/sdcard`, then registers it. A mount configuration error throws `IOException` and returns
-  0 before registration; missing host access is deferred to guest operations. Existing two-argument
-  Kotlin calls use the default path; the native descriptor is `(Ljava/lang/String;ILjava/lang/String;)J`.
+  0 before registration; missing host access is deferred to guest operations. GPU probing defaults to false; calls without an explicit
+  shared-storage path use the default path; the native descriptor is `(Ljava/lang/String;IZLjava/lang/String;)J`.
   Every call clones the `Arc` under the table lock and releases the lock before working, so a
   blocked call keeps its kernel alive across a concurrent `stop`.
 - `stop` removes the handle and then kills everything; `shutdown` runs the inittab shutdown
@@ -82,13 +95,13 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Callers
 
-- All callers are JVM threads; the bridge attaches no native thread to the JVM, and guest and timer
-  threads never call into Java. The main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
-  start), `appine-start` (`start`, OpenRC setup's `spawn`/`waitFor`, and `boot` when setup installs it), the service's worker (the poll's calls, `setRoutes`,
+- GPU context setup attaches its caller to the JVM to bind the service. The retirement thread attaches
+  to release the binding. Other runtime JNI callers include the main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
+  start), `appine-start` (`start`, OpenRC setup's `spawn`/`waitFor` and `boot` when setup installs it), the service's worker (the poll's calls, `setRoutes`,
   `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
   (`spawn`, `waitFor`, `boot` only when setup did not already boot), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
   provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
-  the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside
+  the console through `Machine::read_console_run` in `vt.rs` and calls back into Java from inside
   `pump`.
 
 ### stderr and panics
@@ -114,8 +127,9 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 ### Application startup
 
-- `MainApplication.onCreate` installs `Privacy` first, then `Diagnostics`. Manifest registration
-  and provider configuration are in `android/build`.
+- `MainApplication.onCreate` skips app-wide setup in `:venus`. The main process registers the GPU
+  application context and installs `Privacy` (`android/privacy`) and `Diagnostics`
+  (`android/reports`). Manifest registration and provider configuration are in `android/build`.
 
 ### Guest browser client
 
@@ -139,14 +153,14 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
 
 - `appine_kernel` (`Machine`, `MachineOptions`, routes, store and browse functions), `jni` 0.21,
   `libc` and Android `liblog`; terminal JNI also uses `libjnigraphics`.
-- `MainApplication` installs `android/privacy` and `android/service` diagnostic capture.
+- `MainApplication` installs `android/privacy` and `android/reports` diagnostic capture.
 - `android/service` receives the guest browser client's requests; `android/build` supplies its asset.
 
 ## Invariants and gotchas
 
 - JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the libghostty-vt
   terminal's functions); each `external fun` has exactly one `Java_…` function.
-- `Native.start`'s default path and JNI third parameter must stay in sync; Settings owns Android's
+- `Native.start`'s default path and JNI GPU and storage parameters must stay in sync; Settings owns Android's
   all-files grant flow, while the kernel performs host access under the app's credentials.
 - The crate is `#![cfg(target_os = "android")]`, so it is empty on other hosts, where `build.rs`
   only prints its rerun lines.
@@ -163,6 +177,8 @@ with view and rendering portions in `android/vtview` and `android/vtrender`.
   to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
 
 ## Open questions
+
+- Successful hardware-backed 16 KiB-page operation still awaits a device test. Both tested AHB paths use one physical device.
 
 - Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
   `FileNotFoundException`?

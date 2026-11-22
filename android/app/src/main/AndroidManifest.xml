@@ -106,6 +106,12 @@
             </intent-filter>
         </provider>
 
+        <service
+                android:name=".GpuService"
+                android:process=":venus"
+                android:exported="false"
+                />
+
         <!-- The android/service map: a specialUse foreground service is kept while sessions run -->
         <service
                 android:name=".TerminalService"

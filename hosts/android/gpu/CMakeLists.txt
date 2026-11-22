@@ -1,0 +1,55 @@
+cmake_minimum_required(VERSION 3.22)
+project(appine_venus C)
+set(VIRGL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/virglrenderer/virglrenderer-1.3.0" CACHE PATH "Pinned virglrenderer source")
+set(src "${VIRGL_ROOT}/src")
+if(NOT EXISTS "${src}/venus/vkr_renderer.c")
+    message(FATAL_ERROR "Run scripts/fetch-virglrenderer before building the Android GPU backend")
+endif()
+find_program(Python3_EXECUTABLE python3 NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+set(gen "${CMAKE_CURRENT_BINARY_DIR}/venus")
+file(MAKE_DIRECTORY "${gen}")
+# Compile the Venus decoder and its utilities. The GL renderer needs EGL and libepoxy.
+file(GLOB venus_sources CONFIGURE_DEPENDS "${src}/venus/vkr_*.c")
+list(REMOVE_ITEM venus_sources "${src}/venus/vkr_allocator.c")
+# Copy the Venus headers/sources together so quoted includes also see the patched headers.
+file(GLOB venus_headers CONFIGURE_DEPENDS "${src}/venus/vkr_*.h")
+foreach(source IN LISTS venus_sources venus_headers)
+    get_filename_component(name "${source}" NAME)
+    configure_file("${source}" "${gen}/${name}" COPYONLY)
+endforeach()
+foreach(patch_file IN ITEMS android-blob.patch venus-teardown.patch)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${patch_file}")
+    execute_process(COMMAND patch -s -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/${patch_file}"
+        WORKING_DIRECTORY "${gen}" COMMAND_ERROR_IS_FATAL ANY)
+endforeach()
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${src}/venus/vkr_device_object.py" -o "${gen}"
+    "${src}/venus/vkr_device_object.json" COMMAND_ERROR_IS_FATAL ANY)
+set(VIRGL_MAJOR_VERSION 1)
+set(VIRGL_MINOR_VERSION 3)
+set(VIRGL_MICRO_VERSION 0)
+configure_file("${src}/virgl-version.h.meson" "${gen}/virgl-version.h" @ONLY)
+# The pinned virglrenderer build runs only on arm64 Android, API 30 and above.
+file(STRINGS "${VIRGL_ROOT}/config.h.meson" compiler_macros REGEX "^#mesondefine HAVE_(__BUILTIN|FUNC_ATTRIBUTE)_")
+set(config "")
+foreach(line IN LISTS compiler_macros)
+    string(REPLACE "#mesondefine " "#define " line "${line}")
+    string(APPEND config "${line} 1\n")
+endforeach()
+foreach(macro IN ITEMS HAVE_MEMFD_CREATE HAVE_STRTOK_R HAVE_TIMESPEC_GET HAVE_SYS_UIO_H
+    HAVE_PTHREAD ENABLE_RENDER_SERVER_WORKER_THREAD ENABLE_VENUS ENABLE_VULKAN_DLOAD HAVE_EVENTFD_H HAVE_DMABUF_H HAVE_DLFCN_H
+    UTIL_ARCH_LITTLE_ENDIAN PIPE_ARCH_AARCH64)
+    string(APPEND config "#define ${macro} 1\n")
+endforeach()
+file(WRITE "${gen}/config.h" "${config}#define UTIL_ARCH_BIG_ENDIAN 0\n")
+list(TRANSFORM venus_sources REPLACE "^.*/" "${gen}/")
+set(mesa_sources bitscan hash_table os_file ralloc u_debug anon_file)
+list(TRANSFORM mesa_sources PREPEND "${src}/mesa/util/")
+list(TRANSFORM mesa_sources APPEND ".c")
+add_library(appine_venus STATIC ${venus_sources} ${mesa_sources} "${src}/virgl_util.c" android_os.c android_blob.c
+    worker.c client.c probe.c mapper.c "${VIRGL_ROOT}/server/render_socket.c" "${VIRGL_ROOT}/server/render_common.c")
+target_include_directories(appine_venus PUBLIC "${gen}" "${src}" "${src}/venus"
+    "${src}/gallium/include" "${src}/gallium/auxiliary" "${src}/mesa" "${src}/mesa/compat"
+    "${src}/mesa/pipe" "${src}/mesa/util" "${src}/drm/drm-uapi" "${CMAKE_CURRENT_SOURCE_DIR}" "${VIRGL_ROOT}/server")
+target_compile_options(appine_venus PRIVATE -Oz -flto=full -include "${gen}/config.h" -fvisibility=hidden)
+target_compile_definitions(appine_venus PRIVATE _GNU_SOURCE NDEBUG)
+target_link_libraries(appine_venus PUBLIC android vulkan log dl m)

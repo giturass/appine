@@ -101,6 +101,7 @@ pub(super) fn mmap(
         flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
     // A FUSE file has no page cache to map: the mapping reads its pages into a host file as they
     // are touched (crate::mm::Fill)
+    let mut gpu_mapping = None;
     let mut fuse_fill = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
@@ -168,6 +169,18 @@ pub(super) fn mmap(
                     Some((host.as_raw_fd(), offset, f.writable()))
                 }
             }
+            FileKind::Render { ino, file } => {
+                if !f.readable() || (shared_write && !f.writable()) {
+                    return Err(Errno::EACCES);
+                }
+                if kind != flags::MAP_SHARED || prot & prot::EXEC != 0 || growsdown {
+                    return Err(Errno::EINVAL);
+                }
+                gpu_mapping = Some(file.mapping(offset, len)?);
+                label = Some((f.path.clone(), *ino));
+                deny_write = !f.writable();
+                None
+            }
             // /dev/zero: a private mapping is anonymous memory, a shared one is shared anonymous
             // memory
             FileKind::Device {
@@ -215,11 +228,15 @@ pub(super) fn mmap(
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
     let fill = fuse_fill;
-    let start = match &fill {
-        Some(fill) => cx
-            .mm_mut()
-            .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
-        None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
+    let start = if let Some(mapping) = gpu_mapping {
+        cx.mm_mut().mmap_gpu(addr, len, prot, flags, mapping)?
+    } else {
+        match &fill {
+            Some(fill) => cx
+                .mm_mut()
+                .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
+            None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
+        }
     };
     // MAP_FIXED may have replaced a segment's last attachment
     if flags & flags::MAP_FIXED != 0 {

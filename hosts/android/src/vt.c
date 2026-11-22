@@ -2,9 +2,10 @@
 //
 // The tabs' terminal emulator (android/vtcore map): one libghostty-vt terminal per tab, behind a
 // small C ABI that vt.rs calls. The frame-format specification and Frames section belong to
-// android/vtrender; Input, Paste, Mouse and focus, Selection, Links, Taps on the prompt and Search
-// belong to android/vtview. This file only talks to libghostty-vt; the console, threads and locking
-// are vt.rs's.
+// android/vtrender; Input, Paste, appine_vt_focus (in Mouse and focus) and Search belong to
+// android/vtview; appine_vt_mouse (in Mouse and focus), Selection, Links and Taps on the prompt
+// belong to android/vtgestures. This file only talks to libghostty-vt; the console, threads and
+// locking are vt.rs's.
 //
 // Threading: libghostty-vt is not thread-safe, and neither is anything here. vt.rs holds one lock
 // around every call, so the terminal, the render state and the buffers below are only used by one

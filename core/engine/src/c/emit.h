@@ -42,6 +42,34 @@ static inline uint32_t enc_ldr_size(unsigned size, unsigned rt, unsigned rn)
     return 0x39400000u | size << 30 | rn << 5 | rt;
 }
 
+/* STRB/STRH/STR Wt/STR Xt, [Xn] (size = log2 of the byte count) */
+static inline uint32_t enc_str_size(unsigned size, unsigned rt, unsigned rn)
+{
+    return 0x39000000u | size << 30 | rn << 5 | rt;
+}
+
+/* Unscaled immediate loads/stores (-256..255): size = 0 (B), 1 (H), 2 (W), 3 (X) */
+static inline uint32_t enc_ldur_size(unsigned size, unsigned rt, unsigned rn, int off)
+{
+    return 0x38400000u | size << 30 | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_stur_size(unsigned size, unsigned rt, unsigned rn, int off)
+{
+    return 0x38000000u | size << 30 | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
+}
+
+/* Post-index loads/stores (-256..255): size = 0 (B), 1 (H), 2 (W), 3 (X) */
+static inline uint32_t enc_ldr_post(unsigned size, unsigned rt, unsigned rn, int off)
+{
+    return 0x38400400u | size << 30 | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_str_post(unsigned size, unsigned rt, unsigned rn, int off)
+{
+    return 0x38000400u | size << 30 | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
+}
+
 /* LDARB/LDARH/LDAR */
 static inline uint32_t enc_ldar(unsigned size, unsigned rt, unsigned rn)
 {
@@ -84,6 +112,11 @@ static inline uint32_t enc_stp_x(unsigned rt, unsigned rt2, unsigned rn, int off
 static inline uint32_t enc_stp_x_pre(unsigned rt, unsigned rt2, unsigned rn, int off)
 {
     return 0xa9800000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_stp_x_post(unsigned rt, unsigned rt2, unsigned rn, int off)
+{
+    return 0xa8800000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
 }
 
 static inline uint32_t enc_ldp_x_post(unsigned rt, unsigned rt2, unsigned rn, int off)
@@ -278,6 +311,18 @@ static inline uint32_t enc_and_reg(unsigned rd, unsigned rn, unsigned rm)
 static inline uint32_t enc_lslv(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x9ac02000u | rm << 16 | rn << 5 | rd;
+}
+
+/* RBIT Xd, Xn */
+static inline uint32_t enc_rbit_x(unsigned rd, unsigned rn)
+{
+    return 0xdac00000u | rn << 5 | rd;
+}
+
+/* CLZ Xd, Xn */
+static inline uint32_t enc_clz_x(unsigned rd, unsigned rn)
+{
+    return 0xdac01000u | rn << 5 | rd;
 }
 
 /* ---- SIMD&FP and system registers ---- */

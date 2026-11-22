@@ -1,4 +1,5 @@
-//! Synthetic filesystems (the kernel/procfs map): procfs, devpts, sysfs (CPU topology, network
+//! Synthetic filesystems (the kernel/procfs map; `/proc/sys` sysctls are the kernel/sysctl map and
+//! sysfs is the kernel/sysfs map): procfs, devpts, sysfs (CPU topology, network
 //! interfaces) and cgroup2, mounted at boot on `/proc`, `/dev/pts`, `/sys` and `/sys/fs/cgroup`.
 //!
 //! Nodes are [`PseudoNode`]s, and the directory structure implements [`Pseudo`] through [`View`]
@@ -287,6 +288,20 @@ const PROC_NET: [&[u8]; 18] = [
     b"udp",
     b"udp6",
     b"unix",
+];
+
+/// Platform render-node paths exposed when the machine has a renderer.
+const SYS_GPU: &[&[u8]] = &[
+    b"bus/",
+    b"bus/platform/",
+    b"dev/",
+    b"dev/char/",
+    b"dev/char/226:128/",
+    b"dev/char/226:128/device/",
+    b"dev/char/226:128/device/drm/",
+    b"dev/char/226:128/device/drm/renderD128/",
+    b"dev/char/226:128/device/subsystem",
+    b"dev/char/226:128/device/uevent",
 ];
 
 /// The fixed directories and files under `/proc/sys` and `/proc/sysvipc` (paths relative to
@@ -1103,7 +1118,9 @@ impl Pseudo for View<'_> {
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
             Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
-            Sys(path) => tree_parent(&SYS_STATIC, path).map_or(SysRoot, Sys),
+            Sys(path) => tree_parent(&SYS_STATIC, path)
+                .or_else(|| tree_parent(SYS_GPU, path))
+                .map_or(SysRoot, Sys),
             SysCpu(_, b"") => Sys(SYS_CPU_DIR),
             SysCpu(n, path) => tree_parent(&CPU_FILES, path)
                 .or_else(|| tree_parent(&HOST_CPU_FILES, path))
@@ -1265,27 +1282,42 @@ impl Pseudo for View<'_> {
                 .find(|(n, ..)| n.as_bytes() == name)
                 .filter(|_| self.conf_dir_exists(*dir))
                 .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
-            SysRoot => tree_lookup(&SYS_STATIC, b"", name).map(Sys),
-            Sys(path) => tree_lookup(&SYS_STATIC, path, name).map(Sys).or_else(|| {
-                if *path == SYS_NET_DIR {
-                    return crate::netdev::interfaces(&self.ns().net)
-                        .into_iter()
-                        .find(|i| i.name.as_bytes() == name)
-                        .map(|i| SysNet(i.index, b""));
-                }
-                if *path == SYS_BLOCK_DIR {
-                    let n = name.strip_prefix(b"loop").and_then(parse_num)?;
-                    let n = u32::try_from(n).ok()?;
-                    return self
-                        .k
-                        .loops
-                        .sysfs_exists(n, b"")
-                        .then_some(SysBlock(n, b""));
-                }
-                let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
-                let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
-                (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
-            }),
+            SysRoot => tree_lookup(&SYS_STATIC, b"", name)
+                .or_else(|| {
+                    self.k
+                        .gpu
+                        .as_ref()
+                        .and_then(|_| tree_lookup(SYS_GPU, b"", name))
+                })
+                .map(Sys),
+            Sys(path) => tree_lookup(&SYS_STATIC, path, name)
+                .or_else(|| {
+                    self.k
+                        .gpu
+                        .as_ref()
+                        .and_then(|_| tree_lookup(SYS_GPU, path, name))
+                })
+                .map(Sys)
+                .or_else(|| {
+                    if *path == SYS_NET_DIR {
+                        return crate::netdev::interfaces(&self.ns().net)
+                            .into_iter()
+                            .find(|i| i.name.as_bytes() == name)
+                            .map(|i| SysNet(i.index, b""));
+                    }
+                    if *path == SYS_BLOCK_DIR {
+                        let n = name.strip_prefix(b"loop").and_then(parse_num)?;
+                        let n = u32::try_from(n).ok()?;
+                        return self
+                            .k
+                            .loops
+                            .sysfs_exists(n, b"")
+                            .then_some(SysBlock(n, b""));
+                    }
+                    let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
+                    let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
+                    (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
+                }),
             // A child cgroup, or a file this cgroup has
             Cgroup(id, b"") => self.k.cgroups.get(*id).and_then(|g| {
                 g.children.get(name).map(|&c| Cgroup(c, b"")).or_else(|| {
@@ -1364,6 +1396,7 @@ impl Pseudo for View<'_> {
         Ok(match node {
             PtsRoot(_) | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
             Mq(..) => mode::S_IFREG,
+            Sys(b"dev/char/226:128/device/subsystem") => mode::S_IFLNK,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
                 mode::S_IFDIR
@@ -1414,6 +1447,7 @@ impl Pseudo for View<'_> {
         // Readers not visible in the mount's pid namespace have no self or thread-self (ENOENT)
         let ns = || self.pid_ns(mnt);
         match node {
+            Sys(b"dev/char/226:128/device/subsystem") => Ok(b"/sys/bus/platform".to_vec()),
             SelfLink => Ok(ns()
                 .vnr(self.tgid)
                 .ok_or(Errno::ENOENT)?
@@ -2020,9 +2054,17 @@ pub(crate) fn readdir(
                 .iter()
                 .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
         ),
-        SysRoot => nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys)),
+        SysRoot => {
+            nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys));
+            if ps.k.gpu.is_some() {
+                nodes.extend(tree_children(SYS_GPU, b"").map(Sys));
+            }
+        }
         Sys(path) => {
             nodes.extend(tree_children(&SYS_STATIC, path).map(Sys));
+            if ps.k.gpu.is_some() {
+                nodes.extend(tree_children(SYS_GPU, path).map(Sys));
+            }
             if *path == SYS_CPU_DIR {
                 nodes.extend((0..cpus() as u32).map(|n| SysCpu(n, b"")));
             }
@@ -2695,6 +2737,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         }
         FdInfo(pid, fd) => fdinfo(ps, &ns, *pid, *fd)?,
         Sys(path) => match &path[..] {
+            b"dev/char/226:128/device/uevent" => "OF_FULLNAME=/appine-gpu\nOF_COMPATIBLE_N=1\nOF_COMPATIBLE_0=virtio,mmio\n".to_owned(),
             b"devices/system/cpu/online"
             | b"devices/system/cpu/possible"
             | b"devices/system/cpu/present" => cpu_list(0..cpus()),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-20 (targeted verification only since the full mapping; latest change: OpenRC assets and Android/Cargo release versions)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU build inputs, Appine 1.1.0 packaging and retained signed-release/shared-storage contracts)
 
 ## Responsibilities
 
@@ -49,13 +49,19 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   build -p appine-android --profile <profile>`, with `CARGO_TARGET_DIR=target/android` and both
   `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT` set to AGP's NDK, using `~/.cargo/bin/cargo` when it is
   executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
-  features and use Cargo's `release` profile. The release APK selects the workspace's
+  features, use Cargo's `release` profile, append `.debug` to the application ID
+  (`io.github.mthli.appine.debug`) while keeping `namespace` at `io.github.mthli.appine`, and
+  override `ic_foreground_stroke_color` to `#F5DF4D` to distinguish the two launcher icons
+  (manifest provider authorities use `${applicationId}`). The release APK selects the workspace's
   `android-release` profile, which inherits `release` and enables cross-crate LTO.
 - Gradle resolves Zig from a nonblank, trimmed `zig.path` in `android/local.properties`, then the
   `ZIG` environment variable, then `zig` on `PATH`. `BrowserAssetTask` invokes that executable;
   `CargoNdkTask` passes the same value as `ZIG` to cargo and its build script. The local file is
   ignored by Git, and its contents are read through a Gradle file provider for configuration-cache
   tracking; both tasks declare the selected executable as an input.
+- `scripts/fetch-virglrenderer` checks the 1.3.0 source archive against its SHA-256. SDK CMake
+  3.22.1, Ninja, Python and patch build the Venus decoder in Cargo’s output directory. The static
+  archive and Android Vulkan, log and Hardware Buffer libraries link into `libappine.so`.
 - On an Android target `build.rs` asserts the libghostty-vt source (`build.zig` in
   `target/ghostty/libghostty-vt-1.0.0`, or `APPINE_GHOSTTY_SRC`) and the release's Zig packages
   beside it (the same path with `-deps`), panics on any architecture but aarch64, and runs `$ZIG`
@@ -99,12 +105,12 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: Gradle's intermediate APK is signed with the debug key, versionCode 2 and versionName
-  1.0.1, matching the Cargo workspace version. `harness`'s release workflow builds and lints the requested source revision, then aligns
+- Release: Gradle's intermediate APK is signed with the debug key, versionCode 3 and versionName
+  1.1.0, matching the Cargo workspace version. `harness`'s release workflow builds and lints the requested source revision, then aligns
   and signs the distribution APK with the established Appine PKCS12 key through SDK `apksigner`.
   Passwords stay out of Gradle, and the workflow disables its configuration cache. R8 uses the
   optimized Android defaults and shrinks unused resources. `app/proguard-rules.pro` keeps app
-  JNI declarations and the public void `VtSession.on*` callbacks looked up by the native pump;
+  JNI declarations, the GPU service connection lookup and the public void `VtSession.on*` callbacks looked up by the native pump;
   callbacks outside that pattern need a matching keep rule. The release mapping is under
   `app/build/outputs/mapping/release/`.
   The final `appine-release-<full SHA>` artifact includes the APK, SHA-256 checksum, source SHA,
@@ -114,10 +120,12 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ### Notices
 
+- The virglrenderer notice covers the pinned decoder, Mesa utilities, xxHash and Khronos headers.
+
 - `app/src/main/assets/notices/` holds static HTML, a shared stylesheet and `index.json`, packaged
   without a Gradle generation task. The catalog lists, in order: Appine (its notice and the
   repository's `LICENSE`); Fuchsia's
-  BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); the
+  BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); virglrenderer; the
   terminal's components with their texts from `android/licenses/` (libghostty-vt 1.0.0, uucode
   with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
@@ -135,7 +143,7 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   proc-macros), and the selected Alpine artifacts. The initial debug/release inventories agree.
 - `LicenseTest` checks the catalog's unique IDs, readable files and component notice coverage;
   it is not a general dependency freshness check. `android/README.md` describes maintenance.
-- The component texts in `android/licenses/` (16 files) remain upstream reference copies,
+- The component texts in `android/licenses/` remain upstream reference copies,
   maintained with their corresponding HTML notices; the release's
   `deps/libghostty-vt-third-party.json` lists which projects are linked (translate-c among them,
   though nothing of it shows as an object of its own in `libghostty-vt.a`).
@@ -148,9 +156,9 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   the app's resources rather than dependency translations. Android 11–12
   ignore the attribute and keep following the system language; the application suppresses
   lint's `UnusedAttribute` for this intentional version-specific behavior.
-- Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
-- `MainApplication` also installs `Diagnostics` after the privacy gate. Non-exported
-  `DiagnosticProvider` uses the existing AndroidX FileProvider with manifest path metadata,
+- Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` (android/reports) copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
+- `MainApplication` also installs `Diagnostics` (android/reports) after the privacy gate. Non-exported
+  `DiagnosticProvider` (android/reports) uses the existing AndroidX FileProvider with manifest path metadata,
   granting only generated archives from `cache/diagnostic-exports`; no new permission or
   dependency is required. Retained diagnostic files use the app's no-backup directory.
 - Launcher, settings, licenses list and license reader activities (the application theme
@@ -164,13 +172,13 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   `MANAGE_EXTERNAL_STORAGE` supports Settings' explicit all-files access action and direct
   shared-storage file commands, with a targeted `ScopedStorage` lint suppression.
   The debug source set's network security config allows cleartext to
-  127.0.0.1 only (for the download tests).
+  127.0.0.1 only (for the download tests), and its `colors.xml` overrides `ic_foreground_stroke_color` to `#F5DF4D`.
 
 ### Released sources
 
 - `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
   the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
-  (`cargo vendor --locked` of the whole workspace), `libghostty-vt-<version>.tar.gz` and
+  (`cargo vendor --locked` of the whole workspace), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
   `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
   `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
@@ -213,8 +221,16 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 - The global cache a `--system` build uses must never have held a package's archive: the user's
   `~/.cache/zig` usually has, and Zig 0.17 then panics ("reached unreachable code"), so `build.rs`
   gives the source a cache of its own, which nothing fetches into.
-- `build.rs` reruns only when `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
+- `libghostty-vt`'s `build.zig` invokes `git` to compute Ghostty's app version even under
+  `-Demit-lib-vt`, and panics if `HEAD` has a tag outside Ghostty's `vX.Y.Z` format. Because
+  `target/ghostty/libghostty-vt-*` lives inside Appine's repository, `build.rs` clears `GIT_DIR` /
+  `GIT_WORK_TREE` and sets `GIT_CEILING_DIRECTORIES` to the canonical parent of the source tree so
+  Appine's commits and release tags (e.g. `v1.1.0-3`) never leak into the Zig build.
+- `build.rs` reruns when the `gpu/` sources, `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
   `APPINE_GHOSTTY_SRC` or `ZIG` change, not for other libghostty-vt files or `ANDROID_NDK_HOME`.
+- Unified patch context lines retain a leading space for empty source lines. Git's default
+  whitespace check flags these in `android-blob.patch`; preserve the imported patch and validate
+  its upstream identity and hunk syntax separately.
 - vt.c's Wuffs header is found through the release's layout: the dependency named `wuffs` in
   `pkg/wuffs/build.zig.zon`, the dependency tarball's `<hash>` directories and the file
   `wuffs-v0.4.c`. An upgrade that changes any of them fails the build ("no Wuffs …" or no hash)

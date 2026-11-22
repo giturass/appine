@@ -125,6 +125,13 @@ for bin in "$@"; do
         *) r="exit $code" ;;
         esac
         echo "$t $r"
+        # A normal gtest run exiting 0 or 1 always prints a result line; when it falls through here
+        # on one side only, record both the on-disk size and captured length plus the file's head
+        # so the failure diff distinguishes a truncated/empty file from a command-substitution loss.
+        if [ "$r" = "exit 0" ] || [ "$r" = "exit 1" ]; then
+            echo "  out: file=$(wc -c <gtest.out)B cap=${#out}B"
+            tr '\0' '?' <gtest.out | sed 's/^/  out: /' | head -n 30
+        fi
         if [ -e hang.out ]; then
             if [ "$code" = 137 ] && [ "$(head -n 1 hang.out)" = "$t" ]; then
                 tail -n +2 hang.out | sed 's/^/  /'

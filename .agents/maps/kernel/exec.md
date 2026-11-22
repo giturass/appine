@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: ELF memop symbol discovery and file-offset cache)
 
 ## Responsibilities
 
@@ -129,8 +129,13 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   the strings passed.
 - The main program's code and data bounds (Linux 6.1's `start_code`, `end_code`, `start_data`,
   `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
-- A Go build-ID note in the main program selects the translator's Go register set (`engine`;
+- A Go build-ID note in the main program selects the translator's Go register set (`engine/dbt`;
   `APPINE_DBT_REGS` overrides it).
+- Tier 1 discovers length-gated libc memops only in the exact AArch64 musl from the pinned
+  Alpine rootfs (`scripts/fetch-rootfs`). An executable private mapping uses a read-only snapshot
+  of the bytes verified by SHA-256; symbol names, file paths and build IDs alone never admit a
+  function. File versions cache verification results. File offsets locate symbols across mappings
+  even when `p_vaddr != p_offset`. An unmatched file runs ordinary guest code.
 - Opened store and overlay executables are cached (32 entries, checked against the host file's
   device, inode, ctime and size; forgotten when rehomed, cleared under memory pressure).
   `Machine::spawn` loads through `loader::load`.

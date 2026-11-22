@@ -1,11 +1,11 @@
 # android/service Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/service.md` for the paired decision history.
+> See `.agents/decisions/android/service.md` for the paired decision history (it still holds the decisions on notifications, fault reports and diagnostics made before they were split out into `android/reports`).
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-19 (targeted verification only since the full mapping; latest change: OpenRC migration and recovery for existing Alpine stores)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
 
 ## Responsibilities
 
@@ -16,26 +16,27 @@ outlives an Activity:
   replacing the kernel and its store;
 - all terminal sessions (`VtSession`s, `android/vt`), and restoring tabs after the process
   was killed (`Tabs`);
-- the ongoing notification and its actions, the wake lock, memory trimming;
-- bounded app diagnostics retention and archive export, independent of the service's lifetime;
+- the ongoing foreground notification (id 1) and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
-  directories, too-long holds of the BKL) and turns them into tab messages, notifications and
-  lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
-  program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
-  finish;
-- the settings state that the activities only display and forward (tier in all builds,
-  screen-off running policy, login account, file access, CJK characters filling two cells, the cursor's
-  shape and blinking, whether the volume keys switch tabs, tab-list button visibility, distro switch), the preferences
-  kept in `Settings`.
+  directories, too-long holds of the BKL) and decides whether they become in-tab messages,
+  lifecycle actions or notifications delegated to `android/reports`, and the routing of what
+  programs ask of the app (bells, notifications, program statuses, clipboard writes and reads,
+  browser URL opens via `BrowserBridge`) and of commands the shells' prompt marks see finish;
+- the settings state that activities only display and forward (tier and Vulkan GPU in all builds,
+  screen-off running policy, login account, file access, CJK characters filling two cells, the
+  cursor's shape and blinking, whether the volume keys switch tabs, tab-list button visibility,
+  distro switch), the preferences kept in `Settings`.
 
-Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
-`Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`, `Diagnostics.kt`.
+Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Settings.kt`,
+`Tabs.kt`, `BrowserBridge.kt`.
 
-Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
-(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`) and rendering (`android/vtrender`);
-sessions' internals and the console adapter (`android/vt`), native terminals and compression
-(`android/vtcore`); the Files app provider
-(`android/documents`); JNI and the kernel API (`android/native`, `kernel/boot`, `kernel/process`).
+Outside the module: non-ongoing notifications, channels, copyable fault reports and diagnostic
+retention/export (`android/reports`); rootfs import, downloads, mirrors and `login.sh`
+(`android/setup`); the Settings screen (`android/settings`); the terminal screen
+(`android/terminal`) and its tab bar (`android/tabbar`); the view (`android/vtview`), gestures
+and selection (`android/vtgestures`) and rendering (`android/vtrender`); sessions' internals and the console adapter (`android/vt`), native terminals
+and compression (`android/vtcore`); the Files app provider (`android/documents`); JNI and the
+kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 
 ## Key types
 
@@ -69,20 +70,10 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   `progress`, `mirrorThread`.
 - `GuestActivity` — the last guest CPU sample and activity timestamp used by
   the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
-- `Notifications` — the service's notifications but the ongoing one, which the service builds
-  itself: the channels, the stuck kernel, the last run's crash, boot failures, listens, kill
-  reports and their "copy report" (the report text, receiver and authenticated action), and
-  each tab's notification; with their state: `stallNotified` (the stall last notified),
-  `killNotifications` (the next kill notification's offset, seeded from the clock), `bellNotified`
-  (when each tab's bell last notified), `statusNotified` (the program status a tab's notification
-  shows, while it shows one), `channelLocales` (the languages the channels were last named in).
-  The service decides what is told (the tab in front, a message
-  shown in the tab); `Notifications` builds, posts and cancels.
-- `Diagnostics` — process-local log/report retention and serialized archive export;
-  `DiagnosticFiles` owns synchronized rotation and snapshots, and `DiagnosticProvider` exposes
-  only generated share archives.
+- `BrowserBridge` — per-kernel random-port IPv4 loopback listener with a UUID capability that
+  relays guest HTTP(S) open requests to the focused UI.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (default 1 in all builds), login, running policy and its remembered non-always choice,
+  tier (default 1 in all builds), Vulkan GPU (`gpu`, default off), login, running policy and its remembered non-always choice,
   privacy mode (`privacy_mode`, default off), file access (`file_access`, default off and refused during privacy; old `system_documents` ignored), wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default), and tab-list button visibility (`show_tab_list`, on by default);
@@ -96,18 +87,19 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   (`s-<128-bit SHA-256 prefix of the snapshot>.snap`); `Tab(login, cwd, transcript, snapshot)`
   (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
   transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
-- Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, bell notifications at
-  most once a second per tab, commands notifying from 10 s.
+- Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, commands notifying from
+  10 s.
 
 ## Public entry points
 
-- Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
-  `START_NOT_STICKY`), `onBind`, `onTrimMemory`, `onDestroy`.
+- Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, legacy
+  COPY_REPORT forwarded to `Notifications.copyReport`; `START_NOT_STICKY`), `onBind`,
+  `onTrimMemory`, `onConfigurationChanged`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
-  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
+  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`, `setGpu`,
   `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setFileAccess`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
-  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `startError`,
+  `setVolumeKeysSwitchTabs`, `setShowTabList`, `takeNotice`; state read by them: `machine`, `gpuAvailable`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
 - Settings read without the service: `Settings.login` and `fileAccess` by `Documents`,
   `Settings.fillWide` and `Settings.showTabList` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
@@ -121,18 +113,20 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ### Start and boot
 
-- `onCreate` creates the four channels, starts foreground (type `specialUse` on API 34+) and takes
-  a killed run (`Tabs.takeKilled`; with no marker it deletes `files/tabs/` and there is none): its
-  saved tabs, and how its process ended, looked up by the marker's pid in Android's exit records
-  (`ApplicationExitInfo`); a crash or ANR of Appine posts a notification at once. Then it calls
-  `start(Rootfs.importing())` when no rootfs is ready (Alpine on the first run, else the distro an
-  import was last started for), else `start(null)`.
+- `onCreate` creates the four channels via `Notifications`, starts foreground (type `specialUse` on
+  API 34+) and takes a killed run (`Tabs.takeKilled`; with no marker it deletes `files/tabs/` and
+  there is none): its saved tabs, and how its process ended, looked up by the marker's pid in
+  Android's exit records (`ApplicationExitInfo`); a crash or ANR of Appine posts a notification
+  through `Notifications` at once. Then it calls `start(Rootfs.importing())` when no rootfs is
+  ready (Alpine on the first run, else the distro an import was last started for), else
+  `start(null)`.
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`, `updateProfile`, then
-  `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
-  all builds, defaulting to 1). On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
+  `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
+  `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
+  all builds, defaulting to 1; `gpu` defaults to false) and `Native.hasGpu(handle)` recorded as `gpuAvailable`. On Alpine, `Rootfs.ensureOpenRc` checks the store and installs a missing OpenRC
   before publishing the kernel handle. If it installs or resumes, it runs inittab on this thread.
   A setup I/O failure during import stops the private kernel. On an existing store the service
   presents the error and allows a terminal for repairs. The boot thread runs inittab only if
@@ -144,9 +138,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   start the boot thread, register a default-network callback (routes), post the poll, update the
   notification, `onMachineReady(null)`.
 - On failure: a failed import of a downloaded distro (not Alpine, store not ready) falls back to
-  Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure sets
-  `startError`, updates the wake lock and notification ("Cannot start" with the error in its body,
-  unless privacy mode hides it), reports it to the
+  Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure records
+  the exception in `Diagnostics`, sets `startError`, updates the wake lock and notification
+  ("Cannot start" with the error in its body, unless privacy mode hides it), reports it to the
   listeners, and stops the service as soon as no UI is left and no distro switch is downloading
   (there is no kernel, so no poll would end it; opening the app tries again).
 - Which start: when no store is ready (`startOrImport`, at creation and when an exit finishes with
@@ -154,20 +148,24 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   starts as it is.
 - Boot (`appine-boot` thread): unless the start thread already booted the kernel, run the osclock script without a console (exceptions logged, exit status ignored),
   `Native.boot` (blocks until inittab's boot entries finish), then notify OpenRC services that
-  failed to start, if the kernel is still the same.
+  failed to start through `Notifications`, if the kernel is still the same.
 
 ### Poll (every 2 s)
 
 - On the main thread, while a kernel runs: first `bklStall` (it takes no BKL, and the worker
-  would wait behind a hold that does not end) reports a too-long hold of the BKL (Reports below);
-  then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes` and
-  `takeChangedDirs`, then `guestCpuTime`; the poll reschedules itself at once, whether or not the fetch has run.
+  would wait behind a hold that does not end) reports a too-long hold of the BKL to
+  `Notifications`; then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes`
+  and `takeChangedDirs`, then `guestCpuTime`; the poll reschedules itself at once, whether or not
+  the fetch has run.
 - Changed directories are handled on the worker straight away: `Documents.dirsChanged`, then
   `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
-- The rest is applied on the main thread only if the kernel is still the same: listens, kills,
-  then power. Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs whose
-  shell ended do not count; restored tabs not shown yet do), no listeners and no guest processes
-  (init and zombies excluded) → `exitAll()`.
+- The rest is applied on the main thread only if the kernel is still the same: listens (to
+  `Notifications`), kills (in-tab `[appine]` message into the tab whose console with that number
+  is open, else the newest tab that had it, in yellow above the cursor line and skipped on the
+  alternate screen; then `Notifications` unless shown in the tab in front, and always for an Appine
+  bug), then power. Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs
+  whose shell ended do not count; restored tabs not shown yet do), no listeners and no guest
+  processes (init and zombies excluded) → `exitAll()`.
 
 ### Stopping, restarting, replacing
 
@@ -183,9 +181,9 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   not treat it as the last tab closing), update the wake lock, cancel the poll and saves, release
   (hang up and free) every session and take its notification away, clear `sessions` and
   `unshown`; it runs before the kernel is shut down or stopped.
-- `setTier` ignores the current value; otherwise it saves the choice and calls `restart` in all
-  builds. `restart` (guest reboot or tier change; nothing without a kernel):
-  `transitioning`, `detach`, `onRestarting`, shutdown on the worker, then `start(null)` (or, after
+- `setTier` and `setGpu` ignore unchanged values; otherwise they save the choice and call `restart` in all
+  builds. `restart` (guest reboot, tier or GPU change; nothing without a kernel):
+  `transitioning`, `detach` (which also clears `gpuAvailable`), `onRestarting`, shutdown on the worker, then `start(null)` (or, after
   "exit all" meanwhile, finish the exit); the UI opens a new tab when the new kernel is ready and
   no sessions exist.
 - Distro switch/reset (`switchTo`, allowed while no switch or download is under way and either a
@@ -206,7 +204,7 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   worker down and releases the wake lock. A start completing after destruction closes its browser
   bridge and shuts its returned kernel handle down on a separate `appine-stop` thread.
 
-### Wake lock and notification
+### Wake lock and ongoing notification
 
 - `RunPolicy`: SLEEP (default) allows sleep; ALWAYS holds `PARTIAL_WAKE_LOCK` throughout start,
   import, boot, running, restart, replacement and shutdown; BUSY protects those transitions and
@@ -231,6 +229,12 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   The single toggle names its target: ALWAYS from either non-always policy,
   otherwise the saved `idle_policy` (SLEEP until chosen). Settings and notification stay in sync.
   The toggle is hidden while exiting, and "Exit all" is always there.
+- Exit all, cancel download and running-policy actions always target `TerminalService`, including
+  while locked. The `Privacy` mode-change listener clears old non-ongoing notifications via
+  `Notifications` and refreshes the ongoing notification and UI listeners. `Privacy` owns
+  authenticated mode changes without requiring a service binding: enabling clears file access,
+  revokes grants and refreshes roots; disabling restores neither access nor grants. The service
+  also refuses enabling file access while privacy is on.
 
 ### Memory
 
@@ -306,139 +310,52 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   terminal is focused, including detached multiplexers. Background-app requests fail, not queue.
 - A bell in the tab in front (`inFront`: it is `current` and `MainActivity` is a listener, so not
   another tab and not Settings in front) goes to the listeners' `onBell`; elsewhere it becomes the
-  tab's notification, at most once a second per tab and alerting only once. An OSC 9 or OSC 777
-  notification uses the same `onBell` haptic feedback in the tab in front, sharing the view's
-  100 ms bell throttle and system touch-feedback setting; elsewhere it becomes the tab's
-  notification. A change of a tab's
-  progress or program status goes to the listeners' `onTabStatus`; a program status that is
-  blocked, done or failed (`Notifications.status`) becomes the tab's notification, once per status
-  (the same record again posts nothing), unless the tab is in front, where done and error count as seen
-  at once (`VtSession.statusSeen`). A status that goes without the user (the program was killed or
-  stopped waiting) takes its notification away, unless a bell or a program's notification has
-  replaced it since. A clipboard write sets
-  the clipboard from any tab (labelled Appine), or clears it; before Android 13, which shows copies
-  itself, a toast says a program copied text. A clipboard read (OSC 52) from the tab in front goes
-  to the listeners' `onClipboardRead`, where the terminal Activity asks the user; from any other
-  tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
-  Android lets an app read the clipboard only while it has the focus, and the program would
-  otherwise wait for a timeout.
+  tab's notification via `Notifications` (`android/reports`). An OSC 9 or OSC 777 notification
+  uses the same `onBell` haptic feedback in the tab in front, sharing the view's 100 ms bell
+  throttle and system touch-feedback setting; elsewhere it becomes the tab's notification. A
+  change of a tab's progress or program status goes to the listeners' `onTabStatus`; a program
+  status that is blocked, done or failed (`Notifications.status`) becomes the tab's notification,
+  once per status (the same record again posts nothing), unless the tab is in front, where done
+  and error count as seen at once (`VtSession.statusSeen`). A status that goes without the user
+  (the program was killed or stopped waiting) takes its notification away, unless a bell or a
+  program's notification has replaced it since. A clipboard write sets the clipboard from any tab
+  (labelled Appine), or clears it; before Android 13, which shows copies itself, a toast says a
+  program copied text. A clipboard read (OSC 52) from the tab in front goes to the listeners'
+  `onClipboardRead`, where the terminal Activity asks the user; from any other tab it is answered
+  at once with an empty clipboard (`VtSession.answerClipboardRead(null)`): Android lets an app
+  read the clipboard only while it has the focus, and the program would otherwise wait for a
+  timeout.
 - tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vtcore),
   ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
   (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
   back.
 - A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
   terminal, android/vtcore) after at least 10 s, in a tab not in front (another tab shown, or
-  the terminal Activity not listening), becomes the tab's notification, as Ghostty's
-  `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold 5 s);
-  shorter ones and those in the tab in front post nothing. Like a program's notification it
-  replaces a status notification (`statusNotified` forgets the tab).
-
-### Reports and notifications
-
-- `Diagnostics` starts from `MainApplication`, without starting the service or loading Native.
-  `DiagnosticFiles` retains logcat and report streams in `noBackupFilesDir/diagnostics`: two
-  256 KiB parts per stream for the current process and one previous process (2 MiB total).
-  A shared instance lock protects rotation, appends and snapshots; older bytes are discarded.
-  A daemon reader captures only the current PID's main/crash logcat, warnings and errors plus
-  INFO for `appine`, `Rootfs` and `TerminalService`. Capture failure is reported in exports.
-  Native stderr reaches this stream through the existing JNI redirect; release builds still
-  leave detailed kernel debug logging off. Sudden process death can lose the final logcat lines.
-- Fault reports are saved when built, even if notifications are later dismissed; a stall's
-  ending is saved even after its notification was dismissed. Boot failures and start exceptions
-  are saved too. The uncaught-exception hook records Java stacks before chaining Android's
-  previous handler. Persistence is best effort and never changes normal crash handling.
-- `Diagnostics.export` runs separately from the service worker and calls no native kernel API.
-  Its ZIP contains environment metadata, retained logs/reports, up to five Android exit records,
-  and optionally the latest ANR/native-exit trace if available and at most 1 MiB (API 31+ native
-  protobuf, otherwise ANR text). Unavailable or oversized traces are described in the archive.
-  It does not read terminal transcripts, command history, environment variables or guest files;
-  diagnostic messages themselves can contain names, paths and error details.
-- Generated Share ZIPs live in `cache/diagnostic-exports`; serialized exports retain at most three
-  archives, failing if older files cannot be removed. `DiagnosticProvider` is non-exported and
-  exposes only that directory through FileProvider. Settings grants temporary read-only access
-  to one archive after its final privacy check. An intentional share remains readable by its
-  recipient while Appine is backgrounded; raw retention files and rootfs are not provider roots.
-  `Diagnostics.export(forSave = true)` instead uses `cache/diagnostic-saves`, outside the provider
-  root and share pruning. Each pending picker/transfer owns its ZIP; cancellation, owner destruction
-  while pending, or completed transfer deletes it. `install` attempts to delete save orphans from
-  the previous process. Settings authenticates and prepares before opening SAF, then consumes
-  the pending reference once to copy only that ZIP to the selected document on a separate thread.
-- With privacy enabled, notification event and session details are hidden, including ongoing start errors/download progress. Non-ongoing titles/bodies use generic text; the ongoing title says "Privacy mode" and its body retains the selected running policy. Enabling removes old non-ongoing notifications and refreshes the ongoing one; tab numbers and action labels remain. The `Privacy` mode-change listener refreshes service/UI settings.
-- Exit all, cancel download and running-policy actions always target `TerminalService`, including while locked. Report-copy actions target non-exported `Notifications.ReportReceiver` normally and non-exported `NotificationActivity` during privacy mode; only the latter opens the authentication page. Both copy directly without starting the kernel, and all copy paths (including legacy service intents) check `Privacy.locked` at delivery. Reports are not copied into notification text.
-- `Privacy` owns authenticated mode changes without requiring a service binding: enabling clears file access, revokes grants and refreshes roots; disabling restores neither access nor grants. The service also refuses enabling file access while privacy is on.
-- Kill reports (one tab-separated line each: console, pid, command, `bug` or `oom`, and three
-  fields: for a bug the kernel's report line, its log records and the unimplemented paths, for an
-  OOM kill the cgroup path (empty for the app-wide limit), usage and limit): written as
-  `[appine] …` into the tab whose console with that number is open,
-  else the newest tab that had it (ended tabs keep their number, which the kernel hands to the next
-  console), when the process had one (`VtSession.showMessage`, queued until a tab's terminal exists), in yellow above the cursor line
-  (skipped on the alternate screen); a notification "<command> was killed" follows unless the
-  message was shown in the tab in front (another tab or Settings in front does not count), and
-  always for an Appine bug. OOM kills say whether the app's limit or a cgroup's `memory.max` (in
-  MiB or GiB) was reached.
-- Bugs always notify with "copy report": app version and build, device (Android release and API,
-  maker and model, ABI, page size), distro and the saved tier, the kernel's
-  report line, its kernel log records (up to 10 earlier ones and the report's own, one per line of
-  it), and under
-  "Unimplemented paths reached" the 10 the guest reached most since boot, with a line for the rest
-  (`kernel/signal`). "Copy report" puts the text on the clipboard (with a toast before Android 13)
-  and takes that notification away.
-- Crashes of the last run: a crash (Java or native) or ANR record of the killed run posts "Appine
-  crashed" or "Appine stopped responding" (id 3) with "copy report": the bug report's app, device,
-  distro and tier lines and one line with the pid, the kind (with the signal for a native crash),
-  the time in UTC and, for an ANR, Android's description.
-- Too-long holds of the BKL (`kernel/process`'s watchdog): a new stall of the current kernel posts
-  "Appine's kernel is stuck" (id 4) with the seconds when first seen (not refreshed) and "copy
-  report" (the watchdog's report line); once it has ended, a notification still showing becomes
-  "was stuck" with the total seconds and the kernel log record in its report, without alerting
-  again (a dismissed one stays dismissed); a stall first seen after it ended posts "was stuck"
-  directly.
-- Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot (id 2,
-  "N services did not start", with the services listed as the
-  app's language lists things (ICU's `ListFormatter`)).
-- Listens: the first `listen()` on a non-loopback address per (guest port, host port) pair and
-  kernel (the kernel queues at most 32; one dropped from a full queue is reported only when the
-  guest listens on that pair again), with remap text when the ports differ; the notification id is
-  `1000 + guest port`.
-- Tab notifications (`Notifications.tab`, on the `terminal` channel): one per tab (id
-  `200000 + tab id mod 100000`), replaced by the tab's next one: titled with OSC 777's title or a status record's
-  title, else the program's title (`sh` when none), with the body, "The terminal bell rang", or
-  for a status what it says (`VtSession.describe`: "Waiting for your approval", "Waiting for your
-  answer", "Waiting for credentials", "Waiting for you", "Done", "Failed") and its message after a
-  colon, and "Tab N" as subtext. A finished command's is titled "Command succeeded" (exit code
-  0), "Command failed" (another code) or "Command finished" (none reported), with "Took <time>."
-  or, after a failure, "Took <time> and exited with code N." (the time in ICU's short units in the
-  app's language: hours and minutes, minutes and seconds, or seconds). Tapping
-  one opens the activity on that tab (`EXTRA_TAB` with the session id); showing the tab or closing
-  it takes it away.
-- Channels: `sessions` (low), `network` (default), `problems` (high), `terminal` (high, named "Bells, notifications from
-  programs and finished commands"); kill reports take ids from 100000,
-  counting up from a clock-seeded start and wrapping after 100000. Their names are in the app's
-  language: `onConfigurationChanged` names them anew when the configuration's languages have
-  changed and posts the ongoing notification again; the other notifications keep the language
-  they were posted in. The bug report is in English whatever the language.
-- Newly created `terminal` and `problems` channels use `IMPORTANCE_HIGH` for heads-up alerts;
-  `terminal` also enables the system's default notification vibration. Existing channels retain their settings: Android
-  does not apply increased importance or new vibration defaults after channel creation, so older
-  installations need heads-up alerts and vibration enabled in system notification settings.
-  Notification permission, channel settings and Do Not Disturb govern background alerts; there
-  is no separate vibrator call. Foreground program notifications use view haptics instead.
+  the terminal Activity not listening), becomes the tab's notification via `Notifications`, as
+  Ghostty's `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold
+  5 s); shorter ones and those in the tab in front post nothing.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `MainActivity`, `SettingsActivity` (start and bind, listeners, setters, state); `VtSession`
-  (`Events`); notification `PendingIntent`s; `ConnectivityManager`; system trim callbacks;
-  `Documents` and `MainActivity` (`Settings`).
+- `MainActivity` (`android/terminal`), `SettingsFragment` (`android/settings`: start and bind,
+  listeners, setters, state); `VtSession` (`android/vt`: `Events`); ongoing notification
+  `PendingIntent`s; `ConnectivityManager`; system trim callbacks; `Documents` (`android/documents`),
+  `MainActivity`, `Notifications` and `Diagnostics` (`android/reports`), and `Privacy`
+  (`android/privacy`) reading `Settings`.
 
 ### Outbound
 
-- `Native` (start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls, `bklStall`, routes,
-  `consoleCwd`); `VtNative.compressAll` and `dropImages`, and `VtNative.version` through `Tabs`;
-  `Rootfs` (readiness, importing, prepare, download, mirrors, ensure-files, profile, access lock,
-  store, reset, failed services, rules refresh, login accounts); `Tabs`; `VtSession` and
-  `ConsolePty`; `Documents` (`rootsChanged`, `dirsChanged`).
+- `Notifications` and `Diagnostics` (`android/reports`: channels, non-ongoing notifications,
+  copy-report forwarding, fault retention).
+- `Native` (`android/native`: start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls,
+  `bklStall`, routes, `consoleCwd`); `VtNative.compressAll` and `dropImages`, and `VtNative.version`
+  through `Tabs` (`android/vtcore`); `Rootfs` (`android/setup`: readiness, importing, prepare,
+  download, mirrors, ensure-files, profile, access lock, store, reset, failed services, rules
+  refresh, login accounts); `Tabs`; `VtSession` and `ConsolePty` (`android/vt`); `Documents`
+  (`android/documents`: `rootsChanged`, `dirsChanged`, `revokeAccess`); `Privacy`
+  (`android/privacy`).
 - Android: `ActivityManager` (exit records), `PowerManager`, `NotificationManager`,
   `ConnectivityManager`, `ClipboardManager`, the `settings` preferences, `BuildConfig`.
 
@@ -465,7 +382,8 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
   start it ends with), or the service stops with a kernel still running (or never stops).
 - A thread that outlives the service (a download; the mirror probe posts nothing) posts to the
   main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
-  destroyed, so a new way of posting it must go through that too.
+  destroyed, so a new way of posting it must go through that too. Ongoing notification id 1 must
+  not collide with `android/reports`'s notification id ranges.
 - The marker is rewritten at a start before the first save replaces the old run's index, so a kill
   in between restores the old tabs again; tabs of a killed run kept through a replacement are
   restored into the new distro, where their directories may not exist.
@@ -482,26 +400,12 @@ sessions' internals and the console adapter (`android/vt`), native terminals and
 
 ## Open questions
 
-- Should a long stall's notification update its seconds while the stall goes on?
-- Listen notifications are keyed by guest port only, so listens on one guest port mapped to
-  different host ports replace each other's notification: intended?
+None.
 
 ## To verify
 
 - The ongoing notification's state title, error or running-policy body and expanded text have not
   been checked on a device, including long startup errors and privacy mode.
-- Foreground program-notification haptics and background notification vibration on physical
-  devices, including touch feedback disabled, channel vibration disabled and Do Not Disturb.
-- Heads-up alerts for terminal events and problem reports, including other tabs, the app in
-  the background, new channels, existing channels adjusted in system settings, and vendor-specific suppression.
-- Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34
-  instrumentation. Abrupt native-crash capture, real ANR/native trace attachments and vendor
-  logcat availability remain unverified; unavailable logs/traces are described in the ZIP.
+- Foreground program-notification haptics on physical devices, including touch feedback disabled.
 - Screen-off power consumption and reacquisition on physical devices; busy/idle lock transitions
   and notification toggling were exercised on an API 34 emulator, not across real device suspend.
-- The channel names and the ongoing notification following a language change while the service
-  runs (`onConfigurationChanged`) was compiled only, not tried on a device.
-- Notification routing and stale-report clipboard denial have API 34 instrumentation coverage; privacy's generic ongoing text was checked manually. Report copying after biometric authentication and vendor notification behavior still need device checks. New copy-report actions no longer start the service.
-- Finished-command notifications were tried only on a Pixel 4a API 34 emulator (busybox ash and
-  bash 5.3 from another tab, ash with the app in the background, English and Simplified Chinese),
-  not on real devices or with long durations in hours.

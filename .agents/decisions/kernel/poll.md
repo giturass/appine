@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 >
@@ -135,6 +135,13 @@
 - **Tradeoffs**: A poll that does not ask for `POLLPRI` still takes the change in through the `POLLERR` it always reports, as on Linux.
 - **Watch out**: A new report path that returns events without calling `took_change` would report a mount change forever.
 - **Source**: affb1e2
+
+### D19: GPU output fences signal completion through pollable host descriptors
+- **What**: GPU output-fence retirement signals a host descriptor that reuses ordinary poll and epoll readiness instead of implementing kernel syncobjs.
+- **Why**: Mesa duplicates output fence fds and waits on them through standard fd polling.
+- **Tradeoffs**: Each outstanding output fence consumes host and guest file descriptors.
+- **Watch out**: Early close and worker teardown must preserve completion and hangup semantics.
+- **Source**: 87c7d9db
 
 ## Superseded
 

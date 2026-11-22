@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl references to kernel/sysctl)
 
 ## Responsibilities
 
@@ -216,7 +216,8 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 - `kernel/vfs` and `kernel/files` (every permission and ownership check, file-cap removal),
   `kernel/xattr` (xattr capability rules), `kernel/process` (fork/clone copies, setpriority/ioprio
   `PRIO_USER`, `RLIMIT_NPROC`), `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal`
-  (kill), `kernel/ptrace` (ptrace access), `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix`
+  (kill), `kernel/ptrace` (ptrace access), `kernel/procfs` (status lines, ownership), `kernel/sysctl`
+  (sysctls), `kernel/unix`
   (credentials), `kernel/net`/`kernel/netns`/`kernel/nft` (capability checks), the syscall dispatcher and fast
   path (seccomp).
 

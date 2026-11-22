@@ -91,7 +91,8 @@ internal object Diagnostics {
         appendLine("Appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
         appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
             "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}")
-        appendLine("${Rootfs.installed(context)?.label ?: "unknown distribution"}, Tier ${Settings.tier(context)}")
+        val gpu = if (Settings.gpu(context)) ", Vulkan GPU" else ""
+        appendLine("${Rootfs.installed(context)?.label ?: "unknown distribution"}, Tier ${Settings.tier(context)}$gpu")
     }
 
     /** Called off the main thread, only after the settings page has authorized this export. */

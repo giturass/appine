@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/loop.md` for the paired decision history (decisions from before the split are D21 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose loop-device claims its independent verifiers checked; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint /sys/block references to kernel/sysfs)
 
 ## Responsibilities
 
@@ -16,7 +18,7 @@
 - binding a device to an open file and the status, capacity, block-size and read-only requests;
 - reads and writes forwarded to the backing file at the device offset, with no page cache, and the
   block ioctls;
-- the `/sys/block/loop<N>/` values `kernel/procfs` shows.
+- the `/sys/block/loop<N>/` values `kernel/sysfs` shows.
 
 What it is for: LTP acquires its test device this way (and runs on tmpfs over it), `losetup`
 works, and tools such as mkfs can write images through it. Nothing can be mounted from a device:
@@ -26,7 +28,7 @@ Root: `core/kernel/src/syscall/loopdev.rs`.
 
 Outside the module: device-number dispatch at open, nodev and the cgroup device filter, fd tables,
 the read/write paths of the backing file and the `IoPath` routing (`kernel/files`); the `Device`
-kinds and the boot `/dev` nodes (`kernel/vfs`); the `/sys/block` directory itself (`kernel/procfs`);
+kinds and the boot `/dev` nodes (`kernel/vfs`); the `/sys/block` directory itself (`kernel/sysfs`);
 remount's writer check over backing files (`kernel/mount`); epoll's refusal of the device
 (`kernel/poll`).
 
@@ -44,7 +46,7 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 - From `kernel/files`: `open` (a block node of major 7), `read`, `write`, `seek`, `flush_target`
   (fsync), `ioctl` (the loop and block requests), `control_ioctl` (`LOOP_CTL_*` on
   `/dev/loop-control`).
-- `Loops::numbers`, `sysfs_exists`, `sysfs_read` (`kernel/procfs`'s `/sys/block` view);
+- `Loops::numbers`, `sysfs_exists`, `sysfs_read` (`kernel/sysfs`'s `/sys/block` view);
   `Loops::backing_files` (remount's writer check, `kernel/files`' `opens_of`).
 
 ## Data flow / lifecycle
@@ -110,7 +112,7 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 - `kernel/files`: open of block nodes, the read, write, lseek, fsync and ioctl dispatch
   (`IoPath::Loop`, `kernel/vfs`'s `Device::Loop` and `Device::LoopControl`), `rehome` and
   `opens_of` over backing files.
-- `kernel/procfs`: `/sys/block/loop<N>/`.
+- `kernel/sysfs`: `/sys/block/loop<N>/`.
 - `kernel/mount`: `backing_files` for the read-only remount's writer check.
 
 ### Outbound

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -26,13 +26,16 @@
 - **D7** — Before startup, write loopback-only /etc/network/interfaces only if missing and add osclock to the OpenRC boot runlevel only when no clock service exists, preserving user files and avoiding global rc_provide cycles and hwclock on a guest without an RTC. (round 187 (`187-app-init`))
 - **D21** — Settings exposes Block, Bar or Underline and default-on blinking at any time via the service, with a current-shape summary and English/Chinese labels, while the unfocused view still draws a hollow cursor and the grouping and Chinese layout lack device confirmation. (77d7f36)
 
-## Active (full detail)
+> Full text of D1, D3, D6, D25, D26, D35: `git show c4db5db249c93e2e122d88ef60153f67c94a1f62:.agents/decisions/android/setup.md`
 
-### D1: Alpine is bundled and imported on first launch; Debian is an optional download
-- **What**: The first launch imports the Alpine minirootfs from the APK without asking; Settings can switch to Debian 13 (debuerreotype's `debian:trixie`, the build Docker's official image uses), downloaded only when chosen; Ubuntu is not offered.
-- **Why**: The user decided that the app starts in Alpine with no distro dialog, that Ubuntu is dropped from the app, and that the Debian tarball comes from its official source rather than being self-hosted.
-- **Tradeoffs**: Debian's 47 MB come from GitHub only, which is very slow from China without a proxy.
-- **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`)
+- **D1** — First launch imports the bundled Alpine minirootfs from the APK without asking, Settings can switch to Debian 13 (`debian:trixie`) downloaded on demand from GitHub (slow from China without a proxy), and Ubuntu is not offered (rounds 99, 190)
+- **D3** — Switching or resetting downloads and verifies the new tarball in the background while the old system keeps running, replacing the store only when ready (falling back to bundled Alpine on import failure, with a 30 s cancel join and restart-from-zero if killed) (round 190)
+- **D6** — `login.sh` switches with `su <account> -c 'cd …; exec "$SHELL" -l'` (using `--session-command` when util-linux `su` offers it) so restored tabs keep their directory and job control, Ctrl-C skips Debian sudo install until next login, and package commands read from `/dev/null` (rounds 194, 206)
+- **D25** — Settings summaries stay concise by omitting download sizes and reset distribution names while showing the resolved username (or root) for automatic login, keeping operational detail in switch confirmations (b2f96a63; 20137e4c; d053be24; 39e55b4b)
+- **D26** — Screen-off policy uses a nonpersistent `ListPreference` and shared Material choice dialog for SLEEP, BUSY and ALWAYS synced with notification toggles, with vendor presentation and accessibility unverified (a3f7507e, 1e5de64e; 20137e4c; d053be24; 39e55b4b)
+- **D35** — Settings exposes tab-list visibility as a service-backed nonpersistent `SwitchPreferenceCompat` before volume-key switching, with device layout and accessibility unverified (5c49c5a7; 39e55b4b)
+
+## Active (full detail)
 
 ### D2: Tarballs are trusted by pinned digests, whatever the source
 - **What**: Pinned version, length and sha256 validate tarballs from ordered sources; resume continues on 206, restarts on 200 and fails the source without resetting on other statuses, while a failed attempt already at the full length proceeds to verification.
@@ -40,12 +43,6 @@
 - **Tradeoffs**: Distro updates require new pins, transient resume errors can exhaust Debian’s sole source, and partial files do not survive the download call.
 - **Watch out**: A non-200 reply to an unsupported Range ends the source, and only the final hash checks the 206 payload’s correctness.
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 30d0fab3; 20137e4c; d053be24; 39e55b4b
-
-### D3: Switching or resetting downloads first and replaces the system only when ready
-- **What**: The new tarball is downloaded and verified in the background while the old system keeps running (progress and cancel in Settings and the notification); only then are sessions ended, the store deleted and the new one imported; a failed download leaves the old system, a failed import falls back to the bundled Alpine; reset and switch stay available after a start failure.
-- **Why**: The old reset deleted the store first, and a 47 MB download at 18 KB/s left the app unusable for over forty minutes; a broken store (an unreadable `meta.db`) could otherwise only be fixed by clearing app data.
-- **Tradeoffs**: After a cancel the old download thread must finish (up to a 30 s timeout) before another switch; a download killed with the app restarts from zero.
-- **Source**: round 190 (`190-settings-default-alpine`)
 
 ### D4: Mirrors are measured once after import and only an untouched template is replaced
 - **What**: The post-import throughput probe selects a mirror and rewrites sources from the import template only if the file still exactly matches that template; manual mirror settings and records are no longer used.
@@ -60,23 +57,18 @@
 - **Tradeoffs**: Only tabs opened by the app run the setup (`su -` and ssh logins do not); "no password" is judged from the shadow field alone.
 - **Source**: rounds 193 (`193-login-account`), 206 (`206-debian-sudo-progress`); design doc §11.1
 
-### D6: The login script keeps the start directory and the session's job control
-- **What**: `login.sh` switches with `su <account> -c 'cd …; exec "$SHELL" -l'` instead of `su -l`, using `--session-command` when util-linux su offers it; Ctrl-C during the sudo install skips it until the next login; package commands read from `/dev/null`.
-- **Why**: `su -l` always goes home, but restored tabs must start in their saved directory; util-linux `su -c` starts a new session, which left the shell without job control and made Ctrl-C close the tab; typing ahead must reach the login shell, not apt.
-- **Source**: rounds 194 (`194-restore-tabs`), 206 (`206-debian-sudo-progress`)
-
 ### D8: One rootfs at a time, upgraded by the user
 - **What**: App updates do not upgrade installed distribution packages; Appine-owned per-start integration files may be refreshed (D20, D30); upgrades within a branch are the user's `apk upgrade`/`apt upgrade`, across branches by editing the sources; switching distro discards the old files; rootfs export and import are planned for v1.x.
 - **Why**: The design doc states the rule without a recorded reason.
 - **Tradeoffs**: Two distros cannot be used side by side or share files (that would need mounts across stores).
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 8e211142; d053be24; 39e55b4b
 
-### D9: Distributions, first boot, logins and Settings are one android/setup module
-- **What**: android/setup covers Rootfs, SettingsActivity/SettingsFragment, login, shell-integration and browser-launcher assets, and fetch-rootfs, while service lifecycle stays in android/service.
-- **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
-- **Tradeoffs**: The service drives imports, android/privacy owns authentication, android/licenses owns notices navigation, android/terminal owns the shared page frame, android/vtcore parses prompt marks and android/vt owns the login environment; asset packaging belongs to android/build.
-- **Watch out**: The 2026-11-12 full verification corrected import/login behavior and recorded mirror defects subsequently removed by import-only selection; in-place shadow edits can still delay NOPASSWD refresh, and shell-hook/device checks remain open.
-- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b; 20137e4c; 8e211142; 9c6c51a7; 81f60bef; d053be24; 60790c14; 39e55b4b
+### D9: Distributions, first boot, logins and guest shell integration form android/setup
+- **What**: android/setup covers `Rootfs.kt`, guest login/OpenRC/shell-integration/browser-launcher/GPU-launcher assets and `scripts/fetch-rootfs`, with `To verify` kept to unverified residuals, while `SettingsActivity.kt` belongs to `android/settings` and service lifecycle stays in `android/service`.
+- **Why**: `android/setup.md` reached 49,174 B (106.7% of one read) while mixing guest rootfs/shell setup with the Settings UI.
+- **Tradeoffs**: Changes spanning both rootfs/account logic and the Settings UI touch both `android/setup` and `android/settings`, pre-split Settings decisions remain here, and sibling concerns stay in `android/privacy`, `android/licenses`, `android/terminal`, `android/vtcore`, `android/vt` and `android/build`.
+- **Watch out**: Changes to `Distro` metadata or `regularAccounts` must check `android/settings` consumers, while in-place shadow edits can still delay NOPASSWD refresh and shell-hook/device checks remain open.
+- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b; 20137e4c; 8e211142; 9c6c51a7; 81f60bef; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D12: Settings uses service-driven AndroidX Preferences in a Material page
 - **What**: SettingsActivity supplies the frame and targets the preference RecyclerView for app-bar lift, while SettingsFragment builds stable-key nonpersistent categories, switches and lists driven by service setters, discards stale account loads and restores scrolling only after state and insets are ready.
@@ -128,22 +120,6 @@
 - **Watch out**: Retain a usable fallback and retry cache on failure, refresh disappearing Alpine pins, and keep network sudo installation outside the bundled-install lock.
 - **Source**: 7aa817af; 20137e4c; d053be24; 39e55b4b
 
-### D25: Settings summaries keep the selected value and move operational detail to confirmations
-
-- **What**: Distribution choices omit sizes, automatic login shows the resolved username with root fallback, and reset summaries omit the distribution name.
-- **Why**: Users asked for shorter descriptions while retaining meaningful current state.
-- **Tradeoffs**: The initial chooser no longer previews download size or explains account selection.
-- **Watch out**: Switch confirmations must retain download and deletion details.
-- **Source**: b2f96a63; 20137e4c; d053be24; 39e55b4b
-
-### D26: Screen-off policy is a service-backed choice list
-
-- **What**: A nonpersistent ListPreference replaces the keep-awake switch and uses the shared Material choice dialog with the service’s SLEEP, BUSY and ALWAYS policy descriptions.
-- **Why**: Settings must expose three policies and stay synchronized with notification toggles.
-- **Tradeoffs**: Changing policy opens a list, and BUSY needs its idle-timeout limitations explained.
-- **Watch out**: Vendor presentation and accessibility remain unverified.
-- **Source**: a3f7507e, 1e5de64e; 20137e4c; d053be24; 39e55b4b
-
 ### D27: New Alpine imports stage an independent offline procps-ng bundle
 
 - **What**: Imports cache pinned procps-ng dependencies separately from bash, install before account selection under the install lock using apk’s package database, re-add procps-ng by name and remove the cache only after success.
@@ -154,11 +130,11 @@
 
 ### D28: About actions work independently of service binding
 
-- **What**: About lists Telegram, Project website and Privacy policy in that order with URL summaries and shared unpinned Custom Tabs handling, and shows the version name and code with a Play link that tries com.android.vending before HTTPS fallback.
-- **Why**: Users need discoverable project and installed-version links without a running service.
-- **Tradeoffs**: Routing depends on installed handlers and a Play listing may not exist before publication.
-- **Watch out**: Keep the missing-handler toast for web and Play links; device navigation, fallback routing and return to Settings remain unverified.
-- **Source**: d0a74e94, 0b3c5d8a; d053be24; 39e55b4b; 5f950434, 13675d1d, 5b213f09
+- **What**: About lists Telegram, Project website and Privacy policy in that order with URL summaries and shared unpinned Custom Tabs handling, and shows the version name and code with a Play link pinned to `PLAY_STORE_URL` (`io.github.mthli.appine`) trying `com.android.vending` before HTTPS fallback.
+- **Why**: Users need discoverable project and installed-version links without a running service, and debug builds (`.debug` suffix) must still open the published Play Store listing.
+- **Tradeoffs**: Routing depends on installed handlers, and any future rename of the published Play Store application ID must update `PLAY_STORE_URL` alongside `build.gradle.kts`.
+- **Watch out**: Keep the missing-handler toast for web and Play links; device navigation, fallback routing, store-link routing and return to Settings remain unverified.
+- **Source**: d0a74e94, 0b3c5d8a; d053be24; 39e55b4b; 5f950434, 13675d1d, 5b213f09; 1afcffbc
 
 ### D29: New Alpine imports stage an independent bubblewrap bundle
 
@@ -208,14 +184,6 @@
 - **Watch out**: Existing shells need reloading, custom profiles may not migrate, prompt/history frameworks can interfere, and ash must restore its sanitized title after its visible prompt.
 - **Source**: b04ebd4e, 9f9ba8d7; 39e55b4b
 
-### D35: Settings exposes the saved tab-list visibility
-
-- **What**: A service-backed nonpersistent SwitchPreferenceCompat precedes volume-key switching and reflects the saved tab-list visibility.
-- **Why**: Users need a discoverable visibility control in Terminal settings.
-- **Tradeoffs**: The Terminal group gains one row.
-- **Watch out**: Device layout and accessibility remain unverified.
-- **Source**: 5c49c5a7; 39e55b4b
-
 ### D36: Notification authorization remains available after banner dismissal
 
 - **What**: Enable notifications appears first in the Android group only while app notifications are disabled and uses the shared helper without service binding, refreshing on creation, permission results and resume.
@@ -240,6 +208,38 @@
 - **Watch out**: Vendors may move or rename those controls.
 - **Source**: 7a931d97
 
+### D39: `appine-gpu` selects the packaged Venus Vulkan driver per command
+
+- **What**: `appine-gpu` sets `VK_DRIVER_FILES` to the packaged Venus manifest and execs the supplied command and arguments.
+- **Why**: Loading extra Vulkan drivers such as llvmpipe adds startup overhead to short commands that need hardware compute.
+- **Tradeoffs**: Callers must opt in by prefixing their command with `appine-gpu`.
+- **Watch out**: A distribution that renames its Venus manifest requires updating the launcher script.
+- **Source**: 9cafc90b
+
+### D40: Alpine stores run one-time offline OpenRC setup on both new imports and upgrades
+
+- **What**: Offline OpenRC setup checks `apk`, resumes any staged installer or sources missing packages from the APK, adds `openrc` to world by name, removes the installer and cache and records per-store completion only after verifying the default runlevel and service lock directory (marking preinstalled OpenRC complete immediately).
+- **Why**: Services require OpenRC's runlevel state before first login, and existing upgraded Alpine stores can lack both OpenRC and the original import caches.
+- **Tradeoffs**: First launch adds a package transaction, and the first upgrade migration also installs OpenRC for users who removed it prior to upgrading.
+- **Watch out**: Preserve the staged installer across interrupted setup for retry; custom `inittab` entries or existing package constraints can prevent completion.
+- **Source**: d0ff9a31, 7e85e8dc
+
+### D41: Vulkan GPU acceleration is an explicit Debugging switch with restart confirmation
+
+- **What**: Settings places a nonpersistent Vulkan GPU `SwitchPreferenceCompat` between Execution mode and Export diagnostic logs, enabled only while the kernel runs without a distro switch, confirming enable and disable with `showPrivate` restart dialogs and showing "Unavailable on this device" when enabled without a probed renderer.
+- **Why**: Users need a clear opt-in under Debugging with plain-language summaries and explicit confirmation before restarting active sessions.
+- **Tradeoffs**: Toggling ends all active sessions and restarts the kernel.
+- **Watch out**: Device layout and TalkBack across all five locales remain unverified outside English/Chinese checks on Galaxy S23.
+- **Source**: b605a0a3
+
+### D42: Alpine stores seed bash startup files once for `/etc/skel`, root and existing regular users
+
+- **What**: `Rootfs.ensureBashStartup` runs on new Alpine imports and once per existing Alpine store via `/var/lib/appine/bash-startup-done`, writing `/etc/skel/.bash_profile` and `.bashrc` (`overwrite = false`) and seeding missing `.bash_profile` (unless `.bash_profile`, `.bash_login` or `.profile` exists) and `.bashrc` owned by `uid:gid` for `root` and existing regular `/bin/bash` accounts (UID 1000–65533, non-negative GID) whose home already exists as a non-regular entry.
+- **Why**: Alpine login tabs run `bash -l`, which skips `~/.bashrc` without a login file, and neither Alpine's minirootfs nor its `bash` package ships `/etc/skel` or user bash startup files.
+- **Tradeoffs**: Missing or symlinked regular-user homes are skipped rather than created or dereferenced, intentional dotfile deletions are respected after the marker is written, and stores that wrote the marker before `125f3d00` are not re-run.
+- **Watch out**: A non-directory replacing `/etc/skel` fails startup before boot, non-directory home entries rely on `exists` failing with `ENOTDIR`, and live `TerminalService` upgrade cold starts and 16 KB-page devices remain unverified.
+- **Source**: 9f3e93ed, 125f3d00
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
@@ -255,3 +255,7 @@
 - ~~The keep-awake switch introduced by a3f7507e~~ → replaced by **D26** in 1e5de64e (2026-11-13, predecessor predates structured Decision records)
 - ~~The immediate system-directory toggle summarized under D12~~ → replaced by **D31** in d0ddf170 (2026-11-14)
 - ~~Inline zsh integration with eval-based registration under D20 in a7d8c9f5~~ → replaced by **D20** in 4a10bc49 (2026-11-16), retaining the existing loading scope and prompt marks.
+- ~~Stage OpenRC exclusively during import of a new Alpine store in d0ff9a31~~ → replaced by **D40** in 7e85e8dc (2026-11-19).
+- ~~Open the HTTPS Google Play details URL for `BuildConfig.APPLICATION_ID` in About's Version action in 0b3c5d8a~~ → replaced by **D28** in 1afcffbc (2026-11-21).
+- ~~Leave pre-existing regular Alpine accounts untouched during one-time bash startup seeding in 9f3e93ed~~ → replaced by **D42** in 125f3d00 (2026-11-21).
+- ~~D9 combined ownership of Rootfs and SettingsActivity (12c4afa)~~ → replaced by **D9** and android/settings **D1** in e4d7bbe5 (2026-11-22).

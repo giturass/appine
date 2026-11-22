@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -14,11 +14,12 @@
 - **Watch out**: A host-only behaviour (Android's app seccomp, missing `/proc` files) must be handled in the hal or its caller, not assumed from the Linux development host.
 - **Source**: design doc §3, §13.3; round 07 (`07-m5`); 7c5e636
 
-### D2: DNS goes to the host's resolver: `android_res_nsend` on Android
-- **What**: `dns_query` sends the guest's query packet through `android_res_nsend` on the default network (linked against libandroid) with a 30 s backstop, and on other hosts to the servers in the host's `/etc/resolv.conf`.
-- **Why**: Through the system resolver, Android's Private DNS, VPNs and per-network routing apply to the guest (see `kernel/net` D5 for the stub that calls it).
-- **Tradeoffs**: The call blocks the calling thread; callers must not hold locks.
-- **Source**: round 07 (`07-m5`)
+### D2: DNS goes to the host's resolver: on-demand `android_res_nsend` on Android
+- **What**: `dns_query` sends the guest's query packet through one dynamically loaded and cached Android system resolver (`libandroid.so` `android_res_nsend` symbols resolved on demand using private function-pointer type aliases and shared with preload) with a 30 s backstop, and on other hosts to the servers in `/etc/resolv.conf`.
+- **Why**: Through the system resolver, Android's Private DNS, VPNs and per-network routing apply to the guest (see `kernel/net` D5), while deferring `libandroid.so` avoids loading its dependencies at startup before DNS is needed and explicit type aliases satisfy Android clippy `-D warnings`.
+- **Tradeoffs**: The call blocks the calling thread (callers must not hold locks), and a query arriving before dynamic initialization finishes pays or waits for the load.
+- **Watch out**: Missing Android resolver symbols cause DNS queries to return `ENOSYS`.
+- **Source**: round 07 (`07-m5`); 86d7523c, 7b8838c8
 
 ### D3: Edge-triggered readiness of a host socket comes from a per-fd host epoll
 - **What**: `Edges` is a host epoll registered edge-triggered on one fd; `take()` reports whether read or write edges arrived since the last call.
@@ -144,3 +145,4 @@
 
 - ~~Other hosts keep fallbacks so that they at least compile (design doc §3, round 07)~~ → replaced by **D1** in 7c5e636 (2026-11-08)
 - ~~Other hosts read random bytes from `/dev/urandom` (D9, 9e72dbb)~~ → replaced by **D1** in 7c5e636 (2026-11-08)
+- ~~Linking `libandroid` at startup for Android DNS under D2 (round 07)~~ → replaced by **D2** in 86d7523c (2026-11-21, implicit refinement).
