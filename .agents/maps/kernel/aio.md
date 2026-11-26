@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose AIO claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint aio sysctl references to kernel/sysctl)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: refuse AIO read/write with EINVAL on procfs files lacking read_iter/write_iter via pseudo::has_iter)
 
 ## Responsibilities
 
@@ -21,7 +21,7 @@
 Root: `core/kernel/src/syscall/aio.rs`.
 
 Outside the module: the read, write, vectored and fsync paths and their file checks
-(`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
+(`kernel/fileio`), plus fd lookup and `FileKind` (`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
 (`kernel/poll`); thread groups and exit (`kernel/process`); the timer thread (`kernel/time`); execve
 (`kernel/exec`); the context page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr`
 (`kernel/sysctl`).
@@ -54,7 +54,8 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 - io_setup: `*ctxp` must be 0 and `nr` from 1 to `0x1000_0000 / 32` (`EINVAL`); each context
   charges `nr` to `aio-nr` against `aio-max-nr` (65536; `EAGAIN`).
 - Releasing a context (io_destroy, execve, the process's exit; 6.1's `kill_ioctx`) marks it dead,
-  drops its pending polls without events that could be taken but signals their eventfds, releases
+  drops its pending polls without events that could be taken (calling `unix::released` for any
+  dropped AF_UNIX socket files) and signals their eventfds, releases
   the charge and wakes waiters, which take what is queued; io_destroy (an unknown context
   `EINVAL`) then unmaps the page. It does not wait for a submit still blocked in I/O.
 
@@ -70,20 +71,25 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 - Reads and writes: unknown `aio_rw_flags` bits `EOPNOTSUPP`, then the open mode (`EBADF`), then a
   file without Linux's `read_iter`/`write_iter` `EINVAL` (`has_iter`: directories, epoll, timerfd,
   signalfd, inotify, pidfd, message queue, seccomp and bpf fds, `/dev/loop-control`, reads of
-  `/dev/kmsg`, writes of `/dev/full` and of eventfds), then a negative `aio_offset` `EINVAL`, also
+  `/dev/kmsg`, writes of `/dev/full` and of eventfds, and synthetic files rejected by
+  `pseudo::has_iter` — `/proc/<pid>/{mem,pagemap,cmdline,environ,auxv,oom_score_adj,coredump_filter}`,
+  `/proc/kmsg`, nsfs files, and writes to procfs `seq_file` entries; sysfs, cgroup2 and
+  `/proc/sys` allow both), then a negative `aio_offset` `EINVAL`, also
   on a file that ignores the offset (`rw_verify_area`). Fsyncs: a nonzero `aio_buf`,
   `aio_offset`, `aio_nbytes` or `aio_rw_flags`, or a file fsync refuses (`has_fsync`), is
   `EINVAL`. Polls: events beyond 16 bits or a nonzero `aio_offset`, `aio_nbytes` or
   `aio_rw_flags` is `EINVAL`. The first failure is returned when nothing was submitted, otherwise
   the count so far.
 - PREAD, PWRITE, PREADV, PWRITEV, FSYNC and FDSYNC run synchronously inside io_submit through
-  `kernel/files`' read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
+  `kernel/fileio`'s read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
   io_submit), and their result or negative errno is queued at once (an interrupted one as
   `-EINTR`, as `aio_rw_done` turns restart codes into it). `aio_offset` is used only for
-  positional files; `RWF_NOWAIT` and `RWF_APPEND` are set temporarily as `O_NONBLOCK`/`O_APPEND`
-  on the shared open file. A write to an `O_APPEND` regular file, or with `RWF_APPEND`, goes to the
-  end whatever the offset (`append_offset`), leaving the file position alone, and
-  `RWF_DSYNC`/`RWF_SYNC` sync the file after a write as pwritev2 does (`write_sync`).
+  positional files; `RWF_NOWAIT` and `RWF_APPEND` are passed per request via `kernel/fileio`'s
+  `IoFlags` (`read_file_with`, `write_file_with`, `vectored_with`, `append_offset`) without
+  mutating `O_NONBLOCK`/`O_APPEND` on the shared open file. A write to an `O_APPEND` regular file,
+  or with `RWF_APPEND`, goes to the end whatever the offset (`append_offset`), leaving the file
+  position alone, and `RWF_DSYNC`/`RWF_SYNC` sync the file after a write as pwritev2 does
+  (`write_sync`).
 
 ### Polls and completion
 
@@ -93,15 +99,17 @@ Outside the module: the read, write, vectored and fsync paths and their file che
   looked at: by io_getevents and io_pgetevents on that context, by io_cancel, and, when it signals
   an eventfd, by the timer thread, which watches its context (every wake channel, the pending
   polls' host fds and timerfd expirations, through `kernel/poll`'s `watch_aio_poll`) until no
-  such poll is left. If that check panics, the timer thread forgets every watched context, and
-  only io_getevents and io_cancel complete those polls from then on.
+  such poll is left. Completing or cancelling a pending poll that holds an AF_UNIX socket triggers
+  `unix::released` or deferred `unix::collect` (`collect_deferred` in `check_polls` and syscall
+  dispatch). If `check_polls` panics, the timer thread forgets every watched context, and only
+  io_getevents and io_cancel complete those polls from then on.
 - io_getevents and io_pgetevents (`min_nr <= nr`, relative timeout, optional temporary sigmask):
   complete ready polls, then return once `max(min_nr, 1)` events are queued, `min_nr` is 0 or the
-  deadline has passed; a destroyed context returns what is queued, else `EINVAL`; a signal is
-  `EINTR`; otherwise wait as ppoll would on the pending polls' files (their in-process objects,
-  host fds and timerfd expirations) and on the context, which submission, completion,
-  cancellation and release wake (`wait_aio_polls`). Events whose copy out faults stay queued
-  (`EFAULT`).
+  deadline has passed; a destroyed context returns what is queued, else `EINVAL`; a signal returns
+  already-queued events when `have > 0`, else `EINTR`; otherwise wait as ppoll would on the pending
+  polls' files (their in-process objects, host fds and timerfd expirations) and on the context,
+  which submission, completion, cancellation and release wake (`wait_aio_polls`). Events whose copy
+  out faults stay queued (`EFAULT`).
 - io_cancel reads the iocb's key (`EFAULT`) before looking up the context, then first completes
   ready polls, so it cancels only a poll still pending (an event with result 0 that signals its
   eventfd, then `EINPROGRESS`); everything else has already completed (`EINVAL`).
@@ -118,9 +126,11 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 
 ### Outbound
 
-- `kernel/files`: fd lookup, `read_file`, `write_file`, `vectored`, `fsync`, `has_fsync`,
-  `seekable`, `append_offset`, `write_sync`; `FileKind` for `has_iter`; `kernel/vfs`: `Device`
-  for `has_iter`.
+- `kernel/files`: fd lookup, `FileKind` for `has_iter`; `kernel/procfs`: `pseudo::has_iter`;
+  `kernel/fileio`: `IoFlags`,
+  `read_file_with`, `write_file_with`, `vectored_with`, `fsync`, `has_fsync`, `seekable`,
+  `append_offset`, `write_sync`; `kernel/vfs`: `Device` for `has_iter`; `kernel/unix`: `released`,
+  `defer_collect`, `collect_deferred`, `is_unix_file`.
 - `kernel/poll`: `poll_once`, `wait_aio_polls`, `watch_aio_poll`, `set_temp_mask`/`restore_mask`,
   the resfd eventfds it signals.
 - `kernel/mm`: mapping and unmapping the context page; `UserSlice` copies.
@@ -143,14 +153,7 @@ Outside the module: the read, write, vectored and fsync paths and their file che
 
 ## Confirmed bugs / technical debt
 
-- **Events lost to signals:** io_getevents returns `EINTR` on a signal even when some events
-  (fewer than `min_nr`) are queued, leaving them queued, where Linux returns them.
-- **Per-request flags leak:** `RWF_NOWAIT` and `RWF_APPEND` are set as `O_NONBLOCK`/`O_APPEND` on
-  the shared open file for the duration of the I/O, so other users of the description see them
-  (and an `F_SETFL` of those bits made meanwhile is undone), where Linux keeps them per request.
-- **Synthetic files all take reads and writes:** they are taken to have `read_iter` and
-  `write_iter`, which holds for sysfs, cgroup2 and `/proc/sys` but not for every procfs file
-  (`/proc/<pid>/mem`, `pagemap`), which Linux refuses with `EINVAL`.
+None.
 
 ## To verify
 

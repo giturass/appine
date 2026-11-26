@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/build"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00)
+> Last distilled: 2026-11-23 (HEAD = cc72b093)
 >
 > Decisions on android/build made before it was split from android/native keep their `android/native` tags and live in `.agents/decisions/android/native.md`: D2–D7, D10, D12–D14, D20–D22, D24–D26, D28 and the dependency portion of D32.
 
@@ -50,11 +50,11 @@
 
 ### D6: Cargo and Android use the same release version
 
-- **What**: Keep the shared Cargo version and lockfile package entries synchronized with Android's release version (bumped to 1.0.1 and `versionCode 2`), and ignore local `android/app/release` exports.
+- **What**: Keep the shared Cargo version and lockfile package entries synchronized with Android's release version (bumped to 1.1.0 and `versionCode 3`), and ignore local `android/app/release` exports.
 - **Why**: Native version labels should identify the same Appine release as the APK while keeping local exports out of Git.
 - **Tradeoffs**: Cargo and Gradle still declare versions separately and require manual synchronization.
 - **Watch out**: Check both declarations and the lockfile when preparing a release.
-- **Source**: 295fbe95, 3a7019eb
+- **Source**: 295fbe95, 3a7019eb, 09645b4f
 
 ### D7: The pinned virglrenderer Venus decoder is verified, patched separately and built with CMake
 
@@ -87,6 +87,14 @@
 - **Tradeoffs**: The softer yellow has slightly less contrast against the white icon body, and Android themed/monochrome icons render without the colored stroke while sharing the `Appine` label.
 - **Watch out**: Side-by-side device installation, instrumentation under `io.github.mthli.appine.debug` and launcher icon rendering remain unverified on device.
 - **Source**: 1afcffbc, 8ab3b92b
+
+### D11: `libghostty-vt`'s Zig build is isolated from Appine's Git repository
+
+- **What**: `hosts/android/build.rs` clears `GIT_DIR` and `GIT_WORK_TREE` and sets `GIT_CEILING_DIRECTORIES` to the canonical parent of `libghostty-vt`'s source tree when invoking `zig build`.
+- **Why**: `libghostty-vt`'s `Config.zig` invokes `git` even under `-Demit-lib-vt`, walking up from `target/ghostty/` into Appine's `.git` and panicking on Appine release tags like `v1.1.0-3`.
+- **Tradeoffs**: Relies on standard Git ceiling-directory handling and `fs::canonicalize` succeeding while still allowing an explicit `APPINE_GHOSTTY_SRC` Git checkout to report its own metadata.
+- **Watch out**: Future `libghostty-vt` releases that change how `GitVersion.detect` handles `error.GitNotRepository` or require an explicit version flag will need `build.rs` updated.
+- **Source**: 166dd6ee
 
 ## Superseded
 

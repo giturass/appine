@@ -13,7 +13,9 @@ use std::rc::Rc;
 use crate::cell::RefCell;
 use crate::cred::UserNs;
 use crate::errno::Errno;
-use crate::kernel::{PID_MAX, Tid};
+#[cfg(test)]
+use crate::kernel::PID_MAX;
+use crate::kernel::Tid;
 
 /// The number of the boot pid namespace (`/proc/<pid>/ns/pid`).
 pub(crate) const INIT_PID_NS: u64 = 4_026_531_836;
@@ -73,11 +75,22 @@ impl PidNs {
         })
     }
 
-    /// A new thread or process `g` in namespace `ns`: allocates a number in it and in every
-    /// ancestor (except the boot namespace); `set_tid` is what clone3 specified, from the level of
-    /// `ns` outwards (already checked, see [`crate::kernel::Kernel::choose_pid`]). The process
-    /// numbered 1 is the namespace's reaper; after the reaper exits this is ENOMEM.
+    /// A new thread or process `g` in namespace `ns`, using [`PID_MAX`].
+    #[cfg(test)]
     pub fn register(ns: &Rc<PidNs>, g: Tid, set_tid: &[Tid]) -> Result<(), Errno> {
+        Self::register_with_max(ns, g, set_tid, PID_MAX)
+    }
+
+    /// A new thread or process `g` in namespace `ns`: allocates a number in it and in every
+    /// ancestor (except the boot namespace) below `pid_max`; `set_tid` is what clone3 specified,
+    /// from the level of `ns` outwards (already checked, see [`crate::kernel::Kernel::choose_pid`]).
+    /// The process numbered 1 is the namespace's reaper; after the reaper exits this is ENOMEM.
+    pub fn register_with_max(
+        ns: &Rc<PidNs>,
+        g: Tid,
+        set_tid: &[Tid],
+        pid_max: Tid,
+    ) -> Result<(), Errno> {
         if ns.dead.get() {
             return Err(Errno::ENOMEM);
         }
@@ -85,7 +98,7 @@ impl PidNs {
         let mut cur = Some(&**ns);
         let mut want = set_tid.iter().copied();
         while let Some(n) = cur.filter(|n| n.level > 0) {
-            match n.alloc(g, want.next()) {
+            match n.alloc(g, want.next(), pid_max) {
                 Ok(1) if n.reaper.get().is_none() => {
                     n.reaper.set(Some(g));
                     done.push(n);
@@ -104,9 +117,9 @@ impl PidNs {
     }
 
     /// Allocates a local number for global number `g`: `want` if given (EEXIST if already in use),
-    /// otherwise an unused one after the last, wrapping to 300 at `PID_MAX` (Linux's
+    /// otherwise an unused one after the last, wrapping to 300 at `pid_max` (Linux's
     /// `RESERVED_PIDS`, `alloc_pid`).
-    fn alloc(&self, g: Tid, want: Option<Tid>) -> Result<Tid, Errno> {
+    fn alloc(&self, g: Tid, want: Option<Tid>, pid_max: Tid) -> Result<Tid, Errno> {
         let mut global = self.global.borrow_mut();
         if let Some(l) = want {
             if global.contains_key(&l) {
@@ -116,10 +129,20 @@ impl PidNs {
             self.local.borrow_mut().insert(g, l);
             return Ok(l);
         }
+        let min = if pid_max <= RESERVED_PIDS {
+            1
+        } else {
+            RESERVED_PIDS
+        };
         let mut l = self.next.get();
-        for _ in 0..PID_MAX {
-            if l >= PID_MAX {
-                l = RESERVED_PIDS;
+        let steps = if l >= pid_max {
+            pid_max - min
+        } else {
+            (pid_max - l) + l.saturating_sub(min)
+        };
+        for _ in 0..steps {
+            if l >= pid_max {
+                l = min;
             }
             if let std::collections::hash_map::Entry::Vacant(e) = global.entry(l) {
                 e.insert(g);
@@ -167,6 +190,7 @@ impl PidNs {
 
     /// The process with global number `g` is visible here (it is in this namespace or a
     /// descendant).
+    #[cfg(test)]
     pub fn sees(&self, g: Tid) -> bool {
         self.vnr(g).is_some()
     }
@@ -222,8 +246,8 @@ mod tests {
         let a = PidNs::child(&init, UserNs::init());
         // The first process is number 1 and becomes the reaper; the ancestor (boot) namespace uses
         // global numbers
-        PidNs::register(&a, 100, &[]).unwrap();
-        PidNs::register(&a, 101, &[]).unwrap();
+        PidNs::register_with_max(&a, 100, &[], PID_MAX).unwrap();
+        PidNs::register_with_max(&a, 101, &[], PID_MAX).unwrap();
         assert_eq!(a.reaper.get(), Some(100));
         assert_eq!((a.vnr(100), a.vnr(101), a.vnr(7)), (Some(1), Some(2), None));
         assert_eq!((a.find(2), a.find(3)), (Some(101), None));
@@ -231,7 +255,7 @@ mod tests {
         assert_eq!(a.last_pid(), 2);
         // A process in nested namespaces has one number at each level
         let b = PidNs::child(&a, UserNs::init());
-        PidNs::register(&b, 102, &[]).unwrap();
+        PidNs::register_with_max(&b, 102, &[], PID_MAX).unwrap();
         assert_eq!((b.vnr(102), a.vnr(102)), (Some(1), Some(3)));
         assert!(!b.sees(101));
         let levels: Vec<u32> = b.levels_from(1).iter().map(|n| n.level).collect();
@@ -243,27 +267,44 @@ mod tests {
         // the one just freed
         PidNs::unregister(&b, 102);
         assert_eq!((b.vnr(102), a.vnr(102)), (None, None));
-        PidNs::register(&a, 103, &[]).unwrap();
+        PidNs::register_with_max(&a, 103, &[], PID_MAX).unwrap();
         assert_eq!(a.vnr(103), Some(4));
         // After a write to ns_last_pid, allocation starts after it; after pid_max, from 300
         a.set_last_pid(41);
-        PidNs::register(&a, 104, &[]).unwrap();
+        PidNs::register_with_max(&a, 104, &[], PID_MAX).unwrap();
         assert_eq!(a.vnr(104), Some(42));
         a.set_last_pid(PID_MAX);
-        PidNs::register(&a, 105, &[]).unwrap();
+        PidNs::register_with_max(&a, 105, &[], PID_MAX).unwrap();
         assert_eq!(a.vnr(105), Some(RESERVED_PIDS));
+        // Lower pid_max wraps and stops with EAGAIN once [RESERVED_PIDS, pid_max) is exhausted
+        let d = PidNs::child(&init, UserNs::init());
+        d.set_last_pid(301);
+        PidNs::register_with_max(&d, 200, &[], 302).unwrap();
+        assert_eq!(d.vnr(200), Some(RESERVED_PIDS));
+        PidNs::register_with_max(&d, 201, &[], 302).unwrap();
+        assert_eq!(d.vnr(201), Some(RESERVED_PIDS + 1));
+        assert_eq!(
+            PidNs::register_with_max(&d, 202, &[], 302),
+            Err(Errno::EAGAIN)
+        );
         // Numbers specified by clone3: from the inner level outwards; ones in use are EEXIST
         let c = PidNs::child(&a, UserNs::init());
-        PidNs::register(&c, 107, &[1, 77]).unwrap();
+        PidNs::register_with_max(&c, 107, &[1, 77], PID_MAX).unwrap();
         assert_eq!(
             (c.vnr(107), a.vnr(107), c.reaper.get()),
             (Some(1), Some(77), Some(107))
         );
-        assert_eq!(PidNs::register(&c, 108, &[5, 77]), Err(Errno::EEXIST));
+        assert_eq!(
+            PidNs::register_with_max(&c, 108, &[5, 77], PID_MAX),
+            Err(Errno::EEXIST)
+        );
         assert_eq!((c.vnr(108), a.vnr(108)), (None, None));
         // After the reaper exits no more processes can be created in it
         a.dead.set(true);
-        assert_eq!(PidNs::register(&a, 106, &[]), Err(Errno::ENOMEM));
+        assert_eq!(
+            PidNs::register_with_max(&a, 106, &[], PID_MAX),
+            Err(Errno::ENOMEM)
+        );
         assert_eq!(a.vnr(106), None);
     }
 }

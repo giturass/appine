@@ -20,6 +20,9 @@ import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.nio.file.AccessDeniedException
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.read
 
 /**
@@ -27,7 +30,8 @@ import kotlin.concurrent.read
  * Once enabled in Settings, the login account's home directory is one root and the whole system
  * (`/`) is another, read-only outside the home.
  *
- * Document IDs are the guest's absolute paths (written as described in [Native]) and are looked up
+ * Document IDs contain the guest's absolute path (written as described in [Native]) and a generation
+ * if the path or an ancestor was retired by the provider. Paths are looked up
  * directly in the store ([Native.browseList] and the like), without the kernel running: while it
  * runs, what is seen is what it last committed, and mounts such as `/proc`, `/dev` and `/run` are
  * not visible (they are empty directories in the store). Symbolic links are followed. Only
@@ -62,14 +66,17 @@ class Documents : DocumentsProvider() {
     }
 
     /**
-     * The login account, its UID and GID, and the home directory (as a document ID). null while
+     * The login account, its UID and GID, and the encoded guest path to the home directory. null while
      * there is no store or no home directory; a home of `/` counts as none, since it would make the
      * whole system writable (the native side refuses it too).
      */
     private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
 
+    private data class HomeCache(val generation: Long, val time: Long, val login: String, val home: Home?)
+
     override fun onCreate(): Boolean = true
 
+    @Synchronized
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: ROOT_COLUMNS)
         val context = context ?: return result
@@ -85,7 +92,7 @@ class Documents : DocumentsProvider() {
         val home = home(context)
         if (home != null) result.newRow().apply {
             add(Root.COLUMN_ROOT_ID, ROOT_HOME)
-            add(Root.COLUMN_DOCUMENT_ID, home.path)
+            add(Root.COLUMN_DOCUMENT_ID, providerId(home.path))
             add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
             add(Root.COLUMN_SUMMARY, context.getString(R.string.documents_home, home.account, distro))
             // Creating is supported: so it also appears in other apps' "Save to"
@@ -110,36 +117,31 @@ class Documents : DocumentsProvider() {
 
     private fun home(context: Context): Home? {
         if (!Rootfs.isReady(context)) return null
+        val generation = cacheGeneration.get()
         val login = Settings.login(context)
-        cache?.let { (time, key, home) ->
-            if (key == login && SystemClock.elapsedRealtime() - time < CACHE_MS) return home
+        val now = SystemClock.elapsedRealtime()
+        cache?.let { entry ->
+            if (entry.generation == generation && entry.login == login && now - entry.time < CACHE_MS) {
+                return entry.home
+            }
         }
-        val home = Rootfs.access.read {
-            val account = Rootfs.loginAccount(context, login)
-            val path = canonical("/" + account.home.trim('/'))?.takeIf { it != "/" } ?: return@read null
-            // No root is listed when the home directory does not exist (the account has none)
-            runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
-            Home(account.name, account.uid, account.gid, path)
+        val home = resolveHome(context, login).first
+        if (cacheGeneration.get() == generation) {
+            cache = HomeCache(generation, SystemClock.elapsedRealtime(), login, home)
         }
-        cache = Triple(SystemClock.elapsedRealtime(), login, home)
         return home
     }
 
-    /**
-     * The home directory computed last: one browse queries several times, so /etc/passwd need not
-     * be read every time.
-     */
-    @Volatile
-    private var cache: Triple<Long, String, Home?>? = null
-
+    @Synchronized
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val context = attached()
         val path = visible(context, documentId)
         val meta = browse { Native.browseStat(it, path) }
         val texts = sniff(listOf(path to meta))
-        return MatrixCursor(projection ?: DOCUMENT_COLUMNS).also { row(it, path, meta, home(context), texts) }
+        return MatrixCursor(projection ?: DOCUMENT_COLUMNS).also { row(it, documentId, path, meta, home(context), texts) }
     }
 
+    @Synchronized
     override fun queryChildDocuments(
         parentDocumentId: String,
         projection: Array<out String>?,
@@ -149,10 +151,7 @@ class Documents : DocumentsProvider() {
         val dir = visible(context, parentDocumentId)
         val entries = browse { Native.browseList(it, dir) }
             .map { child(dir, it.substringBefore('\t')) to it.substringAfter('\t') }
-        val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
-        val home = home(context)
-        val texts = sniff(entries)
-        for ((path, meta) in entries) row(result, path, meta, home, texts)
+        val result = documentRows(context, projection, entries)
         result.setNotificationUri(
             context.contentResolver,
             DocumentsContract.buildChildDocumentsUri(authority(context), parentDocumentId),
@@ -160,6 +159,7 @@ class Documents : DocumentsProvider() {
         return result
     }
 
+    @Synchronized
     override fun querySearchDocuments(rootId: String, query: String, projection: Array<out String>?): Cursor {
         val context = attached()
         requireFileAccess(context)
@@ -168,25 +168,18 @@ class Documents : DocumentsProvider() {
             ROOT_SYSTEM -> "/"
             else -> null
         } ?: throw FileNotFoundException("no root $rootId")
-        val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
-        val home = home(context)
         val found = browse { Native.browseSearch(it, dir, query, SEARCH_LIMIT) }
             .map { it.substringBefore('\t') to it.substringAfter('\t') }
-        val texts = sniff(found)
-        for ((path, meta) in found) row(result, path, meta, home, texts)
-        return result
+        return documentRows(context, projection, found)
     }
 
     /** ContentProvider's requireContext needs API 30. */
     private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
 
-    /**
-     * Returns the document ID when it is canonical and inside a root shown now; otherwise treated
-     * as nonexistent.
-     */
+    /** The guest path of a current document ID while file access is enabled. */
     private fun visible(context: Context, documentId: String): String {
         requireFileAccess(context)
-        return canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
+        return providerPath(documentId) ?: throw FileNotFoundException("unknown document $documentId")
     }
 
     private fun requireFileAccess(context: Context) {
@@ -199,10 +192,19 @@ class Documents : DocumentsProvider() {
             Rootfs.access.read { call(store) }
         } catch (e: FileNotFoundException) {
             throw e
+        } catch (e: AccessDeniedException) {
+            throw SecurityException(e.message, e)
         } catch (e: IOException) {
-            throw FileNotFoundException(e.message)
+            throw IllegalStateException(e.message, e)
         }
     }
+
+    private fun providerIds(paths: List<String>): List<String> =
+        if (paths.isEmpty()) emptyList() else browse { readCurrentIds(it, paths) }
+
+    private fun providerId(path: String): String = providerIds(listOf(path)).single()
+
+    private fun providerPath(id: String): String? = idPath(id)?.takeIf { providerId(it) == id }
 
     /**
      * The regular files in [docs] (paths and metadata) whose type the extension cannot tell and
@@ -219,7 +221,20 @@ class Documents : DocumentsProvider() {
         return unknown.filterIndexed { i, _ -> texts.getOrElse(i) { false } }.toSet()
     }
 
-    private fun row(cursor: MatrixCursor, path: String, meta: String, home: Home?, texts: Set<String>) {
+    private fun documentRows(
+        context: Context,
+        projection: Array<out String>?,
+        entries: List<Pair<String, String>>,
+    ): MatrixCursor {
+        val cursor = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
+        val home = home(context)
+        val texts = sniff(entries)
+        val ids = providerIds(entries.map { it.first })
+        entries.forEachIndexed { i, (path, meta) -> row(cursor, ids[i], path, meta, home, texts) }
+        return cursor
+    }
+
+    private fun row(cursor: MatrixCursor, id: String, path: String, meta: String, home: Home?, texts: Set<String>) {
         val f = meta.split('\t')
         if (f.size < 4) return
         val dir = f[0] == "d"
@@ -230,7 +245,7 @@ class Documents : DocumentsProvider() {
             else -> mimeType(name)
         }
         cursor.newRow().apply {
-            add(Document.COLUMN_DOCUMENT_ID, path)
+            add(Document.COLUMN_DOCUMENT_ID, id)
             add(Document.COLUMN_DISPLAY_NAME, name)
             add(Document.COLUMN_MIME_TYPE, mime)
             add(Document.COLUMN_SIZE, if (dir) null else f[1].toLongOrNull())
@@ -248,15 +263,16 @@ class Documents : DocumentsProvider() {
     private fun flags(path: String, dir: Boolean, home: String?): Int {
         if (home == null) return 0
         if (path == home) return if (dir) Document.FLAG_DIR_SUPPORTS_CREATE else 0
-        if (!isChildDocument(home, path)) return 0
+        if (!within(home, path)) return 0
         val common = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_MOVE
         return common or if (dir) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
     }
 
+    @Synchronized
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
         if (!Settings.fileAccess(attached())) return false
-        val parent = canonical(parentDocumentId) ?: return false
-        val doc = canonical(documentId) ?: return false
+        val parent = runCatching { providerPath(parentDocumentId) }.getOrNull() ?: return false
+        val doc = runCatching { providerPath(documentId) }.getOrNull() ?: return false
         return doc != parent && within(parent, doc)
     }
 
@@ -265,6 +281,7 @@ class Documents : DocumentsProvider() {
      * to open a directory it is sent to (a `file:` link to one), and without it shows its default
      * place. The home root is preferred for what lies in both.
      */
+    @Synchronized
     override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
         val context = attached()
         val child = visible(context, childDocumentId)
@@ -277,9 +294,10 @@ class Documents : DocumentsProvider() {
         if (!within(top, child)) throw FileNotFoundException("$childDocumentId is not under $top")
         val path = mutableListOf(child)
         while (path.last() != top) path.add(parent(path.last()))
-        return DocumentsContract.Path(rootId, path.reversed())
+        return DocumentsContract.Path(rootId, providerIds(path.asReversed()))
     }
 
+    @Synchronized
     override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
         val context = attached()
         val flags = ParcelFileDescriptor.parseMode(mode)
@@ -321,11 +339,12 @@ class Documents : DocumentsProvider() {
      * directory itself); otherwise read-only.
      */
     private fun writable(home: Home, documentId: String, top: Boolean = false): String {
-        val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
-        if ((top && path == home.path) || isChildDocument(home.path, path)) return path
+        val path = visible(attached(), documentId)
+        if ((top || path != home.path) && within(home.path, path)) return path
         throw UnsupportedOperationException("$documentId is read-only")
     }
 
+    @Synchronized
     override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
         val context = attached()
         val home = writableHome(context)
@@ -334,9 +353,10 @@ class Documents : DocumentsProvider() {
         val name = fileName(displayName, mimeType, directory)
         val created = browse { Native.browseCreate(it, home.path, dir, name, directory, home.uid, home.gid) }
         childrenChanged(context, dir)
-        return child(dir, created)
+        return providerId(child(dir, created))
     }
 
+    @Synchronized
     override fun deleteDocument(documentId: String) {
         val context = attached()
         val home = writableHome(context)
@@ -346,6 +366,7 @@ class Documents : DocumentsProvider() {
         childrenChanged(context, parent(path))
     }
 
+    @Synchronized
     override fun renameDocument(documentId: String, displayName: String): String {
         val context = attached()
         val home = writableHome(context)
@@ -354,9 +375,10 @@ class Documents : DocumentsProvider() {
         val renamed = child(parent(path), name)
         if (renamed != path) revokeTree(context, documentId, path)
         childrenChanged(context, parent(path))
-        return renamed
+        return providerId(renamed)
     }
 
+    @Synchronized
     override fun moveDocument(
         sourceDocumentId: String,
         sourceParentDocumentId: String,
@@ -366,25 +388,25 @@ class Documents : DocumentsProvider() {
         val home = writableHome(context)
         val path = writable(home, sourceDocumentId)
         val target = writable(home, targetParentDocumentId, top = true)
+        visible(context, sourceParentDocumentId)
         browse { Native.browseMove(it, home.path, path, target) }
         revokeTree(context, sourceDocumentId, path)
         childrenChanged(context, parent(path))
         childrenChanged(context, target)
-        return child(target, path.substringAfterLast('/'))
+        return providerId(child(target, path.substringAfterLast('/')))
     }
 
     /** Something in directory [dir] changed: the Files app lists it again. */
     private fun childrenChanged(context: Context, dir: String) {
-        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
+        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), providerId(dir)), null)
     }
 
     /**
      * Document [documentId] (canonical [path]) was deleted, renamed or moved: the grants on it go,
      * and so do the persisted grants other apps hold on documents below it. The framework revokes
      * a URI together with the URIs under it by path segment, and an ID is one segment, so a grant
-     * on a descendant would outlive the directory and, as IDs are paths, cover a file created at
-     * the same path later. Transient grants below it cannot be listed; they end with the activity
-     * that holds them.
+     * on a descendant can outlive the directory. Retiring the source entry makes those IDs stale,
+     * including transient grants that Android cannot list.
      */
     private fun revokeTree(context: Context, documentId: String, path: String) {
         revokeDocumentPermission(documentId)
@@ -392,11 +414,93 @@ class Documents : DocumentsProvider() {
         grantedUnder(held.map { it.uri }, authority(context), path).forEach(::revokeDocumentPermission)
     }
 
+    /**
+     * Watches `/etc/passwd` (via [Native.loginRuleInputs]) and the auto account's home parent
+     * directory on a running kernel so the Files app refreshes its roots when `login` is `"auto"`
+     * and the resolved home root actually changes (e.g. `adduser` or `deluser`), without
+     * notifying on unrelated `/etc/passwd` edits or when file access is off.
+     */
+    internal class AutoRootsWatcher(private val machine: Long) {
+        private var passwdStamp: LongArray? = null
+        private var lastHome: Home? = null
+        private var homeParent: String? = null
+
+        /**
+         * Samples `/etc/passwd` metadata and [changedDirs] on the service worker. Returns true
+         * when [rootsChanged] was triggered.
+         */
+        fun poll(context: Context, changedDirs: Array<String>? = null): Boolean {
+            if (!Settings.fileAccess(context) || Settings.login(context) != ConsolePty.LOGIN_AUTO || !Rootfs.isReady(context)) {
+                reset()
+                return false
+            }
+            val inputs = Native.loginRuleInputs(machine) ?: return false
+            if (inputs.size < PASSWD_STAMP_END) return false
+            val stamp = inputs.copyOfRange(PASSWD_STAMP_START, PASSWD_STAMP_END)
+            val previous = passwdStamp
+            if (previous != null) {
+                val passwdChanged = !stamp.contentEquals(previous)
+                val parentChanged = homeParent != null && changedDirs != null && homeParent in changedDirs
+                if (!passwdChanged && !parentChanged) return false
+            }
+            passwdStamp = stamp
+            val (home, path) = resolveHome(context, ConsolePty.LOGIN_AUTO)
+            homeParent = path?.let(::parent)
+            val changed = previous != null && home != lastHome
+            lastHome = home
+            if (changed) rootsChanged(context)
+            return changed
+        }
+
+        private fun reset() {
+            passwdStamp = null
+            lastHome = null
+            homeParent = null
+        }
+    }
+
     companion object {
         const val ROOT_HOME = "home"
         const val ROOT_SYSTEM = "system"
 
         private const val TAG = "Documents"
+
+        // Entry 1 of Native.loginRuleInputs is `/etc/passwd` (ino, size, mtime_ns, ctime_ns).
+        private const val PASSWD_STAMP_START = 4
+        private const val PASSWD_STAMP_END = 8
+
+        private fun resolveHome(context: Context, login: String): Pair<Home?, String?> = Rootfs.access.read {
+            val account = Rootfs.loginAccount(context, login)
+            val path = documentId(account.home)?.takeIf { it != "/" } ?: return@read null to null
+            // No root is listed when the home directory does not exist or is not a directory
+            val meta = runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull()
+                ?: return@read null to path
+            if (!meta.startsWith("d\t")) return@read null to path
+            Home(account.name, account.uid, account.gid, path) to path
+        }
+
+        private fun readCurrentIds(store: String, paths: List<String>): List<String> {
+            val generations = Native.browseGenerations(store, paths.toTypedArray())
+            return paths.mapIndexed { i, path -> if (generations[i] == 0L) path else "${generations[i]}$path" }
+        }
+
+        private fun currentIds(context: Context, paths: List<String>, store: String = Rootfs.store(context).path): List<String> {
+            if (paths.isEmpty()) return emptyList()
+            return Rootfs.access.read { readCurrentIds(store, paths) }
+        }
+
+        private fun currentId(context: Context, path: String) = currentIds(context, listOf(path)).single()
+
+        private fun idPath(id: String): String? {
+            val slash = id.indexOf('/')
+            if (slash < 0) return null
+            if (slash > 0) {
+                val prefix = id.substring(0, slash)
+                val generation = prefix.toLongOrNull() ?: return null
+                if (generation <= 0 || generation.toString() != prefix) return null
+            }
+            return canonical(id.substring(slash))
+        }
 
         /** The most results one search gives. */
         private const val SEARCH_LIMIT = 200
@@ -412,13 +516,23 @@ class Documents : DocumentsProvider() {
             Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS,
         )
 
+        /**
+         * The home directory computed last: one browse queries several times, so /etc/passwd need
+         * not be read every time. Cleared and invalidated by [rootsChanged].
+         */
+        @Volatile
+        private var cache: HomeCache? = null
+        private val cacheGeneration = AtomicLong()
+
         fun authority(context: Context) = "${context.packageName}.documents"
 
         /**
-         * The login account, the store or file access changed: the Files app reads the
-         * roots again.
+         * The login account, the store or file access changed: drop the cached home directory and
+         * tell the Files app to read the roots again.
          */
         fun rootsChanged(context: Context) {
+            cacheGeneration.incrementAndGet()
+            cache = null
             context.contentResolver.notifyChange(DocumentsContract.buildRootsUri(authority(context)), null)
         }
 
@@ -432,11 +546,18 @@ class Documents : DocumentsProvider() {
          * The guest changed something in these directories ([Native.takeChangedDirs]): the Files
          * app lists them again if it is looking at them.
          */
-        fun dirsChanged(context: Context, dirs: Array<String>) {
+        fun dirsChanged(context: Context, dirs: Array<String>, store: String = Rootfs.store(context).path) {
             if (dirs.isEmpty()) return
             val authority = authority(context)
             // One call for all of them (each notifyChange is a call into the system server)
-            val uris = dirs.map { DocumentsContract.buildChildDocumentsUri(authority, it) }
+            if (!Settings.fileAccess(context)) return
+            val ids = try {
+                currentIds(context, dirs.asList(), store)
+            } catch (e: IOException) {
+                Log.w(TAG, "cannot notify changed directories", e)
+                return
+            }
+            val uris = ids.map { DocumentsContract.buildChildDocumentsUri(authority, it) }
             context.contentResolver.notifyChange(uris, null, 0)
         }
 
@@ -454,7 +575,12 @@ class Documents : DocumentsProvider() {
                 return FileLink.Remote(host)
             }
             val id = link.encodedPath?.let { linkPath(it) } ?: return FileLink.Missing
-            val uri = DocumentsContract.buildDocumentUri(authority(context), id)
+            val document = try {
+                currentId(context, id)
+            } catch (_: IOException) {
+                return FileLink.Missing
+            }
+            val uri = DocumentsContract.buildDocumentUri(authority(context), document)
             // Through the provider itself, which applies what is shown now and types the file
             val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
             if (mime != null) return FileLink.Found(uri, mime)
@@ -470,7 +596,7 @@ class Documents : DocumentsProvider() {
         }.getOrNull()?.let { String(it, Charsets.UTF_8).trim() }
 
         /**
-         * A `file:` URI's percent-encoded path as a canonical document ID: `%XX` turned into bytes,
+         * A `file:` URI's percent-encoded path as a canonical guest path: `%XX` turned into bytes,
          * written back as the native side writes paths, with empty and `.` components dropped; null
          * when it is not absolute or has `..` (resolving it by name could differ from the guest's
          * resolution through symbolic links).
@@ -517,7 +643,7 @@ class Documents : DocumentsProvider() {
                 if (c >= 0 && c != '%'.code && !Character.isISOControl(c)) {
                     out.appendCodePoint(c)
                 } else {
-                    for (k in i until i + maxOf(n, 1)) out.append("%%%02X".format(path[k].toInt() and 0xff))
+                    for (k in i until i + maxOf(n, 1)) out.append("%%%02X".format(Locale.ROOT, path[k].toInt() and 0xff))
                 }
                 i += maxOf(n, 1)
             }
@@ -543,14 +669,28 @@ class Documents : DocumentsProvider() {
         }
 
         /**
-         * A canonical path: starts with `/`, has no empty, `.` or `..` components, and does not end
-         * with `/` (except `/` itself). null when it is not.
+         * Encodes a raw guest path (such as an `/etc/passwd` home directory) as a canonical
+         * encoded guest path, trimming trailing slashes; null when not absolute or not canonical.
+         */
+        fun documentId(guestPath: String): String? {
+            if (!guestPath.startsWith("/")) return null
+            val trimmed = guestPath.trimEnd('/').ifEmpty { "/" }
+            return canonical(documentId(trimmed.toByteArray(Charsets.UTF_8)))
+        }
+
+        /**
+         * A canonical encoded guest path: starts with `/`, has no empty, `.` or `..` components, does not
+         * end with `/` (except `/` itself), contains no NUL bytes, and matches the exact `%XX`
+         * encoding of [documentId] (rejecting encoded `/` or `.` such as `%2F`/`%2E` and any
+         * non-canonical escape). null when it is not.
          */
         fun canonical(path: String): String? {
             if (path == "/") return path
             if (!path.startsWith("/") || path.endsWith("/")) return null
             val parts = path.substring(1).split('/')
             if (parts.any { it.isEmpty() || it == "." || it == ".." }) return null
+            val decoded = percentDecode(path)
+            if (0.toByte() in decoded || documentId(decoded) != path) return null
             return path
         }
 
@@ -572,7 +712,7 @@ class Documents : DocumentsProvider() {
             val id = runCatching {
                 if (tree) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
             }.getOrNull() ?: return@mapNotNull null
-            val doc = canonical(id) ?: return@mapNotNull null
+            val doc = idPath(id) ?: return@mapNotNull null
             id.takeIf { within(path, doc) }
         }.distinct()
 

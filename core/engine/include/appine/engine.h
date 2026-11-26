@@ -23,6 +23,7 @@
 #define APPINE_VA_BITS 48
 #define APPINE_TLB_ENTRIES 4096 /* data TLB, direct-mapped */
 #define APPINE_ITLB_ENTRIES 512 /* instruction-fetch TLB, used only by Tier 0 */
+#define APPINE_STLB_ENTRIES 1024 /* 2 MiB superpage data TLB, direct-mapped (2 GiB) */
 
 /* Page permissions, with the same values as Linux's PROT_* */
 enum {
@@ -51,7 +52,8 @@ enum appine_fault_kind {
     APPINE_FAULT_BREAK = 5,
 };
 
-/* Exit reasons of appine_cpu_run() */
+/* Guest exceptions and interrupts (SVC, UNDEF, BRK, FAULT, KICK) clear the local exclusive
+ * monitor before returning to the caller. */
 enum appine_exit {
     /* used only by appine_cpu_exec_insn() and appine_cpu_step(): the instruction completed
      * normally */
@@ -153,7 +155,7 @@ struct appine_cpu {
     uint64_t ivau_page;
     /* Host base addresses of several access groups, kept by Tier 1 while a block runs (dbt.c's
      * plan_group) */
-    uint64_t dbt_groups[4];
+    uint64_t dbt_groups[8];
     /* Tier 1 addresses entries as "ldp [cpu + index * 32 + offset]", so the offset of tlb must
      * not exceed the range of ldp's immediate */
     struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
@@ -173,6 +175,10 @@ struct appine_cpu {
     uint32_t reserved;
     uint64_t brk[APPINE_HW_SLOTS];
     struct appine_watch watch[APPINE_HW_SLOTS];
+    /* 2 MiB superpage data TLB, populated from L2 superpage entries when nwatch == 0 and flushed
+     * via stlb_used alongside tlb; 4 KB-aligned so generated code addresses it in one add */
+    uint64_t stlb_used[APPINE_STLB_ENTRIES / 64];
+    _Alignas(4096) struct appine_tlb_entry stlb[APPINE_STLB_ENTRIES];
 };
 
 /* ---- Guest-visible CPU features (the engine map), with the same values as Linux's HWCAP_* ---- */
@@ -219,6 +225,9 @@ uint64_t appine_guest_hwcap2(void);
 /* The MIDR_EL1 the guest reads (0 when the host does not allow reading ID registers) */
 uint64_t appine_guest_midr(void);
 
+/* FPCR bits writable by the guest (AHP, DN, FZ, RMode and, with FP16, FZ16) */
+uint64_t appine_fpcr_write_mask(void);
+
 /* ---- soft-MMU page table (the kernel/mmu map) ---- */
 
 enum {
@@ -230,6 +239,8 @@ enum {
 
 struct appine_mmu *appine_mmu_new(void);
 void appine_mmu_free(struct appine_mmu *mmu);
+/* Total bytes of allocated page tables (root, intermediate, active and retired L3 tables) */
+uint64_t appine_mmu_table_bytes(const struct appine_mmu *mmu);
 
 /*
  * Maps guest [gva, gva + len) to host [host, host + len), replacing existing mappings. gva, host
@@ -308,7 +319,7 @@ void appine_host_fault_last(struct appine_host_fault *out);
 /* Checks the struct layout mirrored on the Rust side; returns 1 when it matches */
 int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
-                            size_t off_tlb, size_t off_v);
+                            size_t off_tlb, size_t off_v, size_t off_stlb);
 
 /* ---- Tier 1: a same-ISA pass-through DBT (the engine/dbt map) ---- */
 
@@ -332,6 +343,7 @@ struct appine_dbt_stats {
     uint64_t blocks_shared; /* blocks among blocks obtained by copying a translation template */
     uint64_t insns_grouped; /* of insns_memory, those sharing one TLB check with an earlier one */
     uint64_t ungrouped;     /* times a shared check failed and it was retranslated ungrouped */
+    uint64_t fast_loops;    /* blocks compiled with a strip-mined in-page fast loop */
 };
 
 /*
@@ -359,7 +371,7 @@ enum appine_dbt_regs {
 };
 struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs);
 void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
-/* Releases the translations kept in the pool (when host memory is tight) */
+/* Releases pooled instances, spare thread workspaces and resident translation-template pages */
 void appine_dbt_trim(void);
 /*
  * Unmaps the pages of every instance's code cache written through the writable view (the one used
@@ -447,11 +459,6 @@ void appine_dbt_detach(struct appine_dbt_thread *t);
 /* Discards all translations: this has to wait until every thread has left translated code, so it
  * is only a request, completed by the next thread to enter appine_dbt_run() */
 void appine_dbt_flush(struct appine_dbt_thread *t);
-
-/* About to run in a different address space (after exec): keeps the translations and, before the
- * next run, checks the guest instruction words block by block, invalidating the ones that do not
- * match. Instances taken from the pool are handled the same way. */
-void appine_dbt_recheck(struct appine_dbt_thread *t);
 
 /* Invalidates the blocks starting in the pages covered by [start, start + len); when `cpu` is
  * given, only those whose guest instruction words differ from the current ones in its address

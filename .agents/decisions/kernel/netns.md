@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-18 (HEAD = ec9ad94b). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -105,6 +105,14 @@
 - **Tradeoffs**: The value is still only recorded, since ping sockets are handed to the host and Android allows all groups.
 - **Watch out**: Writers of IDs unmapped in their namespace now get `EINVAL`, as on Linux.
 - **Source**: 2aca260
+
+### D15: Forwarder spin tests read only the forwarder's own thread ticks
+
+- **What**: Under `#[cfg(test)]`, `Shared::tid` records the forwarding thread's host TID in a `OnceLock<i32>` at the start of `run()` so `resets_and_dead_listeners_do_not_spin` reads only `/proc/self/task/<tid>/stat` via `rsplit_once(") ")`.
+- **Why**: Scanning all of `/proc/self/task` panicked when unrelated test threads exited mid-scan and mixed ticks across parallel forwarder tests.
+- **Tradeoffs**: Adds a test-only field and `gettid()` call to production types and assumes the test interacts with the forwarder before reading `tid`.
+- **Watch out**: A future test reading `shared.tid` before the forwarder handles a connection can observe `None` unless synchronized.
+- **Source**: 45495baf
 
 ## Superseded
 - ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)

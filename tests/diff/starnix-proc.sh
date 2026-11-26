@@ -4,11 +4,9 @@
 # files, their permissions, /proc/sys, /sys/kernel, cpuinfo, pressure files, the cgroup v2 tree and
 # its freezer. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/procfs fidelity gaps: chown delegation of cgroups is impossible
-SKIP="CgroupTest.ChownDirectoryDoesNotPropagate:CgroupTest.NewDirectoryOwnedByCreator"
 # kernel/procfs: /proc/zoneinfo, /proc/pressure/* and /proc/kallsyms are absent; per-process
 # timerslack_ns is absent; Yama is absent; no tracefs
-SKIP="$SKIP:ProcfsTest.ZoneInfo:PressureTest/*:ProcKallsymsTest.*:ProcTaskDirTest.TimerslackNs*"
+SKIP="ProcfsTest.ZoneInfo:PressureTest/*:ProcKallsymsTest.*:ProcTaskDirTest.TimerslackNs*"
 SKIP="$SKIP:SysctlTest/SysctlNodeTest.*/kernel_yama_ptrace_scope:TracefsTest.BufferSizeKbReadWrite"
 # kernel/procfs: /proc/<pid>/fd and fdinfo are open to everyone
 SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwner/fd"
@@ -17,8 +15,7 @@ SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwnerWithoutCapPt
 # kernel/procfs fidelity gaps: /proc/<pid>/attr is absent (the test stats it); procfs mount
 # options are ignored
 SKIP="$SKIP:ProcfsBlksizeTest.StatBlksize:ProcHidePidTest.HidePidAndGidMountOptions"
-# kernel/procfs: a reaped process's held directory behaves like a live or missing one
-SKIP="$SKIP:ProcTaskDirTest.PidDirFdListingAndReadsFailAfterExit"
+# kernel/procfs: lookups through a reaped process's directory fd return ENOENT instead of ESRCH
 SKIP="$SKIP:ProcTaskDirTest.PidDirFdLookupsFailAfterExit"
 # No perf_event_open (ENOSYS, kernel/signal D10) and no tun device (kernel/net D1)
 SKIP="$SKIP:ProcSelfFdTest.PerfEventFdName:SysctlTest.DisableIpv6Default"

@@ -87,11 +87,21 @@ shift $((OPTIND - 1))
 
 out=target/difftest
 mkdir -p "$out"
-# One run at a time: runs share the per-case outputs, the lane claims and the lane clones (which -r
-# deletes), so a second run waits for the first. The lock is a symbolic link naming the owner's
-# pid, made in one step (earlier versions left a directory holding a pid file, also understood);
-# one left by a run that was killed is taken over. The lanes (-G) run under their parent's lock
+# Runs share outputs, lane claims and clones. Lock the output directory itself so replacing a
+# stale PID link cannot split the lock between contenders. Lanes inherit the open descriptor.
 if [ -z "$group" ]; then
+    exec 9<"$out"
+    # macOS has flock(2) but no flock(1). STDIN is a duplicate of the shell's open descriptor,
+    # so the lock survives the helper and is released when the last holder closes it.
+    perl -MFcntl=:flock -e '
+        flock(STDIN, LOCK_EX | LOCK_NB) and exit 0;
+        $!{EWOULDBLOCK} or die "difftest: lock $ARGV[0]: $!\n";
+        warn "difftest: waiting for the run holding $ARGV[0]\n";
+        flock(STDIN, LOCK_EX) or die "difftest: lock $ARGV[0]: $!\n";
+    ' "$out" <&9
+
+    # Older runners in this checkout use only the PID link (or a directory with a pid file).
+    # Honor their lock and publish ours for any already waiting to enter.
     lock=$out/.lock
     owner() { readlink "$1" 2>/dev/null || cat "$1/pid" 2>/dev/null || true; }
     waited=0
@@ -182,8 +192,8 @@ fi
 
 # Prebuilt syscall test suites, once built (scripts/build-starnix-tests for Fuchsia Starnix's,
 # scripts/build-gvisor-tests for gVisor's): each is installed into the store at
-# /usr/lib/<suite>-tests whenever the built version differs from the installed one, which also
-# exports the image again; the starnix-* and gvisor-* cases run them
+# /usr/lib/<suite>-tests whenever its version changes. The store and image may already
+# have different versions, so check both before re-exporting the rootfs.
 for suite in starnix gvisor; do
     tests=$(ls target/$suite-tests/$suite-tests-*.tar 2>/dev/null | tail -n 1)
     if [ -z "$tests" ]; then
@@ -195,7 +205,6 @@ for suite in starnix gvisor; do
         echo "installing $tests into $store"
         linux "$run --rootfs $store -- /bin/sh -c 'rm -rf /usr/lib/$suite-tests &&
             mkdir -p /usr/lib/$suite-tests && tar xf - -C /usr/lib/$suite-tests' <$tests"
-        rebuild=1
     fi
     # The image (and with it the lane clones) is checked too: an export that failed after the
     # install (a full VM disk) leaves the store current and the image without the tests
@@ -247,6 +256,10 @@ run_group() {
     # "not installed" line on both sides without it, and a program missing from it lists no tests
     # on either side: both would pass without running anything
     suite=$(sed -n 's|.*gtest/run\.sh \([a-z]*\) .*|\1|p' "tests/diff/$name.sh")
+    selection=$(sed -n 's|^sh /tmp/difftest-files/gtest/selected\.sh ||p' "tests/diff/$name.sh")
+    if [ -n "$selection" ]; then
+        suite=gvisor
+    fi
     if [ -n "$suite" ]; then
         tests=$(ls target/$suite-tests/$suite-tests-*.tar 2>/dev/null | tail -n 1)
         if [ -z "$tests" ]; then
@@ -300,7 +313,8 @@ run_group() {
     docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined $options \
         -e "$env_path" -e HOME=/root -w / "$image" \
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
-    echo "exit $?" >>"$out/$name.native"
+    native_exit=$?
+    echo "exit $native_exit" >>"$out/$name.native"
     t1=$(date +%s)
     # shellcheck disable=SC2086 # the options must be split on whitespace
     appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root $appine_options -- \
@@ -309,10 +323,16 @@ run_group() {
     t2=$(date +%s)
     set -e
     bugs=$(grep '^appine: internal error' "$out/$name.appine.err" || true)
-    if cmp -s "$out/$name.native" "$out/$name.appine" && [ -z "$bugs" ]; then
+    # Surveyed selections also require every selected test to pass on both sides.
+    if { [ -z "$selection" ] || [ "$native_exit" = 0 ]; } &&
+        cmp -s "$out/$name.native" "$out/$name.appine" && [ -z "$bugs" ]; then
         echo "ok   $name ($((t1 - t0))s native, $((t2 - t1))s appine)"
     else
         echo "FAIL $name"
+        if [ -n "$selection" ] && [ "$native_exit" != 0 ]; then
+            echo "    native gVisor selection exited $native_exit"
+            grep 'expected .* passes' "$out/$name.native" | sed 's/^/    /' || true
+        fi
         diff -u "$out/$name.native" "$out/$name.appine" | sed 's/^/    /' || true
         [ -z "$bugs" ] || printf '%s\n' "$bugs" | sed 's/^/    /'
         kept=$out/failed/$(date +%Y%m%d-%H%M%S)-t$tier-$name
@@ -363,16 +383,18 @@ if [ "$jobs" -le 1 ]; then
     done
 else
     rm -rf "$out"/.slot-*
+    # A single-lane run can install a new suite without refreshing any clones.
+    image_id=$(docker image inspect --format '{{.Id}}' "$image")
     for w in $(seq 1 "$jobs"); do
         clone=$store-w$w
-        if [ ! -f "$clone/.cloned" ] || [ "$rebuild" = 1 ]; then
+        if [ "$(cat "$clone/.cloned" 2>/dev/null || true)" != "$image_id" ] || [ "$rebuild" = 1 ]; then
             rm -rf "$clone"
             if [ "$(uname)" = Darwin ]; then
                 cp -cR "$store" "$clone"
             else
                 cp -a --reflink=auto "$store" "$clone"
             fi
-            touch "$clone/.cloned"
+            echo "$image_id" >"$clone/.cloned"
         fi
     done
     # Groups that took long last time (native plus Appine) start first, so no long group is left to

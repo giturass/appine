@@ -55,6 +55,7 @@ const CLOCK_MONOTONIC: i32 = 1;
 pub(crate) mod level {
     pub const ERR: u8 = 3;
     pub const WARNING: u8 = 4;
+    pub const NOTICE: u8 = 5;
     pub const INFO: u8 = 6;
 }
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream sysctl ownership with the retained host shared-storage server)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's page cache, shared-mapping writeback, directory locks and batched lookups merged with the retained host shared-storage server, whose replies now complete through `Conn::answer`)
 
 ## Responsibilities
 
@@ -21,8 +21,8 @@
   resolution reads under the BKL, and the retry that fetches what it lacks;
 - the file syscalls on FUSE nodes and open FUSE files: open and create, reads and writes,
   directory listing, namespace changes, attribute and xattr changes, statfs, access, fsync,
-  fallocate, flushing and releasing, reading mapped pages as they are touched, and copies of
-  programs for execve;
+  fallocate, flushing and releasing, demand reads and writeback for shared mappings, and
+  program snapshots for execve;
 - forgetting nodes nothing uses (`FUSE_FORGET`);
 - descriptor-anchored host shared-storage operations with Android's host permissions.
 
@@ -31,9 +31,9 @@ Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request
 (the file syscalls on FUSE nodes).
 
 Outside the module: the walker, mount table, fd tables and the dispatch of every file syscall
-(`kernel/vfs` and `kernel/files`, which hand FUSE nodes and files to this module), the syscall
+(`kernel/vfs`, `kernel/files` and `kernel/fileio`, which hand FUSE nodes and files to this module), the syscall
 dispatcher's retry loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
-the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
+the VMAs and host backing for mapped data (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Key types
 
@@ -43,31 +43,44 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   `max_write`, `max_read`), `no` (operations the daemon answered ENOSYS to), the number of attached
   device files, the next `unique` (even, from 2), the queues `pending` and `interrupts` plus
   `requests` by unique, the `forgets` to send with Linux's `forget_batch`, `opens`, the open
-  handles of each node id, and `doomed`, the node ids `drop_caches` kept only for a release in
-  flight, and an optional `Arc<host::Host>` when served in process.
+  handles of each node id, `doomed`, the node ids marked for prompt forgetting (either kept at
+  `drop_caches` only for a release in flight, or whose last link was removed through the mount),
+  `rename_busy`, which serializes cross-directory directory moves on the instance, and an
+  optional `Arc<host::Host>` (`host`) when served in process.
 - `Req` — the whole message, its state (`Pending` until read or host dispatch, `Sent` until answered, `Done` with
-  the reply or error), whether nobody waits for it (`background`: INIT, RELEASE) and whether its
-  caller was interrupted.
+  the reply or error), whether nobody waits for it (`background`: INIT, RELEASE, periodic
+  writeback), optional `BgWriteback` RAII guard (clearing `FillPages::bg_busy` on drop), and
+  whether its caller was interrupted.
 - `Options` — `fd`, `rootmode`, `user_id`/`group_id` (kernel IDs), `default_permissions`,
   `allow_other`, `max_read`, `subtype`.
 - `DevFile` (`FileKind::FuseDev`) — the connection once attached (None before), the device node it
   was opened through, the opener's user namespace.
 - `Fuses` (in `Vfs`) — connections by device number, `Node`s by `FuseId`, the node of each
-  (device, daemon node id), and a `clock` counting entries.
+  (device, daemon node id), a `clock` counting entries, `sweep_at` (the high-water mark above
+  which new entries ask for a sweep), and `mapped`/`next_writeback` (tracking mapped nodes for
+  periodic dirty-page writeback).
 - `FuseId` — a node's number, never reused; `Node::Fuse(MountId, FuseId)` in the VFS. `key(id)` is
-  `3 << 62 | id`, its number in tables keyed by inode (locks, inotify watches, a program's inode).
+  `3 << 62 | id`, its number in tables keyed by inode (locks, inotify watches, a program's inode,
+  AF_UNIX path socket bindings).
 - `Node` — device and daemon node id, the directory and name it was last found under (a root's
-  parent is itself), the last attributes (`Attr`, owners as kernel IDs) with their validity and
-  the syscall that fetched them, the directory's cached names (node, or None for a missing name,
-  with validity and syscall), a symlink target read in this syscall, `nlookup` (entries the daemon
-  returned for it) and `seen` (the clock when last entered).
+  parent is itself), the last attributes (`Attr`, owners as kernel IDs) with their validity,
+  `attr_seen` (whether prior attributes exist for `FUSE_AUTO_INVAL_DATA` comparison) and the
+  syscall that fetched them, the directory's cached names (node, or None for a missing name, with
+  validity and syscall), a symlink target read in this syscall, `nlookup` (entries the daemon
+  returned for it) and `seen` (the clock when last entered). It also holds `io_busy` (serializing
+  fills, writeback, writes and size changes), `dir_busy`/`dir_waiters` (serializing
+  directory-modifying operations and keeping waited directories pinned against eviction), a weak
+  reference to live mapped pages, a weak reference (`sock_pin`) pinning bound AF_UNIX sockets
+  against eviction, and a pinned writable mapping if teardown writeback needs a retry.
 - `Entry` — a `fuse_entry_out`: node id (0 for a missing name), attributes, both validities.
-- `Query` — what a walk lacked: `Lookup`, `Getattr`, `Readlink`, `Program`.
+- `Query` — what a walk lacked: `Lookup`, `LookupWalk` (batching consecutive uncached plain
+  components in one retry), `Getattr` (with optional open file handle), `Readlink`, `Program`.
 - `Handle` (`FileKind::Fuse`, or a FUSE `Directory`'s `fuse`) — Linux's `fuse_file`: connection,
   node, node id, the daemon's file handle, the `FOPEN_*` flags, the open flags sent,
   directory or not, and `no_release` when no open was made. Every handle is counted in its
   connection's `opens` (`counted`) until dropped.
-- `Fill` (`kernel/mm`) — what a mapping of a FUSE file reads its pages into; it holds the open file.
+- `Fill` pins the open file used by a mapping. Its `FillPages` is shared by mappings of the same
+  node, including those opened through a hard link or bind mount.
 - `SWEEP`, `DROP` — atomics asking for a sweep of the node cache at the end of a syscall, and for
   dropping every unused node (`drop_caches`).
 - `Io` (syscall side) — a copy of a handle's fields, taken so no borrow is held while waiting.
@@ -83,16 +96,17 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   `attach`, `readiness`, `object`), `atomic_o_trunc`, `dont_mask`.
 - Cache and retries: `Fuses` (`add`, `remove`, `root_of`, `conn`, `conn_of`, `get`, `node`,
   `cached_child`, `enter`, `enter_negative`, `forget_child`, `moved`, `is_within`, `set_attr`,
-  `stale`, `link`, `set_link`, `evict`), `token`, `new_syscall`, `need`, `serve`, `program`,
-  `lookup`, `getattr`, `cached_attr`, `target`, `key`, `id_of`, `drop_caches`.
+  `stale`, `link`, `set_link`, `evict`, `unlinked`, `pin_socket`, `track_mapped`), `token`,
+  `new_syscall`, `need`, `serve`, `program`, `lookup`, `getattr`, `getattr_no_inval`,
+  `cached_attr`, `cached_attr_fh`, `target`, `key`, `id_of`, `drop_caches`, `flush_dirty`.
 - Request helpers: `open`, `read`, `write`, `readdir`, `statfs`, `access`, `getxattr`,
   `lock_owner`, `snapshot`.
-- File syscalls (`syscall::fuse`): `open`, `create`, `make`, `remove`, `rename`, `rename_at`,
+- File syscalls (`syscall::fuse`): `open`, `create`, `make`, `remove`, `rename_at`,
   `setattr`, `read`, `write`, `lseek`, `fill_dir`, `fsync`, `fallocate`, `flush`, `flush_all`,
-  `flush_at_exit`, `stat`, `statfs`, `access`, `may_chdir`, `xattr_permission`, `set_xattr`,
-  `parent`, `mkdir`, `mknod`, `symlink`, `link`, `unlink`, `truncate`, `ftruncate`, `file_io`,
-  `io_of`, `map_fill`, `fill`, `prefault`, `sweep`, `dev_ioctl`, `seekable`,
-  `checks_permissions`.
+  `flush_at_exit`, `stat`, `stat_fh`, `statfs`, `access`, `may_chdir`, `xattr_permission`,
+  `set_xattr`, `parent`, `mkdir`, `mknod`, `bind_socket`, `symlink`, `link`, `unlink`, `truncate`,
+  `ftruncate`, `file_io`, `io_of`, `map_fill`, `fill`, `prefault`, `prefault_range`,
+  `prefault_iov`, `sweep`, `dev_ioctl`, `seekable`, `checks_permissions`.
 - VFS hooks this module relies on: `Vfs::new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
   `fuse_child`, `fuse_permission`, `type_of`, `mount_nodes`.
 
@@ -114,12 +128,12 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - A new instance gets its own device number, a connection, and a root node (node id 1, the type of
   `rootmode`, attributes not fetched); the device file is attached and `FUSE_INIT` queued
   (7.37, 128 KiB readahead, the offered flags). The mount does not wait for INIT.
-- Offered: `ATOMIC_O_TRUNC`, `EXPORT_SUPPORT`, `BIG_WRITES`, `DONT_MASK`, `NO_OPEN_SUPPORT`,
-  `PARALLEL_DIROPS`, `HANDLE_KILLPRIV`, `MAX_PAGES`, `NO_OPENDIR_SUPPORT` (libfuse 3.17 ends the
-  session when a filesystem wants an unoffered flag, and fuse-overlayfs always wants
-  `DONT_MASK`). Not offered: `ASYNC_READ` (read(2) is not read ahead, and sshfs reads ahead
-  itself only when it is not offered), writeback cache, readdirplus, POSIX and flock locks, cache
-  invalidation, splice (libfuse decides splice by itself).
+- Offered: `ATOMIC_O_TRUNC`, `EXPORT_SUPPORT`, `BIG_WRITES`, `DONT_MASK`, `AUTO_INVAL_DATA`,
+  `NO_OPEN_SUPPORT`, `PARALLEL_DIROPS`, `HANDLE_KILLPRIV`, `MAX_PAGES`, `NO_OPENDIR_SUPPORT`
+  (libfuse 3.17 ends the session when a filesystem wants an unoffered flag, and fuse-overlayfs
+  always wants `DONT_MASK`). Not offered: `ASYNC_READ` (read(2) is not read ahead, and sshfs reads
+  ahead itself only when it is not offered), writeback cache, readdirplus, POSIX and flock locks,
+  splice (libfuse decides splice by itself).
 - The INIT reply: an error or another major version refuses the connection (every request is then
   ECONNREFUSED); otherwise accepted flags are those offered, pages per request 32 (or the reply's
   `max_pages` clamped to 1–256 with `MAX_PAGES`), `max_write` the reply's within one page and that
@@ -128,11 +142,11 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - mountinfo shows the type with its subtype and the options `user_id`, `group_id` (in the
   mounter's namespace), `default_permissions`, `allow_other`, `max_read` (at least 4096) when
   given. statfs reports `FUSE_SUPER_MAGIC`; `/proc/filesystems` lists `nodev fuse`.
-- Aborting (6.1's `fuse_abort_conn`): the last attached device file closing, or `Vfs::collect`
-  finding no attached or detached mount of the instance (umount, a dying mount namespace, or the
-  last open file, cwd or root in a lazily unmounted one going, `kernel/mount`), which also forgets
-  the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
-  ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
+- A forced unmount aborts the whole connection before the mount's busy check. The last attached
+  device file closing also aborts it, as does `Vfs::collect` when no attached or detached mount of
+  the instance remains. Collection also removes the instance and its cached nodes. Aborting wakes readers,
+  pollers and callers waiting for INIT or a reply. Requests not yet answered end with ECONNABORTED,
+  new ones are ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
 
 ### Host shared storage
 
@@ -157,6 +171,9 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - Entry and attribute validity is zero: later syscalls query again to see other apps' changes.
   Guest users share the Android app's host access; inotify still reports only changes made through
   this kernel.
+- Host handles are opened with `FOPEN_DIRECT_IO`: shared mmap is refused (ENODEV), so a host
+  connection has no dirty mapped pages and no periodic background writeback is queued on it.
+  Private mappings fill through ordinary `request` calls.
 
 ### Requests and waiting
 
@@ -168,14 +185,16 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - Waiting (6.1's `request_wait_answer`): a signal marks the request interrupted; once the daemon
   holds it a `FUSE_INTERRUPT` is queued (at once, or when the daemon reads an already-interrupted
   request) and the wait goes on. A killed thread takes back a request not yet read (EINTR), except
-  a forced one (`FUSE_FLUSH`, 6.1's `FR_FORCE`); one already read, or forced, is waited for until
+  a forced one (flush, teardown writeback or a core-dump fill); one already read, or forced, is waited for until
   answered or aborted (after an interrupt), unless the system is stopping, when it is left to the
   daemon and the call is EINTR.
 - One wake object per side: every reply wakes every waiter of the connection, every new request
   every reader.
 - For a host connection, `request` drains pending messages and forgets, marks requests Sent and
   keeps them in `Conn.requests`, then uses `Cx::unlocked` for the host mutex and dispatch. Replies
-  use the same `Conn::answer` path as device replies; an abort that won the race keeps its error.
+  use the same `Conn::answer` path as device replies (request accounting included, and a
+  background-writeback reply it hands back is finished with `finish_bg_writeback`); an abort that
+  won the race keeps its error.
   Keeping Sent requests lets eviction retain their nodes while the BKL is released.
 - `background` queues RELEASE and RELEASEDIR with nobody waiting (an open file's last reference
   dropping), unless the connection is refused or aborted; their replies are dropped. When the
@@ -199,13 +218,18 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   bare header (EINVAL), ENOSYS stopping interrupts, EAGAIN queuing it again, any other error
   accepted; a reply to anything but a held request is ENOENT. An ENOSYS reply marks the operation in `no`. The INIT reply is taken by the
   connection.
-- Notifications: `INVAL_INODE` drops the node's attributes, `INVAL_ENTRY` and `DELETE` drop the
-  name and the directory's attributes, `POLL` and `STORE` are accepted, `RETRIEVE` is ENOSYS.
+- `INVAL_INODE` expires attributes. A nonnegative offset also invalidates overlapping mapped
+  pages across all address spaces. A nonpositive length covers the remainder of the file.
+  `INVAL_ENTRY` and `DELETE` drop the name and directory attributes. `STORE` updates cached
+  `FillPages` (and `attr.size` if extended) directly—populating whole or EOF-tail cold pages
+  without `FUSE_READ`, updating resident pages and clean baselines, and invalidating Tier 1
+  executable code translations when resident bytes change. `POLL` is accepted, and `RETRIEVE`
+  returns ENOSYS.
 - read, write, readv and writev of the device move one whole message (up to 8 MiB); splice into a
   pipe takes one whole request (the device's own `O_NONBLOCK`, EIO when the pipe lacks room, the
-  request then lost as in Linux), and splice from a pipe takes a reply of the length asked, its
-  header's length set to it (`kernel/pipe`).
-- poll: always writable, readable while a request or an interrupt for a held request waits,
+  request then lost as in Linux). Splice from a pipe validates the header against the bytes
+  available up to the requested length. A mismatch returns EINVAL and leaves the pipe intact.
+- poll: always writable, readable while a request, a forget, or an interrupt for a held request waits,
   `POLLERR` once aborted or unattached.
 - `FUSE_DEV_IOC_CLONE` attaches an unattached device file to the connection of another, both
   opened in one user namespace; anything else, a bad fd included, is EINVAL.
@@ -217,13 +241,19 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   at least the current nonzero syscall token; symlink text follows the same token rule without a
   timed validity. Thus a later-started overlapping syscall can fill a zero-validity cache for an
   earlier walk without erasing its retry progress; explicit invalidation still removes validity.
-- A walk in a FUSE directory reads the cache: `fuse_child` for a name, the cached type for
-  `is_dir` and symlinks, the cached parent for `..` (no `..` lookup is ever sent), the cached link
-  for a target. What it lacks becomes a `Query` (`need`) and the internal `FUSE_RETRY`; the
-  dispatcher then calls `serve`, which asks the daemon with the BKL released and caches the answer,
-  and runs the syscall again (at most 16384 times, then EIO). A lookup's ENOENT is cached as a
-  missing name for this syscall (a node id of 0 for its validity); any other error of a query ends
-  the syscall with it.
+- A walk in a FUSE directory reads the cache: `fuse_child` / `lookup_walk` for a name, the cached
+  type for `is_dir` and symlinks, the cached parent for `..` (no `..` lookup is ever sent), the
+  cached link for a target. When a walk misses cache on a plain component, `lookup_walk` batches
+  consecutive plain components (`!= "."`, `!= ".."`, `<= NAME_MAX`) into `Query::LookupWalk`, so
+  multi-component cold FUSE paths resolve in O(n) RPCs and a single retry instead of restarting
+  from the root per component; `serve` stops the batch on non-directories, symlinks, mount points,
+  search-permission failure, signal/kill, or lookup error. What it lacks becomes a `Query` (`need`)
+  and the internal `FUSE_RETRY`; the dispatcher calls `serve` with the BKL released and caches the
+  answer, then runs the syscall again (at most 16384 times, then EIO). A lookup's ENOENT is cached
+  as a missing name for this syscall (a node id of 0 for its validity); non-`ENOENT` lookup errors
+  (other than `EINTR`) are cached in thread-local `LOOKUP_ERRORS` for the current syscall so walks
+  and syscall handlers receive the error directly and can tolerate it when Linux VFS rules allow.
+  `new_syscall` clears `LOOKUP_ERRORS`.
 - `enter` caches a lookup's or creation's entry: the root's node id is EIO, a known node id keeps
   its node (a directory moves under its new parent, the root never moves), a known node id of
   another type gets a new node, and a directory that would move into itself or below is ELOOP, so
@@ -235,23 +265,32 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   truncation, fallocate, xattr changes and links stale the node; SETATTR caches its reply.
 - Every entry accepted counts a lookup on its node (`nlookup`), even one refused as a loop; the
   root's node id counts none.
-- Forgetting (6.1 evicting unused inodes): when an entry takes the cache past 16384 nodes, or a
-  write of 2 or 3 to `vm.drop_caches`, `SWEEP` is set and the dispatcher calls `sweep` at the end
-  of a syscall. It keeps what `in_use` finds (every task's root and cwd, the node of every open
-  file in every fd table, O_PATH ones included, every running program's key, every mount's root
-  and point attached or detached, every inotify watch), each connection's roots, nodes with an
-  open handle, and nodes a request in flight is about (its node, and a rename's other directory or
-  a link's file), plus the directories all of these lie in; it gives up for now when something is
-  borrowed. `evict` then forgets leaves (nodes no other node lies in), oldest entered first, round
-  after round: all it may with `drop_caches`, otherwise down to 12288. A forgotten node leaves the
-  table and the node-id index, the names naming it go with negative entries no longer valid, and
-  its `nlookup` is queued as a forget and the readers woken. A node id looked up again is a new
-  node.
-- A node `drop_caches` keeps only for a release in flight (its file closed, the daemon not yet
-  answering `FUSE_RELEASE`/`RELEASEDIR`) loses its names and is doomed: the daemon's answer to that
-  release asks for a sweep, which forgets it unless something keeps it again or a lookup found it
-  meanwhile (Linux evicts the inode when the release, holding its last reference, ends; its dentry
-  is gone and FUSE keeps no unused inode).
+- Forgetting (6.1 evicting unused inodes): when an entry takes the cache past `sweep_at` (starting
+  at 16384), an unlinked/rmdir'd/overwritten node loses its last link, a doomed node's last open
+  handle or request finishes, or a write of 2 or 3 to `vm.drop_caches` runs, `SWEEP` is set and the
+  dispatcher calls `sweep` at the end of a syscall. It keeps what `in_use` finds (every task's root
+  and cwd, the node of every open file in every fd table, O_PATH ones included, every running
+  program's key and mapped interpreter key, every mount's root and point attached or detached, every inotify watch), each
+  connection's roots, nodes with an open handle, live O_PATH description, bound AF_UNIX socket
+  (`sock_pin`), or active/waited lock (`io_busy`, `dir_busy`, `dir_waiters`), and nodes a request
+  in flight refers to (its node, a rename's other directory, or a link's file). It keeps their
+  ancestor
+  directories and retries if it finds a borrow. `evict` first forgets unused `doomed` nodes (and any
+  unused cached descendants of a doomed directory) leaves-first without waiting for 16384 nodes,
+  then runs bulk LRU eviction only on `drop_caches` (all unused nodes) or while the cache still
+  exceeds 16384 (down to 12288, leaves first, oldest entered first). After a bulk trim or
+  `drop_caches`, `sweep_at` is set to `max(16384, live + max(live / 4, 4096))` so working sets above
+  16384 do not rescan on every new entry, and resets back toward 16384 as nodes drop or an instance
+  is removed. A forgotten node leaves the table and the node-id index, the names naming it go with
+  negative entries no longer valid, and its `nlookup` is queued as a forget and the readers woken. A
+  node id looked up again is a new node (and reusing a doomed node id for any type clears its doom).
+- A node `unlink`, `rmdir`, or non-exchange overwriting `rename` removes the last link of (cached
+  `nlink` decremented, always last for directories) is doomed in `Conn::doomed` and swept at once if
+  unused. If held open or busy in flight, it stays alive and doomed until closed and its
+  `FUSE_RELEASE`/`RELEASEDIR` reply (or `no_release` handle drop, or last non-open request reply)
+  schedules a sweep; one held solely by an `O_PATH` pin, cwd, mount or watch stays alive and is
+  forgotten on the next sweep once released. Likewise, a node `drop_caches` keeps only for a release
+  in flight loses its names and is doomed until that release ends unless a lookup saves it.
 
 ### Permission
 
@@ -265,7 +304,11 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - access(2), chdir, fchdir and chroot: the mount's check, then the cached attributes with
   `default_permissions`, otherwise the daemon's answer to `FUSE_ACCESS` (a daemon without it
   allows).
-- stat is EACCES for a process the mount does not allow; statfs gives it only the magic.
+- stat is EACCES for a process the mount does not allow; statfs gives it only the magic. `fstat`,
+  `AT_EMPTY_PATH` stats (`newfstatat`/`statx`), `/proc/<pid>/fd` stats, `copy_file_range`, `mmap`,
+  and fd-based `setattr` attribute fetches on an open FUSE regular file (with `!no_release`) pass
+  its open file handle (`FUSE_GETATTR_FH`) when refreshing stale attributes (directories and
+  `O_PATH` descriptors do not).
 
 ### Opening and creating
 
@@ -276,39 +319,59 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   writing a program being run ETXTBSY; `O_DIRECTORY` on a non-directory ENOTDIR. Then
   `FUSE_OPENDIR` or `FUSE_OPEN` with the open flags less `O_CREAT`, `O_EXCL`, `O_NOCTTY` (and
   `O_TRUNC` without `ATOMIC_O_TRUNC`, which then is a SETATTR after the open). An ENOSYS answer
-  means no open is needed, now and later (no handle, no release). Device nodes, FIFOs and
+  means no open is needed, now and later (cached pages retained, no handle or release). Device nodes, FIFOs and
   sockets in a FUSE filesystem cannot be opened (ENXIO).
 - Create (`O_CREAT` of a missing name, 6.1's `fuse_create_open`): EROFS, the directory's write and
   search permission, then `FUSE_CREATE` (mode with the umask applied unless `DONT_MASK`, which
   sends it beside), or from a daemon without it `FUSE_MKNOD` and an open. Without `O_EXCL`, an
   EEXIST (another process created the name since the walk; Linux holds the directory's lock across
   both) forgets the missing name and runs the syscall again, which then opens the file.
+- Successful regular-file OPEN and CREATE replies retain mapped pages with `FOPEN_KEEP_CACHE`.
+  Clearing the flag invalidates all mapped pages of that inode, including through another name.
+  An atomic truncating open or create shrinks the mapped backing to zero even with the flag set.
 
 ### Reading, writing and positions
 
 - read and write go to the daemon in requests of the negotiated size, stopping at a short reply;
   errors after the first piece return what was done. One guest read or write moves up to 8 MiB.
+  Reads overlay unacknowledged mapped stores on the reply. Writes update resident mapped bytes and
+  their writeback baseline for exactly the range accepted by the daemon.
 - A file opened `FOPEN_STREAM` has no position (offset 0); with `FOPEN_NONSEEKABLE` or `STREAM`,
   pread, pwrite and lseek are ESPIPE.
 - The position is taken as unlocked I/O takes it (`pos_busy`) and advanced past what moved; a
   fault while copying out moves it back.
 - A write with `O_APPEND` (as the open file's flags are now) asks the daemon for the size first
   and writes there, one append per node at a time from the size to the write (the node's
-  `appending`, waited for on the lock channel, as 6.1 holds the inode lock); `RLIMIT_FSIZE` cuts
-  writes (`SIGXFSZ` and EFBIG at the limit). WRITE carries those current flags, including fcntl changes.
-- lseek: `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE` through `FUSE_LSEEK` (a daemon
-  without it has data up to the end).
+  `io_busy` flag also orders fills, mapped reads, writeback and size changes); `RLIMIT_FSIZE` cuts
+  writes (`SIGXFSZ` and EFBIG at the limit). WRITE carries the file's current flags, including
+  fcntl changes.
+- lseek takes `pos_busy` (`PosGuard`): `SEEK_END` from the daemon's size, `SEEK_DATA`/`SEEK_HOLE`
+  through `FUSE_LSEEK` (a daemon without it has data up to the end).
+- `O_SYNC`/`O_DSYNC`/`RWF_SYNC`/`RWF_DSYNC` writes (including `sendfile`, `copy_file_range` and
+  `splice`) sync via `FUSE_FSYNC` (`write_sync`).
 - copy_file_range and splice treat FUSE files like regular ones and copy block by block.
 
 ### Directories
 
 - getdents64 lists through `FUSE_READDIR` a page at a time on the first call and after a seek to
   0, keeping the daemon's own `.` and `..`; an empty name, one over 1024 bytes or with `/` is EIO.
-  Seeking takes only `SEEK_SET` and `SEEK_CUR`.
+  Directory `lseek` follows 6.1's `generic_file_llseek` on `fuse_dir_operations`: `SEEK_SET`,
+  `SEEK_CUR`, `SEEK_END` and `SEEK_DATA`/`SEEK_HOLE` counted from the directory inode's size
+  (fetching stale attributes via `FUSE_GETATTR` without `FUSE_GETATTR_FH`, never `FUSE_LSEEK`),
+  resetting cached entries on a seek to 0; `FOPEN_NONSEEKABLE` and `FOPEN_STREAM` directories
+  return `ESPIPE`.
 
 ### Namespace changes
 
-- mkdir, mknod (devices need `CAP_MKNOD` unless 0:0), symlink: `.`, `..` or an existing name
+- Directory-modifying operations (`create` including its `MKNOD` fallback, `mkdir`, `mknod`,
+  `symlink`, `link`, `unlink`, `rmdir`, `rename`) serialize per directory under `Node::dir_busy`
+  (Linux's directory `i_rwsem`), sleeping on `wake::LOCK` (killable, RAII-released on error, abort
+  or kill, with `dir_waiters` preventing eviction while waiting). Operations in different
+  directories run concurrently. Cross-directory `rename` locks both directories in canonical
+  `FuseId` order (`lo < hi`) to prevent deadlock; cross-directory directory moves also acquire
+  `Conn::rename_busy` first and re-check `is_within` under the locks to prevent cycles.
+- mkdir, mknod (devices need `CAP_MKNOD` and the cgroup device BPF filter unless character 0:0
+  whiteout), symlink: `.`, `..` or an existing name
   EEXIST, then EROFS, then the directory's permission; the reply's type must be the one asked
   (EIO). mkdir keeps the permission and sticky bits.
 - link (6.1's `do_linkat`): EEXIST, EROFS, EXDEV unless both on one mount, `protected_hardlinks`
@@ -345,26 +408,60 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ### Mappings and programs
 
-- mmap of a FUSE file (`map_fill`) makes a `Fill` (`kernel/mm`): an empty memfd as long as the
-  cached size (fetched by a retry when stale) and the open file, kept open until the last mapping
-  goes, so the release comes after munmap as on Linux. In do_mmap's order a file not open for
-  reading or a shared writable mapping is EACCES and an executable one on a noexec mount EPERM;
-  then a file opened `FOPEN_DIRECT_IO` cannot be mapped shared (ENODEV, 6.1's `fuse_file_mmap`).
-  A shared mapping is never made writable later.
+- mmap of a FUSE file pins its open handle. The first mapping creates a sparse memfd at the
+  inode's cached size. Later mappings reuse its pages at file offsets. A shared writable mapping
+  requires a readable and writable descriptor, including write permission added with mprotect.
+  A noexec mount still refuses execution and a direct-I/O handle refuses shared mmap with ENODEV.
+- `MS_SYNC` writes contiguous runs of changed bytes in range and waits for a data sync.
+  Matching bytes between runs stay untouched on the daemon. File sync and close write
+  back the inode before the daemon sync or flush. Unmap (including fixed replacement) writes back
+  removed shared ranges with write access. Exec and thread exit flush shared ranges of the old mm.
+  In addition, `machine::timers()` calls `fuse::flush_dirty` at the interval configured by
+  `/proc/sys/vm/dirty_writeback_centisecs` (default 500 = 5 s, disabled when `<= 0`) to queue
+  asynchronous background `FUSE_WRITE` requests (`FUSE_WRITE_CACHE`) for dirty mapped byte runs;
+  `FillPages::bg_busy` (released via `BgWriteback`'s `Drop` on reply, error, oversized drop, or
+  abort) serializes background writeback with foreground `with_io`. A short write keeps
+  unacknowledged bytes dirty. Failed teardown retains a writable handle and cached data for a later
+  sync.
+- Writes, truncate, atomic truncating open and fallocate through the mount update the backing.
+  Shrink revokes guest translations before resizing the memfd. Hole punching also clears resident
+  mapped bytes. Private host mappings keep their own modified pages.
+- Data invalidation from a notification, open, or `FUSE_AUTO_INVAL_DATA` (when negotiated and
+  `LOOKUP`/`GETATTR` reports changed `size` or `mtime` on an existing node) revokes translations
+  without waiting for the inode I/O lock. The next fill rechecks size and merges unacknowledged
+  mapped stores with fresh daemon data. A fill discards replies overtaken by either kind of
+  invalidation.
 - Pages are read as they are touched (`fill`: `FUSE_READ` through the mapped file's handle, the
-  BKL released): on a guest fault, on a kernel copy failing with `FUSE_RETRY`, before read and
-  write syscalls for their buffers (`prefault`), and for the whole mapping with `MAP_POPULATE`
-  (errors ignored). How much one fault reads is `kernel/mm`'s (`Fill::window`).
+  BKL released): on a guest fault, on a kernel copy failing with `FUSE_RETRY`, before I/O,
+  offset-updating, polling, fd-creating, and socket syscalls for their buffers (`prefault`), and
+  for `mlock`/`mlock2`/`mlockall`, `MADV_WILLNEED`, `MADV_POPULATE_*`, `MAP_POPULATE`/`MAP_LOCKED`,
+  and `remap_file_pages`. Proc memory transfers and stateful result copies retry cold pages locally.
+  Core dumps force fills for selected file pages and ELF header checks after group exit. If only
+  the dumping process holds the device, its cold pages are unavailable. How much one fault reads is
+  `kernel/mm`'s (`Fill::window`).
+- AF_UNIX `bind` in a FUSE directory (`bind_socket`) creates the socket entry with `FUSE_MKNOD`
+  (`S_IFSOCK | (0o777 & !umask)`), maps `EEXIST` and trailing slashes to `EADDRINUSE`, and pins the
+  node via `Node::sock_pin` so `connect` finds the bound socket by `key(id)` across cache eviction.
 - execve of a FUSE program (or interpreter) reads it whole into a memfd through a retry
   (`Query::Program`, one copy per file per syscall), runs it as from a nosuid mount, and gives it
-  its node's key as inode number, so running it and writing it exclude each other (ETXTBSY).
+  its node's key as the internal image inode. The main program's key enforces ETXTBSY.
+  Procfs resolves image keys to daemon inodes for maps and smaps and skips the store's
+  deleted-file lookup for FUSE paths. Ordinary FUSE mappings already carry the daemon inode.
 
 ### inotify
 
-- Watches key FUSE nodes by `key`; reads and writes report `IN_ACCESS`/`IN_MODIFY`, opens and
-  closes through the open file's record, creations `IN_CREATE`, removals `IN_ATTRIB`, delete-self
-  and `IN_DELETE`, renames the moved pair and move-self (a replaced name's delete-self only for its
-  last link). Only changes made through this kernel are seen.
+- When the daemon accepts a program open, `serve` reports it to the exec attempt before
+  fetching attributes or copying data. A subsequent read failure still delivers open and close.
+  The successful retry reuses the same open.
+
+- Watches key FUSE nodes by `key`; reads and writes report `IN_ACCESS`/`IN_MODIFY`, opens (with
+  `IN_MODIFY` on `O_TRUNC`) and closes through the open file's record, creations `IN_CREATE` (once
+  even on the MKNOD fallback via `make_node`), attribute and xattr changes (`chmod`, `chown`,
+  `utimensat`, `setxattr`, `removexattr`) `IN_ATTRIB`/`IN_ACCESS`/`IN_MODIFY`, truncations and
+  `fallocate` `IN_MODIFY`, removals `IN_ATTRIB`, delete-self and `IN_DELETE`, renames the moved
+  pair and move-self (a replaced name's delete-self only for its last link). Unlinks and
+  overwriting renames call `inotify::unlinked` so `IN_EXCL_UNLINK` filters unlinked FUSE names
+  without dropping linked child events. Only changes made through this kernel are seen.
 
 ## Dependencies (inbound / outbound)
 
@@ -373,31 +470,33 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - `kernel/mount`: mount(2) (`fuse_mount`), host shared-storage attachment and collection.
 - `kernel/vfs`: the walk (`fuse_child`, `fuse_permission`, kind, readlink, parents) and the FUSE
   branches of getdents, stat, statfs, access, chdir and the attribute and namespace syscalls.
-- `kernel/files`: opening `/dev/fuse` and the FUSE branches of open, the I/O routes, readv/writev,
-  lseek, the close paths, fsync and copy_file_range; `kernel/pipe` and `kernel/xattr`: those of
+- `kernel/files`: opening `/dev/fuse`, the FUSE branches of open and the close paths;
+  `kernel/fileio`: the I/O routes, readv/writev, lseek, fsync and copy_file_range; `kernel/pipe` and `kernel/xattr`: those of
   splice and the xattr calls.
 - `kernel/process`: the dispatcher's retry loop (`new_syscall`, `serve`), thread exit
   (`flush_at_exit`).
 - `kernel/exec`: execve (`open_fuse`, close-on-exec flush).
 - `kernel/mm` (`map_fill` for mmap, `fill` from the fault path), `kernel/poll` (device readiness
-  and wake object), `kernel/procfs` (mountinfo type and options), `kernel/sysctl` (`drop_caches`).
+  and wake object), `kernel/procfs` (mountinfo type and options, mapping inodes), `kernel/sysctl` (`drop_caches`).
 - The dispatcher: `fill` and `prefault` for mapped pages, `sweep` after every syscall.
+- `kernel/net` calls `fill` for socket output copies, including payload, address, control data
+  and message header fields. recvmmsg also fills pages when importing the current record.
 
 ### Outbound
 
 - `kernel/process`: the wait API (`wait_object`, wake objects), `interrupted`, `killed`,
   `stopping`.
 - `kernel/mount`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`).
-- `kernel/vfs`: `resolve_parent`, `encode_stat`; `kernel/files`: `open_mask`, `executing`,
-  `check_fsize`.
+- `kernel/vfs`: `resolve_parent`, `encode_stat`; `kernel/files`: `open_mask`, `executing`;
+  `kernel/fileio`: `check_fsize`, `fsize_room`, `PosGuard` and `truncating`.
 - `kernel/inotify`: the hooks for FUSE namespace changes.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
-  `capable_wrt`.
+  `capable_wrt`; `kernel/cgroup`: `check_device` for `mknod`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
 - Host libc and `std::fs`: descriptor-based shared-storage operations and metadata.
-- `kernel/mm`: `Fill` (`window`, `store`, `first_unread`, `has_fills`).
-- The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
+- `kernel/mm`: `Fill` and `FillPages` for reads and dirty byte runs, and `Mm::invalidate_fill` for notification and open-time shootdowns.
+- The task table, fd tables, mm `exe` and `mapped_inos`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
   (`watched`) for `in_use`.
 
 ## Invariants and gotchas
@@ -421,49 +520,26 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
 - The type of a node never changes; a reply giving another type is EIO (getattr, setattr) or a new
   node (lookup).
 - Nodes are forgotten only between syscalls (`sweep`), so a `FuseId` in a syscall's locals stays
-  valid; across a wait it stays valid only while an open handle, a request in flight or one of
-  `in_use`'s holders keeps it. Code keeping a `Node::Fuse` somewhere new across syscalls must be
-  added to `in_use`.
+  valid. A path description from open or open_tree holds a shared pin for its cache entry,
+  including while its only reference is in an AF_UNIX message. Other holders across waits need
+  a daemon handle, a pending request or a reference visible to `in_use`.
 
 ## Confirmed bugs / technical debt
 
 - **Host releases wait for another request:** background RELEASE/RELEASEDIR and FORGET queues are
   drained by the next host request; the final unused host handles and anchors can stay open until
   another shared-storage operation or connection teardown.
-- **No page cache:** a mapped page keeps what was read when first touched, so a shared mapping
-  never sees later writes through the mount or another process, separate mmap calls read
-  separately, and a shared writable mapping is refused (SQLite's WAL `-shm` file and programs
-  writing through `MAP_SHARED` fail on FUSE); reads and writes always reach the daemon (no
-  read-ahead for read(2), writeback or readdirplus).
-- **Forgetting is coarser than Linux's:** nodes go only above 16384 or with `drop_caches`, not when
-  a file unlinked through the mount is no longer used (Linux forgets it at once); an O_PATH
-  descriptor in flight in an `SCM_RIGHTS` message does not keep its node, which then answers
-  ENOTCONN; and when nothing can go (everything above the limit in use) every new entry makes the
-  next syscall's end scan every task again.
 - **Locks stay local:** POSIX, OFD and flock locks on FUSE files work only between processes of this
   kernel; the daemon never sees them.
 - **Missing pieces:** no `fuseblk` (ntfs-3g), no fusectl (`/sys/fs/fuse/connections` and its
   `abort`), no `FUSE_IOCTL`, `FUSE_POLL`, `FUSE_COPY_FILE_RANGE`, `FUSE_TMPFILE` or notify
-  retrieve; device nodes, FIFOs and sockets on FUSE cannot be opened (ENXIO), and an AF_UNIX bind
-  in a FUSE directory is EXDEV (Linux makes the socket with `FUSE_MKNOD`).
+  retrieve; device nodes and FIFOs on FUSE cannot be opened (ENXIO).
 - **Programs:** set-id bits and file capabilities of FUSE programs never apply (even on a mount
-  without nosuid), `/proc/<pid>/exe` is followed by path, and maps show the node's key as inode.
-- **inotify gaps:** path-based chmod, chown, utimensat, truncate, ftruncate and xattr changes
-  report no `IN_ATTRIB`/`IN_MODIFY`, an `O_TRUNC` open no `IN_MODIFY`, and creating through the
-  MKNOD fallback reports `IN_CREATE` twice.
-- **Directory changes run concurrently:** creations, removals and renames in one directory reach
-  the daemon in parallel where Linux serializes them under the directory's lock; only the
-  create-after-create race is handled (EEXIST without `O_EXCL` opens the file).
-- **Retries cost:** an uncached path of n components takes n retries, each walking again from the
-  start; any error but ENOENT of a lookup ends the syscall even where the walk would tolerate it.
-- **Small fidelity gaps:** fstat asks `FUSE_GETATTR` without the open file's handle; seeking a
-  FUSE directory to its end is EINVAL; spliced replies have their header length replaced
-  (`kernel/pipe`).
+  without nosuid), and `/proc/<pid>/exe` is followed by path.
 
 ## Open questions
 
-- Would readdirplus or a page cache for read-only mappings be worth their complexity for sshfs and
-  rclone workloads?
+- Would readdirplus benefit sshfs and rclone workloads?
 
 ## To verify
 
@@ -471,6 +547,6 @@ the copy mappings (`kernel/mm`), mountinfo (`kernel/procfs`).
   what the `fuse` and `fuse-tools` differential cases exercise was observed on a native 6.8 kernel
   (fuse-overlayfs, sshfs, rclone, mount option errors, `/dev/fuse` before a mount, the clone
   ioctl, ETXTBSY, `RLIMIT_FSIZE`, mapped pages, which nodes `drop_caches` forgets), while
-  interrupts, oversized requests, notifications, refused INIT, the `max_read` shown, the forget
+  interrupts, oversized requests, notifications other than `INVAL_INODE`, refused INIT, the `max_read` shown, the forget
   interleaving and `FOPEN_DIRECT_IO` mappings were not (a 6.6+ kernel lets libfuse 3.17 map
   direct-I/O files shared).

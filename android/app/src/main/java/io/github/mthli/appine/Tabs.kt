@@ -60,11 +60,11 @@ internal object Tabs {
     private fun marker(context: Context) = File(dir(context), "running")
 
     /**
-     * The hash of the index contents last written, null with none: an unchanged index is not
-     * written again (saved every minute, so as not to keep writing flash; transcripts are skipped
-     * by their names).
+     * The serialized index layout last written, null with none: an unchanged index is not written
+     * again (saved every minute, so as not to keep writing flash; transcripts are skipped by their
+     * names).
      */
-    private var writtenLayout: Int? = null
+    private var writtenLayout: String? = null
 
     /**
      * Called once when the service starts: returns the killed run when the last run did not exit
@@ -193,7 +193,7 @@ internal object Tabs {
             }
             // The index carries the save time: not rewritten when the transcripts, the layout and
             // the current directories are all unchanged
-            val layout = (entries.toString() + current).hashCode()
+            val layout = "$current:$entries"
             val index = File(dir, "index.json")
             if (writtenLayout != layout || !index.isFile) {
                 val json = JSONObject()

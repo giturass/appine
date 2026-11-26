@@ -1,9 +1,11 @@
 # kernel/cow Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/cow.md` for the paired decision history (not yet created; decisions from before the split are D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39 in `.agents/decisions/kernel/mm.md`).
+> See `.agents/decisions/kernel/cow.md` for the paired decision history (decisions from before the split are D6, D10, D11, D19, D24, D25 and the fork/copy-on-write parts of D15, D16, D18, D20, D22, D31 and D39 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-26 (targeted verification of fork rollback, CoW fault and mprotect permissions, and loan retention on page-table allocation failure)
 
 ## Responsibilities
 
@@ -41,6 +43,9 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   owner's `HostRegion` alive.
 - `Runs` — coalesces consecutive pages into runs for PTE updates; a run never crosses a VMA.
 - `MmRef` — weak self-handle (`me`) recorded in loans.
+- `Vma::accounted` records the sticky guest commit charge. For private anonymous memory,
+  `written` tracks potential contents in a host piece, `has_anon_vma` tracks the identity of the
+  logical VMA, and `anon` distinguishes child identities when comparing adjacent pieces.
 
 ## Public entry points
 
@@ -55,31 +60,39 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 ### fork
 
 - The caller quiesces the parent (`kernel/mmu`), then `fork` checks commit unless
-  `vm.overcommit_memory` is 1 (`commit_too_big`: counts private, currently writable,
-  non-`MAP_NORESERVE`, non-dontfork VMAs the child gets, merging adjacent ones the way Linux
-  `vma_merge` would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it; mode 2's
-  strict accounting is not emulated). `fork` cannot fail after lending starts; the parent's TLB
-  flush waits for its `sync`.
+  `vm.overcommit_memory` is 1 (`commit_too_big`: counts `accounted` mappings the child inherits,
+  combining adjacent pieces using `same_vma`, including their page offsets and fork identity; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it; mode 2's
+  strict accounting is not emulated). After a successful fork the parent's TLB flush waits for its `sync`.
 - The child keeps the parent's membarrier registrations (Linux copies `membarrier_state`) and
   `memops`; execve starts a fresh `Mm` without them.
-- Each child VMA with contents of its own gets a new `anon` identity, shared by the pieces of one
-  Linux VMA (Linux's `anon_vma_fork`), so it no longer joins its neighbours while the parent's
-  pieces still do: a written anonymous VMA, or a written private file VMA when a page of its host
-  region holds a private copy (host pagemap: present without the file bit, or swapped; unreadable
-  pagemap counts as yes).
+- Private writable mmap or mprotect sets `accounted` unless the mapping has `MAP_NORESERVE`.
+  Removing write permission preserves the charge. Forced kernel writes alone do not charge it.
+  Splits, moves, extensions, DONTUNMAP remnants and fork preserve the charge.
+- Private anonymous entries prefill without write permission until a guest write fault, kernel
+  write or write-population. That transition marks the host piece written and propagates
+  `has_anon_vma` across the logical VMA. Compatible pieces joining it inherit that identity.
+  Read faults, read-population and permission grants do not create it. DONTNEED retains it.
+- Fork gives each faulted logical VMA a fresh child `anon` shared across its pieces; the
+  parent's identity stays unchanged. Untouched anonymous VMAs and wiped child VMAs start with
+  zero identity. Private files retain the host private-page test (present without the file bit,
+  or swapped; unreadable pagemap counts as yes).
 - Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
-  - shared mappings, reservations and read-only private file mappings share the parent's region;
+  - private tmpfs mappings get a fresh private view of the pinned file. Fork copies only pages
+    already written privately. Clean pages keep following the backing file and its quota.
+  - shared mappings, reservations and read-only private files outside tmpfs share the parent's region;
     read-only private file VMAs are marked `cow` on both sides;
-  - non-growsdown, non-reserved, non-heap anonymous or writable private-file VMAs of at most 1 MB
+  - non-growsdown, non-reserved, non-heap anonymous VMAs of at most 1 MB
     are carved (`carve`) from one `spare` region (`kernel/hostmem`);
   - the heap (the anonymous VMA at the page-aligned `brk_start`, at most 256 MB) gets a `spare`
     region of 256 MB; a growsdown anonymous VMA with reserved room below (`spare_below`) gets a
-    `spare` region of room plus length; everything else gets new anonymous memory
+    `spare` region of room plus length; other private anonymous VMAs get new anonymous memory
     (`kernel/hostmem`);
   - private anonymous VMAs that were ever written are lent, except `MADV_WIPEONFORK` ones, where
     the child keeps its own all-zero memory; never-written ones need nothing;
-  - writable private file VMAs are copied page by page up to EOF, skipping all-zero pages
-    (`copy_nonzero_pages`); a `Fill` one instead maps its host file privately again and copies the
+  - ordinary writable private file VMAs remap their pinned file and inherit only private pages,
+    including same-value writes. Host pagemap identifies these pages where readable. Otherwise
+    guest write faults record detached host pages across VMA splits. The verified musl snapshot keeps its own contents.
+    A `Fill` VMA maps its host file privately again and copies the
     pages read that differ from it, keeping the same fill (pages either side reads later reach
     both), and is never carved.
 
@@ -90,20 +103,32 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   (`touched_windows`, merged up to 1 GB); untouched pages are known zero and the child keeps its
   own. If pagemap is unreadable, every page in the windows is lent. Pages the parent itself
   borrowed are re-lent from their owner. Parent and child get read-only entries for the lent pages
-  (none for `PROT_NONE` VMAs; a later mprotect rebuilds them).
+  (fork skips PTE installation for `PROT_NONE` VMAs). Fork maps all child runs first, then
+  downgrades newly lent parent runs. On allocation failure it restores the attempted parent runs,
+  including a partially mapped run. The lending plan pins the borrowed host regions until the
+  unpublished child drops.
 - Borrower write (`cow_break`): only for a writable private anonymous VMA whose page is borrowed
   or lent. A borrowed page is copied into the VMA's own slot (`materialize`), re-mapped with the
   VMA prot, the borrower's threads are shot down (`kernel/mmu`), and the loan is returned.
+  A failed remap leaves the borrowed record, host region and loan in place.
 - Owner write, munmap, mremap move or `MADV_DONTNEED` of a lent page (`recall`): every borrower
   copies first (interrupting its guest threads), then the owner gets write permission back
-  (`repossess`).
+  (`repossess`). If a borrower cannot remap its copy, recall retains the failed borrowers in the
+  loan and the owner stays read-only. Range operations propagate the error before using that page.
 - Borrower munmap (`cow_unmap`/`give_back`) returns borrowed pages without copying; borrower
   mremap and `MADV_DONTNEED` copy first (`cow_settle`).
 - When the last borrower returns a page (`return_loans`), the owner's entries are restored at once
-  (`repossess`), in runs that never cross VMAs, without a flush.
-- mprotect over CoW pages (`cow_pages`, `cow_entries`, `write_around`) never gives a CoW page
-  write permission or a borrowed page an entry at the borrower's own host page, not even between
-  steps (see `kernel/mm`'s mprotect), since other threads may run guest code meanwhile.
+  (`repossess`), in runs that never cross VMAs, without a flush. If demotion fails, the next write
+  fault can retry. An owner write fault counts as handled only when the page translates writable.
+- Before mprotect grants access, `cow_entries` installs CoW pages at their owners' host addresses
+  with the old non-writable permissions (zero when leaving `PROT_NONE`). An allocation failure
+  leaves the VMA permissions intact. The range then gets its new non-writable permissions before
+  `write_around` grants writes to the intervening pages. Eager fill preserves existing entries.
+- `try_fault_in` restores a missing CoW entry on read or execute at the owner's host address.
+  Writes require a CoW break. Anonymous leaf-window fills and read-population skip CoW slots
+  when filling PTEs. Read-population touches borrowed contents in the owner’s host memory.
+- `Mm::release` returns borrowed pages only after redirecting their entries and flushing stale
+  translations. A failed remap retains the loan for a later release or address-space destruction.
 - Futex keys of private memory are the address space's id and the address, so computing a key does
   not copy a borrowed page (writing the word, as PI locks, robust lists and `FUTEX_WAKE_OP` do,
   breaks CoW); see `kernel/futex` and `kernel/mm`.
@@ -132,12 +157,12 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
 ### Outbound
 
 - `kernel/mm`: `Mm` fields (`vmas`, `me`, `dirty`, `shared_maps`, layout/exec fields), `same_vma`,
-  `insert`, `fill_copy`, `note_shared_maps`, `OVERCOMMIT_MEMORY`.
+  `insert_vma`, `copy_private_file`, `note_shared_maps`, `OVERCOMMIT_MEMORY`.
 - `kernel/hostmem`: `HostRegion`, `spare::anonymous`, `Carved`, `Mm::new_anonymous`,
   `discard_host`, `copy_nonzero_pages`.
 - `kernel/mmu`: `Mmu::map_shared`, `Mmu::protect`, `Mmu::protect_shared`, `shootdown`,
   `touched_windows` (relying on page-table entries for non-zero pages).
-- `appine_hal`: `ram_and_swap`, `page_size`, `touched_pages`, `has_private_pages`.
+- `appine_hal`: `ram_and_swap`, `page_size`, `touched_pages`, `has_private_pages`, `private_pages`.
 
 ## Invariants and gotchas
 
@@ -151,25 +176,17 @@ orchestration (`kernel/process`); futex key selection (`kernel/futex`).
   no borrow is held across a BKL release.
 - CoW never mutably borrows two address spaces at once: borrower-side loan returns run inside the
   borrower's own operation or drop, and owner-side `recall` only takes shared borrows of
-  borrowers. The `try_borrow` guard in `return_loans` is therefore defensive (see the latent
-  hazard below).
+  borrowers. `return_loans` therefore borrows the owner directly (`owner.borrow().repossess`) so a
+  violation fails loudly instead of silently leaking a loan-less lent entry, and fork
+  debug-asserts that any re-lent page still has a live loan entry.
 - Host `mincore` reports pages swapped to zram as absent, which is why `fork`'s touched-page check
   reads `/proc/self/pagemap` instead.
-- `fork` cannot fail after lending starts; all host allocations (`carve`, `spare::anonymous`,
-  `new_anonymous`, `fill_copy`, `child.insert`) run before `lend`.
+- Fork publishes the loan table, both CoW sets and the parent's flush requirement only after all
+  lending runs succeed. Rollback covers newly lent pages exclusively, so earlier loans stay read-only.
 
 ## Confirmed bugs / technical debt
 
-- **Latent CoW leak:** if `return_loans` ever ran while the owner was mutably borrowed, the page
-  would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
-  loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
-  and the guard's comment cites a path (`recall`) that never reaches it.
-- **A written private file mapping marked `cow` at fork is not reverted by `MADV_DONTNEED`:** fork
-  marks every read-only private file VMA `cow`, written or not, and `kernel/mm`'s `discard` skips
-  `cow` VMAs, so the written data stays in both processes.
-- **`anon_vma` and commit approximation at fork:** anonymous memory that has been writable counts
-  as having an `anon_vma` although Linux creates one only at the first write fault, and
-  `commit_too_big` checks only current permissions rather than Linux's sticky `VM_ACCOUNT`.
+- None.
 
 ## Open questions
 

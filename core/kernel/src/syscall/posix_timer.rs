@@ -125,7 +125,12 @@ fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
             };
             let k = cx.kr();
             if thread {
-                let serial = k.tasks.get(&pid).ok_or(Errno::EINVAL)?.serial;
+                let serial = k
+                    .tasks
+                    .get(&pid)
+                    .map(|t| t.serial)
+                    .or_else(|| k.groups.get(&pid).and_then(|g| g.borrow().leader_serial))
+                    .ok_or(Errno::EINVAL)?;
                 Clock::Thread { tid: pid, serial }
             } else {
                 let serial = k.groups.get(&pid).ok_or(Errno::EINVAL)?.borrow().serial;

@@ -17,6 +17,7 @@
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/sem.h>
@@ -460,10 +461,22 @@ static void test_creds(void)
         CHECK(setgroups(2, groups) == 0, "setgroups");
         gid_t back[4];
         CHECK(getgroups(4, back) == 2 && back[1] == 20, "getgroups");
+        /* Linux 6.1 check order as root: size/pointer checks after permission check */
+        CHECK(syscall(SYS_setgroups, -1, (void *)1) == -1 && errno == EINVAL, "root setgroups(-1)");
+        CHECK(syscall(SYS_setgroups, 65537, (void *)1) == -1 && errno == EINVAL, "root setgroups(65537)");
+        CHECK(syscall(SYS_setgroups, 0, (void *)1) == 0, "root setgroups(0, badptr)");
+        CHECK(syscall(SYS_setgroups, 1, (void *)1) == -1 && errno == EFAULT, "root setgroups(1, badptr)");
+        CHECK(prctl(PR_CAPBSET_DROP, 41, 0, 0, 0) == -1 && errno == EINVAL, "root PR_CAPBSET_DROP(41)");
         CHECK(setresgid(100, 100, 100) == 0, "setresgid");
         /* Change only the effective user ID: root can still be regained afterwards */
         CHECK(setresuid(-1, 1000, -1) == 0 && geteuid() == 1000 && getuid() == 0, "seteuid");
         CHECK(setgroups(0, NULL) < 0 && errno == EPERM, "no CAP_SETGID");
+        /* Without CAP_SETGID / CAP_SETPCAP, EPERM precedes EINVAL and EFAULT */
+        CHECK(syscall(SYS_setgroups, -1, (void *)1) == -1 && errno == EPERM, "unpriv setgroups(-1)");
+        CHECK(syscall(SYS_setgroups, 65537, (void *)1) == -1 && errno == EPERM, "unpriv setgroups(65537)");
+        CHECK(syscall(SYS_setgroups, 1, (void *)1) == -1 && errno == EPERM, "unpriv setgroups(1, badptr)");
+        CHECK(prctl(PR_CAPBSET_DROP, 41, 0, 0, 0) == -1 && errno == EPERM, "unpriv PR_CAPBSET_DROP(41)");
+        CHECK(prctl(PR_CAPBSET_DROP, -1UL, 0, 0, 0) == -1 && errno == EPERM, "unpriv PR_CAPBSET_DROP(-1)");
         CHECK(setresuid(-1, 0, -1) == 0 && geteuid() == 0, "back to root");
         /* Change all three IDs: there is no way back */
         CHECK(setuid(1000) == 0, "setuid");
@@ -541,6 +554,22 @@ static void test_ptrace(void)
     struct iovec local = {buf, sizeof buf}, remote = {secret, sizeof secret};
     CHECK(process_vm_readv(pid, &local, 1, &remote, 1, 0) == sizeof buf && !strcmp(buf, "ptrace secret"),
           "process_vm_readv");
+    /* Zero local bytes returns 0 before checking remote iovcnt (>1024), rvec, or pid */
+    struct iovec zero = {buf, 0};
+    CHECK(syscall(SYS_process_vm_readv, -1, (void *)1, 0, (void *)1, 1025, 0) == 0,
+          "process_vm_readv liovcnt=0 riovcnt=1025");
+    CHECK(syscall(SYS_process_vm_readv, -1, &zero, 1, (void *)1, 1025, 0) == 0,
+          "process_vm_readv zero local len riovcnt=1025");
+    CHECK(syscall(SYS_process_vm_writev, -1, &zero, 1, (void *)1, 1025, 0) == 0,
+          "process_vm_writev zero local len riovcnt=1025");
+    CHECK(syscall(SYS_process_vm_readv, -1, &local, 1, (void *)1, 0, 0) == 0,
+          "process_vm_readv riovcnt=0");
+    CHECK(syscall(SYS_process_vm_readv, -1, &local, 1, (void *)1, 1025, 0) == -1 && errno == EINVAL,
+          "process_vm_readv nonzero local riovcnt=1025");
+    CHECK(syscall(SYS_process_vm_readv, -1, (void *)1, 1025, NULL, 0, 0) == -1 && errno == EINVAL,
+          "process_vm_readv liovcnt=1025");
+    CHECK(syscall(SYS_process_vm_readv, pid, NULL, 0, NULL, 0, 1) == -1 && errno == EINVAL,
+          "process_vm_readv flags!=0");
     /* Single-step: every stop is SIGTRAP, TRAP_TRACE for ordinary instructions, SI_USER for svc */
     for (int i = 0; i < 3; i++) {
         CHECK(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == 0, "SINGLESTEP");

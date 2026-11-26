@@ -13,13 +13,10 @@ SKIP="$SKIP:FcntlTest.NoatimePermission"
 SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
 # kernel/sysfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
-# kernel/vfs: umount ignores mappings
-SKIP="$SKIP:MountTest.BusyWithMmap"
 # kernel/procfs: procfs mount options (hidepid, gid) are ignored
 SKIP="$SKIP:ProcMountsTest.FilesystemMountOptions"
-# kernel/vfs: O_NOTIFICATION_PIPE is EINVAL; pipe I/O with faulting buffers ignores Linux's
-# per-buffer rules; splice-family argument checks differ; splice into a file stops quietly at
-# RLIMIT_FSIZE; vmsplice copies the data at the call
+# kernel/pipe: O_NOTIFICATION_PIPE is EINVAL; pipe I/O with faulting buffers ignores Linux's
+# per-buffer rules; splice-family argument checks differ; vmsplice copies the data at the call
 SKIP="$SKIP:PipeTest.NotificationPipeUnsupported:PipeTest.PartialEfaultRollbackAndShortCounts"
 SKIP="$SKIP:PipeTest.SpliceValidationAndRlimitFsize"
 SKIP="$SKIP:VmspliceTest.FileInPipe:VmspliceTest.ForkWithBufferInPipe:VmspliceTest.ModifyBufferInPipe"

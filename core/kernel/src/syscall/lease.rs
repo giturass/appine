@@ -35,36 +35,54 @@ pub(crate) struct Lease {
     /// The process that set it (Linux's `lease_init` records the tgid, which a later change of
     /// type keeps), for `/proc/locks`.
     pid: Tid,
+    /// Acquisition order for `/proc/locks`, retained across type changes.
+    seq: u64,
 }
 
 impl Lease {
+    pub(crate) fn new(file: &FileRef, fd: i32, ty: i16, pid: Tid) -> Self {
+        Self {
+            file: Rc::downgrade(file),
+            fd,
+            ty,
+            breaking: None,
+            pid,
+            seq: crate::locks::next_seq(),
+        }
+    }
+
     fn is(&self, file: &FileRef) -> bool {
         self.file.as_ptr() == Rc::as_ptr(file)
     }
 
     /// What `/proc/locks` shows ([`crate::locks::proc_locks`]): the open file while it lives, a
     /// write lease (or, while being broken, whether the type it goes down to is one, Linux's
-    /// `target_leasetype`; None for `F_UNLCK`), whether it is being broken, and who set it.
-    pub(crate) fn shown(&self) -> Option<(FileRef, Option<bool>, bool, Tid)> {
+    /// `target_leasetype`; None for `F_UNLCK`), its break status, setter and acquisition sequence.
+    pub(crate) fn shown(&self) -> Option<(FileRef, Option<bool>, bool, Tid, u64)> {
         let file = self.file.upgrade()?;
         let ty = self.breaking.map_or(self.ty, |(target, _)| target);
         let write = (ty != F_UNLCK).then_some(ty == F_WRLCK);
-        Some((file, write, self.breaking.is_some(), self.pid))
+        Some((file, write, self.breaking.is_some(), self.pid, self.seq))
     }
 }
 
 /// fcntl(`F_SETLEASE`).
 pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<(), Errno> {
-    let (ino, writable) = {
+    super::fs::follow_copy_up(cx, file)?;
+    let (ino, store_ino, writable) = {
         let f = file.borrow();
-        (ino_of(&f).ok_or(Errno::EINVAL)?, f.writable())
+        let key = key_of(&f).ok_or(Errno::EINVAL)?;
+        let FileKind::Regular { ino, .. } = f.kind else {
+            return Err(Errno::EINVAL);
+        };
+        (key, ino, f.writable())
     };
     if !matches!(arg, F_RDLCK | F_WRLCK | F_UNLCK) {
         return Err(Errno::EINVAL);
     }
     // Only the file's owner (or a holder of CAP_LEASE) may set a lease
     let st = cx.vfs()?.store().stat_open(
-        ino,
+        store_ino,
         match &file.borrow().kind {
             FileKind::Regular { file, .. } => file,
             _ => unreachable!("checked above"),
@@ -127,13 +145,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
         }
         None => {
             file.borrow_mut().holds_locks = true;
-            list.push(Lease {
-                file: Rc::downgrade(file),
-                fd,
-                ty: arg,
-                breaking: None,
-                pid: tgid,
-            });
+            list.push(Lease::new(file, fd, arg, tgid));
         }
     }
     // As on Linux (lease_setup's __f_setown without force), the signal for a break goes to the
@@ -159,7 +171,7 @@ fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
     let mine: Vec<_> = files
         .iter()
         .map(|f| f.borrow())
-        .filter(|f| ino_of(f) == Some(ino))
+        .filter(|f| key_of(f) == Some(ino))
         .map(|f| f.writable())
         .collect();
     let writers = mine.iter().filter(|&&w| w).count();
@@ -168,7 +180,7 @@ fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
 
 /// fcntl(`F_GETLEASE`): while being broken, the type it is to be downgraded to.
 pub(super) fn get(cx: &mut Cx<'_>, file: &FileRef) -> i16 {
-    let Some(ino) = ino_of(&file.borrow()) else {
+    let Some(ino) = key_of(&file.borrow()) else {
         return F_UNLCK;
     };
     prune(cx.k(), ino);
@@ -285,10 +297,11 @@ pub(super) fn break_leases(
     }
 }
 
-/// The inode of a regular file.
-fn ino_of(f: &OpenFile) -> Option<Ino> {
+/// The lease key of a regular file: its store inode, or its overlay node's key when opened
+/// through an overlay (Linux keys leases on the overlay inode, which copy-up does not change).
+pub(super) fn key_of(f: &OpenFile) -> Option<Ino> {
     match f.kind {
-        FileKind::Regular { ino, .. } => Some(ino),
+        FileKind::Regular { ino, .. } => Some(f.ovl.map_or(ino, crate::vfs::overlay::key)),
         _ => None,
     }
 }

@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cred::{Cred, UserNs, cap};
 use crate::errno::Errno;
@@ -507,6 +508,22 @@ pub(crate) struct ShmSeg {
 /// namespace numbers its ids separately).
 pub(crate) type ShmKey = (u64, i32);
 
+/// Shared SysV `SEM_UNDO` list identity (Linux's `struct sem_undo_list`): shared across tasks
+/// created with `CLONE_SYSVSEM`, unshared by `unshare(CLONE_SYSVSEM | CLONE_NEWIPC)` or IPC
+/// `setns`, and applied only when its last sharer leaves.
+pub(crate) struct SemUndo {
+    pub id: u64,
+}
+
+impl SemUndo {
+    pub fn new() -> SemUndo {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        SemUndo {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
 /// All objects in an IPC namespace ([`crate::nsproxy::IpcNs`]): System V IPC objects and POSIX
 /// message queues, and their limits.
 #[derive(Default)]
@@ -514,8 +531,8 @@ pub(crate) struct Ipc {
     pub msg: Table<MsgQueue>,
     pub sem: Table<SemSet>,
     pub shm: Table<ShmSeg>,
-    /// SEM_UNDO undo values: (process, semaphore set) → a value per semaphore.
-    pub undo: BTreeMap<(Tid, i32), Vec<i32>>,
+    /// SEM_UNDO undo values: (undo list id, semaphore set) → a value per semaphore.
+    pub undo: BTreeMap<(u64, i32), Vec<i32>>,
     pub tunables: Tunables,
     /// POSIX message queues, by name (`syscall::mqueue`).
     pub mqueues: BTreeMap<Vec<u8>, Rc<crate::cell::RefCell<crate::syscall::MessageQueue>>>,
@@ -526,8 +543,8 @@ pub(crate) struct Ipc {
 }
 
 impl Ipc {
-    /// A semaphore's value was set directly by SETVAL or SETALL: every process's undo value for it
-    /// is cleared. `num` None means the whole set.
+    /// A semaphore's value was set directly by SETVAL or SETALL: every undo list's adjustment for
+    /// it is cleared. `num` None means the whole set.
     pub fn clear_undo(&mut self, id: i32, num: Option<usize>) {
         for ((_, sid), adj) in self.undo.iter_mut() {
             if *sid == id {
@@ -549,16 +566,17 @@ impl Ipc {
         self.undo.retain(|&(_, sid), _| sid != id);
     }
 
-    /// Process exit: adjusts semaphores by the SEM_UNDO undo values (results clamped between 0 and
-    /// SEMVMX).
-    pub fn exit(&mut self, tgid: Tid) {
+    /// Last sharer of undo list `undo_id` exited or left this IPC namespace: adjusts semaphores by
+    /// the SEM_UNDO undo values (results clamped between 0 and SEMVMX) and records `tgid` as the
+    /// last operating process.
+    pub fn exit(&mut self, undo_id: u64, tgid: Tid) {
         let mine: Vec<(i32, Vec<i32>)> = self
             .undo
-            .range((tgid, i32::MIN)..=(tgid, i32::MAX))
+            .range((undo_id, i32::MIN)..=(undo_id, i32::MAX))
             .map(|(&(_, id), adj)| (id, adj.clone()))
             .collect();
         for (id, adj) in mine {
-            self.undo.remove(&(tgid, id));
+            self.undo.remove(&(undo_id, id));
             if let Ok((_, set)) = self.sem.get_mut(id) {
                 for (i, a) in adj.iter().enumerate().filter(|(_, a)| **a != 0) {
                     if let Some(v) = set.vals.get_mut(i) {
@@ -593,18 +611,38 @@ pub(crate) fn reap_shm(k: &mut Kernel) {
     }
 }
 
-/// Process exit: its SEM_UNDO undo values in every IPC namespace ([`Ipc::exit`]).
-pub(crate) fn exit(k: &mut Kernel, tgid: Tid) {
+/// Last sharer of undo list `undo_id` exited: applies its SEM_UNDO adjustments in every IPC
+/// namespace ([`Ipc::exit`]).
+pub(crate) fn exit(k: &mut Kernel, undo_id: u64, tgid: Tid) {
     for (_, ipc) in k.ipcs.values_mut() {
-        ipc.exit(tgid);
+        ipc.exit(undo_id, tgid);
+    }
+}
+
+/// Detaches the calling task from its current `SEM_UNDO` list (`unshare(CLONE_SYSVSEM |
+/// CLONE_NEWIPC)` or IPC `setns`), installing a fresh list and applying the old list's adjustments
+/// in the current IPC namespace only if this task was its last sharer.
+pub(crate) fn leave_undo(cx: &mut crate::kernel::Cx<'_>) {
+    let old = std::mem::replace(&mut cx.t.sem_undo, Rc::new(SemUndo::new()));
+    if Rc::strong_count(&old) == 1 {
+        let tgid = cx.tgid();
+        cx.ipc_mut().exit(old.id, tgid);
     }
 }
 
 /// The contents of `/proc/sysvipc/{msg,sem,shm}` for IPC namespace `ns`, with owners and groups
-/// translated into the user namespace of the reader `reader` (Linux's `seq_user_ns`).
-pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> String {
+/// translated into the user namespace of `reader` (Linux's `seq_user_ns`) and pids into the
+/// reader's pid namespace `pid_ns` (`pid_vnr`).
+pub(crate) fn proc_listing(
+    k: &Kernel,
+    ns: u64,
+    which: &[u8],
+    reader: &Cred,
+    pid_ns: &crate::pidns::PidNs,
+) -> String {
     use std::fmt::Write;
     let ipc = k.ipc(ns);
+    let pid = |p: Tid| pid_ns.vnr(p).unwrap_or(0);
     let mut s = String::new();
     match which {
         b"msg" => {
@@ -618,8 +656,8 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> 
                     p.mode & 0o777,
                     q.cbytes,
                     q.msgs.len(),
-                    q.lspid,
-                    q.lrpid,
+                    pid(q.lspid),
+                    pid(q.lrpid),
                     reader.uid_out(p.uid),
                     reader.gid_out(p.gid),
                     reader.uid_out(p.cuid),
@@ -657,7 +695,7 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> 
                 writeln!(
                     s,
                     "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}",
-                    p.key, id, p.mode & 0o1777, seg.size, seg.cpid, seg.lpid, nattch(k, (ns, id)),
+                    p.key, id, p.mode & (0o777 | SHM_DEST | SHM_LOCKED), seg.size, pid(seg.cpid), pid(seg.lpid), nattch(k, (ns, id)),
                     reader.uid_out(p.uid), reader.gid_out(p.gid), reader.uid_out(p.cuid), reader.gid_out(p.cgid), seg.atime, seg.dtime, seg.ctime,
                     seg.mem.len(), 0
                 )
@@ -811,8 +849,61 @@ mod tests {
             Err(Errno::ERANGE)
         );
         ipc.undo.insert((10, id), undo);
-        ipc.exit(10);
+        ipc.exit(10, 10);
         assert_eq!(ipc.sem.get(id).unwrap().1.vals, vec![0, 0]);
+    }
+
+    #[test]
+    fn sem_undo_exit_is_scoped_to_undo_list_id() {
+        let mut ipc = Ipc::default();
+        let root = Cred::root();
+        let user_ns = root.user_ns.clone();
+        let id = ipc
+            .sem
+            .get_or_create(
+                77,
+                IPC_CREAT | 0o600,
+                (&root, &user_ns),
+                16,
+                |_| Ok(()),
+                || SemSet::new(1),
+            )
+            .unwrap();
+        let mut u1 = vec![0i32; 1];
+        let mut u2 = vec![0i32; 1];
+        {
+            let (_, s) = ipc.sem.get_mut(id).unwrap();
+            s.apply(
+                &[SemOp {
+                    num: 0,
+                    op: 3,
+                    flg: SEM_UNDO,
+                }],
+                &mut u1,
+                10,
+            )
+            .unwrap();
+            s.apply(
+                &[SemOp {
+                    num: 0,
+                    op: 5,
+                    flg: SEM_UNDO,
+                }],
+                &mut u2,
+                20,
+            )
+            .unwrap();
+        }
+        ipc.undo.insert((1, id), u1);
+        ipc.undo.insert((2, id), u2);
+        assert_eq!(ipc.sem.get(id).unwrap().1.vals, vec![8]);
+        // Exiting undo list 1 reverts only its +3 adjustment, leaving list 2's +5 intact
+        ipc.exit(1, 10);
+        assert_eq!(ipc.sem.get(id).unwrap().1.vals, vec![5]);
+        assert!(ipc.undo.contains_key(&(2, id)));
+        ipc.exit(2, 20);
+        assert_eq!(ipc.sem.get(id).unwrap().1.vals, vec![0]);
+        assert!(ipc.undo.is_empty());
     }
 
     #[test]
@@ -830,5 +921,71 @@ mod tests {
         assert_eq!(t.sem, [i32::MAX as u64, 2, 3, 4]);
         // Unsigned longs on Linux too
         assert_eq!(t.write(b"shmmax", b"18446744073709551615"), Ok(()));
+    }
+
+    #[test]
+    fn proc_listing_translates_pids_and_shows_shm_locked() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let ns_id = k.init_ns.ipc.id;
+        let root = Cred::root();
+        let user_ns = root.user_ns.clone();
+
+        let msg_id = k
+            .ipc_mut(ns_id)
+            .msg
+            .get_or_create(
+                111,
+                IPC_CREAT | 0o600,
+                (&root, &user_ns),
+                16,
+                |_| Ok(()),
+                || Ok(MsgQueue::new(16384)),
+            )
+            .unwrap();
+        {
+            let (_, q) = k.ipc_mut(ns_id).msg.get_mut(msg_id).unwrap();
+            q.lspid = 42;
+            q.lrpid = 99;
+        }
+
+        let shm_id = k
+            .ipc_mut(ns_id)
+            .shm
+            .get_or_create(
+                222,
+                IPC_CREAT | 0o600,
+                (&root, &user_ns),
+                16,
+                |_| Ok(()),
+                || {
+                    Ok(ShmSeg {
+                        mem: SharedMemory::new(4096)?,
+                        size: 4096,
+                        atime: 0,
+                        dtime: 0,
+                        ctime: 0,
+                        cpid: 42,
+                        lpid: 99,
+                    })
+                },
+            )
+            .unwrap();
+        k.ipc_mut(ns_id).shm.get_mut(shm_id).unwrap().0.mode |= SHM_LOCKED;
+
+        // Global tid 42 is local pid 7 in child_ns; global tid 99 is invisible (0)
+        let init_pid_ns = crate::pidns::PidNs::init();
+        let child_pid_ns = crate::pidns::PidNs::child(&init_pid_ns, user_ns);
+        crate::pidns::PidNs::register(&child_pid_ns, 42, &[7]).unwrap();
+
+        let msg_out = proc_listing(&k, ns_id, b"msg", &root, &child_pid_ns);
+        let msg_cols: Vec<&str> = msg_out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(msg_cols[5], "7");
+        assert_eq!(msg_cols[6], "0");
+
+        let shm_out = proc_listing(&k, ns_id, b"shm", &root, &child_pid_ns);
+        let shm_cols: Vec<&str> = shm_out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(shm_cols[2], "2600");
+        assert_eq!(shm_cols[4], "7");
+        assert_eq!(shm_cols[5], "0");
     }
 }

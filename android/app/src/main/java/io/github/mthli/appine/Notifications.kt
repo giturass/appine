@@ -155,22 +155,24 @@ internal class Notifications(private val service: TerminalService) {
     }
 
     /**
-     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. One notification per
-     * port.
+     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. Keyed by both guest
+     * and host port so remappings of the same guest port to different host ports do not overwrite
+     * each other's notification.
      */
     fun listen(line: String) {
         val fields = line.split('\t')
         if (fields.size != 3) return
         val comm = fields[0]
-        val port = fields[1].toIntOrNull() ?: return
-        val hostPort = fields[2].toIntOrNull() ?: return
+        val port = fields[1].toIntOrNull()?.takeIf { it in 0..65535 } ?: return
+        val hostPort = fields[2].toIntOrNull()?.takeIf { it in 0..65535 } ?: return
         val text = if (hostPort != port) {
             service.getString(R.string.listening_mapped, hostPort, port)
         } else {
             service.getString(R.string.listening_direct)
         }
         val title = service.getString(R.string.listening_title, comm, port)
-        manager.notify(LISTEN_NOTIFICATION_BASE + port, builder(NETWORK_CHANNEL_ID, title, text).build())
+        val (tag, id) = listenKey(port, hostPort)
+        manager.notify(tag, id, builder(NETWORK_CHANNEL_ID, title, text).build())
     }
 
     /**
@@ -374,8 +376,15 @@ internal class Notifications(private val service: TerminalService) {
         /** The notification that a kernel operation held the kernel lock too long ([stall]). */
         private const val STALL_NOTIFICATION_ID = 4
 
-        /** Listen notifications are numbered by port: 1000 + port, below [KILL_NOTIFICATION_BASE]. */
+        /**
+         * Listen notifications are keyed by `(tag = "listen:<guest>:<host>", id = 1000 + guest)`,
+         * keeping IDs below [KILL_NOTIFICATION_BASE] while letting the same guest port mapped to
+         * different host ports show separate notifications.
+         */
         private const val LISTEN_NOTIFICATION_BASE = 1000
+
+        internal fun listenKey(port: Int, hostPort: Int): Pair<String, Int> =
+            "listen:$port:$hostPort" to (LISTEN_NOTIFICATION_BASE + port)
 
         /**
          * Notifications of ended processes: one id per report, above every listen id, so neither a

@@ -30,7 +30,22 @@ chown 12:34 l1/d/x
 touch -d '2020-01-02 03:04:05' l1/f l1/d l1/mv
 python3 -c 'import os; os.setxattr("l1/f", "trusted.note", b"kept")'
 
+python3 - <<'PY'
+import mmap, os
+fd = os.open("l1/sparse", os.O_CREAT | os.O_RDWR, 0o600)
+os.ftruncate(fd, 3*4096)
+os.posix_fallocate(fd, 0, 4096)
+with mmap.mmap(fd, 3*4096, access=mmap.ACCESS_READ) as m:
+    assert m[8192] == 0
+PY
 mount -t overlay overlay -o lowerdir=l1:l2,upperdir=u,workdir=w,redirect_dir=follow m && echo "mount $?"
+chmod 640 m/sparse
+python3 - <<'PY'
+import os
+for name in ("l1/sparse", "u/sparse", "m/sparse"):
+    fd = os.open(name, os.O_RDONLY)
+    print("sparse copy", name, os.fstat(fd).st_blocks, os.lseek(fd, 0, os.SEEK_DATA))
+PY
 awk '$5 == "/tmp/ovl/m" {
     for (i = 7; $i != "-"; i++) {}
     split($(i + 3), o, ",")

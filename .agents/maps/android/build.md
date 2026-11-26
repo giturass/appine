@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU build inputs, Appine 1.1.0 packaging and retained signed-release/shared-storage contracts)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's Gradle-verified rootfs asset inventory, JVM unit tests and `scripts/release-sources` aports lookup alongside the retained signed-release/shared-storage contracts)
 
 ## Responsibilities
 
@@ -23,18 +23,14 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`, owning the workspace,
   process execution and cargo lookup), `RootfsAssetTask` (one `rootfsAsset` shared by all variants);
-  helpers `byVersion` (compares file names by their runs of digits, then by how many runs),
-  `newestFetched` (the newest file in `target/rootfs` whose name matches), `fetchedPackages`
-  (the newest APK for each requested name, null if any is missing), used by `bashPackages`
-  (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
-  and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
-  packages, null when any is missing), `bubblewrapPackages` (bubblewrap and libcap2, null when either
-  is missing), `openrcPackages` (the four new OpenRC packages), and `alpineBranch` (from the tarball's name, `edge` without one).
+  `rootfsAssets` reads the pinned filenames, digests and destinations from `fetch-rootfs --assets`.
+  `alpineBranch` derives the APK's Alpine branch from the pinned tarball name.
 - `BrowserAssetTask` builds the static guest browser client as a generated asset.
 
 ## Public entry points
 
-- Build: `./gradlew assembleDebug lintDebug` (what ordinary CI runs), `assembleRelease` (the optimized intermediate APK), `connectedDebugAndroidTest` (with
+- Build: `./gradlew assembleDebug lintDebug` (what ordinary CI runs), `testDebugUnitTest` (JVM unit tests),
+  `assembleRelease` (the optimized intermediate APK), `connectedDebugAndroidTest` (with
   `-Pandroid.testInstrumentationRunnerArguments.network=true` for the download of a distribution),
   `scripts/fetch-ghostty [dir]` (default `target/ghostty`), `scripts/release-sources [dir]` (default
   `target/release-sources`).
@@ -88,14 +84,14 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
   `androidx.biometric:biometric` 1.1.0 (including its merged biometric permission), `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
   `androidx.webkit:webkit` 1.18.0, `androidx.recyclerview:recyclerview` 1.2.1 and Material Components 1.14.0 (which
-  brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
+  brings AppCompat and androidx.activity); JVM unit tests use `junit:junit` 4.13.2
+  (`testImplementation`), and instrumentation tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
-- Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
-  since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
+- Assets: the pinned Alpine minirootfs tarball from `target/rootfs` (as `rootfs.tgz`,
+  since AAPT would unpack `.gz`), the pinned doas package as `doas.apk`, and bash's four packages under `bash/`
   with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
   ncurses so either bundle installs independently), bubblewrap/libcap2 under `bubblewrap/`, and OpenRC, openrc-user, ifupdown-ng and bridge under `openrc/`
-  (all by `byVersion`; `rootfsAsset` fails with "run
-  scripts/fetch-rootfs first" when any is missing), checked-in `notices/`, and
+  (`rootfsAsset` rejects a missing input or checksum mismatch and writes the verified bytes), checked-in `notices/`, and
   the terminal font (`fonts/`, `android/vtrender`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
 - SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
@@ -178,7 +174,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 - `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
   the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
-  (`cargo vendor --locked` of the whole workspace), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
+  (`cargo vendor --locked` of the locked Cargo workspace, required for offline `--locked` builds of
+  the shipped workspace archive), `virglrenderer-1.3.0.tar.gz`, `libghostty-vt-<version>.tar.gz` and
   `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
   `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
@@ -187,7 +184,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
   package's `.PKGINFO`) contains `GPL` (LGPL included; so bash, readline, procps-ng/libproc2 and
   libintl, bubblewrap, libcap2 and bridge, not doas, ncurses, utmps-libs or skalibs-libs),
   downloads each origin's
-  aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
+  aports directory at its commit (GitLab archive, trying `main/<origin>` then `community/<origin>`
+  until an `APKBUILD` is present), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
   mirror (the branch's directory, then `edge`); any miss or mismatch stops the script. APKBUILDs
   are never executed.
@@ -249,13 +247,8 @@ fetch/provisioning `android/setup`. CI orchestration remains `harness`.
 
 ## Confirmed bugs / technical debt
 
-- The Alpine tarball's checksum is checked only in `scripts/fetch-rootfs`.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
-- `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball and
-  packages while the APK bundles the newest ones in `target/rootfs`, so the two can differ; its
-  aports path is fixed to `main/`; and it vendors the whole workspace although its header speaks
-  of the crates linked into the app.
 
 ## Open questions
 

@@ -28,8 +28,8 @@ use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
 use crate::vfs::store::{Ino, mode};
 use crate::vfs::{
-    Dentry, Fs, Mount, MountId, Node, PropagationType, Pseudo, PseudoNode, Target, TmpfsParams,
-    Vfs, fuse, lock, ms, overlay,
+    Dentry, Fs, MntNs, Mount, MountId, Node, PropagationType, Pseudo, PseudoNode, Target,
+    TmpfsParams, Vfs, fuse, lock, ms, overlay,
 };
 
 const MS_REMOUNT: u64 = 0x20;
@@ -213,11 +213,18 @@ fn new_mount(
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;
     // A filesystem with a single instance cannot be mounted again on the root of its own mount
-    // (Linux's do_add_mount); mqueue has one instance per IPC namespace
+    // (Linux's do_add_mount); mqueue has one instance per IPC namespace and sysfs one per network
+    // namespace
+    let net = cx.ns().net;
     let same_instance = |m: &Mount| {
         m.fs == fs
             && (fs != Fs::Mqueue
                 || matches!(&m.root, Node::Pseudo(_, PseudoNode::MqRoot(n)) if *n == ipc.id))
+            && (fs != Fs::Sys
+                || vfs
+                    .sys_net_ns(m.id)
+                    .map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
+                    == net.id)
     };
     if !fs.new_instance()
         && let Some(id) = vfs.mount_root(&target)
@@ -267,20 +274,21 @@ fn new_mount(
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
+    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
     let (root, dev) = match fs {
         Fs::Mqueue => (
             Node::Pseudo(0, PseudoNode::MqRoot(ipc.id)),
             Some(vfs.mq_dev(ipc.id)),
         ),
+        Fs::Sys => (fs.root(), Some(vfs.sys_dev(&net))),
         // The root of cgroup2 is the root of the caller's cgroup namespace (Linux's
         // cgroup_get_tree)
         Fs::Cgroup => (
-            Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"")),
+            Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"", 0)),
             Some(fs.dev()),
         ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
     };
-    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
     let id = vfs.add_mount(
         fs,
         root,
@@ -524,16 +532,17 @@ fn visible_locks(cx: &Cx<'_>, fs: Fs, flags: u64) -> Result<u64, Errno> {
     }
     let vfs = cx.vfs()?;
     let mounts: Vec<Mount> = vfs.mounts().into_iter().filter(|m| m.ns == ns.id).collect();
+    let blocked: HashSet<MountId> = mounts
+        .iter()
+        .filter(|c| c.locks & lock::MOUNT != 0 && !c.point.as_ref().is_some_and(empty_mount_point))
+        .filter_map(Mount::parent)
+        .collect();
     let visible = mounts.iter().find(|m| {
         m.fs == fs
             && m.root == fs.root().in_mount(m.id)
             && (m.locks & lock::READONLY == 0 || flags & ms::RDONLY != 0)
             && (m.locks & lock::ATIME == 0 || m.flags & ATIME == flags & ATIME)
-            && !mounts.iter().any(|c| {
-                c.parent() == Some(m.id)
-                    && c.locks & lock::MOUNT != 0
-                    && !c.point.as_ref().is_some_and(empty_mount_point)
-            })
+            && !blocked.contains(&m.id)
     });
     match visible {
         Some(m) => Ok(m.locks & (lock::READONLY | lock::ATIME)),
@@ -611,7 +620,7 @@ fn bind(
     let plan = plan_copies(&vfs, &view, &inside, &src)?;
     let size = 1 + plan.len();
     let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?;
-    let id = vfs.add_mount(
+    let id = vfs.add_mount_unattached(
         m.fs,
         src.clone(),
         (target, at),
@@ -750,6 +759,7 @@ fn remount(
     if let Some((data, _)) = data
         && m.fs == Fs::Tmpfs
     {
+        super::fs::evict_unlinked_tmpfs(cx.kr(), &vfs);
         remount_tmpfs(&vfs, m.dev, data)?;
     }
     if let Some((_, sb)) = data {
@@ -1005,51 +1015,72 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
     let o_path = crate::fd::oflags::O_PATH;
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
+    let attached_ns = matches!(node, Node::Pseudo(_, PseudoNode::NsFile(..)))
+        && vfs
+            .mount(node.mnt())
+            .is_some_and(|m| m.fs == Fs::Nsfs && m.root == node);
     let file = if clone {
-        if vfs.propagation(node.mnt()).unbindable {
-            return Err(Errno::EINVAL);
-        }
-        check_mnt(cx, &vfs, node.mnt())?;
-        if flags & AT_RECURSIVE == 0 && has_locked_children(&vfs, &view, &node) {
-            return Err(Errno::EINVAL);
-        }
-        let dir = vfs.is_dir(&view, &node)?;
-        // The anonymous namespace counts against max_mnt_namespaces too (alloc_mnt_ns)
-        let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
-        let euid = cx.cred().euid;
-        super::ns::check_counts(cx.k(), &[Counted::Mnt], &owner, euid)?;
-        let ns = vfs.anon_ns(owner.clone());
-        super::ns::count(cx.k(), Counted::Mnt, &owner, euid, ns.clone());
-        let view = cx.view(&vfs);
-        // Note the mounts inside the source before mounting (as in bind)
-        let inside = if flags & AT_RECURSIVE != 0 {
-            vfs.mounts()
+        let (ns, id) = if let Node::Pseudo(_, PseudoNode::NsFile(kind, ns_id)) = node
+            && !attached_ns
+        {
+            // Namespace files not rooted at an attached nsfs mount (procfs, detached, or
+            // NS_GET_USERNS/NS_GET_PARENT) live on Linux's internal `nsfs_mnt`: clone as an nsfs
+            // mount pinning the namespace. `mnt_ns_loop` is checked on attach in `move_tree`.
+            let pinned = super::ns::find(cx.kr(), Some(&vfs), kind, ns_id).ok_or(Errno::ENOENT)?;
+            let ns = alloc_anon_ns(cx, &vfs)?;
+            let id = vfs.clone_ns_mount(&node, pinned, ns.id);
+            (ns, id)
         } else {
-            Vec::new()
+            if vfs.propagation(node.mnt()).unbindable {
+                return Err(Errno::EINVAL);
+            }
+            // Linux 6.1's open_detached_copy skips check_mnt for nsfs files (`NSFS_MAGIC`).
+            if !attached_ns {
+                check_mnt(cx, &vfs, node.mnt())?;
+            }
+            if flags & AT_RECURSIVE == 0 && has_locked_children(&vfs, &view, &node) {
+                return Err(Errno::EINVAL);
+            }
+            let dir = vfs.is_dir(&view, &node)?;
+            let ns = alloc_anon_ns(cx, &vfs)?;
+            let view = cx.view(&vfs);
+            // Note the mounts inside the source before mounting (as in bind)
+            let inside = if flags & AT_RECURSIVE != 0 {
+                vfs.mounts()
+            } else {
+                Vec::new()
+            };
+            let plan = plan_copies(&vfs, &view, &inside, &node)?;
+            let id = vfs.clone_mount(&node, found.filter(|_| !dir && !attached_ns), ns.id)?;
+            vfs.add_copies(id, &plan);
+            (ns, id)
         };
-        let plan = plan_copies(&vfs, &view, &inside, &node)?;
-        let id = vfs.clone_mount(&node, found.filter(|_| !dir), ns.id)?;
-        vfs.add_copies(id, &plan);
         let file = crate::fd::OpenFile::new(crate::fd::FileKind::Path(node.in_mount(id)), o_path);
         file.borrow_mut().tree = Some(ns);
         cx.shared.fast_changed();
         file
     } else {
-        let path = vfs
-            .found_path(&view, &cx.root(), &node, found.as_ref())
-            .ok()
-            .map(std::rc::Rc::from);
+        let path = if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node
+            && !attached_ns
+        {
+            Some(Rc::from(view.name(*mnt, p)))
+        } else {
+            vfs.found_path(&view, &cx.root(), &node, found.as_ref())
+                .ok()
+                .map(Rc::from)
+        };
         crate::fd::OpenFile::with_path(crate::fd::FileKind::Path(node), o_path, path)
     };
+    file.borrow_mut().pin_fuse_path(&vfs)?;
     let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
-    Ok(cx.fds_mut().install(file, cloexec, 0)? as u64)
+    Ok(cx.install_fd(file, cloexec)? as u64)
 }
 
 /// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a
 /// directory fd (with `F_EMPTY_PATH`/`T_EMPTY_PATH` they may be the fd itself, with
 /// `F_SYMLINKS`/`T_SYMLINKS` the last symlink is followed), and the move works as `MS_MOVE`
-/// ([`move_tree`]). `MOVE_MOUNT_SET_GROUP` (putting the target in the source's peer group) is not
-/// implemented and always EINVAL, which Linux answers only when the source is not shared.
+/// ([`move_tree`]). With `MOVE_MOUNT_SET_GROUP` it instead copies `from`'s peer/slave sharing
+/// group to private mount `to` (Linux 6.1's `do_set_group`).
 pub(super) fn sys_move_mount(
     cx: &mut Cx<'_>,
     from: (i32, u64),
@@ -1066,9 +1097,58 @@ pub(super) fn sys_move_mount(
     let (src, _) = walk_at(cx, from, flags & F_EMPTY_PATH != 0, flags & F_SYMLINKS != 0)?;
     let target = walk_at(cx, to, flags & T_EMPTY_PATH != 0, flags & T_SYMLINKS != 0)?;
     if flags & SET_GROUP != 0 {
-        return Err(Errno::EINVAL);
+        return set_group(cx, &src, &target.0);
     }
     move_tree(cx, &src, target)
+}
+
+/// `move_mount(MOVE_MOUNT_SET_GROUP)` (Linux 6.1's `do_set_group`): copies the propagation peer
+/// group (or slave relationship, including shared-to-slave across different owning user
+/// namespaces) from attached shared/slave mount `src` to attached private mount `target` on the
+/// same filesystem instance whose root lies at or under `src`'s root.
+fn set_group(cx: &mut Cx<'_>, src: &Node, target: &Node) -> SysResult {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    let from = vfs
+        .mount_root(src)
+        .and_then(|id| vfs.mount(id))
+        .ok_or(Errno::EINVAL)?;
+    let to = vfs
+        .mount_root(target)
+        .and_then(|id| vfs.mount(id))
+        .ok_or(Errno::EINVAL)?;
+    let (Some(from_ns), Some(to_ns)) = (vfs.find_ns(from.ns), vfs.find_ns(to.ns)) else {
+        return Err(Errno::EINVAL);
+    };
+    if from_ns.anon || to_ns.anon {
+        return Err(Errno::EINVAL);
+    }
+    if !cx.cred().ns_capable(&from_ns.owner, cap::SYS_ADMIN)
+        || !cx.cred().ns_capable(&to_ns.owner, cap::SYS_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    if from.fs != to.fs || from.dev != to.dev {
+        return Err(Errno::EINVAL);
+    }
+    let to_in_from = to.root.clone().in_mount(from.id);
+    if to_in_from != from.root && !vfs.is_under(&view, &to_in_from, &from.root) {
+        return Err(Errno::EINVAL);
+    }
+    if to.prop.group != 0 || to.prop.master != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if from.prop.group == 0 && from.prop.master == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let prop = if from_ns.owner.id == to_ns.owner.id {
+        from.prop.of_bind()
+    } else {
+        from.prop.of_slave_copy()
+    };
+    vfs.set_mount_prop(to.id, prop);
+    cx.shared.fast_changed();
+    Ok(0)
 }
 
 /// mount_setattr(2) (Linux 6.1's `mount_setattr`, `build_mount_kattr`): changes the flags of a
@@ -1156,12 +1236,9 @@ pub(super) fn mount_setattr(
     )?;
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
-    // In the caller's namespace, or copied by open_tree and not yet attached
-    let anon = vfs
-        .mount_ns(id)
-        .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon);
-    if !anon {
+    // In the caller's namespace, or the root of a tree copied by open_tree and not yet attached
+    // (Linux 6.1's do_mount_setattr: exempt only a mount without a parent in an anonymous ns)
+    if anon_root_ns(&vfs, id).is_none() {
         check_mnt(cx, &vfs, id)?;
     }
     let bit = |a: u64, m: u64| if set & a != 0 { m } else { 0 };
@@ -1178,11 +1255,7 @@ pub(super) fn mount_setattr(
         | cleared(attr::NOEXEC, ms::NOEXEC)
         | cleared(attr::NODIRATIME, ms::NODIRATIME)
         | cleared(attr::NOSYMFOLLOW, ms::NOSYMFOLLOW);
-    let targets = if flags & AT_RECURSIVE != 0 {
-        vfs.subtree(id)
-    } else {
-        vec![id]
-    };
+    let recursive = flags & AT_RECURSIVE != 0;
     let changed = |m: &Mount| {
         let mut f = (m.flags & !clr_ms) | set_ms;
         if let Some(a) = atime {
@@ -1191,38 +1264,24 @@ pub(super) fn mount_setattr(
         f
     };
     // Every mount is checked before any changes (mount_setattr_prepare): locked flags stay, and
-    // a mount with files open for writing cannot become read-only (EBUSY, mnt_hold_writers)
-    if targets
-        .iter()
-        .filter_map(|&t| vfs.mount(t))
-        .any(|m| !m.keeps_locked(changed(&m)))
-    {
-        return Err(Errno::EPERM);
-    }
-    if set_ms & ms::RDONLY != 0 {
-        let writers = writers(cx.kr());
-        if targets
-            .iter()
-            .filter_map(|&t| vfs.mount(t))
-            .any(|m| m.flags & ms::RDONLY == 0 && writers.contains(&m.id))
-        {
-            return Err(Errno::EBUSY);
-        }
-    }
-    for &t in &targets {
-        vfs.update_mount(t, |m| m.flags = changed(m));
-    }
-    // The propagation type, after the flags (mount_setattr_commit)
-    if let Some(kind) = propagation_type(propagation) {
-        vfs.set_propagation(id, kind, flags & AT_RECURSIVE != 0);
-    }
+    // a mount with files open for writing cannot become read-only (EBUSY, mnt_hold_writers);
+    // flags and propagation then apply in one pass with a single fast-path rebuild.
+    vfs.set_mount_attrs(
+        id,
+        recursive,
+        changed,
+        set_ms & ms::RDONLY != 0,
+        || writers(cx.kr()),
+        propagation_type(propagation),
+    )?;
     cx.shared.fast_changed();
     Ok(0)
 }
 
-/// A path argument of the new mount API: resolves `path` from `dirfd` (with `empty` it may be
-/// empty, meaning `dirfd` itself), past mount points to the topmost mount. Returns the node and
-/// the dentry it was found at.
+/// A path argument of the new mount API (Linux 6.1's `user_path_at`): resolves `path` from
+/// `dirfd` (with `empty` it may be empty, meaning `dirfd` itself), following mount points only
+/// during component lookups (`Vfs::walk`), not when the target is reached without a lookup (an
+/// `AT_EMPTY_PATH` fd, `.`, `/`, or a magic link). Returns the node and the dentry it was found at.
 fn walk_at(
     cx: &Cx<'_>,
     (dirfd, path): (i32, u64),
@@ -1231,30 +1290,30 @@ fn walk_at(
 ) -> Result<(Node, Option<Dentry>), Errno> {
     let path = cx.mm().read_cstr(path, super::PATH_MAX - 1)?;
     let vfs = cx.vfs()?;
-    let (node, at) = if path.is_empty() {
+    if path.is_empty() {
         if !empty {
             return Err(Errno::ENOENT);
         }
-        let node = if dirfd == AT_FDCWD {
-            cx.cwd()
-        } else {
-            cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF)?
-        };
-        (node, None)
-    } else {
-        let start = start_dir(cx, dirfd, &path)?;
-        vfs.walk(
-            &cx.view(&vfs),
-            &cx.cred(),
-            &cx.root(),
-            &start,
-            &path,
-            follow,
-        )?
-    };
-    let top = vfs.mounted(node.clone());
-    let at = at.filter(|_| top == node);
-    Ok((top, at))
+        if dirfd == AT_FDCWD {
+            return Ok((cx.cwd(), None));
+        }
+        let file = cx.fds().get(dirfd)?;
+        let f = file.borrow();
+        let node = f.node().ok_or(Errno::EBADF)?;
+        let view = cx.view(&vfs);
+        let dir = vfs.is_dir(&view, &node).unwrap_or(true);
+        let at = f.current_dentry().filter(|_| !dir && !f.dentry_unlinked());
+        return Ok((node, at));
+    }
+    let start = start_dir(cx, dirfd, &path)?;
+    vfs.walk(
+        &cx.view(&vfs),
+        &cx.cred(),
+        &cx.root(),
+        &start,
+        &path,
+        follow,
+    )
 }
 
 // ---- pivot_root and umount2 ----
@@ -1346,11 +1405,19 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, target)?;
-    let node = lookup_at(cx, AT_FDCWD, &path, flags & UMOUNT_NOFOLLOW == 0)?;
-    if !may_mount(cx) {
+    let start = start_dir(cx, AT_FDCWD, &path)?;
+    let vfs = cx.vfs()?;
+    let node = vfs.resolve_mountpoint(
+        &cx.view(&vfs),
+        &cx.cred(),
+        &cx.root(),
+        &start,
+        &path,
+        flags & UMOUNT_NOFOLLOW == 0,
+    )?;
+    if !may_mount(cx) || (flags & MNT_FORCE != 0 && !cx.cred().capable(cap::SYS_ADMIN)) {
         return Err(Errno::EPERM);
     }
-    let vfs = cx.vfs()?;
     // Paths such as `.` and the cwd also unmount what is mounted on them (LOOKUP_MOUNTPOINT)
     let node = vfs.mounted(node);
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
@@ -1368,12 +1435,18 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         if busy(cx, &vfs, id) {
             return Err(Errno::EBUSY);
         }
-        // The first time only marks it; if nobody has used it, the next time unmounts it. Linux
-        // removes the mark once somebody has used it; here it is not removed
+        // The first time only marks it; if nobody has accessed it since (clearing the mark in
+        // Vfs::touch_mount), the next time unmounts it
         if !vfs.mount(id).is_some_and(|m| m.expiring) {
-            vfs.update_mount(id, |m| m.expiring = true);
+            vfs.set_expiring(id);
             return Err(Errno::EAGAIN);
         }
+    }
+    // Linux's fuse_umount_begin aborts the instance even if an open file keeps the mount busy.
+    if flags & MNT_FORCE != 0
+        && let Node::Fuse(_, root) = node
+    {
+        vfs.fuse().conn_of(root)?.borrow_mut().abort();
     }
     // The root of a mount tree cannot be unmounted; the mount the caller's root directory is in
     // can only be unmounted with MNT_DETACH (without it, Linux remounts the root filesystem
@@ -1400,27 +1473,31 @@ fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
 /// takes its mounts down, and the detached mounts whose last use were the thread's files or
 /// directories go ([`collect_released`]).
 pub(crate) fn collect_unused(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    super::fs::evict_unlinked_tmpfs(k, vfs);
     if vfs.released_detached() || vfs.has_dead_ns() {
         collect_now(k, vfs);
     }
 }
 
-/// At the end of a syscall: a detached mount this thread let go of the last use of goes
+/// At the end of a syscall: a detached mount this thread let go of the last use of, or an
+/// unattached anonymous mount namespace whose last open_tree fd closed, goes
 /// ([`crate::vfs::released`]; a lazily unmounted FUSE mount then aborts its connection, so its
 /// daemon exits).
 pub(super) fn collect_released(k: &crate::kernel::Kernel, vfs: &Vfs) {
-    if vfs.released_detached() {
+    super::fs::evict_unlinked_tmpfs(k, vfs);
+    if vfs.released_detached() || vfs.has_dead_ns() {
         collect_now(k, vfs);
     }
 }
 
-/// At the end of a syscall, once enough overlay names have been removed: drops the nodes
-/// behind them that nothing can use any more ([`overlay::Overlays::sweep`]). Kept are the nodes
-/// processes' roots and cwds are, mounts' roots and points, and inotify watches; open files and
-/// the programs processes run (`/proc/<pid>/exe`) hold their own ([`overlay::Hold`]). A system
-/// call another thread is in may hold nodes it looked up while it waits, so it keeps those
-/// removed since it began, unless it waits only on files it holds ([`waits_on_files_only`]): a
-/// long wait4, epoll_wait or read keeps nothing.
+/// At the end of a syscall, once enough overlay names have been removed or the live node cache
+/// outgrows its bound: drops removed and excess unused nodes nothing can use any more
+/// ([`overlay::Overlays::sweep`]). Kept are the nodes processes' roots and cwds are, mounts'
+/// roots, points and recorded file-mount directories (`Mount::at`, `Mount::root_at`), and inotify
+/// watches; open files and the programs processes run (`/proc/<pid>/exe`) hold their own
+/// ([`overlay::Hold`]). A system call another thread is in may hold nodes it looked up while it
+/// waits, so it keeps those removed or touched since it began, unless it waits only on files it
+/// holds ([`waits_on_files_only`]): a long wait4, epoll_wait or read keeps nothing.
 pub(super) fn sweep_overlays(cx: &Cx<'_>) {
     let Ok(vfs) = cx.vfs() else {
         return;
@@ -1476,19 +1553,21 @@ fn waits_on_files_only(nr: u64) -> bool {
 fn collect_now(k: &crate::kernel::Kernel, vfs: &Vfs) {
     match try_in_use(k) {
         Some(used) => vfs.collect(&used),
-        // Something is borrowed (not expected between syscalls): another time
-        None => crate::vfs::released(crate::vfs::ANY_MOUNT),
+        // Something is borrowed (not expected between syscalls): retry on the next pass on any
+        // thread
+        None => vfs.defer_collect(),
     }
 }
 
-/// The mounts that processes' root directories, cwds and open files are in.
+/// Mounts held by tasks and by files being transferred over AF_UNIX sockets.
 fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
-    try_in_use(k).expect("a task's directories or fd table are borrowed")
+    try_in_use(k).expect("mount holders are available during unmount")
 }
 
-/// [`in_use`], or None when some task's directories, fd table or open file is borrowed.
+/// [`in_use`], or None when a holder is borrowed during teardown.
 fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
     let mut used = HashSet::new();
+    let mut seen_mm = HashSet::new();
     for task in k.tasks.values() {
         let res = task.res.try_borrow().ok()?;
         {
@@ -1496,32 +1575,58 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
             used.insert(fs.root.mnt());
             used.insert(fs.cwd.mnt());
         }
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let mm = res.mm.try_borrow().ok()?;
+            mm.mapped_mounts(&mut used);
+        }
         let fds = res.fds.try_borrow().ok()?;
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
-            let file = file.try_borrow().ok()?;
-            if let Some(node) = file.node() {
-                used.insert(node.mnt());
-            }
-            if let crate::fd::FileKind::Pty(end) = &file.kind
-                && end.pin
-            {
-                used.insert(end.mnt);
-            }
+            note_file_mount(&file, &mut used)?;
+        }
+    }
+    for file in crate::unix::try_inflight_files(k)? {
+        note_file_mount(&file, &mut used)?;
+    }
+    for file in k.loops.try_backing_files()? {
+        note_file_mount(&file, &mut used)?;
+    }
+    for group in k.groups.values() {
+        let g = group.try_borrow().ok()?;
+        if !g.threads.is_empty()
+            && let Some(exe) = &g.exe
+            && let Some(mnt) = exe.mnt()
+        {
+            used.insert(mnt);
         }
     }
     Some(used)
 }
 
-/// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and
-/// synthetic files opened with write access in some process's fd table, or backing a loop device
-/// opened writable; devices, FIFOs and sockets do not count (`special_file`), nor do memfds,
-/// which Linux keeps on an internal tmpfs (here they have the store's root mount).
+fn note_file_mount(file: &crate::fd::FileRef, used: &mut HashSet<MountId>) -> Option<()> {
+    let file = file.try_borrow().ok()?;
+    if let Some(node) = file.node() {
+        used.insert(node.mnt());
+    } else if matches!(file.kind, FileKind::MessageQueue(_)) && !file.pseudo {
+        used.insert(file.mnt);
+    }
+    if let FileKind::Pty(end) = &file.kind
+        && end.pin
+    {
+        used.insert(end.mnt);
+    }
+    Some(())
+}
+
+/// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular,
+/// FUSE and synthetic files opened with write access in some process's fd table, or backing a loop
+/// device opened writable; devices, FIFOs and sockets do not count (`special_file`), nor do
+/// memfds, which Linux keeps on an internal tmpfs (here they have the store's root mount).
 fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
     let writes = |f: &crate::fd::OpenFile| {
         f.writable()
             && match &f.kind {
                 FileKind::Regular { ino, .. } => !k.seals.contains_key(ino),
-                FileKind::Proc { .. } => true,
+                FileKind::Proc { .. } | FileKind::Fuse(_) => true,
                 _ => false,
             }
     };
@@ -1553,9 +1658,8 @@ fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
 /// file of it is open for writing through any of its mounts, attached or detached ([`writers`]), or
 /// a file of it whose last name was removed is still in use (Linux's `s_remove_count`, inodes
 /// with no links not yet evicted): open (in an fd table, in flight in an AF_UNIX message, or
-/// backing a loop device), a task's root or cwd, or a running program. memfds do not count (as
-/// in [`writers`]); neither do files that are only mapped, whose mappings do not record their
-/// mount, nor FUSE files.
+/// backing a loop device), mapped in an address space (store, tmpfs, overlay, or FUSE), a task's
+/// root or cwd, or a running program. memfds do not count (as in [`writers`]).
 fn sb_busy(k: &crate::kernel::Kernel, vfs: &Vfs, dev: u64) -> bool {
     let of_dev = |mnt: MountId| vfs.mount_dev(mnt) == Some(dev);
     if writers(k).into_iter().any(of_dev) {
@@ -1567,36 +1671,60 @@ fn sb_busy(k: &crate::kernel::Kernel, vfs: &Vfs, dev: u64) -> bool {
                 !k.seals.contains_key(ino) && vfs.store().attrs(*ino).is_ok_and(|st| st.nlink == 0)
             }
             Node::Overlay(_, o) => !vfs.overlay().linked(*o),
-            Node::Pseudo(..) | Node::Fuse(..) => false,
+            Node::Fuse(_, f) => vfs.fuse().get(*f).is_some_and(|n| n.unlinked),
+            Node::Pseudo(..) => false,
         };
         gone && of_dev(node.mnt())
+    };
+    let file_removed = |file: &crate::fd::FileRef| {
+        file.try_borrow()
+            .is_ok_and(|f| f.node().is_some_and(|n| removed(&n)))
     };
     let mut files = k.open_files();
     files.extend(crate::unix::inflight_files(k));
     files.extend(k.loops.backing_files());
-    if files.iter().any(|f| {
-        f.try_borrow()
-            .is_ok_and(|f| f.node().is_some_and(|n| removed(&n)))
-    }) {
+    if files.iter().any(file_removed) {
         return true;
     }
-    k.tasks.values().any(|task| {
+    let mut seen_mm = HashSet::new();
+    let mut mapped = Vec::new();
+    let mut mapped_fuse = Vec::new();
+    for task in k.tasks.values() {
         let res = task.res.borrow();
-        let fs = res.fs.borrow();
+        {
+            let fs = res.fs.borrow();
+            if removed(&fs.root) || removed(&fs.cwd) {
+                return true;
+            }
+        }
+        if seen_mm.insert(Rc::as_ptr(&res.mm) as usize) {
+            let mm = res.mm.borrow();
+            mapped.clear();
+            mapped_fuse.clear();
+            mm.mapped_file_inos(&mut mapped, &mut mapped_fuse);
+            if mapped
+                .iter()
+                .any(|&(mnt, ino)| removed(&Node::Store(mnt, ino)))
+                || mapped_fuse.iter().any(file_removed)
+            {
+                return true;
+            }
+        }
         let exe = k
             .groups
             .get(&task.tgid)
             .and_then(|g| g.borrow().exe.clone());
-        removed(&fs.root)
-            || removed(&fs.cwd)
-            || exe.is_some_and(|e| {
-                e.node
-                    .is_some_and(|(mnt, ino)| removed(&Node::Store(mnt, ino)))
-                    || e.ovl
-                        .as_ref()
-                        .is_some_and(|(mnt, o, _)| removed(&Node::Overlay(*mnt, *o)))
-            })
-    })
+        if exe.is_some_and(|e| {
+            e.node
+                .is_some_and(|(mnt, ino)| removed(&Node::Store(mnt, ino)))
+                || e.ovl
+                    .as_ref()
+                    .is_some_and(|(mnt, o, _)| removed(&Node::Overlay(*mnt, *o)))
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- Shared helpers ----
@@ -1686,10 +1814,7 @@ fn plan_attach(
     for t in &targets {
         *added.entry(t.ns).or_default() += size;
     }
-    if added
-        .into_iter()
-        .any(|(ns, n)| n > 0 && vfs.count_in(ns) + n > cx.kr().mount_max)
-    {
+    if vfs.any_ns_over(&added, cx.kr().mount_max) {
         return Err(Errno::ENOSPC);
     }
     Ok(targets)
@@ -1712,15 +1837,16 @@ fn propagate(cx: &Cx<'_>, vfs: &Vfs, id: MountId, targets: &[Target]) {
 fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) -> SysResult {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
+    // Lift target to the topmost mount (Linux's lock_mount in do_move_mount): mount(2)'s MS_MOVE
+    // already lifted it, while move_mount(2)'s walk_at leaves no-lookup targets unlifted.
+    let top = vfs.mounted(target.clone());
+    let at = at.filter(|_| top == target);
+    let target = top;
     // The root of a mount tree is also mounted (on the invisible rootfs); when it is moved the
     // target is always inside it, which is the ELOOP below
     let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
-    let anon = vfs
-        .mount_ns(id)
-        .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon)
-        && vfs.mount(id).is_some_and(|m| m.point.is_none());
-    if !anon {
+    let anon_ns = anon_root_ns(&vfs, id);
+    if anon_ns.is_none() {
         check_mnt(cx, &vfs, id)?;
     }
     check_mnt(cx, &vfs, target.mnt())?;
@@ -1734,36 +1860,83 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     // A mount in a shared parent does not move, nor a tree holding an unbindable mount onto a
     // shared mount (do_move_mount)
     let parent = vfs.mount(id).and_then(|m| m.parent());
-    if !anon && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
+    if anon_ns.is_none() && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
         return Err(Errno::EINVAL);
     }
-    if vfs.propagation(target.mnt()).group != 0
-        && vfs
-            .subtree(id)
-            .iter()
-            .any(|&m| vfs.propagation(m).unbindable)
-    {
+    if vfs.propagation(target.mnt()).group != 0 && vfs.subtree_has_unbindable(id) {
+        return Err(Errno::EINVAL);
+    }
+    // Prevent mount-namespace reference cycles (Linux 6.1's mnt_ns_loop in do_move_mount): a mount
+    // pinning a mount namespace can only be attached into namespaces strictly older than it.
+    let subtree = vfs.subtree(id);
+    let min_pinned = subtree
+        .iter()
+        .filter_map(|&mid| match vfs.mount(mid)?.pin {
+            Some(NsRef::Mnt(pinned)) => Some(pinned.id),
+            _ => None,
+        })
+        .min();
+    let caller_ns = cx.mnt_ns();
+    if min_pinned.is_some_and(|p| caller_ns >= p) {
         return Err(Errno::EINVAL);
     }
     // An attached tree is in the namespace already; its copies count anyway
-    let targets = if anon {
-        let size = vfs.mount_ns(id).map_or(0, |ns| vfs.count_in(ns));
+    let targets = if let Some(ns_id) = anon_ns {
+        let size = vfs.count_in(ns_id);
         plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?
     } else {
         if vfs.is_under(&view, &target, src) {
             return Err(Errno::ELOOP);
         }
-        let size = vfs.subtree(id).len();
-        plan_attach(cx, &vfs, (&target, at.as_ref()), 0, size)?
+        plan_attach(cx, &vfs, (&target, at.as_ref()), 0, subtree.len())?
     };
-    if anon {
+    if min_pinned.is_some_and(|p| targets.iter().any(|t| t.ns >= p)) {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(ns_id) = anon_ns {
         vfs.attach_tree(id, (target, at), cx.mnt_ns());
+        // Free the emptied anonymous namespace immediately (Linux 6.1's do_move_mount calls
+        // put_mnt_ns) so it stops counting against max_mnt_namespaces while the open_tree fd
+        // stays open
+        release_anon_ns(cx.kr(), ns_id);
     } else {
         vfs.move_mount(id, Some((target, at)));
     }
     vfs.attached(id);
     propagate(cx, &vfs, id, &targets);
     Ok(0)
+}
+
+/// Allocates and accounts an anonymous mount namespace for `open_tree(OPEN_TREE_CLONE)`
+/// (`alloc_mnt_ns` counts against `max_mnt_namespaces`).
+fn alloc_anon_ns(cx: &mut Cx<'_>, vfs: &Vfs) -> Result<Rc<MntNs>, Errno> {
+    let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
+    let euid = cx.cred().euid;
+    super::ns::check_counts(cx.k(), &[Counted::Mnt], &owner, euid)?;
+    let ns = vfs.anon_ns(owner.clone());
+    super::ns::count(cx.k(), Counted::Mnt, &owner, euid, ns.clone());
+    Ok(ns)
+}
+
+/// If `id` is the parentless root of an unattached anonymous (`open_tree`) namespace, returns
+/// that namespace's id (Linux 6.1's `is_anon_ns` + `!mnt_has_parent`).
+fn anon_root_ns(vfs: &Vfs, id: MountId) -> Option<u64> {
+    let m = vfs.mount(id)?;
+    (m.point.is_none() && vfs.find_ns(m.ns).is_some_and(|ns| ns.anon)).then_some(m.ns)
+}
+
+/// Drops the anonymous mount namespace `ns_id` from any open `open_tree(OPEN_TREE_CLONE)` file
+/// once its mounts have been attached into a real namespace.
+fn release_anon_ns(k: &crate::kernel::Kernel, ns_id: u64) {
+    let mut files = k.open_files();
+    files.extend(crate::unix::inflight_files(k));
+    for file in files {
+        if let Ok(mut f) = file.try_borrow_mut()
+            && f.tree.as_ref().is_some_and(|ns| ns.id == ns_id)
+        {
+            f.tree = None;
+        }
+    }
 }
 
 /// Whether mounts may be changed (Linux's `may_mount`): `CAP_SYS_ADMIN` in the owner (a user

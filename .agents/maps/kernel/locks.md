@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint lease-break-time sysctl reference to kernel/sysctl)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: blocked flock waiters and lease acquisition order in `/proc/locks`)
 
 ## Responsibilities
 
@@ -20,16 +20,20 @@
 Root: `core/kernel/src/locks.rs`, `syscall/lease.rs`, and in `syscall/fs.rs` `flock` and the
 fcntl lock commands (`record_lock`).
 
-Outside the module: closing fds and open files, which call `locks::closed`, and the opens and
-truncations that call `break_leases` (`kernel/files`); the lock keys of overlay and FUSE nodes
+Outside the module: closing fds and open files, which call `locks::closed`, and opens calling
+`break_leases` (`kernel/files`), plus truncations calling `break_leases` (`kernel/fileio`); the lock keys of overlay and FUSE nodes
 (`lock_ino`, `kernel/files`); owners and the signals a lease break sends (`kernel/files`'
 `F_SETOWN`, `kernel/signal`); the procfs files that show the listings (`kernel/procfs`).
 
 ## Key types
 
-- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, ranges, taker's pid, waiters),
-  `FlockHolder`, `Lease` (with its setter's pid); leases are registered by inode in
-  `Kernel::leases`.
+- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, taking `file: Weak<OpenFile>`,
+  ranges, taker's pid, acquisition `seq`, per-thread `Waiter`s keyed by `tid`).
+- `Flocks` stores `FlockHolder`s with acquisition sequence numbers and per-thread `FlockWaiter`s
+  with the requested mode, a weak open file reference and the requester's tgid.
+- `Kernel::leases` registers each `Lease` by inode. A lease keeps its setter's pid and acquisition
+  sequence number across type changes.
+- `Flocks` and the record-lock table use the same `LockKey` for filesystem nodes, pipes, sockets and devpts inodes.
 - `FdTable::holds_locks`, and lock ownership in `OpenFile` (`kernel/files`).
 
 ## Public entry points
@@ -45,10 +49,19 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 - All in-process. Locks key on the store inode (bind mounts share them), on an overlay node with
   the top bit set, or on a FUSE node's key (top two bits; `OpenFile::lock_ino`), the daemon never
-  asked; leases key on the store inode behind a regular file (FUSE files `EINVAL`). The host
+  asked; leases key on `lease::key_of` — the overlay node's key (`overlay::key`) for overlay
+  regular files so leases survive copy-up and break before copy-up on write opens and truncations,
+  or the store inode otherwise (FUSE files `EINVAL`). The host
   `flock` is used only by the store itself. `flock` and fcntl locks are separate tables.
-- `flock`: one entry per open file; relocking converts; `LOCK_NB` `EAGAIN`; released on `LOCK_UN`
-  or when the open file goes. On an `O_PATH` fd it is `EBADF`.
+- The ends of an anonymous pipe share one pipefs lock key. A socket has its own sockfs key.
+  PTYs opened through a store or overlay device node use that node's lock key. Direct devpts
+  opens key on the instance and inode, so independent opens of its ptmx conflict, as do
+  independent opens of the same slave. Named FIFOs keep their filesystem keys.
+- `flock`: each open file owns its lock, including through dup or fork. Conversion drops the old
+  mode before trying the new one, including on `LOCK_NB` failure (`EAGAIN`). Unlock or the last
+  close releases the lock. Dead holders and keys are swept as the table grows. On an `O_PATH` fd
+  flock is `EBADF`. A blocking request registers its thread while waiting and clears the waiter
+  on acquisition, interruption or a wait error.
 - POSIX locks belong to the fd table and go with any close of the file in that table (close,
   close_range, dup2 replacement, close-on-exec, seccomp addfd); OFD locks belong to the open file;
   both kinds share one table and conflict. Ranges follow `flock64_to_posix_lock`: a start past
@@ -56,8 +69,9 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
   (`EOVERFLOW` past it), 0 means to the end and beyond, a negative one covers the bytes before the
   start (`EINVAL` below 0). Ranges split and merge; `F_SETLKW` detects deadlocks for POSIX requests
   only (`EDEADLK`; the chain may pass through OFD waiters, which Linux excludes) and waits on the
-  lock channel. Files without a store inode (anonymous pipes, sockets, PTYs, synthetic files,
-  eventfds) succeed silently and `F_GETLK` reports unlocked; named FIFOs lock normally.
+  lock channel. Closing an `O_PATH` descriptor preserves POSIX locks. Files without a lock key
+  (for example eventfds) still succeed silently and `F_GETLK` reports unlocked. The record-lock
+  table reclaims dead owners across keys as it grows.
 - Clone without `CLONE_FILES` copies the slots and resets `holds_locks`; a copied table (also from
   unshare, execve or `CLOSE_RANGE_UNSHARE`) is a new owner of POSIX locks, so an unshared table
   keeps its locks. The last reference to an open file wakes lock waiters when it held locks.
@@ -69,22 +83,28 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 ### Listings
 
-- Listing (6.1's `lock_get_status`): every flock, POSIX and OFD lock and lease, in that order and
-  by inode, as `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
+- Listing (6.1's `lock_get_status`): `/proc/locks` lists every flock, POSIX and OFD lock and lease
+  newest first by a shared acquisition sequence as
+  `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
   `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken shows its target type),
   the taker's pid (the caller's tgid at flock, F_SETLK or F_SETLEASE; -1 for OFD locks), the device
-  and inode fstat shows through the holding open file (an overlay node's shown inode), and the
-  range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`. `/proc/locks` numbers lines by
-  position, leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
-  numbers from 1 the locks held through that open file, a POSIX lock through the open file of its
-  table's lowest fd on the file.
+  and inode fstat shows through the holding open file (the shown inode on overlayfs, the cached
+  inode on FUSE, the pipefs inode for an anonymous pipe, sockfs or PTY fstat identity for those
+  files), and the range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`, with blocked
+  `flock`, `F_SETLKW` and `F_OFD_SETLKW` waiters immediately below their first conflicting live
+  lock (`<pos>: -> ...`, omitted when either the blocker or waiter is invisible in the reader's
+  pid namespace).
+  `/proc/locks` numbers lines by position, omitting entries without a shown identity without
+  advancing the count and leaving out (numbers included) locks whose pid the reader's procfs cannot
+  see; fdinfo numbers from 1 (in per-inode order: flock, POSIX/OFD, lease) the held locks taken
+  through that open file (`fl_file`, matching Linux's `show_fd_locks`).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens and truncation
-  (`break_leases`), the last reference to an open file.
+- `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens (`break_leases`),
+  the last reference to an open file; `kernel/fileio`: truncation (`break_leases`).
 - `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; `kernel/sysctl`: the `lease-break-time`
   sysctl.
 - `kernel/overlay` and `kernel/fuse`: the nodes whose keys locks use.
@@ -104,18 +124,7 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 ## Confirmed bugs / technical debt
 
-- **Leases are lost across an overlay copy-up:** a lease taken through an overlay before copy-up
-  sits on the lower inode; the write open or truncate that copies up breaks leases on the upper
-  inode without notifying the holder, and once `follow_copy_up` moves the holder's description,
-  `F_GETLEASE` reports `F_UNLCK` while `F_SETLEASE(F_UNLCK)` fails with `EAGAIN` until close.
-  Linux keys leases on the overlay file's own inode.
-- **Locks on inode-less files are no-ops:** `flock` and `F_SETLK` on anonymous pipes, sockets and
-  PTYs succeed without locking, though processes sharing an inherited fd can coordinate with them
-  on Linux.
-- **Lock listings differ:** `/proc/locks` goes by kind and inode where Linux lists newest first
-  (lslocks prints another order) and leaves out `F_SETLKW` waiters (Linux's `->` lines); a POSIX
-  lock shows in the fdinfo of its table's lowest fd on the file, not of the open file that took
-  it; locks on FUSE files are left out of both, still using up `/proc/locks` line numbers.
+- None recorded.
 
 ## Open questions
 
@@ -123,5 +132,5 @@ truncations that call `break_leases` (`kernel/files`); the lock keys of overlay 
 
 ## To verify
 
-- None beyond the full mapping's: the 6.1 comparisons here were checked from knowledge of the
-  kernel, not against its source.
+- The full mapping's Linux 6.1 comparisons still need source verification outside flock waiter
+  conflicts and in-place lease type changes.

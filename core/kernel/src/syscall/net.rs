@@ -6,6 +6,7 @@
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
 //! times out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,8 @@ use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
     NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
-    SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
+    SOCK_STREAM, Socket, TCP_CLOSE, TCP_INFO, TCP_LISTEN, ip_of, is_local, is_stub, map_proto,
+    mappable, servfail, stub_addr, translate_peer,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -29,6 +31,9 @@ pub(crate) type SocketRef = Rc<RefCell<Socket>>;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_NONBLOCK: u32 = oflags::O_NONBLOCK;
 const SOCK_CLOEXEC: u32 = oflags::O_CLOEXEC;
+const SOL_IP: i32 = 0;
+const IP_TOS: i32 = 1;
+const IP_TTL: i32 = 2;
 const IPPROTO_ICMP: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_IPV6: i32 = 41;
@@ -52,6 +57,17 @@ const NETLINK_CAP_ACK: i32 = 10;
 const NETLINK_EXT_ACK: i32 = 11;
 const NETLINK_GET_STRICT_CHK: i32 = 12;
 const SCM_CREDENTIALS: i32 = 2;
+const SO_REUSEADDR: i32 = 2;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_PRIORITY: i32 = 12;
+const SO_LINGER: i32 = 13;
+const SO_REUSEPORT: i32 = 15;
+const SO_RCVLOWAT: i32 = 18;
+const SO_BINDTODEVICE: i32 = 25;
+const SO_BINDTOIFINDEX: i32 = 62;
+const SO_ACCEPTCONN: i32 = 30;
+const DROP_TCP: &[u8] = &[6, 0, 0, 0, 0, 0, 0, 0];
 const SO_TYPE: i32 = 3;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
@@ -81,7 +97,7 @@ const POLLERR: i16 = 0x008;
 /// The largest sockaddr length (`sockaddr_storage`).
 const SOCKADDR_MAX: usize = 128;
 /// The most bytes per send or receive.
-const MSG_MAX: usize = 1 << 20;
+pub(super) const MSG_MAX: usize = 1 << 20;
 
 // ---- Creating sockets ----
 
@@ -94,7 +110,8 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
     let net = cx.task.ns.borrow().net.clone();
     let owner = net.owner.clone();
     let net = net.host_net.is_some().then_some(net);
-    let sock = match domain {
+    let cred = cx.cred();
+    let mut sock = match domain {
         AF_INET | AF_INET6 => {
             // A raw socket needs CAP_NET_RAW over the network namespace's owner (Linux's
             // inet_create: a wrong protocol number is reported first, left to the host). The raw
@@ -112,7 +129,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             // ICMP socket would not match up (on EPERM they fall back to ping sockets)
             if base == SOCK_RAW
                 && (1..256).contains(&protocol)
-                && (!icmp || !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW))
+                && (!icmp || !cred.ns_capable(&owner, crate::cred::cap::NET_RAW))
             {
                 return Err(Errno::EPERM);
             }
@@ -132,7 +149,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                     let _ = appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes());
                 }
                 let tap = crate::rawicmp::tap_for(cx.k(), &net)?;
-                s.icmp = Some(crate::rawicmp::RawIcmp::new(domain, tap));
+                let mut raw = crate::rawicmp::RawIcmp::new(domain, tap);
+                raw.sync_rcvbuf(fd);
+                s.icmp = Some(raw);
                 // The timer thread watches aggregation points for waiters in poll and epoll: this
                 // one may be new, so wake it
                 crate::kernel::signal_later(&cx.shared.timers);
@@ -141,6 +160,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                 s.proto = protocol;
             }
             s.net = net;
+            s.euid = cred.euid;
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
@@ -177,8 +197,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         }
         _ => return Err(Errno::EAFNOSUPPORT),
     };
+    sock.set_owner(cred.fsuid, cred.fsgid);
     let sock = Rc::new(RefCell::new(sock));
-    if matches!(&*sock.borrow(), Socket::Netlink(s) if s.protocol == NETLINK_ROUTE) {
+    if matches!(&*sock.borrow(), Socket::Netlink(_)) {
         let all = &mut cx.k().rtnl_sockets;
         all.retain(|w| w.strong_count() > 0);
         all.push(Rc::downgrade(&sock));
@@ -253,58 +274,47 @@ pub(super) fn socketpair(
 
 // ---- Binding, listening, connecting, accepting ----
 
-/// Whether two host socket addresses name the same address (family and address, not the port).
-fn same_host(a: &[u8], b: &[u8]) -> bool {
-    match (a.get(..2), b.get(..2)) {
-        (Some(fa), Some(fb)) if fa == fb => match u16::from_le_bytes([fa[0], fa[1]]) as i32 {
-            AF_INET => a.get(4..8) == b.get(4..8),
-            AF_INET6 => a.get(8..24) == b.get(8..24),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
-    if let Socket::Netlink(s) = &mut *sock.borrow_mut() {
-        return netlink_bind(cx, s, &addr).map(|()| 0);
+    if matches!(&*sock.borrow(), Socket::Netlink(_)) {
+        return netlink_bind(cx, &sock, &addr).map(|()| 0);
     }
-    let kind = match &*sock.borrow() {
-        Socket::Inet(s) => Some((s.family, s.raw)),
-        _ => None,
-    };
-    let addr = match kind {
-        Some((family, raw)) => inet_bind_addr(family, raw, addr)?,
-        None => addr,
-    };
-    // In a new network namespace, translate to the host address first (EADDRNOTAVAIL when it is
-    // not a local address)
-    let (net, icmp6, raw) = match &*sock.borrow() {
-        Socket::Inet(s) => (s.net.clone(), s.icmp6(), s.icmp.is_some()),
-        _ => (None, false, false),
+    let (mut addr, net, icmp6, raw) = {
+        let socket = sock.borrow();
+        let Socket::Inet(s) = &*socket else {
+            unreachable!("inet bind")
+        };
+        let addr = inet_bind_addr(s.family, s.raw, addr)?;
+        let raw = s.icmp.is_some();
+        // raw_bind / rawv6_bind check the socket state before resolving the local address.
+        if raw && s.peer.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        (addr, s.net.clone(), s.icmp6(), raw)
     };
     // Raw sockets have no port (Linux's raw_bind ignores it). The host's ping socket, however,
     // takes it as the echo number: busybox's traceroute binds the receiving socket to the sending
     // socket's address (got from getsockname, with the port), so the two would share one number
     // and replies would arrive on the other one
-    let mut addr = addr;
-    if raw && addr.len() >= 4 {
+    if raw {
         addr[2..4].fill(0);
     }
     let w = cx.kr().world();
     let me = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
     let mapped = crate::netns::to_host(&w, &me, &addr, crate::netns::Use::Bind, icmp6)?;
+    if raw {
+        bind_raw(cx, &sock, &mapped.addr, &addr, mapped.vaddr)?;
+        return Ok(0);
+    }
     // In a new network namespace a datagram socket binding the wildcard address with port 0
     // (busybox's ping and Java's DatagramSocket do this): bind the wildcard address on the host
     // too, otherwise it cannot send to the outside (Socket::wide)
     let wide = net.is_some()
         && !icmp6
-        && !raw
         && matches!(&*sock.borrow(), Socket::Inet(s) if s.ty == SOCK_DGRAM)
         && crate::netns::is_any(&addr)
         && port_of(&addr) == Some(0);
@@ -340,39 +350,87 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         Socket::Inet(s) => {
             // Identify again which interface the traffic counts on (connect does the same)
             s.route = None;
+            if s.net.is_some() && !s.raw {
+                // Linux's __inet6_bind rejects IPv4-mapped addresses when IPV6_V6ONLY is set.
+                if s.family == AF_INET6 && s.v6only && !ipv6_proper(&addr) {
+                    return Err(Errno::EINVAL);
+                }
+                // Linux's inet_bind / inet6_bind rejects rebinding a socket that already holds a
+                // port before running conflict checks.
+                if s.bound
+                    && appine_hal::net::sockname(s.fd, false)
+                        .is_ok_and(|cur| port_of(&cur) != Some(0))
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
             // Ports below 1024 move to another one when the host does not let the original be
             // bound (crate::portmap); ports bound explicitly in a new network namespace always
-            // move (so the port is not taken on the host, and the outer namespace and other
-            // namespaces can still bind it)
+            // move into the namespace's binding table so guest-level conflicts are enforced by
+            // guest address and distinct guest addresses (such as 127.0.0.1 vs a virtual IP) get
+            // distinct host ports.
             let own = s.net.is_some() && !wide;
             match port_of(&host_addr)
                 .filter(|&p| mappable(s) && p != 0 && (own || map.borrow().maps(p)))
             {
                 Some(port) if own => {
-                    let fd = s.fd;
-                    let try_bind = |h: u16| {
-                        let mut a = host_addr.clone();
-                        set_port(&mut a, h);
-                        appine_hal::net::bind(fd, &a)
+                    let net = s.net.clone().expect("own requires s.net");
+                    let proto = map_proto(s);
+                    let baddr = crate::netns::BindAddr::from_guest(&addr).ok_or(Errno::EINVAL)?;
+                    let reuseaddr = guest_reuseaddr(s);
+                    let reuseport = guest_reuseport(s);
+                    let v6only = s.family == AF_INET6 && s.v6only;
+                    let req = crate::netns::BindReq {
+                        proto,
+                        guest_port: port,
+                        addr: baddr,
+                        v6only,
+                        reuseaddr,
+                        reuseport,
+                        euid: s.euid,
+                        bound_dev_if: s.bound_dev_if,
                     };
-                    let bound = || {
-                        appine_hal::net::sockname(fd, false)
+                    if crate::netns::bind_conflict(&net, &req, None) {
+                        return Err(Errno::EADDRINUSE);
+                    }
+                    let host_ip = crate::netns::host_ipv4(&host_addr);
+                    let target_port =
+                        crate::netns::shared_host_port(&net, &req, host_ip).unwrap_or(0);
+                    let mut a = host_addr.clone();
+                    set_port(&mut a, target_port);
+                    appine_hal::net::bind(s.fd, &a).map_err(Errno)?;
+                    let host = if target_port != 0 {
+                        target_port
+                    } else {
+                        appine_hal::net::sockname(s.fd, false)
                             .ok()
                             .and_then(|a| port_of(&a))
+                            .ok_or(Errno::EADDRINUSE)?
                     };
-                    // An IPv6-only binding gets a host port of its own (crate::portmap::bind_any)
-                    let v6only = s.family == AF_INET6 && s.v6only && ipv6_proper(&addr);
-                    let (host, lease) = crate::portmap::bind_any(
-                        &map,
-                        ns_key(s),
-                        map_proto(s),
+                    let id = crate::netns::add_binding(
+                        &net,
                         port,
-                        v6only,
-                        try_bind,
-                        bound,
-                    )?;
-                    s.lease = Some(lease);
+                        crate::netns::NewBinding {
+                            proto,
+                            addr: baddr,
+                            v6only,
+                            reuseaddr,
+                            reuseport,
+                            euid: s.euid,
+                            bound_dev_if: s.bound_dev_if,
+                            listening: proto == IPPROTO_UDP,
+                            accepted: false,
+                            host_ip,
+                            host_port: host,
+                            wide: false,
+                        },
+                    );
+                    s.listener = Some(id);
                     s.local_map = Some((port, host));
+                    s.bound = true;
+                    s.any = crate::netns::is_any(&addr);
+                    s.vaddr = mapped.vaddr;
+                    s.wide = false;
                     remap = true;
                 }
                 Some(port) => {
@@ -388,7 +446,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                             .and_then(|a| port_of(&a))
                     };
                     let (host, lease, new) =
-                        crate::portmap::bind(&map, ns_key(s), map_proto(s), port, try_bind, bound)?;
+                        crate::portmap::bind(&map, map_proto(s), port, try_bind, bound)?;
                     if new && host != port {
                         let proto = if map_proto(s) == IPPROTO_TCP {
                             "tcp"
@@ -404,20 +462,16 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     s.lease = Some(lease);
                     s.local_map = Some((port, host));
                 }
-                // A raw socket may be bound again (raw_bind), but its host ping socket refuses a
-                // second bind: binding the address it already has succeeds without one
-                None if s.icmp.is_some()
-                    && appine_hal::net::sockname(s.fd, false).is_ok_and(|cur| {
-                        port_of(&cur) != Some(0) && same_host(&cur, &host_addr)
-                    }) => {}
-                None => appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?,
-            }
-            if s.net.is_some() {
-                s.bound = true;
-                s.any = crate::netns::is_any(&addr);
-                s.vaddr = mapped.vaddr;
-                s.wide = wide;
-                register_udp(s);
+                None => {
+                    appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?;
+                    if s.net.is_some() {
+                        s.bound = true;
+                        s.any = crate::netns::is_any(&addr);
+                        s.vaddr = mapped.vaddr;
+                        s.wide = wide;
+                        claim_ephemeral(s, Some(&addr));
+                    }
+                }
             }
             // A UDP socket with a bound port in the boot namespace: when PREROUTING has a DNAT,
             // forward what comes from outside
@@ -441,25 +495,212 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     Ok(0)
 }
 
+/// Linux permits repeated binds on an unconnected raw socket. Its host ping socket
+/// permits only the first, so a change of host address needs a replacement fd.
+fn bind_raw(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    host_addr: &[u8],
+    addr: &[u8],
+    vaddr: Option<[u8; 4]>,
+) -> Result<(), Errno> {
+    let replacement = {
+        let socket = sock.borrow();
+        let Socket::Inet(s) = &*socket else {
+            unreachable!("raw ICMP socket")
+        };
+        let current = appine_hal::net::sockname(s.fd, false).map_err(Errno)?;
+        if port_of(&current) == Some(0) {
+            appine_hal::net::bind(s.fd, host_addr).map_err(Errno)?;
+            None
+        } else if same_host(&current, host_addr) {
+            None
+        } else {
+            let new = rebind_raw_host_fd(s, host_addr)?;
+            let (old, family, tap) = (s.fd, s.family, s.icmp.as_ref().unwrap().tap.clone());
+            // Dispatch may borrow any receiver, including this socket.
+            drop(socket);
+            take_errors(cx, &tap, old);
+            crate::rawicmp::replace_source(&tap, sock, old, new.as_raw_fd(), family)?;
+            Some(new)
+        }
+    };
+    let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+        unreachable!("raw ICMP socket")
+    };
+    if let Some(new) = replacement {
+        let old = std::mem::replace(&mut s.fd, new.into_raw_fd());
+        s.icmp.as_mut().unwrap().sync_rcvbuf(s.fd);
+        appine_hal::net::close(old);
+    }
+    s.route = None;
+    s.any = s.net.is_some() && crate::netns::is_any(addr);
+    if s.net.is_some() {
+        s.bound = true;
+        s.vaddr = vaddr;
+        s.wide = false;
+    }
+    Ok(())
+}
+
+/// Whether two host socket addresses name the same address (family and address, not the port).
+fn same_host(a: &[u8], b: &[u8]) -> bool {
+    match (a.get(..2), b.get(..2)) {
+        (Some(fa), Some(fb)) if fa == fb => match u16::from_le_bytes([fa[0], fa[1]]) as i32 {
+            AF_INET => a.get(4..8) == b.get(4..8),
+            AF_INET6 => a.get(8..24) == b.get(8..24),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Creates a replacement host ping socket for rebinding a raw ICMP socket to `host_addr`,
+/// copying host-side options and binding atomically (closing the new fd on failure so the old
+/// socket stays untouched).
+fn rebind_raw_host_fd(s: &InetSocket, host_addr: &[u8]) -> Result<OwnedFd, Errno> {
+    let fd = appine_hal::net::socket(s.family, SOCK_DGRAM, s.proto).map_err(Errno)?;
+    // SAFETY: socket returned a new fd, owned here until bind commits the replacement.
+    let new = unsafe { OwnedFd::from_raw_fd(fd) };
+    copy_raw_host_options(s, fd)?;
+    appine_hal::net::bind(fd, host_addr).map_err(Errno)?;
+    Ok(new)
+}
+
+/// Copies host-side options to a freshly created ping socket before its first bind.
+fn copy_raw_host_options(s: &InetSocket, new_fd: i32) -> Result<(), Errno> {
+    const SO_DONTROUTE: i32 = 5;
+    const SO_BROADCAST: i32 = 6;
+    const SO_OOBINLINE: i32 = 10;
+    const SO_TIMESTAMP: i32 = 29;
+    const SO_TIMESTAMPNS: i32 = 35;
+    const SO_TIMESTAMPING: i32 = 37;
+    const SO_TIMESTAMP_NEW: i32 = 63;
+    const SO_TIMESTAMPNS_NEW: i32 = 64;
+    const SO_TIMESTAMPING_NEW: i32 = 65;
+
+    let old_fd = s.fd;
+    // Linux doubles SO_RCVBUF / SO_SNDBUF on setsockopt.
+    for opt in [SO_RCVBUF, SO_SNDBUF] {
+        let size = int_option(old_fd, opt)?;
+        if int_option(new_fd, opt)? != size {
+            appine_hal::net::setsockopt(new_fd, SOL_SOCKET, opt, &(size / 2).to_ne_bytes())
+                .map_err(Errno)?;
+        }
+    }
+
+    // Some options are unavailable on older hosts. A fresh socket already has the
+    // defaults, including disabled privileged options such as IP_TRANSPARENT.
+    let copy = |level, name, len| -> Result<(), Errno> {
+        if let Ok(value) = appine_hal::net::getsockopt(old_fd, level, name, len)
+            && !value.is_empty()
+            && appine_hal::net::getsockopt(new_fd, level, name, len).as_ref() != Ok(&value)
+        {
+            appine_hal::net::setsockopt(new_fd, level, name, &value).map_err(Errno)?;
+        }
+        Ok(())
+    };
+    for &(level, name) in crate::rawicmp::RawIcmp::host_options(s.family) {
+        copy(level, name, 4)?;
+    }
+    for opt in [
+        SO_REUSEADDR,
+        SO_DONTROUTE,
+        SO_BROADCAST,
+        SO_OOBINLINE,
+        SO_RCVLOWAT,
+        SO_REUSEPORT,
+        SO_TIMESTAMP,
+        SO_TIMESTAMPNS,
+        SO_TIMESTAMPING,
+        SO_TIMESTAMP_NEW,
+        SO_TIMESTAMPNS_NEW,
+        SO_TIMESTAMPING_NEW,
+    ] {
+        copy(SOL_SOCKET, opt, 4)?;
+    }
+    copy(SOL_SOCKET, SO_LINGER, 8)?;
+    if s.family == AF_INET {
+        for opt in [
+            6,  // IP_RECVOPTS
+            7,  // IP_RETOPTS
+            10, // IP_MTU_DISCOVER
+            13, // IP_RECVTOS
+            15, // IP_FREEBIND
+            18, // IP_PASSSEC
+            19, // IP_TRANSPARENT
+            20, // IP_RECVORIGDSTADDR
+            21, // IP_MINTTL
+            IP_TOS, IP_TTL,
+        ] {
+            copy(SOL_IP, opt, 4)?;
+        }
+    } else {
+        for opt in [
+            16, // IPV6_UNICAST_HOPS
+            23, // IPV6_MTU_DISCOVER
+            49, // IPV6_RECVPKTINFO
+            51, // IPV6_RECVHOPLIMIT
+            53, // IPV6_RECVHOPOPTS
+            56, // IPV6_RECVRTHDR
+            58, // IPV6_RECVDSTOPTS
+            66, // IPV6_RECVTCLASS
+            67, // IPV6_TCLASS
+            78, // IPV6_FREEBIND
+        ] {
+            copy(IPPROTO_IPV6, opt, 4)?;
+        }
+        if s.net.is_none() {
+            copy(IPPROTO_IPV6, IPV6_V6ONLY, 4)?;
+        }
+    }
+    // IP_TOS changes sk_priority, even when the guest subsequently reset it to zero.
+    copy(SOL_SOCKET, SO_PRIORITY, 4)?;
+    if s.net.is_none() && s.bound_dev_if != 0 {
+        let dev =
+            appine_hal::net::getsockopt(old_fd, SOL_SOCKET, SO_BINDTODEVICE, 16).map_err(Errno)?;
+        if !dev.is_empty() {
+            appine_hal::net::setsockopt(new_fd, SOL_SOCKET, SO_BINDTODEVICE, &dev)
+                .map_err(Errno)?;
+        }
+    }
+    let n = match appine_hal::net::get_filter(old_fd, 0) {
+        Ok((count, _)) => count,
+        Err(e) if e == Errno::ENOPROTOOPT.0 => 0,
+        Err(e) => return Err(Errno(e)),
+    };
+    if n > 0 {
+        if n as usize > BPF_MAXINSNS {
+            return Err(Errno::EINVAL);
+        }
+        let (got, insns) = appine_hal::net::get_filter(old_fd, n).map_err(Errno)?;
+        if got != n || insns.len() != n as usize * 8 {
+            return Err(Errno::EINVAL);
+        }
+        attach_host_filter(new_fd, SO_ATTACH_FILTER, &insns).map_err(Errno)?;
+    }
+    copy(SOL_SOCKET, SO_LOCK_FILTER, 4)
+}
+
 /// bind on a netlink socket (Linux's `netlink_bind`): the address must be a whole
 /// `sockaddr_nl`; groups need a protocol anyone may listen to or `CAP_NET_ADMIN` over the
 /// namespace owner (rtnetlink's multicast-routing groups always), and only those the protocol
-/// has count; a bound socket keeps its `nl_pid` (another one is EINVAL), an unbound one takes
-/// the one given or, for 0, the caller's tgid (other sockets holding it are not looked for); the
-/// groups given replace the first 32 joined.
-fn netlink_bind(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), Errno> {
+/// has count; a bound socket keeps its `nl_pid` (another one is EINVAL); an unbound one takes
+/// the one given (`EADDRINUSE` if another socket of the same protocol and namespace holds it) or,
+/// for 0, an unused autobind id; the groups given replace the first 32 joined.
+fn netlink_bind(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
     const RTNLGRP_MROUTE_R: u64 = (1 << 29) | (1 << 30);
     if addr.len() < 12 || u16::from_le_bytes([addr[0], addr[1]]) != AF_NETLINK as u16 {
         return Err(Errno::EINVAL);
     }
     let pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
     let mut groups = u64::from(u32::from_le_bytes(addr[8..12].try_into().unwrap()));
+    let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
+        unreachable!("checked by the caller");
+    };
     let admin = netlink_admin(cx, s);
-    if groups != 0 {
-        if !(admin || netlink_listen_unprivileged(s.protocol)) {
-            return Err(Errno::EPERM);
-        }
-        s.groups.get_or_insert(0);
+    if groups != 0 && !(admin || netlink_listen_unprivileged(s.protocol)) {
+        return Err(Errno::EPERM);
     }
     groups &= (1 << s.ngroups()) - 1;
     if s.pid != 0 && pid != s.pid {
@@ -468,12 +709,20 @@ fn netlink_bind(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), E
     if s.protocol == NETLINK_ROUTE && groups & RTNLGRP_MROUTE_R != 0 && !admin {
         return Err(Errno::EPERM);
     }
-    if s.pid == 0 {
-        s.pid = if pid == 0 {
-            cx.pid_out(cx.tgid()) as u32
+    let chosen = if s.pid == 0 {
+        if pid == 0 {
+            netlink_alloc_pid(cx, sock, &s.net, s.protocol)
+        } else if netlink_find_peer(cx.kr(), sock, &s.net, s.protocol, pid).is_some() {
+            return Err(Errno::EADDRINUSE);
         } else {
             pid
-        };
+        }
+    } else {
+        s.pid
+    };
+    s.pid = chosen;
+    if groups != 0 {
+        s.groups.get_or_insert(0);
     }
     if let Some(g) = &mut s.groups {
         *g = (*g & !0xffff_ffff) | groups;
@@ -481,34 +730,107 @@ fn netlink_bind(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), E
     Ok(())
 }
 
-/// connect on a netlink socket (Linux's `netlink_connect`): `AF_UNSPEC` disconnects; otherwise
-/// the address must be a whole `sockaddr_nl`, and naming a port or group needs `CAP_NET_ADMIN`
-/// over the namespace owner (no protocol here lets anyone send to one). An unbound socket gets
-/// its `nl_pid` ([`netlink_autobind`]). Only the kernel answers, so the peer is not recorded.
-fn netlink_connect(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), Errno> {
+/// connect on a netlink socket (Linux's `netlink_connect`): `AF_UNSPEC` disconnects (clearing
+/// `dst_pid` and `dst_group`); otherwise the address must be a whole `sockaddr_nl`, and naming a
+/// port or group needs `CAP_NET_ADMIN` over the namespace owner (no protocol here lets anyone send
+/// to one). An unbound socket gets its `nl_pid` ([`netlink_autobind`]), and the connected port and
+/// group (1-based lowest bit, as Linux's `ffs`) are recorded for `getpeername` and address-less
+/// sends.
+fn netlink_connect(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
     let family = addr
         .get(..2)
         .map(|f| u16::from_le_bytes([f[0], f[1]]))
         .ok_or(Errno::EINVAL)?;
+    let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
+        unreachable!("checked by the caller");
+    };
     if family == 0 {
+        s.dst_pid = 0;
+        s.dst_group = 0;
         return Ok(());
     }
-    if family != AF_NETLINK as u16 || addr.len() < 12 {
-        return Err(Errno::EINVAL);
-    }
-    if addr[4..12] != [0; 8] && !netlink_admin(cx, s) {
-        return Err(Errno::EPERM);
-    }
-    netlink_autobind(cx, s);
+    let (dst_pid, dst_group) = netlink_dst(cx, s, addr)?;
+    netlink_autobind(cx, sock, s);
+    s.dst_pid = dst_pid;
+    s.dst_group = dst_group;
     Ok(())
 }
 
-/// Gives an unbound netlink socket its `nl_pid` at connect and send, as bind with 0 does (Linux's
-/// `netlink_autobind`, which takes another number when the tgid is held; other sockets are not
-/// looked at here).
-fn netlink_autobind(cx: &Cx<'_>, s: &mut NetlinkSocket) {
+/// Parses and authorizes a destination `sockaddr_nl` for `connect` and `sendto`, returning
+/// `(dst_pid, dst_group)` with `dst_group` as the 1-based lowest set bit (0 for none).
+fn netlink_dst(cx: &Cx<'_>, s: &NetlinkSocket, addr: &[u8]) -> Result<(u32, u32), Errno> {
+    if addr.len() < 12 || u16::from_le_bytes([addr[0], addr[1]]) != AF_NETLINK as u16 {
+        return Err(Errno::EINVAL);
+    }
+    let pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
+    let groups = u32::from_le_bytes(addr[8..12].try_into().unwrap());
+    let group = if groups == 0 {
+        0
+    } else {
+        groups.trailing_zeros() + 1
+    };
+    if (pid != 0 || group != 0) && !netlink_admin(cx, s) {
+        return Err(Errno::EPERM);
+    }
+    Ok((pid, group))
+}
+
+/// Gives an unbound netlink socket a unique `nl_pid` at connect and send (Linux's
+/// `netlink_autobind`): the caller's tgid when unused in this `(net, protocol)`, otherwise a
+/// distinct negative/high port ID.
+fn netlink_autobind(cx: &Cx<'_>, sock: &SocketRef, s: &mut NetlinkSocket) {
     if s.pid == 0 {
-        s.pid = cx.pid_out(cx.tgid()) as u32;
+        s.pid = netlink_alloc_pid(cx, sock, &s.net, s.protocol);
+    }
+}
+
+/// Finds another live netlink socket in the same network namespace and protocol holding `pid`.
+fn netlink_find_peer(
+    k: &crate::kernel::Kernel,
+    self_sock: &SocketRef,
+    net: &Option<Rc<crate::nsproxy::NetNs>>,
+    protocol: i32,
+    pid: u32,
+) -> Option<SocketRef> {
+    let want_ns = net.as_ref().map(Rc::as_ptr);
+    k.rtnl_sockets
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .find(|other| {
+            !Rc::ptr_eq(other, self_sock)
+                && matches!(
+                    other.try_borrow().as_deref(),
+                    Ok(Socket::Netlink(o))
+                        if o.protocol == protocol
+                            && o.pid == pid
+                            && o.net.as_ref().map(Rc::as_ptr) == want_ns
+                )
+        })
+}
+
+/// Picks an unused netlink `nl_pid` for `(net, protocol)`: the caller's tgid first, then negative
+/// IDs counting down from `-4097` (matching Linux's `netlink_autobind`).
+fn netlink_alloc_pid(
+    cx: &Cx<'_>,
+    sock: &SocketRef,
+    net: &Option<Rc<crate::nsproxy::NetNs>>,
+    protocol: i32,
+) -> u32 {
+    static ROVER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-4097);
+    let tgid = cx.pid_out(cx.tgid()) as u32;
+    if tgid != 0 && netlink_find_peer(cx.kr(), sock, net, protocol, tgid).is_none() {
+        return tgid;
+    }
+    loop {
+        let mut cand = ROVER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if cand >= -4096 {
+            ROVER.store(-4097, std::sync::atomic::Ordering::Relaxed);
+            cand = -4097;
+        }
+        let pid = cand as u32;
+        if pid != 0 && netlink_find_peer(cx.kr(), sock, net, protocol, pid).is_none() {
+            return pid;
+        }
     }
 }
 
@@ -565,7 +887,8 @@ fn inet_bind_addr(family: i32, raw: bool, mut addr: Vec<u8>) -> Result<Vec<u8>, 
 }
 
 pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
+    let mut remap = false;
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             let src = s
@@ -573,31 +896,28 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
                 .as_ref()
                 .and_then(|ns| crate::netns::implicit_bind(ns, s.family, s.icmp6()));
             ensure_bound(s, src.as_deref())?;
-            appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
-            s.listening = true;
-            // TCP listens in a new network namespace are registered in the namespace: incoming
-            // connections are judged by it (crate::netns)
-            if let Some(net) = &s.net
-                && s.listener.is_none()
+            // Entering TCP_LISTEN in a new namespace re-checks bind conflicts (Linux's
+            // inet_csk_listen_start -> inet_csk_get_port): e.g. two SO_REUSEADDR sockets bound
+            // to overlapping guest addresses fail here when the second tries to listen.
+            if !s.listening
                 && map_proto(s) == IPPROTO_TCP
-                && let Ok(local) = appine_hal::net::sockname(s.fd, false)
-                && let Some(host) = port_of(&local)
+                && let (Some(net), Some(id)) = (&s.net, s.listener)
+                && crate::netns::listen_conflict(net, id)
             {
-                let port = match s.local_map {
-                    Some((g, h)) if h == host => g,
-                    _ => host,
-                };
-                let v6 = s.family == AF_INET6;
-                let at = crate::netns::ListenAt {
-                    port,
-                    any: s.any,
-                    vaddr: s.vaddr,
-                    host: &local,
-                    v6,
-                    v6only: s.v6only,
-                    udp: false,
-                };
-                s.listener = Some(crate::netns::add_listener(net, &at));
+                return Err(Errno::EADDRINUSE);
+            }
+            if s.filter.as_deref() == Some(DROP_TCP) {
+                defer_listen(s, backlog)?;
+            } else {
+                appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
+            }
+            s.listening = true;
+            // Mark the socket's binding as actively listening in the namespace (crate::netns)
+            if let (Some(net), Some(id)) = (&s.net, s.listener)
+                && map_proto(s) == IPPROTO_TCP
+            {
+                crate::netns::set_listening(net, id, true);
+                remap = true;
             }
             // A listen in the boot namespace: when PREROUTING has a DNAT, forward connections from
             // outside (crate::forward)
@@ -621,7 +941,51 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(u) => unix::listen(u, backlog, cx.ucred())?,
     }
+    if remap
+        && cx
+            .kr()
+            .init_ns
+            .net
+            .nft
+            .borrow()
+            .has_nat(crate::nft::HOOK_PRE_ROUTING)
+    {
+        forward_all(cx.kr());
+    }
     Ok(0)
+}
+
+/// Reserve the guest port without exposing a host accept queue while RET 0 is installed.
+fn defer_listen(s: &mut InetSocket, backlog: i32) -> Result<(), Errno> {
+    if let Some(held) = &mut s.deferred {
+        if let Some(listener) = &held.forward {
+            appine_hal::net::listen(listener.0.as_raw_fd(), backlog).map_err(Errno)?;
+        }
+        held.backlog = backlog;
+        return Ok(());
+    }
+    let local = appine_hal::net::sockname(s.fd, false).map_err(Errno)?;
+    let unbound = port_of(&local) == Some(0);
+    const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
+    if unbound
+        && appine_hal::net::getsockopt(s.fd, 0, IP_BIND_ADDRESS_NO_PORT, 4)
+            .is_ok_and(|v| v.iter().any(|&b| b != 0))
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    // A bound TCP socket with SO_REUSEADDR would let a second caller take the port.
+    let reuse_addr = int_option(s.fd, SO_REUSEADDR)?;
+    set_reuse_addr(s.fd, 0)?;
+    if unbound && let Err(e) = appine_hal::net::bind(s.fd, &local) {
+        set_reuse_addr(s.fd, reuse_addr)?;
+        return Err(Errno(e));
+    }
+    s.deferred = Some(Box::new(crate::net::DeferredListen {
+        backlog,
+        reuse_addr,
+        forward: None,
+    }));
+    Ok(())
 }
 
 pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: u32) -> SysResult {
@@ -633,9 +997,9 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    let newfd = cx.fds_mut().reserve(0)?;
+    let newfd = cx.reserve_fd()?;
     let accepted = (|| {
-        let (sock, nonblock) = socket_of(cx, fd)?;
+        let (_file, sock, nonblock) = socket_of(cx, fd)?;
         let (new, peer) = if is_unix(&sock) {
             unix::accept(cx, &sock, nonblock)?
         } else {
@@ -674,24 +1038,38 @@ fn accept_host(
                 s.net.clone(),
                 s.local_map,
                 s.vaddr,
-                (s.mark(), s.filter.clone(), s.v6only),
+                (s.mark(), s.v6only, s.euid, s.bound_dev_if),
             ),
             Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
             Socket::Unix(_) => unreachable!("handled by accept4"),
         };
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
-        match appine_hal::net::accept(host_fd) {
+        let held = matches!(&*sock.borrow(), Socket::Inet(s) if s.deferred.is_some());
+        let accepted = if held {
+            Err(Errno::EAGAIN.0)
+        } else {
+            appine_hal::net::accept(host_fd)
+        };
+        match accepted {
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
                 // The listener's timeouts and the filter kept in Appine carry over (sk_clone_lock
                 // copies the whole sock and shares sk_filter)
                 (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
-                let (mark, filter, v6only) = &inherited;
-                new.filter = filter.clone();
-                // IPV6_V6ONLY, recorded in a new namespace (sk_clone_lock copies sk_ipv6only)
+                let (mark, v6only, euid, bound_dev_if) = &inherited;
+                if let Socket::Inet(s) = &*sock.borrow() {
+                    new.filter = s.filter.clone();
+                }
+                // IPV6_V6ONLY and SO_BINDTODEVICE carry over (sk_clone_lock); the accepted
+                // socket's inode ownership comes from the accepting task (do_accept -> sock_alloc).
                 new.v6only = *v6only;
+                new.euid = *euid;
+                let cred = cx.cred();
+                new.uid = cred.fsuid;
+                new.gid = cred.fsgid;
+                new.bound_dev_if = *bound_dev_if;
                 new.local_map = local_map;
                 new.net = net.clone();
                 // The accepted connection inherits the listener's SO_MARK (ir_mark in
@@ -718,23 +1096,77 @@ fn accept_host(
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
                 let w = cx.kr().world();
-                let peer = unmap_addr(&cx.kr().portmap, &w, &new, peer, false);
-                let me = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
-                let peer = crate::netns::from_host(&w, &me, &peer, crate::netns::Role::Peer, false);
+                let outside = is_outside_host(&peer);
+                let raw_peer = peer;
+                let peer = translate_peer(&cx.kr().portmap, &w, &new, &raw_peer, false);
+                if outside && !is_outside_host(&peer) {
+                    new.track_mut().outside_peer = Some(peer.clone());
+                }
                 new.bound = net.is_some();
                 new.vaddr = vaddr;
+                // Register the accepted child socket in its namespace binding table (non-listening)
+                // so a later non-SO_REUSEADDR bind on the same port still sees it if the listener
+                // closes while this connection remains established.
+                if let Some(ns) = &net
+                    && mappable(&new)
+                    && let Ok(local) = appine_hal::net::sockname(new.fd, false)
+                    && let Some(host_port) = port_of(&local).filter(|&p| p != 0)
+                {
+                    let guest_port = match new.local_map {
+                        Some((g, h)) if h == host_port => g,
+                        _ => host_port,
+                    };
+                    let guest_local = crate::netns::from_host(
+                        &w,
+                        ns,
+                        &local,
+                        crate::netns::Role::Local {
+                            any: false,
+                            vaddr,
+                            peer: Some(&raw_peer),
+                        },
+                        false,
+                    );
+                    if let Some(baddr) = crate::netns::BindAddr::from_guest(&guest_local) {
+                        new.listener = Some(crate::netns::add_binding(
+                            ns,
+                            guest_port,
+                            crate::netns::NewBinding {
+                                proto: map_proto(&new),
+                                addr: baddr,
+                                v6only: new.family == AF_INET6 && new.v6only,
+                                reuseaddr: guest_reuseaddr(&new),
+                                reuseport: guest_reuseport(&new),
+                                euid: new.euid,
+                                bound_dev_if: new.bound_dev_if,
+                                listening: false,
+                                accepted: true,
+                                host_ip: crate::netns::host_ipv4(&local),
+                                host_port,
+                                wide: false,
+                            },
+                        ));
+                    }
+                }
                 new.net = net;
                 return Ok((Rc::new(RefCell::new(Socket::Inet(new))), peer));
             }
             // A signal is EINTR when the wait has a timeout (inet_csk_wait_for_connect's
             // sock_intr_errno), as for AF_UNIX
             Err(e) if e == Errno::EAGAIN.0 => {
-                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN).map_err(
-                    |e| match e {
-                        Errno::ERESTARTSYS if timeout.is_some() => Errno::EINTR,
-                        e => e,
-                    },
-                )?;
+                wait_host(
+                    cx,
+                    sock,
+                    if held { -1 } else { host_fd },
+                    POLLIN,
+                    nonblock,
+                    deadline,
+                    Errno::EAGAIN,
+                )
+                .map_err(|e| match e {
+                    Errno::ERESTARTSYS if timeout.is_some() => Errno::EINTR,
+                    e => e,
+                })?;
             }
             Err(e) => return Err(Errno(e)),
         }
@@ -742,20 +1174,23 @@ fn accept_host(
 }
 
 pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
     }
-    if let Socket::Netlink(s) = &mut *sock.borrow_mut() {
-        return netlink_connect(cx, s, &addr).map(|()| 0);
+    if matches!(&*sock.borrow(), Socket::Netlink(_)) {
+        return netlink_connect(cx, &sock, &addr).map(|()| 0);
     }
     let map = cx.k().portmap.clone();
     let w = cx.kr().world();
     let init = cx.kr().init_ns.net.clone();
     let cred = cx.cred();
-    let (host_addr, tcp, host_fd, origs) = match &mut *sock.borrow_mut() {
+    let (host_addr, tcp, host_fd, origs, udp_state) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
+            if s.filter.as_deref() == Some(DROP_TCP) {
+                return Err(Errno::EOPNOTSUPP);
+            }
             // The local address may have changed: identify again which interface the traffic
             // counts on
             s.route = None;
@@ -792,11 +1227,31 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 verdict.0,
                 crate::nft::Outcome::Accept | crate::nft::Outcome::Dnat(..)
             );
+            if m.isolated {
+                if s.ty == SOCK_STREAM {
+                    return Err(Errno::ECONNREFUSED);
+                }
+                if nat_proto(s) == Some(IPPROTO_UDP as u8) {
+                    disconnect_host_keep_port(s.fd);
+                    ensure_bound(s, None)?;
+                    s.guest_peer = Some(connected_peer(&w, &me, s, &addr));
+                    s.peer = Some(addr.clone());
+                    s.any = false;
+                    s.vconn = None;
+                    s.peer_map = None;
+                    let t = s.track_mut();
+                    t.nat_back.clear();
+                    t.udp_target = None;
+                    t.blocked = Some(0);
+                    return Ok(0);
+                }
+                return Err(Errno::ENETUNREACH);
+            }
             if blocked && s.ty == SOCK_STREAM {
                 if let crate::nft::Outcome::Reject(e) = verdict.0 {
                     return Err(Errno(e));
                 }
-                s.guest_peer = Some(connected_peer(s, &addr));
+                s.guest_peer = Some(connected_peer(&w, &me, s, &addr));
                 let hole = blackhole(cx.kr()).ok_or(Errno::ETIMEDOUT)?;
                 let hole = if s.family == AF_INET6 {
                     let mut a = vec![0u8; 28];
@@ -808,23 +1263,28 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 } else {
                     hole
                 };
-                (hole, false, s.fd, None)
+                (hole, false, s.fd, None, None)
             } else {
-                // Connecting into a new network namespace: ECONNREFUSED when there is no matching
-                // listener there (a socket listening on the wildcard address in the boot namespace
-                // on the host also covers this address, so it cannot be left to the host)
-                if s.ty == SOCK_STREAM
-                    && let Some(t) = &m.target
+                // Connecting into a new network namespace: resolve the matching listener's host
+                // endpoint (ECONNREFUSED for TCP when none matches; a wildcard listener in the
+                // boot namespace on the host also covers this address, so it cannot be left to
+                // the host).
+                let mut resolved = None;
+                if let Some(t) = &m.target
                     && t.host_net.is_some()
-                    && !crate::netns::listening(t, &there, false)
+                    && mappable(s)
                 {
-                    return Err(Errno::ECONNREFUSED);
+                    resolved = crate::netns::resolve_target(t, map_proto(s), &there);
+                    if s.ty == SOCK_STREAM && resolved.is_none() {
+                        return Err(Errno::ECONNREFUSED);
+                    }
                 }
                 let back: Vec<_> = actual.iter().map(|t| (t.clone(), addr.clone())).collect();
                 if !back.is_empty() || s.track.is_some() {
                     let t = s.track_mut();
                     t.nat_back = back;
                     t.blocked = None;
+                    t.udp_target = None;
                 }
                 let dst = &dst;
                 if crate::netns::is_inet(&addr) {
@@ -832,57 +1292,72 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 }
                 // getpeername reports the address connected to (right even when the host-side peer
                 // cannot be translated back, such as when connecting to its own address)
-                s.guest_peer = crate::netns::is_inet(&addr).then(|| connected_peer(s, &addr));
-                // Mapped low ports on the local machine become the host's (crate::portmap), by the
-                // namespace the destination is in
-                let key = m.target.as_ref().map_or(0, key_of);
+                s.guest_peer =
+                    crate::netns::is_inet(&addr).then(|| connected_peer(&w, &me, s, &addr));
+                // Destination host endpoint: new-namespace targets use the listener's resolved
+                // `(host_ip, host_port)`; initial-namespace targets use low-port mapping
+                // (`crate::portmap`).
                 let to = if s.ty == SOCK_DGRAM {
                     crate::netns::toward_self(&me, dst, m.addr)
                 } else {
                     m.addr
                 };
-                let (host_addr, pm) = map_dest(&map, s, to, key, ipv6_proper(&there));
+                let (host_addr, pm) = if let Some((ip, h)) = resolved {
+                    let gport = port_of(&there).unwrap_or(0);
+                    (
+                        crate::netns::with_host_endpoint(&to, ip, h),
+                        Some((gport, h)),
+                    )
+                } else if m.target.as_ref().is_some_and(|t| t.host_net.is_some()) {
+                    (to, None)
+                } else {
+                    map_dest(&map, s, to)
+                };
                 s.peer_map = pm;
+                // Filter verdict and namespace listener target to record for connected UDP sends
+                let blocked_code = blocked.then_some(if verdict.1 { Errno::EPERM.0 } else { 0 });
+                let udp_target = (nat_proto(s) == Some(IPPROTO_UDP as u8))
+                    .then(|| {
+                        m.target
+                            .as_ref()
+                            .filter(|t| t.host_net.is_some())
+                            .map(|t| (Rc::downgrade(t), there.clone()))
+                    })
+                    .flatten();
                 // A datagram socket bound to the wildcard address on the host connects to a mapped
                 // destination: the host socket is not connected and the peer is recorded here
                 // (InetSocket::vconn); a previous host-side connection is undone first
                 let was = s.vconn.take();
                 if s.wide && s.ty == SOCK_DGRAM && m.target.is_some() {
-                    // Disconnect only when really connected on the host; disconnecting releases
-                    // the port the kernel assigned (when bound to port 0, udp_disconnect), so bind
-                    // the original one back, keeping getsockname and the registered port unchanged
-                    if was.is_none() && appine_hal::net::sockname(s.fd, true).is_ok() {
-                        let old = appine_hal::net::sockname(s.fd, false).ok();
-                        let _ = appine_hal::net::connect(s.fd, &[0u8; 16]);
-                        if let Some(o) = old
-                            && appine_hal::net::sockname(s.fd, false)
-                                .ok()
-                                .as_deref()
-                                .and_then(port_of)
-                                != port_of(&o)
-                        {
-                            let _ = appine_hal::net::bind(s.fd, &o);
-                        }
+                    if was.is_none() {
+                        disconnect_host_keep_port(s.fd);
                     }
                     s.vconn = Some(host_addr);
                     s.peer = Some(addr.clone());
                     s.any = false;
+                    if blocked_code.is_some() || udp_target.is_some() {
+                        let t = s.track_mut();
+                        t.blocked = blocked_code;
+                        t.udp_target = udp_target;
+                    }
                     return Ok(0);
                 }
                 if was.is_some() && !crate::netns::is_inet(&addr) {
                     s.peer = None;
                     return Ok(0);
                 }
-                // The destination of a connected UDP socket is dropped by a filter chain: sends
-                // get EPERM on OUTPUT and are silently dropped elsewhere
-                if blocked {
-                    s.track_mut().blocked = Some(if verdict.1 { Errno::EPERM.0 } else { 0 });
-                }
                 // Traffic in new network namespaces is not counted on the host's interfaces (nor
                 // in /proc/net/snmp)
                 let tcp = s.net.is_none() && s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
                 let stream = s.ty == SOCK_STREAM && nat_proto(s) == Some(IPPROTO_TCP as u8);
-                (host_addr, tcp, s.fd, stream.then_some(origs))
+                (
+                    host_addr,
+                    tcp,
+                    s.fd,
+                    stream.then_some(origs),
+                    (blocked_code.is_some() || udp_target.is_some())
+                        .then_some((blocked_code, udp_target)),
+                )
             }
         }
         Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
@@ -911,14 +1386,21 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         && let Socket::Inet(s) = &mut *sock.borrow_mut()
     {
         s.any &= !connected;
+        claim_ephemeral(s, None);
     }
     match r {
         Ok(()) => {
-            // A datagram socket records the peer; AF_UNSPEC disconnects
+            // A datagram socket records the peer, filter block verdict and namespace listener
+            // target; AF_UNSPEC disconnects
             if let Socket::Inet(s) = &mut *sock.borrow_mut()
                 && s.ty != SOCK_STREAM
             {
                 s.peer = connected.then(|| addr.clone());
+                if let Some((blocked_code, udp_target)) = udp_state {
+                    let t = s.track_mut();
+                    t.blocked = blocked_code;
+                    t.udp_target = udp_target;
+                }
             }
             return Ok(0);
         }
@@ -1032,15 +1514,17 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
                 Some(addr) => {
                     appine_hal::net::bind(s.fd, addr).map_err(Errno)?;
                     s.any = true;
-                    register_udp(s);
-                    // A UDP socket sending to its own virtual address: register the port so that
-                    // answers can be delivered (crate::netns)
+                    claim_ephemeral(s, None);
+                    // A UDP socket sending to its own virtual address: register the guest port so
+                    // that answers can be delivered (crate::netns)
                     if s.ty == SOCK_DGRAM
                         && crate::netns::is_self_source(&net, addr)
-                        && let Some(p) = appine_hal::net::sockname(s.fd, false)
-                            .ok()
-                            .as_deref()
-                            .and_then(port_of)
+                        && let Some(p) = s.local_map.map(|(g, _)| g).or_else(|| {
+                            appine_hal::net::sockname(s.fd, false)
+                                .ok()
+                                .as_deref()
+                                .and_then(port_of)
+                        })
                     {
                         net.lo.borrow_mut().self_udp.push(p);
                         s.self_port = Some(p);
@@ -1064,15 +1548,14 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
     Ok(())
 }
 
-/// UDP sockets bound in a new network namespace are registered in the namespace
-/// ([`crate::netns::listening`]): datagrams sent there use it to decide whether anyone receives
-/// them. Both explicit binds and binds made on its behalf before sending count.
-fn register_udp(s: &mut InetSocket) {
+/// Registers an ephemeral host port (`bind(0)`, implicit bind, or host autobind) in a new network
+/// namespace's binding table ([`crate::netns::add_ephemeral`]) so it cannot alias an explicitly
+/// bound guest port and so later explicit binds check conflicts against it.
+fn claim_ephemeral(s: &mut InetSocket, addr: Option<&[u8]>) {
     let Some(net) = s.net.clone() else {
         return;
     };
-    if s.ty != SOCK_DGRAM || s.icmp.is_some() || s.listener.is_some() || map_proto(s) != IPPROTO_UDP
-    {
+    if !mappable(s) || s.listener.is_some() {
         return;
     }
     let Ok(local) = appine_hal::net::sockname(s.fd, false) else {
@@ -1081,21 +1564,55 @@ fn register_udp(s: &mut InetSocket) {
     let Some(host) = port_of(&local).filter(|&p| p != 0) else {
         return;
     };
-    let port = match s.local_map {
-        Some((g, h)) if h == host => g,
-        _ => host,
+    let proto = map_proto(s);
+    let baddr = addr
+        .and_then(crate::netns::BindAddr::from_guest)
+        .or_else(|| s.vaddr.map(crate::netns::BindAddr::V4))
+        .unwrap_or(if s.family == AF_INET6 {
+            crate::netns::BindAddr::AnyV6
+        } else {
+            crate::netns::BindAddr::AnyV4
+        });
+    let v6only = s.family == AF_INET6 && s.v6only;
+    let host_ip = if s.wide {
+        [0; 4]
+    } else {
+        crate::netns::host_ipv4(&local)
     };
-    let any = s.any || s.wide || crate::netns::is_any(&local);
-    let at = crate::netns::ListenAt {
-        port,
-        any,
-        vaddr: s.vaddr,
-        host: &local,
-        v6: s.family == AF_INET6,
-        v6only: s.v6only,
-        udp: true,
-    };
-    s.listener = Some(crate::netns::add_listener(&net, &at));
+    let (lo, hi) = net.devs.borrow().conf.port_range;
+    let range = (lo.clamp(1, 65535) as u16, hi.clamp(1, 65535) as u16);
+    let (guest, id) = crate::netns::add_ephemeral(
+        &net,
+        crate::netns::NewBinding {
+            proto,
+            addr: baddr,
+            v6only,
+            reuseaddr: guest_reuseaddr(s),
+            reuseport: guest_reuseport(s),
+            euid: s.euid,
+            bound_dev_if: s.bound_dev_if,
+            listening: proto == IPPROTO_UDP,
+            accepted: false,
+            host_ip,
+            host_port: host,
+            wide: s.wide,
+        },
+        range,
+    );
+    s.listener = Some(id);
+    s.local_map = Some((guest, host));
+}
+
+fn guest_reuseaddr(s: &InetSocket) -> bool {
+    if let Some(held) = &s.deferred {
+        held.reuse_addr != 0
+    } else {
+        int_option(s.fd, SO_REUSEADDR).is_ok_and(|v| v != 0)
+    }
+}
+
+fn guest_reuseport(s: &InetSocket) -> bool {
+    int_option(s.fd, SO_REUSEPORT).is_ok_and(|v| v != 0)
 }
 
 /// Counts active TCP connections (`/proc/net/snmp`'s ActiveOpens, AttemptFails,
@@ -1144,7 +1661,7 @@ pub(super) fn getpeername(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64) -> 
 }
 
 fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let value = match &*sock.borrow() {
         Socket::Inet(s) if peer && s.stub_peer => stub_addr(s.family),
         // The host connection of a UDP socket the aggregation point watches may have been changed
@@ -1154,32 +1671,86 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
             peer: Some(p),
             ..
         }) if peer => p.clone(),
-        // The peer is recorded (InetSocket::vconn): the host socket is not connected
+        // The peer is recorded (InetSocket::vconn, or a connected UDP socket isolated from a
+        // container loopback block): the host socket is not connected
         Socket::Inet(InetSocket {
             vconn: Some(_),
             guest_peer: Some(p),
             ..
         }) if peer => p.clone(),
-        Socket::Inet(s) => inet_name(cx, s, peer)?,
-        Socket::Netlink(_) if peer => {
-            let mut b = vec![0u8; 12];
-            b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-            b
+        Socket::Inet(InetSocket {
+            ty,
+            peer: Some(p),
+            guest_peer,
+            track: Some(t),
+            ..
+        }) if peer && *ty != SOCK_STREAM && t.blocked.is_some() => {
+            guest_peer.as_ref().unwrap_or(p).clone()
         }
+        Socket::Inet(s) => inet_name(cx, s, peer)?,
+        Socket::Netlink(s) if peer => s.peer_sockaddr(),
         Socket::Netlink(s) => s.sockaddr(),
         Socket::Unix(u) => unix::sockname(u, peer)?,
     };
     write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
 }
 
+/// Disconnects a host UDP socket if currently connected, rebinding its previous local address when
+/// `udp_disconnect` releases an ephemeral port so `getsockname` and the registered port stay intact.
+fn disconnect_host_keep_port(fd: i32) {
+    if appine_hal::net::sockname(fd, true).is_ok() {
+        let old = appine_hal::net::sockname(fd, false).ok();
+        let _ = appine_hal::net::connect(fd, &[0u8; 16]);
+        if let Some(o) = old
+            && appine_hal::net::sockname(fd, false)
+                .ok()
+                .as_deref()
+                .and_then(port_of)
+                != port_of(&o)
+        {
+            let _ = appine_hal::net::bind(fd, &o);
+        }
+    }
+}
+
+/// The bound IPv4 address of `s` as the guest sees it, when explicitly bound to a non-wildcard
+/// IPv4 (or IPv4-mapped) address (`ip_route_connect` routes wildcard `0.0.0.0` connects to it).
+fn bound_v4(
+    w: &crate::netns::World,
+    me: &crate::nsproxy::NetNs,
+    s: &InetSocket,
+) -> Option<[u8; 4]> {
+    if s.any {
+        return None;
+    }
+    if let Some(v) = s.vaddr {
+        return (v != [0; 4]).then_some(v);
+    }
+    let local = appine_hal::net::sockname(s.fd, false).ok()?;
+    let role = crate::netns::Role::Local {
+        any: false,
+        vaddr: None,
+        peer: None,
+    };
+    let g = crate::netns::from_host(w, me, &local, role, s.icmp6());
+    match ip_of(&g) {
+        Some(std::net::IpAddr::V4(v4)) if !v4.is_unspecified() => Some(v4.octets()),
+        _ => None,
+    }
+}
+
 /// The peer getpeername reports after connecting inet socket `s` to `addr` (Linux's
 /// `inet_getname` and `inet6_getname` after connect): the wildcard address stands for the local
-/// machine (`ip_route_connect` and `tcp_v6_connect` take the loopback address, IPv4-mapped when
-/// the IPv6 socket's local address is), an IPv4 address given to an IPv6 socket is reported
-/// IPv4-mapped, and an IPv6 peer has no flow information and a scope only when link-local. An
-/// IPv4 socket bound to an address of its own would connect to that one instead of the loopback;
-/// this is not followed.
-fn connected_peer(s: &InetSocket, addr: &[u8]) -> Vec<u8> {
+/// machine (`ip_route_connect` takes the socket's bound IPv4 address when it has one, otherwise
+/// `127.0.0.1`; `tcp_v6_connect` takes `::1`, or IPv4-mapped when the IPv6 socket's local address
+/// is), an IPv4 address given to an IPv6 socket is reported IPv4-mapped, and an IPv6 peer has no
+/// flow information and a scope only when link-local.
+fn connected_peer(
+    w: &crate::netns::World,
+    me: &crate::nsproxy::NetNs,
+    s: &InetSocket,
+    addr: &[u8],
+) -> Vec<u8> {
     let family = s.family;
     // Shorter than its family's sockaddr: kept as given (the host refuses the connect)
     let fam = addr
@@ -1198,7 +1769,7 @@ fn connected_peer(s: &InetSocket, addr: &[u8]) -> Vec<u8> {
         AF_INET => {
             let mut ip: [u8; 4] = addr[4..8].try_into().unwrap();
             if ip == [0; 4] {
-                ip = [127, 0, 0, 1];
+                ip = bound_v4(w, me, s).unwrap_or([127, 0, 0, 1]);
             }
             if family == AF_INET6 {
                 let mut a = vec![0u8; 28];
@@ -1221,11 +1792,14 @@ fn connected_peer(s: &InetSocket, addr: &[u8]) -> Vec<u8> {
             let mapped_local = appine_hal::net::sockname(s.fd, false)
                 .is_ok_and(|l| l.get(8..20) == Some(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]));
             if a[8..24] == [0; 16] && mapped_local {
-                a[18..24].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+                let ip = bound_v4(w, me, s).unwrap_or([127, 0, 0, 1]);
+                a[18..20].copy_from_slice(&[0xff, 0xff]);
+                a[20..24].copy_from_slice(&ip);
             } else if a[8..24] == [0; 16] {
                 a[23] = 1;
             } else if mapped && a[20..24] == [0; 4] {
-                a[20..24].copy_from_slice(&[127, 0, 0, 1]);
+                let ip = bound_v4(w, me, s).unwrap_or([127, 0, 0, 1]);
+                a[20..24].copy_from_slice(&ip);
             }
             a[4..8].fill(0);
             if !(a[8] == 0xfe && a[9] & 0xc0 == 0x80) {
@@ -1247,32 +1821,33 @@ fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> 
         a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
     }
     let w = cx.kr().world();
-    let a = unmap_addr(&cx.kr().portmap, &w, s, a, !peer);
     let me = net_of(cx, s);
-    let other = if peer {
-        None
-    } else {
-        appine_hal::net::sockname(s.fd, true).ok()
-    };
-    if peer && let Some(g) = &s.guest_peer {
-        return Ok(g.clone());
+    if peer {
+        if let Some(g) = &s.guest_peer {
+            return Ok(g.clone());
+        }
+        if let Some(p) = s.track.as_ref().and_then(|t| t.outside_peer.as_ref()) {
+            return Ok(p.clone());
+        }
+        return Ok(translate_peer(&cx.kr().portmap, &w, s, &a, false));
     }
+    let a = unmap_addr(s, a);
+    let other = s
+        .track
+        .as_ref()
+        .and_then(|t| t.outside_peer.clone())
+        .or_else(|| appine_hal::net::sockname(s.fd, true).ok());
     // The peer is recorded (InetSocket::vconn): the local end is the address facing the peer
-    if !peer
-        && s.vconn.is_some()
+    if s.vconn.is_some()
         && let Some(g) = s.guest_peer.as_deref()
         && let Some(local) = crate::netns::local_toward(&me, &a, g)
     {
         return Ok(local);
     }
-    let role = if peer {
-        crate::netns::Role::Peer
-    } else {
-        crate::netns::Role::Local {
-            any: s.any,
-            vaddr: s.vaddr,
-            peer: other.as_deref(),
-        }
+    let role = crate::netns::Role::Local {
+        any: s.any,
+        vaddr: s.vaddr,
+        peer: other.as_deref(),
     };
     Ok(crate::netns::from_host(&w, &me, &a, role, s.icmp6()))
 }
@@ -1287,11 +1862,9 @@ pub(super) fn setsockopt(
     value: u64,
     len: u32,
 ) -> SysResult {
-    const SO_SNDBUF: i32 = 7;
-    const SO_RCVBUF: i32 = 8;
     const SO_SNDBUFFORCE: i32 = 32;
     const SO_RCVBUFFORCE: i32 = 33;
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let name = new_timeouts(level, name);
     let optlen = len;
     let len = (len as usize).min(256);
@@ -1345,96 +1918,73 @@ pub(super) fn setsockopt(
         Some(false) => return Ok(0),
         None => {}
     }
-    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF), checked in Linux 6.1.y's
-    // order: an optlen under an int is EINVAL; SO_ATTACH_FILTER on a TCP socket needs
-    // CAP_NET_ADMIN over the socket's network namespace (Linux 5d39580f68e6, EPERM); struct
-    // sock_fprog must be exactly 16 bytes (EINVAL); a locked filter is EPERM; a count of 0 or above
-    // BPF_MAXINSNS, or no program, is EINVAL. The pointer to the instructions is then replaced
-    // with one on the host, which checks them. dockerd attaches a drop-everything filter to each
-    // TCP port it publishes until its DNAT rules are in place, and a host with 5d39580f68e6
-    // refuses TCP filters from the app, which never has CAP_NET_ADMIN: the program is then checked
-    // on a scratch UDP socket and kept in InetSocket::filter, filtering nothing
+    const SO_ATTACH_BPF: i32 = 50;
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
-    let inet = match &*sock.borrow() {
-        Socket::Inet(s) => Some((
-            s.fd,
-            s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP,
-            net_of(cx, s).owner.clone(),
-        )),
-        _ => None,
+    const SO_ATTACH_REUSEPORT_EBPF: i32 = 52;
+    let mut socket = sock.borrow_mut();
+    let Socket::Inet(s) = &mut *socket else {
+        unreachable!("handled above")
     };
-    if let Some((host_fd, tcp, owner)) = inet
-        && level == SOL_SOCKET
-        && matches!(name, SO_ATTACH_FILTER | SO_ATTACH_REUSEPORT_CBPF)
-    {
-        let tcp_filter = tcp && name == SO_ATTACH_FILTER;
+    let tcp = s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
+    // eBPF socket filters (SO_ATTACH_BPF, SO_ATTACH_REUSEPORT_EBPF): never pass a raw guest fd
+    // number to the host kernel. Validate optlen, TCP CAP_NET_ADMIN (Linux 5d39580f68e6) and
+    // guest fd table (EBADF for closed/bad fd); Appine's bpf(2) only supports cgroup device
+    // programs, so any valid guest fd is not a BPF_PROG_TYPE_SOCKET_FILTER program (EINVAL).
+    if level == SOL_SOCKET && matches!(name, SO_ATTACH_BPF | SO_ATTACH_REUSEPORT_EBPF) {
         if optlen < 4 {
             return Err(Errno::EINVAL);
         }
-        if tcp_filter && !cx.cred().ns_capable(&owner, crate::cred::cap::NET_ADMIN) {
-            return Err(Errno::EPERM);
-        }
-        if optlen != 16 {
-            return Err(Errno::EINVAL);
-        }
-        if filter_locked(host_fd) {
-            return Err(Errno::EPERM);
-        }
-        let n = usize::from(u16::from_le_bytes([v[0], v[1]]));
-        let ptr = u64::from_le_bytes(v[8..16].try_into().unwrap());
-        if n == 0 || n > BPF_MAXINSNS || ptr == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let mut insns = vec![0u8; n * 8];
-        cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
-        let mut host = [0u8; 16];
-        host[..2].copy_from_slice(&(n as u16).to_le_bytes());
-        host[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
-        let attach = |fd: i32| appine_hal::net::setsockopt(fd, level, name, &host);
-        let res = if tcp_filter && crate::bug::host_refuses_tcp_filters() {
-            Err(Errno::EPERM.0)
-        } else {
-            attach(host_fd)
-        };
-        let kept = match res {
-            Ok(()) => None,
-            Err(e) if e == Errno::EPERM.0 && tcp_filter => {
-                let scratch = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
-                let checked = attach(scratch);
-                appine_hal::net::close(scratch);
-                checked.map_err(Errno)?;
-                Some(insns)
-            }
-            Err(e) => return Err(Errno(e)),
-        };
-        if name == SO_ATTACH_FILTER
-            && let Socket::Inet(s) = &mut *sock.borrow_mut()
+        if tcp
+            && name == SO_ATTACH_BPF
+            && !cx
+                .cred()
+                .ns_capable(&net_of(cx, s).owner, crate::cred::cap::NET_ADMIN)
         {
-            s.filter = kept;
-        }
-        return Ok(0);
-    }
-    // SO_DETACH_FILTER of a program kept in Appine (Linux's sk_detach_filter: EPERM while the
-    // filter is locked); without one the host answers (ENOENT when it has none either)
-    if (level, name) == (SOL_SOCKET, SO_DETACH_FILTER)
-        && let Socket::Inet(s) = &mut *sock.borrow_mut()
-        && s.filter.is_some()
-    {
-        if optlen < 4 {
-            return Err(Errno::EINVAL);
-        }
-        if filter_locked(s.fd) {
             return Err(Errno::EPERM);
         }
-        s.filter = None;
-        return Ok(0);
+        if optlen != 4 {
+            return Err(Errno::EINVAL);
+        }
+        let ufd = i32::from_le_bytes(v[..4].try_into().unwrap());
+        cx.fds().get(ufd)?;
+        return Err(Errno::EINVAL);
     }
+    let kept = match (level, name) {
+        (SOL_SOCKET, SO_ATTACH_FILTER) => attach_classic_filter(cx, s, name, &v, tcp)?,
+        (SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF) => {
+            attach_classic_filter(cx, s, name, &v, false)?;
+            return Ok(0);
+        }
+        (SOL_SOCKET, SO_DETACH_FILTER) if s.filter.is_some() => {
+            if optlen < 4 {
+                return Err(Errno::EINVAL);
+            }
+            if filter_locked(s.fd) {
+                return Err(Errno::EPERM);
+            }
+            None
+        }
+        _ => return set_inet_option(cx, s, level, name, &v),
+    };
+    if kept.as_deref() != Some(DROP_TCP) && s.deferred.is_some() {
+        activate_listener(cx.kr(), s)?;
+        request_wake_object(wake::of(&sock));
+    }
+    s.filter = kept;
+    Ok(0)
+}
+
+fn set_inet_option(
+    cx: &mut Cx<'_>,
+    s: &mut InetSocket,
+    level: i32,
+    name: i32,
+    v: &[u8],
+) -> SysResult {
     // SO_MARK: only recorded (InetSocket::mark); packets sent by this machine carry it in
     // nftables. Linux requires CAP_NET_RAW or CAP_NET_ADMIN over the owner of the socket's
     // network namespace (sk_setsockopt)
-    if (level, name) == (SOL_SOCKET, SO_MARK)
-        && let Socket::Inet(s) = &mut *sock.borrow_mut()
-    {
+    if (level, name) == (SOL_SOCKET, SO_MARK) {
         let mark = v.get(..4).ok_or(Errno::EINVAL)?;
         let owner = net_of(cx, s).owner.clone();
         let cred = cx.cred();
@@ -1449,21 +1999,125 @@ pub(super) fn setsockopt(
         }
         return Ok(0);
     }
-    match &mut *sock.borrow_mut() {
-        Socket::Inet(s) => match (level, name) {
-            (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v)?,
-            (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v)?,
-            // In a new network namespace the host socket must use IPv4-mapped addresses: only
-            // record it
-            (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
-                let on = v.get(..4).ok_or(Errno::EINVAL)?;
-                s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+    match (level, name) {
+        (SOL_SOCKET, SO_REUSEADDR) if s.deferred.is_some() => {
+            let on = v.get(..4).ok_or(Errno::EINVAL)? != [0; 4];
+            s.deferred.as_mut().unwrap().reuse_addr = i32::from(on);
+            if let (Some(net), Some(id)) = (&s.net, s.listener) {
+                crate::netns::set_reuse(net, id, false, on);
             }
-            _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
-        },
-        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
+        }
+        (SOL_SOCKET, SO_BINDTODEVICE | SO_BINDTOIFINDEX)
+            if s.deferred.as_ref().is_some_and(|h| h.forward.is_some()) =>
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        (SOL_SOCKET, SO_BINDTODEVICE | SO_BINDTOIFINDEX) => {
+            set_bind_device(cx, s, name == SO_BINDTOIFINDEX, v)?;
+        }
+        (SOL_SOCKET, SO_REUSEPORT) if s.filter.as_deref() == Some(DROP_TCP) => {
+            let arg = v.get(..4).ok_or(Errno::EINVAL)?;
+            if arg != [0; 4] {
+                return Err(Errno::EOPNOTSUPP);
+            }
+        }
+        (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(v)?,
+        (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(v)?,
+        // In a new network namespace the host socket must use IPv4-mapped addresses: only
+        // record it (Linux's do_ipv6_setsockopt refuses changes once bound).
+        (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
+            let on = v.get(..4).ok_or(Errno::EINVAL)?;
+            if s.bound && s.listener.is_some() {
+                return Err(Errno::EINVAL);
+            }
+            s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+        }
+        _ => {
+            appine_hal::net::setsockopt(s.fd, level, name, v).map_err(Errno)?;
+            if level == SOL_SOCKET
+                && name == SO_RCVBUF
+                && let Some(r) = &mut s.icmp
+            {
+                r.sync_rcvbuf(s.fd);
+            }
+            if level == SOL_SOCKET
+                && matches!(name, SO_REUSEADDR | SO_REUSEPORT)
+                && let (Some(net), Some(id)) = (&s.net, s.listener)
+            {
+                let on = v.get(..4).is_some_and(|b| b != [0; 4]);
+                crate::netns::set_reuse(net, id, name == SO_REUSEPORT, on);
+            }
+        }
     }
     Ok(0)
+}
+
+/// `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` (Linux 6.1's `sock_setbindtodevice` /
+/// `sock_bindtoindex_locked`): resolves interface names and indices against the socket's own
+/// network namespace (including virtual devices) rather than blindly against host interfaces.
+/// Unprivileged callers may bind an unbound socket; changing or clearing an existing binding
+/// requires `CAP_NET_RAW` over the namespace owner (`EPERM`, checked after device lookup).
+fn set_bind_device(cx: &Cx<'_>, s: &mut InetSocket, by_index: bool, v: &[u8]) -> Result<(), Errno> {
+    const IFNAMSIZ: usize = 16;
+    let ns = net_of(cx, s);
+    let target = if by_index {
+        let raw = v.get(..4).ok_or(Errno::EINVAL)?;
+        let idx = i32::from_le_bytes(raw.try_into().unwrap());
+        if idx < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if idx == 0 {
+            None
+        } else {
+            let iface = crate::netdev::interfaces(&ns)
+                .into_iter()
+                .find(|i| i.index as i32 == idx)
+                .ok_or(Errno::ENODEV)?;
+            Some((idx, iface.name))
+        }
+    } else {
+        // Linux truncates to IFNAMSIZ - 1 bytes and NUL-terminates before lookup.
+        let capped = &v[..v.len().min(IFNAMSIZ - 1)];
+        let name = capped.split(|&c| c == 0).next().unwrap_or_default();
+        if name.is_empty() {
+            None
+        } else {
+            let iface = crate::netdev::interfaces(&ns)
+                .into_iter()
+                .find(|i| i.name.as_bytes() == name)
+                .ok_or(Errno::ENODEV)?;
+            Some((iface.index as i32, iface.name))
+        }
+    };
+    let cap_raw = cx.cred().ns_capable(&ns.owner, crate::cred::cap::NET_RAW);
+    if s.bound_dev_if != 0 && !cap_raw {
+        return Err(Errno::EPERM);
+    }
+    let new_idx = target.as_ref().map_or(0, |(i, _)| *i);
+    // In the initial namespace, forward real host interface bindings to the host socket so host
+    // routing uses them; virtual devices and new-namespace sockets stay purely in process.
+    if s.net.is_none() {
+        if let Some((idx, name)) = &target
+            && crate::netdev::base(&ns)
+                .iter()
+                .any(|b| b.index as i32 == *idx)
+        {
+            let mut z = name.as_bytes().to_vec();
+            z.push(0);
+            match appine_hal::net::setsockopt(s.fd, SOL_SOCKET, SO_BINDTODEVICE, &z) {
+                Ok(()) => {}
+                Err(e) if e == Errno::EPERM.0 && cap_raw => {}
+                Err(e) => return Err(Errno(e)),
+            }
+        } else if s.bound_dev_if != 0 {
+            let _ = appine_hal::net::setsockopt(s.fd, SOL_SOCKET, SO_BINDTODEVICE, b"");
+        }
+    }
+    s.bound_dev_if = new_idx;
+    if let (Some(net), Some(id)) = (&s.net, s.listener) {
+        crate::netns::set_bound_dev(net, id, new_idx);
+    }
+    Ok(())
 }
 
 /// `SO_RCVTIMEO_NEW` and `SO_SNDTIMEO_NEW` are the old options on a 64-bit kernel: the same
@@ -1476,6 +2130,132 @@ fn new_timeouts(level: i32, name: i32) -> i32 {
         (SOL_SOCKET, SO_SNDTIMEO_NEW) => SO_SNDTIMEO,
         _ => name,
     }
+}
+
+/// Attach a classic BPF program, returning the instructions if Appine must enforce it.
+fn attach_classic_filter(
+    cx: &mut Cx<'_>,
+    s: &InetSocket,
+    name: i32,
+    v: &[u8],
+    tcp_filter: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    // Linux checks the TCP capability before the full sock_fprog size and the filter lock.
+    if v.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    if tcp_filter
+        && !cx
+            .cred()
+            .ns_capable(&net_of(cx, s).owner, crate::cred::cap::NET_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    if v.len() != 16 {
+        return Err(Errno::EINVAL);
+    }
+    if filter_locked(s.fd) {
+        return Err(Errno::EPERM);
+    }
+    let n = usize::from(u16::from_le_bytes([v[0], v[1]]));
+    let ptr = u64::from_le_bytes(v[8..16].try_into().unwrap());
+    if n == 0 || n > BPF_MAXINSNS || ptr == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut insns = vec![0u8; n * 8];
+    cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
+    let attach = |fd| attach_host_filter(fd, name, &insns);
+    let emulate = tcp_filter && (crate::bug::host_refuses_tcp_filters() || s.deferred.is_some());
+    if !emulate {
+        match attach(s.fd) {
+            Ok(()) => return Ok(None),
+            Err(e) if tcp_filter && e == Errno::EPERM.0 => {}
+            Err(e) => return Err(Errno(e)),
+        }
+    }
+    // On a restricted host, validate the program on UDP before emulating its verdict.
+    let scratch = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
+    let checked = attach(scratch);
+    appine_hal::net::close(scratch);
+    checked.map_err(Errno)?;
+    if insns == DROP_TCP {
+        let state = appine_hal::net::getsockopt(s.fd, IPPROTO_TCP, TCP_INFO, 1).map_err(Errno)?;
+        if state.first() != Some(&TCP_CLOSE) || int_option(s.fd, SO_REUSEPORT)? != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+    } else if !passes_all_tcp(&insns) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if s.filter.is_none() && appine_hal::net::get_filter(s.fd, 0).map_err(Errno)?.0 != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(Some(insns))
+}
+
+/// Pass a validated instruction count and a live host pointer as a sock_fprog.
+fn attach_host_filter(fd: i32, name: i32, insns: &[u8]) -> Result<(), i32> {
+    let mut prog = [0u8; 16];
+    prog[..2].copy_from_slice(&((insns.len() / 8) as u16).to_ne_bytes());
+    prog[8..].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+    appine_hal::net::setsockopt(fd, SOL_SOCKET, name, &prog)
+}
+
+/// A validated straight-line program ending in RET UINT_MAX. The preceding immediate/length
+/// loads cannot reject a packet or affect the constant return.
+fn passes_all_tcp(insns: &[u8]) -> bool {
+    let Some((loads, last)) = insns.split_last_chunk::<8>() else {
+        return false;
+    };
+    last == &[6, 0, 0, 0, 255, 255, 255, 255]
+        && loads
+            .chunks_exact(8)
+            .all(|insn| matches!(u16::from_ne_bytes([insn[0], insn[1]]), 0 | 0x80))
+}
+
+fn int_option(fd: i32, option: i32) -> Result<i32, Errno> {
+    let bytes = appine_hal::net::getsockopt(fd, SOL_SOCKET, option, 4).map_err(Errno)?;
+    Ok(i32::from_ne_bytes(
+        bytes.try_into().map_err(|_| Errno::EINVAL)?,
+    ))
+}
+
+fn set_reuse_addr(fd: i32, value: i32) -> Result<(), Errno> {
+    appine_hal::net::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &value.to_ne_bytes()).map_err(Errno)
+}
+
+/// Start the guest listener after detaching (or replacing) RET 0. If DNAT is active,
+/// stop its private accept queue first. Its fd is still bound until the worker drops
+/// its dup, so both sockets need SO_REUSEADDR during the handover.
+fn activate_listener(k: &crate::kernel::Kernel, s: &mut InetSocket) -> Result<(), Errno> {
+    let held = s.deferred.as_ref().unwrap();
+    set_reuse_addr(s.fd, 1)?;
+    let forward = held.forward.as_ref().map(|listener| listener.0.as_raw_fd());
+    if let Some(fd) = forward
+        && let Err(e) = appine_hal::net::shutdown(fd, 2)
+    {
+        set_reuse_addr(s.fd, 0)?;
+        return Err(Errno(e));
+    }
+    if let Err(e) = appine_hal::net::listen(s.fd, held.backlog) {
+        let restored = forward.is_none_or(|fd| appine_hal::net::listen(fd, held.backlog).is_ok());
+        set_reuse_addr(s.fd, 0)?;
+        if !restored {
+            s.deferred.as_mut().unwrap().forward = None;
+            s.fwd = None;
+        }
+        return Err(Errno(e));
+    }
+    // listen succeeded, so the filter is gone even if restoring the guest option fails.
+    if let Err(e) = set_reuse_addr(s.fd, held.reuse_addr) {
+        crate::debug::log(format_args!(
+            "TCP listen: restoring SO_REUSEADDR: errno {}",
+            e.0
+        ));
+    }
+    s.deferred = None;
+    s.fwd = None;
+    forward_socket(k, s);
+    Ok(())
 }
 
 /// Whether the host socket's filter is locked (`SO_LOCK_FILTER`, which goes to the host): Linux
@@ -1703,7 +2483,7 @@ pub(super) fn getsockopt(
     value: u64,
     len: u64,
 ) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
+    let (_file, sock, _) = socket_of(cx, fd)?;
     let name = new_timeouts(level, name);
     let room = usize::try_from(i32::from_le_bytes(get(cx, len)?)).map_err(|_| Errno::EINVAL)?;
     let encode_tv = encode_timeval;
@@ -1725,25 +2505,21 @@ pub(super) fn getsockopt(
     // each), and optlen comes back as the program's count; with 0 only the count is asked, and
     // fewer than the program has is EINVAL. A program kept in Appine (InetSocket::filter) answers
     // itself; otherwise the host is asked with the count, never above BPF_MAXINSNS
-    let inet = match &*sock.borrow() {
-        Socket::Inet(s) => Some((s.fd, s.filter.clone())),
-        _ => None,
-    };
     if (level, name) == (SOL_SOCKET, SO_GET_FILTER)
-        && let Some((host_fd, kept)) = inet
+        && let Socket::Inet(s) = &*sock.borrow()
     {
-        let (n, insns) = match kept {
+        let (n, insns) = match &s.filter {
             Some(insns) => {
                 let n = insns.len() / 8;
                 match room {
                     0 => (n, Vec::new()),
                     r if r < n => return Err(Errno::EINVAL),
-                    _ => (n, insns),
+                    _ => (n, insns.clone()),
                 }
             }
             None => {
                 let count = room.min(BPF_MAXINSNS) as u32;
-                let (n, insns) = appine_hal::net::get_filter(host_fd, count).map_err(Errno)?;
+                let (n, insns) = appine_hal::net::get_filter(s.fd, count).map_err(Errno)?;
                 (n as usize, insns)
             }
         };
@@ -1768,6 +2544,9 @@ pub(super) fn getsockopt(
         Socket::Inet(s) if (level, name) == (SOL_SOCKET, SO_ERROR) && s.icmp_err.get() != 0 => {
             Some(Ok(s.icmp_err.replace(0).to_le_bytes().to_vec()))
         }
+        Socket::Inet(s) if (level, name) == (SOL_SOCKET, SO_ERROR) && s.pending_err.get() != 0 => {
+            Some(Ok(s.pending_err.replace(0).to_le_bytes().to_vec()))
+        }
         Socket::Inet(InetSocket { icmp: Some(r), .. }) => r.getsockopt(level, name),
         Socket::Inet(s) => crate::rawicmp::udp_getsockopt(s, level, name).map(Ok),
         _ => None,
@@ -1780,10 +2559,45 @@ pub(super) fn getsockopt(
                 (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
                     (s.v6only as i32).to_le_bytes().to_vec()
                 }
+                (SOL_SOCKET, SO_ACCEPTCONN) if s.deferred.is_some() => 1i32.to_le_bytes().to_vec(),
+                (SOL_SOCKET, SO_REUSEADDR) if s.deferred.is_some() => s
+                    .deferred
+                    .as_ref()
+                    .unwrap()
+                    .reuse_addr
+                    .to_le_bytes()
+                    .to_vec(),
+                (IPPROTO_TCP, TCP_INFO) if s.deferred.is_some() => {
+                    let mut info = appine_hal::net::getsockopt(s.fd, level, name, room.min(256))
+                        .map_err(Errno)?;
+                    if let Some(state) = info.first_mut() {
+                        *state = TCP_LISTEN;
+                    }
+                    info
+                }
                 (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
                 (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
                 // SO_MARK: the recorded one (the one on the host is set by Android's netd)
                 (SOL_SOCKET, SO_MARK) => s.mark().to_le_bytes().to_vec(),
+                // SO_BINDTODEVICE / SO_BINDTOIFINDEX: resolved against the socket's own namespace
+                (SOL_SOCKET, SO_BINDTOIFINDEX) => s.bound_dev_if.to_le_bytes().to_vec(),
+                (SOL_SOCKET, SO_BINDTODEVICE) => {
+                    if s.bound_dev_if == 0 {
+                        Vec::new()
+                    } else {
+                        if room < 16 {
+                            return Err(Errno::EINVAL);
+                        }
+                        let ns = net_of(cx, s);
+                        let iface = crate::netdev::interfaces(&ns)
+                            .into_iter()
+                            .find(|i| i.index as i32 == s.bound_dev_if)
+                            .ok_or(Errno::ENODEV)?;
+                        let mut b = iface.name.into_bytes();
+                        b.push(0);
+                        b
+                    }
+                }
                 // Raw ICMP is a ping socket on the host
                 (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
                 _ => {
@@ -1889,6 +2703,7 @@ pub(crate) struct Message {
     pub len: usize,
     pub addr: Vec<u8>,
     pub control: Vec<u8>,
+    pub rights: Option<Rc<crate::unix::PendingRights>>,
     pub flags: u32,
 }
 
@@ -1949,7 +2764,7 @@ pub(super) fn sendto(
     addr: u64,
     addrlen: u32,
 ) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let len = len.min(MSG_MAX);
     let mut data = vec![0u8; len];
     cx.mm().read(UserSlice::new(buf, len), &mut data)?;
@@ -1970,23 +2785,42 @@ pub(super) fn recvfrom(
     addr: u64,
     addrlen: u64,
 ) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
-    let m = recv(cx, &sock, nonblock, len, 0, flags)?;
-    cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
-    let more = recv_rest(cx, &sock, nonblock, m.len, len, flags, |cx, off, d| {
-        cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d)
-    });
-    write_addr(cx, addr, addrlen, &m.addr)?;
-    Ok((if flags & MSG_TRUNC != 0 {
-        m.len
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
+    let (received, message) = recv_into(cx, &sock, nonblock, &[(buf, len)], 0, flags)?;
+    write_addr(cx, addr, addrlen, &message.addr)?;
+    Ok(received as u64)
+}
+
+/// Copies the payload into guest iovecs and returns the syscall byte count and ancillary data.
+fn recv_into(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    iovecs: &[(u64, usize)],
+    control_len: usize,
+    flags: u32,
+) -> Result<(usize, Message), Errno> {
+    let (copied, message, more) = if is_unix(sock) {
+        let (copied, message) = unix::recv_into(cx, sock, nonblock, iovecs, control_len, flags)?;
+        (copied, message, 0)
     } else {
-        m.data.len()
-    } + more) as u64)
+        let total = iovecs.iter().map(|&(_, len)| len).sum();
+        let message = recv(cx, sock, nonblock, total, control_len, flags)?;
+        scatter_received(cx, iovecs, 0, &message.data)?;
+        let more = recv_rest(cx, sock, nonblock, message.len, total, flags, iovecs);
+        (message.data.len(), message, more)
+    };
+    let first = if flags & MSG_TRUNC != 0 {
+        message.len
+    } else {
+        copied
+    };
+    Ok((first + more, message))
 }
 
 /// recvfrom and recvmsg with `MSG_WAITALL` (without `MSG_PEEK`) on an internet stream socket: one
 /// [`recv`] takes at most [`MSG_MAX`], so a longer request goes on piece by piece, each written out
-/// by `put` at its offset, until it is complete or a piece comes up short (end of file, a signal,
+/// at its iovec offset, until it is complete or a piece comes up short (end of file, a signal,
 /// the timeout, an error), as Linux's tcp_recvmsg returns what it copied. `first` is the length the
 /// first piece gave (its `len`, as with `MSG_TRUNC` a stream piece carries no data); returns how
 /// much more was received.
@@ -1997,19 +2831,28 @@ fn recv_rest(
     first: usize,
     total: usize,
     flags: u32,
-    mut put: impl FnMut(&mut Cx<'_>, usize, &[u8]) -> Result<(), Errno>,
+    iovecs: &[(u64, usize)],
 ) -> usize {
-    let stream = matches!(&*sock.borrow(), Socket::Inet(s) if s.ty == SOCK_STREAM);
-    if !stream || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL {
+    if flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL
+        || !matches!(&*sock.borrow(), Socket::Inet(s) if s.ty == SOCK_STREAM)
+    {
         return 0;
     }
     let mut got = first;
     let mut last = first;
     while last == MSG_MAX && got < total {
-        let Ok(m) = recv(cx, sock, nonblock, total - got, 0, flags) else {
-            break;
+        let m = match recv(cx, sock, nonblock, total - got, 0, flags) {
+            Ok(m) => m,
+            Err(e) => {
+                if !matches!(e, Errno::EAGAIN | Errno::EINTR | Errno::ERESTARTSYS)
+                    && let Socket::Inet(s) = &*sock.borrow()
+                {
+                    s.pending_err.set(e.0);
+                }
+                break;
+            }
         };
-        if put(cx, got, &m.data).is_err() {
+        if scatter_received(cx, iovecs, got, &m.data).is_err() {
             break;
         }
         last = m.len;
@@ -2035,7 +2878,7 @@ pub(super) fn sendmmsg(cx: &mut Cx<'_>, fd: i32, vec: u64, vlen: u32, flags: u32
 }
 
 pub(super) fn sendmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let MsgHdr {
         name,
         namelen,
@@ -2075,14 +2918,27 @@ pub(super) fn recvmmsg(
     timeout: u64,
 ) -> SysResult {
     let deadline = super::poll::deadline_ts(cx, timeout)?;
+    if vlen == 0 {
+        return Ok(0);
+    }
+    let (file, sock, _) = socket_of(cx, fd)?;
     let mut flags = flags;
     let mut done = 0;
     for i in 0..vlen.min(MMSG_MAX) as u64 {
         let hdr = vec + i * MMSGHDR_SIZE;
-        match recvmsg(cx, fd, hdr, flags & !MSG_WAITFORONE) {
-            Ok(n) => put(cx, hdr + 56, (n as u32).to_le_bytes())?,
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
+        // A mapped input can fault before this record is consumed. Keep the socket and all
+        // completed records across the fill. recv_one handles faults after consumption.
+        let result = super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+            let nonblock = file.borrow().nonblocking();
+            recv_one(cx, &sock, nonblock, hdr, flags & !MSG_WAITFORONE)
+        });
+        if let Err(e) = result
+            .and_then(|n| super::copy_result(cx, |cx| put(cx, hdr + 56, (n as u32).to_le_bytes())))
+        {
+            if done == 0 {
+                return Err(e);
+            }
+            break;
         }
         done += 1;
         if flags & MSG_WAITFORONE != 0 {
@@ -2096,7 +2952,11 @@ pub(super) fn recvmmsg(
 }
 
 pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResult {
-    let (sock, nonblock) = socket_of(cx, fd)?;
+    let (_file, sock, nonblock) = socket_of(cx, fd)?;
+    recv_one(cx, &sock, nonblock, msg, flags)
+}
+
+fn recv_one(cx: &mut Cx<'_>, sock: &SocketRef, nonblock: bool, msg: u64, flags: u32) -> SysResult {
     let MsgHdr {
         name,
         namelen,
@@ -2104,25 +2964,6 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         control,
         controllen,
     } = read_msghdr(cx, msg)?;
-    let total: usize = iovecs.iter().map(|v| v.1).sum();
-    // AF_UNIX data is taken off its queue: when the part of the iovecs that the queued data
-    // would fill cannot take it, fail first, leaving the data queued (Linux keeps a stream's
-    // message when copying it faults)
-    let queued = match &*sock.borrow() {
-        Socket::Unix(u) => u.unread().unwrap_or(0),
-        _ => 0,
-    };
-    let mut need = total.min(queued);
-    for &(base, len) in &iovecs {
-        if need == 0 {
-            break;
-        }
-        let n = len.min(need);
-        if !cx.mm().can_write(base, n as u64) {
-            return Err(Errno::EFAULT);
-        }
-        need -= n;
-    }
     // A NULL control buffer holds nothing whatever its length (scm_recv): control messages are
     // cut (MSG_CTRUNC) and passed files dropped
     let room = if control == 0 {
@@ -2130,47 +2971,53 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } else {
         controllen.min(4096)
     };
-    let mut m = recv(cx, &sock, nonblock, total, room, flags)?;
-    scatter(cx, &iovecs, 0, &m.data)?;
-    let more = recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
-        scatter(cx, &iovecs, off, d)
-    });
+    let (received, mut m) = recv_into(cx, sock, nonblock, &iovecs, room, flags)?;
     // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
-        cx.mm().write(UserSlice::new(name, n), &m.addr[..n])?;
-        put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())?;
+        super::copy_result(cx, |cx| {
+            cx.mm().write(UserSlice::new(name, n), &m.addr[..n])
+        })?;
+        super::copy_result(cx, |cx| {
+            put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())
+        })?;
     }
     let mut n = controllen.min(m.control.len());
-    // A control buffer that cannot be written loses its messages, not the data: the passed files
-    // are not installed (receive_fd_user) and MSG_CTRUNC is set
+    // A control buffer that cannot be written loses its messages, not the data: the passed
+    // files are not installed (receive_fd_user) and MSG_CTRUNC is set
     if n > 0
-        && cx
-            .mm()
-            .write(UserSlice::new(control, n), &m.control[..n])
-            .is_err()
+        && super::copy_result(cx, |cx| {
+            cx.mm().write(UserSlice::new(control, n), &m.control[..n])
+        })
+        .is_err()
     {
-        unix::drop_passed_files(cx, &m.control);
+        m.rights = None;
         m.flags |= MSG_CTRUNC;
         n = 0;
     }
-    put(cx, msg + 40, (n as u64).to_le_bytes())?;
+    super::copy_result(cx, |cx| put(cx, msg + 40, (n as u64).to_le_bytes()))?;
     // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
     const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
-    put(
-        cx,
-        msg + 48,
-        (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
-    )?;
-    Ok((if flags & MSG_TRUNC != 0 {
-        m.len
-    } else {
-        m.data.len()
-    } + more) as u64)
+    super::copy_result(cx, |cx| {
+        put(
+            cx,
+            msg + 48,
+            (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
+        )
+    })?;
+    if let Some(rights) = m.rights.take() {
+        rights.install(&mut cx.fds_mut(), flags & MSG_CMSG_CLOEXEC != 0);
+    }
+    Ok(received as u64)
 }
 
 /// Writes `data` over the iovecs in order, starting `off` bytes into them.
-fn scatter(cx: &mut Cx<'_>, iovecs: &[(u64, usize)], off: usize, data: &[u8]) -> Result<(), Errno> {
+pub(super) fn scatter(
+    iovecs: &[(u64, usize)],
+    off: usize,
+    data: &[u8],
+    mut write: impl FnMut(UserSlice, &[u8]) -> Result<(), Errno>,
+) -> Result<(), Errno> {
     let mut skip = off;
     let mut done = 0;
     for &(base, len) in iovecs {
@@ -2182,12 +3029,74 @@ fn scatter(cx: &mut Cx<'_>, iovecs: &[(u64, usize)], off: usize, data: &[u8]) ->
         if n == 0 {
             break;
         }
-        cx.mm()
-            .write(UserSlice::new(base + skip as u64, n), &data[done..done + n])?;
+        write(UserSlice::new(base + skip as u64, n), &data[done..done + n])?;
         done += n;
         skip = 0;
     }
     Ok(())
+}
+
+/// The socket has already consumed these bytes. Keep completed iovecs across a page fill.
+fn scatter_received(
+    cx: &mut Cx<'_>,
+    iovecs: &[(u64, usize)],
+    off: usize,
+    data: &[u8],
+) -> Result<(), Errno> {
+    scatter(iovecs, off, data, |dst, bytes| {
+        super::copy_result(cx, |cx| cx.mm().write(dst, bytes))
+    })
+}
+
+/// Writes `data` over `iovecs` starting at byte offset `off`, returning how many bytes were
+/// written before any fault (`Ok(n)` with `n < data.len()` on a partial copy, or `Err(e)` when
+/// nothing could be written at all, preserving `EFAULT` and `FUSE_RETRY`).
+pub(super) fn scatter_partial(
+    cx: &mut Cx<'_>,
+    iovecs: &[(u64, usize)],
+    off: usize,
+    data: &[u8],
+) -> Result<usize, Errno> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let mut skip = off;
+    let mut done = 0;
+    for &(base, len) in iovecs {
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let n = (len - skip).min(data.len() - done);
+        if n == 0 {
+            break;
+        }
+        let dst = base.wrapping_add(skip as u64);
+        let slice = &data[done..done + n];
+        if cx.write_user(UserSlice::new(dst, n), slice).is_err() {
+            let mut part = 0;
+            while part < n {
+                let at = dst.wrapping_add(part as u64);
+                let step = ((appine_engine::PAGE_SIZE - at % appine_engine::PAGE_SIZE) as usize)
+                    .min(n - part);
+                match cx
+                    .mm()
+                    .write(UserSlice::new(at, step), &slice[part..part + step])
+                {
+                    Ok(()) => part += step,
+                    Err(e) => {
+                        done += part;
+                        return if done > 0 { Ok(done) } else { Err(e) };
+                    }
+                }
+            }
+            done += part;
+        } else {
+            done += n;
+        }
+        skip = 0;
+    }
+    Ok(done)
 }
 
 /// read, readv, write and writev on a socket (Linux's `sock_read_iter` and `sock_write_iter`): a
@@ -2203,22 +3112,11 @@ pub(super) fn rw(
     write: bool,
 ) -> SysResult {
     if !write {
-        let total: usize = iovecs.iter().map(|v| v.1).sum();
-        if total == 0 {
+        if iovecs.iter().all(|&(_, len)| len == 0) {
             return Ok(0);
         }
-        let m = recv(cx, sock, nonblock, total, 0, 0)?;
-        let mut off = 0;
-        for &(base, len) in iovecs {
-            let n = len.min(m.data.len() - off);
-            if n == 0 {
-                break;
-            }
-            cx.mm()
-                .write(UserSlice::new(base, n), &m.data[off..off + n])?;
-            off += n;
-        }
-        return Ok(m.data.len() as u64);
+        let (received, _) = recv_into(cx, sock, nonblock, iovecs, 0, 0)?;
+        return Ok(received as u64);
     }
     let stream = match &*sock.borrow() {
         Socket::Inet(s) => s.ty == SOCK_STREAM,
@@ -2271,23 +3169,54 @@ pub(super) fn rw(
 }
 
 pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
-    let (sock, _) = socket_of(cx, fd)?;
-    match &mut *sock.borrow_mut() {
+    let (_file, sock, _) = socket_of(cx, fd)?;
+    let mut wake_rd = false;
+    let res = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             const SHUT_RD: i32 = 0;
             const SHUT_RDWR: i32 = 2;
+            if let Some(held) = &s.deferred {
+                match how {
+                    1 => return Ok(0),
+                    SHUT_RD | SHUT_RDWR => {
+                        set_reuse_addr(s.fd, held.reuse_addr)?;
+                        s.deferred = None;
+                        s.fwd = None;
+                        s.listening = false;
+                        if let (Some(id), Some(net)) = (s.listener, &s.net) {
+                            crate::netns::set_listening(net, id, false);
+                        }
+                        s.rd_shut = true;
+                        request_wake_object(wake::of(&sock));
+                        return Ok(0);
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
             let r = appine_hal::net::shutdown(s.fd, how).map_err(Errno);
             // The host records the shutdown even on an unconnected socket, failing with ENOTCONN
             // as Linux's inet_shutdown does, and recv needs to know about it (InetSocket::rd_shut)
+            // and wake any receivers waiting on this socket (notably raw ICMP sockets)
             if matches!(r, Ok(()) | Err(Errno::ENOTCONN)) && matches!(how, SHUT_RD | SHUT_RDWR) {
                 s.rd_shut = true;
+                wake_rd = true;
+                if s.listening {
+                    s.listening = false;
+                    if let (Some(id), Some(net)) = (s.listener, &s.net) {
+                        crate::netns::set_listening(net, id, false);
+                    }
+                }
             }
-            r?
+            r
         }
-        Socket::Netlink(_) => {}
-        Socket::Unix(u) => unix::shutdown(u, how)?,
+        // Linux's netlink_ops uses sock_no_shutdown (EOPNOTSUPP).
+        Socket::Netlink(_) => Err(Errno::EOPNOTSUPP),
+        Socket::Unix(u) => unix::shutdown(u, how),
+    };
+    if wake_rd {
+        request_wake_object(wake::of(&sock));
     }
-    Ok(0)
+    res.map(|()| 0)
 }
 
 fn read_msghdr(cx: &Cx<'_>, msg: u64) -> Result<MsgHdr, Errno> {
@@ -2345,13 +3274,28 @@ pub(crate) fn send(
         return unix::send(cx, sock, nonblock, data, addr, control, flags);
     }
     if matches!(&*sock.borrow(), Socket::Netlink(_)) {
-        return netlink_send(cx, sock, data);
+        return netlink_send(cx, sock, data, addr);
     }
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    // Validate guest destination addresses before reaching the host (so Linux 6.1 errnos like
+    // EINVAL / EAFNOSUPPORT are returned consistently rather than host LSM errors like AppArmor's
+    // EAFNOSUPPORT for bogus families on AF_INET6 UDP). TCP without MSG_FASTOPEN ignores addr.
+    let validated = match &*sock.borrow() {
+        Socket::Inet(s)
+            if !addr.is_empty() && (s.ty != SOCK_STREAM || flags & MSG_FASTOPEN != 0) =>
+        {
+            Some(inet_send_addr(s, addr)?)
+        }
+        _ => None,
+    };
+    let addr = validated.as_deref().unwrap_or(addr);
     let (host_fd, ty, timeout, to_stub) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
-            if let Some(r) = &mut s.icmp {
-                r.sent(data);
+            if flags & MSG_FASTOPEN != 0 && s.filter.as_deref() == Some(DROP_TCP) {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if s.ty == SOCK_STREAM && s.pending_err.get() != 0 {
+                return Err(Errno(s.pending_err.replace(0)));
             }
             let to_stub = stub_capable(s) && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
             (s.fd, s.ty, s.sndtimeo, to_stub)
@@ -2414,30 +3358,61 @@ pub(crate) fn send(
     let w = cx.kr().world();
     let init = cx.kr().init_ns.net.clone();
     let cred = cx.cred();
-    let mut key = None;
-    // The destination as seen in its namespace is an IPv6 address (map_dest)
-    let mut dest_v6 = false;
+    let mut target_in_new_ns = false;
     // A socket bound to the host's wildcard address sending to a mapped destination: specify the
     // source address (Socket::wide)
     let mut pktinfo = None;
     // The destination of a connected UDP socket was dropped by a filter chain (recorded at
-    // connect)
+    // connect), or targets a new network namespace where the listener may have bound/rebound
+    // onto a new host port since connect()
     if addr.is_empty()
-        && let Socket::Inet(s) = &*sock.borrow()
+        && let Socket::Inet(s) = &mut *sock.borrow_mut()
         && s.ty != SOCK_STREAM
-        && let Some(e) = s.track.as_ref().and_then(|k| k.blocked)
     {
-        return if e == 0 {
-            Ok(data.len())
-        } else {
-            Err(Errno(e))
-        };
+        if let Some(e) = s.track.as_ref().and_then(|k| k.blocked) {
+            return if e == 0 {
+                Ok(data.len())
+            } else {
+                Err(Errno(e))
+            };
+        }
+        if nat_proto(s) == Some(IPPROTO_UDP as u8)
+            && let Some((target, there)) = s.track.as_ref().and_then(|k| k.udp_target.as_ref())
+        {
+            let Some((ip, h)) = target
+                .upgrade()
+                .and_then(|t| crate::netns::resolve_target(&t, IPPROTO_UDP, there))
+            else {
+                return Ok(data.len());
+            };
+            let gport = port_of(there).unwrap_or(0);
+            if let Some(v) = &mut s.vconn {
+                let desired = crate::netns::with_host_endpoint(v, ip, h);
+                if !same_endpoint(v, &desired) {
+                    *v = desired;
+                }
+            } else {
+                let current = appine_hal::net::sockname(s.fd, true).ok();
+                let desired = match &current {
+                    Some(cur) => crate::netns::with_host_endpoint(cur, ip, h),
+                    None => crate::netns::with_host_endpoint(&crate::netns::any_like(there), ip, h),
+                };
+                if current
+                    .as_deref()
+                    .is_none_or(|cur| !same_endpoint(cur, &desired))
+                {
+                    let _ = appine_hal::net::connect(s.fd, &desired);
+                }
+            }
+            s.peer_map = Some((gport, h));
+        }
     }
     let host_addr = match &mut *sock.borrow_mut() {
         Socket::Inet(s) if ty != SOCK_STREAM && (s.net.is_some() || !addr.is_empty()) => {
             let me = s.net.clone().unwrap_or_else(|| init.clone());
             if let (true, Some(v)) = (addr.is_empty(), &s.vconn) {
                 pktinfo = crate::netns::implicit_bind(&me, s.family, false);
+                target_in_new_ns = true;
                 Some(v.clone())
             } else if addr.is_empty() {
                 let src = crate::netns::implicit_bind(&me, s.family, s.icmp6());
@@ -2461,15 +3436,29 @@ pub(crate) fn send(
                     (_, true) => return Err(Errno::EPERM),
                     (_, false) => return Ok(data.len()),
                 }
-                // Sending to a port nobody binds in a new network namespace (or bound only to
-                // other addresses): dropped on Linux, and it cannot be left to the host (a UDP
-                // socket bound to the wildcard address outside would receive it)
+                // Initial-namespace socket targeting an allocated container loopback block:
+                // silently drop UDP (matching native Linux when nothing listens in init-ns) and
+                // fail raw/other datagram sockets with ENETUNREACH.
+                if m.isolated {
+                    if nat_proto(s) == Some(IPPROTO_UDP as u8) {
+                        ensure_bound(s, None)?;
+                        return Ok(data.len());
+                    }
+                    return Err(Errno::ENETUNREACH);
+                }
+                // Sending to a new network namespace: resolve the matching UDP listener's host
+                // endpoint (drop silently when none matches, so a wildcard UDP socket outside
+                // cannot capture it).
+                let mut resolved = None;
                 if nat_proto(s) == Some(IPPROTO_UDP as u8)
                     && let Some(t) = &m.target
                     && t.host_net.is_some()
-                    && !crate::netns::listening(t, &there, true)
                 {
-                    return Ok(data.len());
+                    let Some(ep) = crate::netns::resolve_target(t, IPPROTO_UDP, &there) else {
+                        return Ok(data.len());
+                    };
+                    resolved = Some(ep);
+                    target_in_new_ns = true;
                 }
                 if let Some(t) = &actual
                     && !s
@@ -2500,10 +3489,18 @@ pub(crate) fn send(
                     });
                     ensure_bound(s, source)?;
                 }
-                key = Some(m.target.as_ref().map_or(0, key_of));
-                dest_v6 = ipv6_proper(&there);
                 if s.wide && m.target.is_some() {
-                    pktinfo = crate::netns::implicit_bind(&me, s.family, false);
+                    let same_fam = |src: &Vec<u8>| {
+                        src.get(..2).is_some_and(|b| {
+                            i32::from(u16::from_le_bytes([b[0], b[1]])) == s.family
+                        })
+                    };
+                    pktinfo = m
+                        .source
+                        .as_ref()
+                        .filter(|src| same_fam(src))
+                        .cloned()
+                        .or_else(|| crate::netns::implicit_bind(&me, s.family, false));
                 }
                 // Bound to the wildcard address in the boot namespace (a UDP server answering a
                 // client in a new namespace): the source address the host chooses is 127.0.0.1,
@@ -2517,7 +3514,11 @@ pub(crate) fn send(
                 {
                     pktinfo = Some(src.clone());
                 }
-                Some(crate::netns::toward_self(&me, dst, m.addr))
+                let to = crate::netns::toward_self(&me, dst, m.addr);
+                Some(match resolved {
+                    Some((ip, h)) => crate::netns::with_host_endpoint(&to, ip, h),
+                    None => to,
+                })
             }
         }
         _ => None,
@@ -2529,13 +3530,21 @@ pub(crate) fn send(
     let addr = if ty == SOCK_STREAM && flags & MSG_FASTOPEN == 0 {
         &[][..]
     } else {
+        if ty == SOCK_STREAM
+            && !addr.is_empty()
+            && let Socket::Inet(s) = &*sock.borrow()
+        {
+            let me = s.net.as_deref().unwrap_or(&init);
+            if crate::netns::is_foreign_loopback(&w, me, addr) {
+                return Err(Errno::ECONNREFUSED);
+            }
+        }
         addr
     };
-    // Sending to a mapped low port on the local machine: switch to the host's (crate::portmap)
+    // Sending to a mapped low port in the initial namespace: switch to the host's (crate::portmap)
     let mapped = match &*sock.borrow() {
-        Socket::Inet(s) if !addr.is_empty() => {
-            let k = key.unwrap_or_else(|| ns_key(s));
-            let (a, pm) = map_dest(&cx.kr().portmap, s, addr.to_vec(), k, dest_v6);
+        Socket::Inet(s) if !addr.is_empty() && !target_in_new_ns => {
+            let (a, pm) = map_dest(&cx.kr().portmap, s, addr.to_vec());
             pm.map(|_| a)
         }
         _ => None,
@@ -2570,13 +3579,23 @@ pub(crate) fn send(
     let mut done = 0;
     let mut sent_datagram = false;
     let r = loop {
-        let r = appine_hal::net::sendmsg(
-            host_fd,
-            &data[done..],
-            addr,
-            control,
-            flags as i32 & !(MSG_DONTWAIT | MSG_NOSIGNAL) as i32,
-        );
+        let send = |payload: &[u8]| {
+            appine_hal::net::sendmsg(
+                host_fd,
+                payload,
+                addr,
+                control,
+                flags as i32 & !(MSG_DONTWAIT | MSG_NOSIGNAL) as i32,
+            )
+        };
+        let r = if tap.is_some()
+            && let Socket::Inet(s) = &*sock.borrow()
+            && let Some(raw) = &s.icmp
+        {
+            raw.send(host_fd, data, send)
+        } else {
+            send(&data[done..])
+        };
         match r {
             Ok(n) => {
                 done += n;
@@ -2621,14 +3640,65 @@ pub(crate) fn send(
         account(cx, sock, false, done, addr);
     }
     // Bound automatically by the host (on the first send to the outside in a new namespace): only
-    // now is the port known, so register it
-    if sent_datagram
-        && let Socket::Inet(s) = &mut *sock.borrow_mut()
-        && s.listener.is_none()
-    {
-        register_udp(s);
+    // now is the port known, so register its ephemeral binding
+    if sent_datagram && let Socket::Inet(s) = &mut *sock.borrow_mut() {
+        claim_ephemeral(s, None);
     }
     r
+}
+
+/// Validates a guest destination address for `sendto`/`sendmsg` on an inet socket as Linux 6.1
+/// does (`udp_sendmsg`, `udpv6_sendmsg`, `raw_sendmsg`, `rawv6_sendmsg`, `ping_v4_sendmsg`,
+/// `ping_v6_sendmsg`, `tcp_sendmsg_fastopen`) before passing it to the host.
+fn inet_send_addr<'a>(s: &InetSocket, addr: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, Errno> {
+    use std::borrow::Cow;
+    const AF_UNSPEC: i32 = 0;
+    let given = addr
+        .get(..2)
+        .map(|b| i32::from(u16::from_le_bytes([b[0], b[1]])));
+    let rewrite = |fam: i32| {
+        let mut out = addr.to_vec();
+        out[..2].copy_from_slice(&(fam as u16).to_le_bytes());
+        Cow::Owned(out)
+    };
+    if s.family == AF_INET {
+        if addr.len() < 16 {
+            return Err(Errno::EINVAL);
+        }
+        return match given {
+            Some(AF_INET) => Ok(Cow::Borrowed(addr)),
+            // udp_sendmsg and raw_sendmsg accept AF_UNSPEC as AF_INET; rewrite before the host so
+            // LSMs like AppArmor do not reject AF_UNSPEC with EAFNOSUPPORT.
+            Some(AF_UNSPEC) if s.ty == SOCK_DGRAM && (s.raw || s.proto != IPPROTO_ICMP) => {
+                Ok(rewrite(AF_INET))
+            }
+            _ => Err(Errno::EAFNOSUPPORT),
+        };
+    }
+    // AF_INET6 UDP (udpv6_sendmsg): checks sa_family first (short < 2 or unknown family is EINVAL,
+    // AF_UNSPEC clears msg_name, AF_INET falls through to IPv4 if !IPV6_V6ONLY).
+    if s.ty == SOCK_DGRAM && !s.raw && s.proto != IPPROTO_ICMPV6 {
+        return match given {
+            Some(AF_INET6) if addr.len() >= 24 => Ok(Cow::Borrowed(addr)),
+            Some(AF_INET) if addr.len() >= 16 => {
+                if is_v6only(s) {
+                    Err(Errno::ENETUNREACH)
+                } else {
+                    Ok(Cow::Borrowed(addr))
+                }
+            }
+            Some(AF_UNSPEC) => Ok(Cow::Borrowed(&[])),
+            _ => Err(Errno::EINVAL),
+        };
+    }
+    if addr.len() < 24 {
+        return Err(Errno::EINVAL);
+    }
+    match given {
+        Some(AF_INET6) => Ok(Cow::Borrowed(addr)),
+        Some(AF_UNSPEC) if s.raw => Ok(rewrite(AF_INET6)),
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
 }
 
 /// Appends to control messages `control` an `IP_PKTINFO` (`IPV6_PKTINFO`, for IPv4-mapped
@@ -2724,6 +3794,7 @@ pub(crate) fn recv(
             len: d.len(),
             addr,
             control: Vec::new(),
+            rights: None,
             flags: if d.len() > n { MSG_TRUNC } else { 0 },
         }
     };
@@ -2738,11 +3809,11 @@ pub(crate) fn recv(
                 Some((s.fd, s.ty, s.rcvtimeo))
             }
             Socket::Netlink(s) => {
-                // A dropped notification is reported before what is queued (sock_error)
+                // A dropped notification or reply is reported before what is queued (sock_error)
                 if s.overrun.take() {
                     return Err(Errno::ENOBUFS);
                 }
-                if let Some((d, group)) = take(&mut s.queue, peek) {
+                if let Some((d, group)) = s.dequeue(max, peek) {
                     // From the kernel (pid 0), with the group a notification went to as a mask
                     let mut addr = vec![0u8; 12];
                     addr[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
@@ -2803,6 +3874,13 @@ pub(crate) fn recv(
             }
         }
     };
+    // Preserve an error the host consumed after an earlier partial MSG_WAITALL read
+    if flags & MSG_ERRQUEUE == 0
+        && let Socket::Inet(s) = &*sock.borrow()
+        && s.pending_err.get() != 0
+    {
+        return Err(Errno(s.pending_err.replace(0)));
+    }
     // A UDP socket handed to the aggregation point: ICMP errors the host recorded for it would
     // make the receive fail, so take them off first; when the receive fails because of one, take
     // it off too and try again
@@ -2879,18 +3957,8 @@ pub(crate) fn recv(
                         // From a mapped low port on the local machine: report the guest's port
                         // (crate::portmap)
                         let w = cx.kr().world();
-                        let a = unmap_addr(&cx.kr().portmap, &w, s, r.addr, false);
-                        let me = net_of(cx, s);
-                        let a = match s.self_port.and_then(|_| crate::netns::from_self(&me, &a)) {
-                            Some(v) => v,
-                            None => crate::netns::from_host(
-                                &w,
-                                &me,
-                                &a,
-                                crate::netns::Role::Peer,
-                                s.icmp6(),
-                            ),
-                        };
+                        let a =
+                            translate_peer(&cx.kr().portmap, &w, s, &r.addr, s.self_port.is_some());
                         // From the destination DNAT rewrote to: report the one the guest sent to
                         match s
                             .track
@@ -2926,6 +3994,7 @@ pub(crate) fn recv(
                     len,
                     addr,
                     control: r.control,
+                    rights: None,
                     flags: r.flags as u32,
                 });
             }
@@ -2951,6 +4020,7 @@ pub(crate) fn recv(
                         len: 0,
                         addr: Vec::new(),
                         control: Vec::new(),
+                        rights: None,
                         flags: 0,
                     });
                 }
@@ -2971,14 +4041,22 @@ pub(crate) fn recv(
                 }
                 retried = true;
             }
-            // An error after part of a MSG_WAITALL read: return the part (the host has taken the
-            // error, so the next read sees end of file where Linux would report it)
-            Err(_) if got > 0 => break,
+            // An error after part of a MSG_WAITALL read: return the partial count and preserve the
+            // host error so the next read/SO_ERROR reports it instead of EOF.
+            Err(e) if got > 0 => {
+                if let Socket::Inet(s) = &*sock.borrow() {
+                    s.pending_err.set(e);
+                }
+                break;
+            }
             Err(e) => return Err(Errno(e)),
         }
     }
     // Part of a MSG_WAITALL read
     buf.truncate(got);
+    if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
+        buf.clear();
+    }
     if counted {
         account(cx, sock, true, got, &[]);
     }
@@ -2987,6 +4065,7 @@ pub(crate) fn recv(
         data: buf,
         addr: Vec::new(),
         control: Vec::new(),
+        rights: None,
         flags: 0,
     })
 }
@@ -3002,7 +4081,6 @@ fn wait_peek(
     nonblock: bool,
     deadline: Option<Instant>,
 ) -> Result<bool, Errno> {
-    const SO_RCVLOWAT: i32 = 18;
     if nonblock {
         return Err(Errno::EAGAIN);
     }
@@ -3066,6 +4144,7 @@ fn raw_recv(
             len,
             addr,
             control,
+            rights: None,
             flags: out_flags | MSG_ERRQUEUE,
         });
     }
@@ -3107,7 +4186,21 @@ fn raw_recv(
                 len,
                 addr: src,
                 control,
+                rights: None,
                 flags: out_flags,
+            });
+        }
+        // A raw ICMP socket shut down for reading: a blocking receive with nothing queued returns
+        // 0 before timeouts and signals (Linux's __skb_wait_for_more_packets checks RCV_SHUTDOWN);
+        // a nonblocking receive still returns EAGAIN.
+        if !nonblock && matches!(&*sock.borrow(), Socket::Inet(s) if s.rd_shut) {
+            return Ok(Message {
+                data: Vec::new(),
+                len: 0,
+                addr: Vec::new(),
+                control: Vec::new(),
+                rights: None,
+                flags: 0,
             });
         }
         if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
@@ -3164,33 +4257,73 @@ fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8
 
 // ---- netlink (the kernel/netlink map) ----
 
-/// Sends a netlink request: the kernel answers it at once into the socket's queue. A change
-/// request on `NETLINK_ROUTE` also notifies the sockets that joined the link, address or route
-/// groups of a namespace it changed ([`rtnl_watched`], [`rtnl_notify`]).
-fn netlink_send(cx: &mut Cx<'_>, sock: &SocketRef, data: &[u8]) -> Result<usize, Errno> {
-    let notes = {
+/// Sends a netlink message: validates `msg_name` (Linux's `netlink_sendmsg`), autobinds if
+/// unbound, and when addressed to the kernel (port 0, group 0) answers it at once into the
+/// socket's queue. A change request on `NETLINK_ROUTE` also notifies the sockets that joined the
+/// link, address or route groups of a namespace it changed ([`rtnl_watched`], [`rtnl_notify`]).
+fn netlink_send(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    data: &[u8],
+    addr: &[u8],
+) -> Result<usize, Errno> {
+    enum Delivery {
+        Kernel(Vec<RtnlNotes>),
+        Peer(SocketRef),
+        Drop,
+    }
+    let delivery = {
         let mut guard = sock.borrow_mut();
         let Socket::Netlink(s) = &mut *guard else {
             unreachable!("checked by the caller")
         };
-        netlink_autobind(cx, s);
-        let mut host = KernelHost::of(cx, s.net.clone());
-        if s.protocol == NETLINK_ROUTE {
-            host.watched = rtnl_watched(cx.kr(), Some((sock, s)));
+        let (dst_pid, dst_group) = if !addr.is_empty() {
+            netlink_dst(cx, s, addr)?
+        } else {
+            (s.dst_pid, s.dst_group)
+        };
+        netlink_autobind(cx, sock, s);
+        if dst_group != 0 {
+            Delivery::Drop
+        } else if dst_pid != 0 {
+            if dst_pid == s.pid {
+                s.enqueue(data.to_vec(), 0);
+                Delivery::Kernel(Vec::new())
+            } else {
+                let peer = netlink_find_peer(cx.kr(), sock, &s.net, s.protocol, dst_pid)
+                    .ok_or(Errno::ECONNREFUSED)?;
+                Delivery::Peer(peer)
+            }
+        } else {
+            let mut host = KernelHost::of(cx, s.net.clone());
+            if s.protocol == NETLINK_ROUTE {
+                host.watched = rtnl_watched(cx.kr(), Some((sock, s)));
+            }
+            // The nftables ruleset of the boot namespace changed: look again at which ports to
+            // forward
+            let init = &cx.kr().init_ns.net;
+            let before = (s.net.is_none() && s.protocol == NETLINK_NETFILTER)
+                .then(|| init.nft.borrow().generation);
+            s.handle(data, &host);
+            if before.is_some_and(|g| g != init.nft.borrow().generation) {
+                forward_all(cx.kr());
+            }
+            Delivery::Kernel(host.notes.into_inner())
         }
-        // The nftables ruleset of the boot namespace changed: look again at which ports to
-        // forward
-        let init = &cx.kr().init_ns.net;
-        let before = (s.net.is_none() && s.protocol == NETLINK_NETFILTER)
-            .then(|| init.nft.borrow().generation);
-        s.handle(data, &host);
-        if before.is_some_and(|g| g != init.nft.borrow().generation) {
-            forward_all(cx.kr());
-        }
-        host.notes.into_inner()
     };
-    request_wake_object(wake::of(sock));
-    rtnl_notify(cx.k(), notes);
+    match delivery {
+        Delivery::Kernel(notes) => {
+            request_wake_object(wake::of(sock));
+            rtnl_notify(cx.k(), notes, Some(sock));
+        }
+        Delivery::Peer(peer) => {
+            if let Socket::Netlink(p) = &mut *peer.borrow_mut() {
+                p.enqueue(data.to_vec(), 0);
+            }
+            request_wake_object(wake::of(&peer));
+        }
+        Delivery::Drop => {}
+    }
     Ok(data.len())
 }
 
@@ -3229,21 +4362,26 @@ const CHANGING_IOCTLS: [u32; 15] = [
 ];
 
 /// Queues the notifications of a change request on the sockets of each namespace that joined
-/// their groups, and wakes them.
-fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>) {
+/// their groups, and wakes them. Notifications already echoed to `sender` via `NLM_F_ECHO` skip
+/// `sender` during multicast broadcast so a subscribed sender does not receive a duplicate.
+fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>, sender: Option<&SocketRef>) {
     if notes.is_empty() {
         return;
     }
     k.rtnl_sockets.retain(|w| w.strong_count() > 0);
     for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let is_sender = sender.is_some_and(|s| Rc::ptr_eq(&sock, s));
         let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
             continue;
         };
         let ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
         let mut any = false;
         for (_, changes) in notes.iter().filter(|(n, _)| Rc::ptr_eq(n, &ns)) {
-            for (group, msg) in changes {
-                any |= s.notify(*group, msg);
+            for note in changes {
+                if note.echo && is_sender {
+                    continue;
+                }
+                any |= s.notify(note.group, &note.msg);
             }
         }
         if any {
@@ -3252,8 +4390,8 @@ fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>) {
     }
 }
 
-/// A namespace and the notifications (group, message) for what a request changed in it.
-type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<(u32, Vec<u8>)>);
+/// A namespace and the notifications for what a request changed in it.
+type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<crate::net::RtnlNote>);
 
 /// Host information for netlink answers: interfaces come from the host, traffic counters and the
 /// routes the host handed over come from the kernel. In a new network namespace there is only its
@@ -3306,13 +4444,14 @@ impl<'a> KernelHost<'a> {
         &self,
         watched: &[Rc<crate::nsproxy::NetNs>],
         before: Vec<crate::net::Snapshot>,
+        cause: crate::net::NotifyCause,
     ) -> Vec<RtnlNotes> {
         let after = self.snapshots(watched);
         watched
             .iter()
             .zip(before)
             .zip(after)
-            .map(|((ns, before), after)| (ns.clone(), after.changes(&before)))
+            .map(|((ns, before), after)| (ns.clone(), after.changes(&before, cause)))
             .filter(|(_, changes)| !changes.is_empty())
             .collect()
     }
@@ -3431,24 +4570,53 @@ impl crate::net::Host for KernelHost<'_> {
         self.cred.ruid
     }
 
-    fn configure(&self, req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+    fn configure(&self, req: &[u8], port: u32) -> Option<crate::net::ConfigureResult> {
         // IFLA_NET_NS_PID (19) is a process, IFLA_NET_NS_FD (28) a namespace file
         let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
         // What the namespaces being watched look like before and after a change request
         // (RTM_NEW, DEL and SETLINK, NEW and DELADDR, NEW and DELROUTE): it can change another
-        // namespace too (moving a link, a veth's peer)
-        let ty = req
-            .get(4..6)
-            .map_or(0, |t| u16::from_le_bytes([t[0], t[1]]));
-        let watched = match ty {
-            16 | 17 | 19 | 20 | 21 | 24 | 25 => &self.watched[..],
-            _ => &[],
+        // namespace too (moving a link, a veth's peer). When an echoable request sets NLM_F_ECHO,
+        // also snapshot the sender's namespace even if no multicast listener is subscribed.
+        let cause = crate::net::NotifyCause::from_req(req, port);
+        let echo = cause.wants_echo();
+        let ns = self.ns();
+        let mut extra_watched = Vec::new();
+        let watched: &[Rc<crate::nsproxy::NetNs>] = if !cause.is_change() {
+            &[]
+        } else if echo && !self.watched.iter().any(|w| Rc::ptr_eq(w, &ns)) {
+            extra_watched.extend(self.watched.iter().cloned());
+            extra_watched.push(ns.clone());
+            &extra_watched
+        } else {
+            &self.watched
         };
         let before = self.snapshots(watched);
-        let done = crate::netdev::request(&self.ns(), &self.cred, req, &resolve);
-        let notes = self.changed_since(watched, before);
+        let done = crate::netdev::request(&ns, &self.cred, req, &resolve);
+        let notes = self.changed_since(watched, before, cause);
+        let echoed: Vec<(u32, Vec<u8>)> = if echo {
+            notes
+                .iter()
+                .filter(|(n, _)| Rc::ptr_eq(n, &ns))
+                .flat_map(|(_, changes)| {
+                    changes
+                        .iter()
+                        .filter(|n| n.echo)
+                        .map(|n| (n.group, n.msg.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.notes.borrow_mut().extend(notes);
-        done
+        done.map(|result| crate::net::ConfigureResult { result, echoed })
+    }
+
+    fn ip_forward(&self, iif: u32) -> bool {
+        crate::netdev::forwarding_v4(&self.ns(), iif)
+    }
+
+    fn route_localnet(&self, iif: u32) -> bool {
+        crate::netdev::route_localnet_v4(&self.ns(), iif)
     }
 
     fn peer_net(&self, attr: u16, value: u32) -> Result<Option<i32>, i32> {
@@ -3458,7 +4626,7 @@ impl crate::net::Host for KernelHost<'_> {
         Ok(crate::netdev::nsid(&self.ns(), &peer))
     }
 
-    fn netfilter(&self, data: &[u8], peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+    fn netfilter(&self, data: &[u8], peer: &crate::nft::Peer<'_>) -> Vec<crate::net::NetlinkItem> {
         let comm = self.comm.split(|&c| c == 0).next().unwrap_or_default();
         let peer = crate::nft::Peer {
             proc_pid: self.proc_pid,
@@ -3484,13 +4652,18 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     }
     let before = KernelHost::of(cx, None).snapshots(&watched);
     let r = socket_ioctl(cx, sock, request, arg);
-    let notes = KernelHost::of(cx, None).changed_since(&watched, before);
-    rtnl_notify(cx.k(), notes);
+    let notes = KernelHost::of(cx, None).changed_since(
+        &watched,
+        before,
+        crate::net::NotifyCause::default(),
+    );
+    rtnl_notify(cx.k(), notes, None);
     r
 }
 
 /// Socket ioctls, as [`ioctl`] without the notifications.
 fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
+    const SIOCOUTQ: u32 = 0x5411;
     const FIONREAD: u32 = 0x541b;
     const SIOCATMARK: u32 = 0x8905;
     // Routes on an internet socket, in its namespace
@@ -3536,6 +4709,10 @@ fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> Sy
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
             let n = u.unread().ok_or(Errno::EINVAL)? as i32;
+            return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+        }
+        Socket::Unix(u) if request == SIOCOUTQ => {
+            let n = u.outq() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
         Socket::Netlink(_) | Socket::Unix(_) => None,
@@ -3935,7 +5112,7 @@ pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
         // taken off by the timer thread
         Socket::Inet(s @ InetSocket { icmp: Some(r), .. }) => {
             let key = wake::of_value(sock);
-            let ready = crate::rawicmp::queued(&r.tap, key).0;
+            let ready = crate::rawicmp::queued(&r.tap, key).0 || s.rd_shut;
             let read = if ready { POLLIN | POLLRDNORM } else { 0 };
             let errors = s.icmp_err.get() != 0 || crate::rawicmp::has_errors(&r.tap, key);
             let err = if errors { POLLERR } else { 0 };
@@ -3956,7 +5133,9 @@ pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
             };
             (err | stub, Some(s.fd))
         }
+        Socket::Inet(s) if s.deferred.is_some() => (0, None),
         Socket::Inet(s) if !s.answers.is_empty() => (POLLIN | POLLOUT, None),
+        Socket::Inet(s) if s.pending_err.get() != 0 => (POLLIN | POLLERR, Some(s.fd)),
         Socket::Inet(s) => (0, Some(s.fd)),
         Socket::Netlink(s) => {
             let err = if s.overrun.get() { POLLERR } else { 0 };
@@ -3996,7 +5175,6 @@ pub(crate) fn deliver_dns(k: &mut crate::kernel::Kernel, answers: &crate::kernel
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
             // A full receive queue drops the answer (__udp_enqueue_schedule_skb: what is queued
             // already exceeds SO_RCVBUF), counting answers by their length
-            const SO_RCVBUF: i32 = 8;
             let rcvbuf = appine_hal::net::getsockopt(s.fd, SOL_SOCKET, SO_RCVBUF, 4)
                 .ok()
                 .and_then(|v| Some(i32::from_le_bytes(v.get(..4)?.try_into().ok()?)))
@@ -4066,7 +5244,8 @@ const NAT_BACK_MAX: usize = 16;
 
 /// The destination address `addr` (the guest's) of connect or sendto: it first goes through `me`'s
 /// OUTPUT nat and is translated to the host's; when it enters another namespace
-/// ([`crate::netns::entering`]) it also goes through that namespace's PREROUTING nat and is
+/// ([`crate::netns::entering`]) it also goes through that namespace's PREROUTING nat, including
+/// any enabled bridge hop before the endpoint, and is
 /// translated to the host's by that namespace (containers connecting to published ports through
 /// the gateway or the outer address).
 fn route(
@@ -4076,76 +5255,115 @@ fn route(
     addr: &[u8],
     cred: &crate::cred::Cred,
 ) -> Result<Routed, Errno> {
-    let nat = nat_dest(s, me, addr, cred)?;
+    let (nat, out_block) = match nat_dest(s, me, addr, cred)? {
+        crate::netns::NatResult::Pass => (None, None),
+        crate::netns::NatResult::Dnat(d) => (Some(d), None),
+        crate::netns::NatResult::Block(o) => (None, Some(o)),
+    };
     let mut origs = Vec::new();
     if nat.is_some() {
         origs.push((me.id, addr.to_vec()));
     }
     let dst = nat.clone().unwrap_or_else(|| addr.to_vec());
-    let mut m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
-    let mut actual = nat;
-    let mut there = dst.clone();
-    if let Some(proto) = nat_proto(s)
-        && let Some(t) = crate::netns::entering(w, me, &m, &dst)
-        && let Some(d2) = crate::netns::prerouting_nat(me, &t, proto, local_port(s), &dst)?
+    let m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
+    let mut route = Routed {
+        m,
+        there: dst.clone(),
+        dst,
+        actual: nat,
+        verdict: (crate::nft::Outcome::Accept, false),
+        origs,
+    };
+    if let Some(o) = out_block {
+        route.verdict = (o, true);
+        return Ok(route);
+    }
+    let Some(proto) = nat_proto(s) else {
+        return Ok(route);
+    };
+    let mut bridge = crate::netns::bridge_hop(me, &route.m, &route.dst);
+    let entered = if let Some(b) = &mut bridge {
+        if let Some(o) = route.preroute(w, me, s, proto, &b.ns, Some(&b.iif))? {
+            route.verdict = (o, false);
+            return Ok(route);
+        }
+        b.dst.clone_from(&route.there);
+        route
+            .m
+            .target
+            .as_ref()
+            .filter(|ns| !Rc::ptr_eq(ns, &b.ns))
+            .cloned()
+    } else {
+        crate::netns::entering(w, me, &route.m, &route.dst)
+    };
+    if let Some(t) = entered
+        && let Some(o) = route.preroute(w, me, s, proto, &t, None)?
     {
-        let m2 = crate::netns::to_host(w, &t, &d2, crate::netns::Use::Reach, s.icmp6())?;
-        origs.push((t.id, dst.clone()));
-        there = d2;
-        actual = Some(crate::netns::from_host(
+        route.verdict = (o, false);
+        return Ok(route);
+    }
+    let flow = crate::netns::Flow {
+        proto,
+        vaddr: s.vaddr,
+        sport: local_port(s),
+        dst: &route.dst,
+        bridge: bridge.as_ref(),
+        origs: &route.origs,
+        there: &route.there,
+        uid: cred.euid,
+        gid: cred.egid,
+        established: proto == IPPROTO_UDP as u8
+            && s.track
+                .as_ref()
+                .is_some_and(|k| k.seen.iter().any(|p| same_endpoint(p, addr))),
+        mark: s.mark(),
+    };
+    route.verdict = crate::netns::path_filter(w, me, route.m.target.as_ref(), &flow);
+    Ok(route)
+}
+
+impl Routed {
+    fn preroute(
+        &mut self,
+        w: &crate::netns::World,
+        me: &Rc<crate::nsproxy::NetNs>,
+        s: &InetSocket,
+        proto: u8,
+        ns: &Rc<crate::nsproxy::NetNs>,
+        ingress: Option<&crate::nft::Iif>,
+    ) -> Result<Option<crate::nft::Outcome>, Errno> {
+        let dst =
+            match crate::netns::prerouting_nat(me, ns, proto, local_port(s), &self.there, ingress)?
+            {
+                crate::netns::NatResult::Pass => return Ok(None),
+                crate::netns::NatResult::Block(o) => return Ok(Some(o)),
+                crate::netns::NatResult::Dnat(dst) => dst,
+            };
+        // A port-only bridge DNAT keeps the original L2 path, even on an unnumbered bridge.
+        let via = if ingress.is_some() && ip_of(&self.there) == ip_of(&dst) {
+            me
+        } else {
+            ns
+        };
+        let mapped = crate::netns::to_host(w, via, &dst, crate::netns::Use::Reach, s.icmp6())?;
+        self.origs
+            .push((ns.id, std::mem::replace(&mut self.there, dst)));
+        self.actual = Some(crate::netns::from_host(
             w,
             me,
-            &m2.addr,
+            &mapped.addr,
             crate::netns::Role::Peer,
             s.icmp6(),
         ));
-        // Going through the host network originally, no source address was chosen: when DNAT
-        // leads into a namespace, a new namespace binds its loopback address so the other side
-        // recognizes the source; when DNAT leads to another address outside it still does not
-        // bind, since bound it could not get out
-        let source = m.source.take().or_else(|| {
-            m2.target.as_ref()?;
-            me.host_net
-                .and_then(|_| crate::netns::implicit_bind(me, s.family, s.icmp6()))
-        });
-        m = crate::netns::Mapped {
-            addr: m2.addr,
-            target: m2.target,
-            source,
-            vaddr: m.vaddr,
-        };
-    }
-    // The filter chains passed (crate::netns::path_filter): UDP sending back to peers it received
-    // from is ESTABLISHED
-    let verdict = match nat_proto(s) {
-        Some(proto) => {
-            let established = proto == IPPROTO_UDP as u8
-                && s.track
-                    .as_ref()
-                    .is_some_and(|k| k.seen.iter().any(|p| same_endpoint(p, addr)));
-            let flow = crate::netns::Flow {
-                proto,
-                vaddr: s.vaddr,
-                sport: local_port(s),
-                dst: &dst,
-                there: &there,
-                uid: cred.euid,
-                gid: cred.egid,
-                established,
-                mark: s.mark(),
-            };
-            crate::netns::path_filter(w, me, m.target.as_ref(), &flow)
+        // DNAT from the host network into a namespace needs an implicit source bind.
+        if self.m.source.is_none() && mapped.target.is_some() && me.host_net.is_some() {
+            self.m.source = crate::netns::implicit_bind(me, s.family, s.icmp6());
         }
-        None => (crate::nft::Outcome::Accept, false),
-    };
-    Ok(Routed {
-        m,
-        dst,
-        there,
-        actual,
-        verdict,
-        origs,
-    })
+        self.m.addr = mapped.addr;
+        self.m.target = mapped.target;
+        Ok(None)
+    }
 }
 
 /// The destination address rewritten by nftables' OUTPUT nat ([`crate::netns::output_nat`]);
@@ -4155,9 +5373,9 @@ fn nat_dest(
     me: &crate::nsproxy::NetNs,
     dst: &[u8],
     cred: &crate::cred::Cred,
-) -> Result<Option<Vec<u8>>, Errno> {
+) -> Result<crate::netns::NatResult, Errno> {
     let Some(proto) = nat_proto(s) else {
-        return Ok(None);
+        return Ok(crate::netns::NatResult::Pass);
     };
     crate::netns::output_nat(
         me,
@@ -4180,12 +5398,17 @@ fn nat_proto(s: &InetSocket) -> Option<u8> {
     }
 }
 
-/// The host socket's local port (0 while unbound).
+/// The guest socket's local port (0 while unbound): unmaps mapped host ports via `s.local_map`
+/// so nftables `sport` checks see the guest port rather than a host ephemeral port.
 fn local_port(s: &InetSocket) -> u16 {
-    appine_hal::net::sockname(s.fd, false)
+    let host = appine_hal::net::sockname(s.fd, false)
         .ok()
         .and_then(|a| port_of(&a))
-        .unwrap_or(0)
+        .unwrap_or(0);
+    match s.local_map {
+        Some((g, h)) if h == host => g,
+        _ => host,
+    }
 }
 
 /// Whether two IPv4 or IPv6 socket addresses have the same protocol family, port and address
@@ -4204,12 +5427,70 @@ fn same_endpoint(a: &[u8], b: &[u8]) -> bool {
 /// Decides by the current rules whether `s` is forwarded and where to ([`crate::forward`]).
 fn forward_socket(k: &crate::kernel::Kernel, s: &mut InetSocket) {
     let want = forward_target(k, s);
-    if want.as_ref() == s.fwd.as_ref().map(|h| &h.target) {
+    if want.as_ref() == s.fwd.as_ref().and_then(|h| h.target.as_ref()) {
         return;
     }
-    // Hand over the new one before dropping the old: no gap in between
-    let new = want.and_then(|t| k.forward.add(s.fd, t).ok()).map(Box::new);
-    s.fwd = new;
+    // Non-deferred sockets with an existing handle update in place rather than dropping and
+    // recreating the handle: for UDP this preserves active relays across rule updates and pauses
+    // intake (`None`) when the rule disappears while letting in-flight replies drain until idle
+    // expiry or socket close.
+    if s.deferred.is_none()
+        && let Some(h) = &mut s.fwd
+        && (want.is_some() || s.ty == SOCK_DGRAM)
+    {
+        h.update(want);
+        return;
+    }
+    // A held guest listener keeps its own accept queue empty. Only a matching target gets
+    // a host listener; a failed registration or removal drops that listener and its queue.
+    s.fwd = want.and_then(|target| {
+        let fd = match &mut s.deferred {
+            Some(held) => {
+                if held.forward.is_none() {
+                    held.forward = Some(forward_listener(s.fd, s.family, held.backlog).ok()?);
+                }
+                held.forward.as_ref()?.0.as_raw_fd()
+            }
+            None => s.fd,
+        };
+        k.forward.add(fd, target).ok().map(Box::new)
+    });
+    if s.fwd.is_none()
+        && let Some(held) = &mut s.deferred
+    {
+        held.forward = None;
+    }
+}
+
+/// The forwarding queue has an independent lifetime: withdrawing DNAT discards queued
+/// handshakes and leaves even an ephemeral guest port reserved on its original fd.
+fn forward_listener(
+    guest: i32,
+    family: i32,
+    backlog: i32,
+) -> Result<crate::net::ForwardListener, Errno> {
+    let addr = appine_hal::net::sockname(guest, false).map_err(Errno)?;
+    let raw = appine_hal::net::socket(family, SOCK_STREAM, IPPROTO_TCP).map_err(Errno)?;
+    // SAFETY: socket returned a new fd owned by this function.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if family == AF_INET6 {
+        let only =
+            appine_hal::net::getsockopt(guest, IPPROTO_IPV6, IPV6_V6ONLY, 4).map_err(Errno)?;
+        appine_hal::net::setsockopt(raw, IPPROTO_IPV6, IPV6_V6ONLY, &only).map_err(Errno)?;
+    }
+    let dev = appine_hal::net::getsockopt(guest, SOL_SOCKET, SO_BINDTODEVICE, 16).map_err(Errno)?;
+    if !dev.is_empty() {
+        appine_hal::net::setsockopt(raw, SOL_SOCKET, SO_BINDTODEVICE, &dev).map_err(Errno)?;
+    }
+    // Two SO_REUSEADDR sockets may bind before either listens. Once listening, the
+    // forwarder excludes other listeners, including those requesting SO_REUSEPORT.
+    set_reuse_addr(raw, 1)?;
+    set_reuse_addr(guest, 1)?;
+    let result =
+        appine_hal::net::bind(raw, &addr).and_then(|()| appine_hal::net::listen(raw, backlog));
+    set_reuse_addr(guest, 0)?;
+    result.map_err(Errno)?;
+    Ok(crate::net::ForwardListener(fd))
 }
 
 /// When a connection from outside the host reaches `s` in the boot namespace (a TCP listen, or a
@@ -4241,20 +5522,38 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
         set_port(&mut local, g);
     }
     let proto = if udp { IPPROTO_UDP } else { IPPROTO_TCP };
-    let dst = crate::netns::external_nat(init, proto as u8, &local)?;
+    let (original, dst) = crate::netns::external_nat(init, proto as u8, &local).or_else(|| {
+        // Dual-stack AF_INET6 wildcard listener (!IPV6_V6ONLY): also probe as IPv4 wildcard so
+        // IPv4 PREROUTING DNAT rules match it.
+        if s.family != AF_INET6 || !crate::netns::is_any(&local) || is_v6only(s) {
+            return None;
+        }
+        let mut v4_any = vec![0u8; 16];
+        v4_any[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        v4_any[2..4].copy_from_slice(&local[2..4]);
+        crate::netns::external_nat(init, proto as u8, &v4_any)
+    })?;
     let w = k.world();
     let m = crate::netns::to_host(&w, init, &dst, crate::netns::Use::Reach, false).ok()?;
+    if m.isolated {
+        return None;
+    }
     // Not forwarded when dropped or rejected by filter chains (FORWARD and so on)
-    if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &dst) {
+    if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &original, &dst) {
         return None;
     }
     let mut addr = m.addr;
-    let key = m.target.as_ref().map_or(0, key_of);
-    let map = k.portmap.borrow();
-    if let Some(p) = port_of(&addr)
-        && let Some(h) = map.host_port(key, proto, p, ipv6_proper(&dst))
-    {
-        set_port(&mut addr, h);
+    if let Some(t) = m.target.as_ref().filter(|t| t.host_net.is_some()) {
+        if let Some((ip, h)) = crate::netns::resolve_target(t, proto, &dst) {
+            addr = crate::netns::with_host_endpoint(&addr, ip, h);
+        }
+    } else {
+        let map = k.portmap.borrow();
+        if let Some(p) = port_of(&addr)
+            && let Some(h) = map.host_port(proto, p)
+        {
+            set_port(&mut addr, h);
+        }
     }
     Some(crate::forward::Target {
         udp,
@@ -4265,7 +5564,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
 
 /// After the nftables ruleset of the boot namespace changes, looks at all sockets again.
 fn forward_all(k: &crate::kernel::Kernel) {
-    for (sock, _) in crate::pseudo::sockets(k) {
+    for sock in crate::pseudo::sockets(k) {
         if let Ok(mut b) = sock.try_borrow_mut()
             && let Socket::Inet(s) = &mut *b
             && s.net.is_none()
@@ -4277,20 +5576,15 @@ fn forward_all(k: &crate::kernel::Kernel) {
 
 // ---- Low ports ----
 
-/// Connecting or sending to host address `addr`: a mapped low port on the local machine becomes
-/// the host port ([`crate::portmap`]), by the registration of the network namespace the
-/// destination is in (`key`, [`key_of`]); `v6` says whether the destination as seen in that
-/// namespace is an IPv6 address, which picks an IPv6-only binding first
-/// ([`crate::portmap::PortMap::host_port`]). Returns the rewritten address and (guest port, host
-/// port). Not rewritten when no program in the guest binds this port: if another app on the
-/// phone happens to hold the host port, connecting there would be wrong, and it should fail to
-/// connect as before.
+/// Connecting or sending to host address `addr` in the initial namespace: a mapped low port on
+/// the local machine becomes the host port ([`crate::portmap`]). Returns the rewritten address
+/// and `(guest port, host port)`. Not rewritten when no program in the guest binds this port: if
+/// another app on the phone happens to hold the host port, connecting there would be wrong, and it
+/// should fail to connect as before.
 fn map_dest(
     map: &crate::cell::RefCell<crate::portmap::PortMap>,
     s: &InetSocket,
     mut addr: Vec<u8>,
-    key: usize,
-    v6: bool,
 ) -> (Vec<u8>, Option<(u16, u16)>) {
     let Some(port) = port_of(&addr) else {
         return (addr, None);
@@ -4299,9 +5593,7 @@ fn map_dest(
         if !mappable(s) {
             return (addr, None);
         }
-        // Only low ports and ports bound explicitly in new namespaces are registered; unregistered
-        // ones are not rewritten
-        map.borrow().host_port(key, map_proto(s), port, v6)
+        map.borrow().host_port(map_proto(s), port)
     };
     match host {
         Some(h) if is_local(&addr) => {
@@ -4312,106 +5604,34 @@ fn map_dest(
     }
 }
 
-/// In a local (`local`) or peer address given by the host, a mapped host port is translated back
-/// to the guest's: the local end by the socket's bound mapping; the peer first by what was
-/// recorded at connect, then by whether it was mapped on the local machine (the source of UDP, or
-/// an accepted peer bound with a low port), by the network namespace the peer address is in
-/// ([`crate::netns::owner_of_host`]).
-pub(crate) fn unmap_addr(
-    map: &crate::cell::RefCell<crate::portmap::PortMap>,
-    w: &crate::netns::World,
-    s: &InetSocket,
-    mut addr: Vec<u8>,
-    local: bool,
-) -> Vec<u8> {
-    let Some(port) = port_of(&addr) else {
-        return addr;
-    };
-    let known = if local { s.local_map } else { s.peer_map };
-    // The source of a connection forwarded in from outside is not a mapped port (crate::forward)
-    let outside = ip_of(&addr).is_some_and(|ip| match ip {
-        std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
-        std::net::IpAddr::V6(_) => false,
-    });
-    let guest = match known {
-        Some((g, h)) if h == port => Some(g),
-        _ if local || !mappable(s) || outside => None,
-        _ => {
-            let key =
-                crate::netns::owner_of_host(w, &addr).map_or_else(|| ns_key(s), |n| key_of(&n));
-            map.borrow()
-                .guest_port(key, map_proto(s), port)
-                .filter(|_| is_local(&addr))
-        }
-    };
-    if let Some(g) = guest {
+/// In a local address given by the host, translates a mapped host port back to the guest's using
+/// the socket's bound mapping ([`InetSocket::local_map`]).
+pub(crate) fn unmap_addr(s: &InetSocket, mut addr: Vec<u8>) -> Vec<u8> {
+    if let Some(port) = port_of(&addr)
+        && let Some((g, h)) = s.local_map
+        && h == port
+    {
         set_port(&mut addr, g);
     }
     addr
 }
 
-/// Mapped low ports apply to this socket ([`crate::portmap`]): TCP, UDP, not raw sockets.
-fn mappable(s: &InetSocket) -> bool {
-    !s.raw && matches!(map_proto(s), IPPROTO_TCP | IPPROTO_UDP)
-}
-
-/// The protocol in the low-port mapping registry: MPTCP's ports are the same as TCP's (Go 1.24 and
-/// later listen with MPTCP by default).
-fn map_proto(s: &InetSocket) -> i32 {
-    if s.proto == IPPROTO_MPTCP {
-        IPPROTO_TCP
-    } else {
-        s.proto
-    }
-}
-
-/// The network namespace in the registry: the boot one is 0.
-fn ns_key(s: &InetSocket) -> usize {
-    s.net.as_ref().map_or(0, |n| Rc::as_ptr(n) as usize)
-}
-
-/// The key of a network namespace in the low-port mapping registry ([`ns_key`]).
-fn key_of(n: &Rc<crate::nsproxy::NetNs>) -> usize {
-    if n.host_net.is_none() {
-        0
-    } else {
-        Rc::as_ptr(n) as usize
-    }
-}
-
-/// The host address is local: loopback, the wildcard address, or one on a host interface
-/// (connecting to its own wlan0 address).
-fn is_local(addr: &[u8]) -> bool {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let Some(ip) = ip_of(addr) else {
-        return false;
-    };
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    appine_hal::net::interfaces().iter().any(|i| {
-        i.addrs.iter().any(|(_, a, _)| {
-            let own = match a.len() {
-                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&a[..]).unwrap())),
-                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&a[..]).unwrap())),
-                _ => return false,
-            };
-            own == ip
-        })
-    })
-}
-
 // ---- Shared helpers ----
 
-/// The socket of an fd; ENOTSOCK when it is not a socket.
-fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
+/// The open file and socket of an fd; ENOTSOCK when it is not a socket. Keeping the [`FileRef`]
+/// alive for the duration of the syscall ensures `unix::collect` sees the socket as referenced
+/// while a blocking call waits.
+fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(FileRef, SocketRef, bool), Errno> {
     let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    match &f.kind {
-        _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
-        FileKind::Socket(s) => Ok((s.clone(), f.nonblocking())),
-        _ => Err(Errno::ENOTSOCK),
-    }
+    let (sock, nonblock) = {
+        let f = file.borrow();
+        match &f.kind {
+            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
+            FileKind::Socket(s) => (s.clone(), f.nonblocking()),
+            _ => return Err(Errno::ENOTSOCK),
+        }
+    };
+    Ok((file, sock, nonblock))
 }
 
 /// AF_UNIX operations that wait or need the socket itself are handed to [`unix`].
@@ -4434,7 +5654,7 @@ fn read_addr(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
 /// length is written back (truncated when the buffer is too small). accept's and recvfrom's
 /// `addr` may be NULL, meaning no address is wanted; otherwise a NULL `addrlen` is EFAULT
 /// (move_addr_to_user).
-fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
+fn write_addr(cx: &mut Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
     if addr == 0 {
         return Ok(());
     }
@@ -4442,11 +5662,14 @@ fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), 
 }
 
 /// getsockname, getpeername: `addrlen` must be valid, and a negative length is EINVAL.
-fn write_addr_to(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
-    let room = usize::try_from(i32::from_le_bytes(get(cx, addrlen)?)).map_err(|_| Errno::EINVAL)?;
+fn write_addr_to(cx: &mut Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
+    let len = super::copy_result(cx, |cx| get(cx, addrlen))?;
+    let room = usize::try_from(i32::from_le_bytes(len)).map_err(|_| Errno::EINVAL)?;
     let n = room.min(value.len());
-    cx.mm().write(UserSlice::new(addr, n), &value[..n])?;
-    put(cx, addrlen, (value.len() as u32).to_le_bytes())
+    super::copy_result(cx, |cx| cx.mm().write(UserSlice::new(addr, n), &value[..n]))?;
+    super::copy_result(cx, |cx| {
+        put(cx, addrlen, (value.len() as u32).to_le_bytes())
+    })
 }
 
 /// Waits for host socket `sock` (host fd `fd`) to become ready: EAGAIN at once when nonblocking,
@@ -4483,7 +5706,7 @@ fn net_of(cx: &Cx<'_>, s: &InetSocket) -> Rc<crate::nsproxy::NetNs> {
 /// Puts a socket into the fd table; `flags` may include `SOCK_NONBLOCK`, `SOCK_CLOEXEC`.
 fn install(cx: &mut Cx<'_>, sock: SocketRef, flags: u32) -> Result<i32, Errno> {
     let file = socket_file(sock, flags);
-    cx.fds_mut().install(file, flags & SOCK_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & SOCK_CLOEXEC != 0)
 }
 
 /// The open file of a socket; `flags` may include `SOCK_NONBLOCK`.
@@ -4512,18 +5735,105 @@ fn ipv6_proper(addr: &[u8]) -> bool {
     matches!(ip_of(addr), Some(std::net::IpAddr::V6(_)))
 }
 
-/// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
-fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
-    match family {
-        AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
-            <[u8; 4]>::try_from(addr.get(4..8)?).ok()?,
-        ))),
-        AF_INET6 => {
-            let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(addr.get(8..24)?).ok()?);
-            Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
+/// Whether IPv6 socket `s` has `IPV6_V6ONLY` enabled (recorded in new namespaces, queried from the
+/// host in the initial namespace).
+fn is_v6only(s: &InetSocket) -> bool {
+    if s.net.is_some() {
+        s.v6only
+    } else {
+        appine_hal::net::getsockopt(s.fd, IPPROTO_IPV6, IPV6_V6ONLY, 4)
+            .is_ok_and(|v| v.get(..4).is_some_and(|b| b != [0; 4]))
+    }
+}
+
+/// Whether `addr` is in the forwarder's `127.254.0.0/16` outside-client block (IPv4 or
+/// IPv4-mapped IPv6).
+fn is_outside_host(addr: &[u8]) -> bool {
+    ip_of(addr).is_some_and(|ip| match ip {
+        std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
+        std::net::IpAddr::V6(_) => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sockaddr_in(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut a = vec![0u8; 16];
+        a[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[4..8].copy_from_slice(&ip);
+        a
+    }
+
+    #[test]
+    fn rebind_raw_host_fd_copies_options_and_is_atomic_on_error() {
+        let fd1 = match appine_hal::net::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) {
+            Err(e) if e == Errno::EACCES.0 || e == Errno::EPERM.0 => return,
+            result => result.unwrap(),
+        };
+        let mut inet = InetSocket::new(fd1, AF_INET, SOCK_DGRAM);
+        inet.raw = true;
+        inet.proto = IPPROTO_ICMP;
+        let lo1 = sockaddr_in([127, 0, 0, 1], 0);
+        let lo2 = sockaddr_in([127, 0, 0, 2], 0);
+        appine_hal::net::bind(fd1, &lo1).unwrap();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_BINDTODEVICE, b"lo\0").unwrap();
+        inet.bound_dev_if = int_option(fd1, SO_BINDTOIFINDEX).unwrap();
+        for (level, opt, value) in [
+            (SOL_SOCKET, SO_RCVBUF, 8192i32),
+            (SOL_SOCKET, SO_SNDBUF, 4096),
+            (SOL_SOCKET, SO_RCVLOWAT, 17),
+            (SOL_IP, IP_TTL, 42),
+            (SOL_IP, IP_TOS, 16),
+            (SOL_SOCKET, SO_PRIORITY, 0),
+        ] {
+            appine_hal::net::setsockopt(fd1, level, opt, &value.to_ne_bytes()).unwrap();
         }
-        _ => None,
+        let linger = [1i32.to_ne_bytes(), 7i32.to_ne_bytes()].concat();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_LINGER, &linger).unwrap();
+        attach_host_filter(fd1, SO_ATTACH_FILTER, DROP_TCP).unwrap();
+        appine_hal::net::setsockopt(fd1, SOL_SOCKET, SO_LOCK_FILTER, &1i32.to_ne_bytes()).unwrap();
+
+        // Rebinding to an invalid non-local address fails cleanly without touching fd1.
+        let bogus = sockaddr_in([203, 0, 113, 9], 0);
+        assert_eq!(
+            rebind_raw_host_fd(&inet, &bogus).unwrap_err(),
+            Errno::EADDRNOTAVAIL
+        );
+        assert!(same_host(
+            &appine_hal::net::sockname(fd1, false).unwrap(),
+            &lo1
+        ));
+
+        // Rebinding to a different local address succeeds and preserves host options.
+        let replacement = rebind_raw_host_fd(&inet, &lo2).unwrap();
+        let fd2 = replacement.as_raw_fd();
+        assert!(same_host(
+            &appine_hal::net::sockname(fd2, false).unwrap(),
+            &lo2
+        ));
+        for (level, opt, size) in [
+            (SOL_SOCKET, SO_RCVBUF, 4),
+            (SOL_SOCKET, SO_SNDBUF, 4),
+            (SOL_SOCKET, SO_RCVLOWAT, 4),
+            (SOL_SOCKET, SO_LINGER, 8),
+            (SOL_SOCKET, SO_BINDTODEVICE, 16),
+            (SOL_IP, IP_TTL, 4),
+            (SOL_IP, IP_TOS, 4),
+            (SOL_SOCKET, SO_PRIORITY, 4),
+        ] {
+            assert_eq!(
+                appine_hal::net::getsockopt(fd2, level, opt, size).unwrap(),
+                appine_hal::net::getsockopt(fd1, level, opt, size).unwrap(),
+                "option {level}/{opt}"
+            );
+        }
+        assert_eq!(
+            appine_hal::net::get_filter(fd2, 1).unwrap(),
+            (1, DROP_TCP.to_vec())
+        );
+        assert!(filter_locked(fd2));
     }
 }

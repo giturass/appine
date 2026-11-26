@@ -587,7 +587,13 @@ nft add rule ip t out udp dport 9002 drop
 nft add rule ip t out udp dport 9003 quota over 100 bytes drop
 iptables --wait -A OUTPUT -p udp --dport 9004 -m limit --limit 2/second --limit-burst 3 -j ACCEPT
 iptables --wait -A OUTPUT -p udp --dport 9004 -j DROP
-for p in 9001 9002 9003 9004 9005; do ./ratesend $p; done
+nft add rule ip t out udp dport 9006-9007 meter by_port "{ udp dport limit rate over 1/minute burst 2 packets }" drop
+iptables --wait -A OUTPUT -p udp --dport 9008:9009 -m hashlimit --hashlimit-mode dstport --hashlimit-name by_port --hashlimit-above 1/minute --hashlimit-burst 2 -j DROP
+# Both rules consume credit from the same named hashlimit table.
+for target in "" "-j DROP"; do
+    iptables --wait -A OUTPUT -p udp --dport 9010 -m hashlimit --hashlimit-mode dstport --hashlimit-name shared --hashlimit-above 1/minute --hashlimit-burst 2 $target
+done
+for p in 9001 9002 9003 9004 9005 9006 9007 9008 9009 9010; do ./ratesend $p; done
 '
 # Small checks: O_DIRECT opens (store files only; not directories, devices or procfs);
 # getdents64 on a removed directory and with a count above INT_MAX; copy_file_range's order of

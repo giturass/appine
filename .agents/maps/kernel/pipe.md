@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint pipe-max-size sysctl references to kernel/sysctl)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: live vmsplice reads, snapshot fallback on pipe transfers, and validation of spliced FUSE replies)
 
 ## Responsibilities
 
@@ -21,14 +21,14 @@ Root: `core/kernel/src/pipe.rs`; in `syscall/fs.rs` `pipe2`, `open_fifo`, the pi
 commands, `pipe_read`, `pipe_write` and `broken_pipe`, and the splice block from `splice` to
 `wait_splice_done`.
 
-Outside the module: fd tables, open files and the read, write and vectored paths that reach pipes
-(`kernel/files`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
+Outside the module: fd tables and open files (`kernel/files`); the read, write and vectored paths
+that reach pipes (`kernel/fileio`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
 (`kernel/poll`); `/dev/fuse` and AF_UNIX sockets as splice ends (`kernel/fuse`, `kernel/unix`); the
 `pipe-max-size` sysctl (`kernel/sysctl`).
 
 ## Key types
 
-- `Pipe` / `PipeEnd` — buffer, capacity, reader and writer counts, `writer_need`, EPOLLET
+- `Pipe` / `PipeEnd` — payload bytes and occupied page slots, capacity, reader and writer counts, EPOLLET
   counters, `splicing`; FIFOs by inode in `Kernel::fifos` (weak).
 - `FileKind::Pipe` (`kernel/files`).
 
@@ -46,9 +46,17 @@ Outside the module: fd tables, open files and the read, write and vectored paths
 - Data lives in process memory. `pipe2` accepts `O_CLOEXEC|O_NONBLOCK|O_DIRECT` (`O_DIRECT`
   ignored: no packet mode, not in `F_GETFL`). Capacity 64 KiB, capped at `pipe-max-size` (1 MiB)
   without `CAP_SYS_RESOURCE`; `F_SETPIPE_SZ` rounds up to a power of two of at least a page
-  (`EPERM` over the max, `EBUSY` below the buffered bytes).
-- A write wakes readers only when the pipe was empty; a read wakes writers only when it crosses
-  `PIPE_BUF` of free room or meets the room a blocked writer asked for (`writer_need`).
+  (`EPERM` when growing beyond the max, `EBUSY` when the new capacity cannot hold all occupied
+  and reserved slots).
+- Pipe reads (`read`, `readv`, read-side `vmsplice`) peek and copy into guest memory via
+  `pipe_read_user` (`write_user_partial`), draining only the bytes actually copied so a faulting
+  user buffer (`EFAULT`) leaves unread bytes in the pipe.
+- Ordinary writes (`pipe_write_user` for guest `write`/`writev`) merge an initial `total % 4096`
+  prefix into the last anonymous write slot if it fits and copies completely, then copy and commit
+  remaining data one `PIPE_BUF` (4096-byte) page slot at a time; a fault discards the incomplete
+  page and returns bytes committed so far (`EFAULT` when none), so a sub-page faulting `writev`
+  writes nothing. Reading a prefix keeps its slot occupied until the final byte leaves. Freeing a
+  slot from a full pipe wakes blocked writers and advances the write-end edge counter.
 - FIFO open: one `Pipe` per inode; write-only nonblocking without a reader `ENXIO`; read-only
   nonblocking succeeds; read-write never waits; blocking one-ended opens wait for a peer present
   or opened since (`ERESTARTSYS` on a signal); access mode 3 `EINVAL` (`fifo_open`).
@@ -63,20 +71,22 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   (read, readv, vmsplice, another splice out) waits whatever `O_NONBLOCK` says, as for Linux's pipe
   lock; writers do not wait. Unknown flags `EINVAL`; a zero length returns 0 first in splice,
   after the flags in tee, and in vmsplice after the flags, access mode and iovecs (a non-pipe fd
-  is `EBADF` only after that). splice checks access modes (`EBADF`), then its `EINVAL` cases (no
-  pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that way), then offsets on
-  a pipe (`ESPIPE`); an offset with an AF_UNIX stream input is ignored for the read and written back
-  advanced, on other unseekable inputs `ESPIPE` only after the wait for room. `/dev/fuse` splices
+  is `EBADF` only after that). splice rejects `O_PATH` fds (`EBADF`), checks offsets on a pipe
+  (`ESPIPE`) and reads user offsets (`EFAULT`) before checking access modes (`EBADF`), then its
+  `EINVAL` cases (no pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that
+  way), then rejects explicit offsets on any unseekable end or negative offsets (`EINVAL`) before
+  waiting for pipe room or data. `/dev/fuse` splices
   one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
-  room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
-  fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
-  see).
+  room). A spliced reply must declare the number of bytes supplied. A mismatch returns EINVAL
+  and leaves the bytes in the pipe.
 - Which files splice at each end follows Linux's `splice_read` and `splice_write`
   (`splice_reads`, `splice_writes`, also used by sendfile): pipes, regular and FUSE files,
-  sockets, terminals, host fds, `/dev/fuse`, procfs and sysfs files, and the devices, except that
-  `/dev/null` cannot be read from, `/dev/full` cannot be written to, and `/dev/kmsg` and
-  `/dev/loop-control` neither; directories, eventfd, epoll and the other anonymous files cannot
-  splice at all.
+  sockets, terminals, host fds, `/dev/fuse`, sysfs/cgroup2 and `/proc/sys` files, global/`net`/
+  `sysvipc` procfs files and `/proc/<pid>/{mounts,mountinfo}` (reads only), and the devices,
+  except that `/dev/null` cannot be read from, `/dev/full` cannot be written to, `/dev/kmsg` and
+  `/dev/loop-control` neither, and per-process procfs entries (other than `mounts`/`mountinfo`),
+  `fdinfo`, `ns/*` and `/proc/kmsg` cannot splice (`EINVAL`); directories, eventfd, epoll and the
+  other anonymous files cannot splice at all.
 - When splice waits follows 6.1: between two pipes and for tee, for data (going on at end of file)
   and then room, unless `SPLICE_F_NONBLOCK` or either end's `O_NONBLOCK`, then moving or copying
   what is there and fits (splice waits again if a race took it, tee returns 0); from a pipe, for
@@ -86,30 +96,35 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   `O_NONBLOCK` says, except that an AF_UNIX stream socket also stops waiting for the splice flag or
   the pipe's `O_NONBLOCK` (TCP does not). vmsplice writes when the fd is open for writing (a FIFO
   opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever the
-  pipe's `O_NONBLOCK`. Room is the free space in whole pages, as Linux counts free page buffers.
+  pipe's `O_NONBLOCK`. Regular-file splice and sendfile split at file page boundaries, vmsplice
+  at each iovec's guest page boundaries. Each fragment occupies a separate slot. A whole slot moved between
+  pipes keeps its merge flag; tee and partial moves create nonmergeable destination slots.
+- A vmspliced slot keeps a weak reference to the source address space and a snapshot of the bytes.
+  Reads and splice sample the live page at the slot's current offset. Tee and pipe-to-pipe splice
+  carry the same source and capture the transferred bytes as the destination's fallback snapshot.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
-  first grows a grows-down mapping below it (`kernel/files`).
+  first grows a grows-down mapping below it (`kernel/fileio`).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close;
-  sendfile asks `splice_reads`/`splice_writes` about its ends.
+- `kernel/files`: opening FIFO nodes, fcntl, ioctl, close; `kernel/fileio`: the read, write and
+  vectored paths, and sendfile asking `splice_reads`/`splice_writes` about its ends.
 - `kernel/poll` (pipe readiness, `EPOLLET` counters), `kernel/fuse` (`/dev/fuse` as a splice end),
   `kernel/unix` (stream sockets as splice inputs).
 
 ### Outbound
 
-- `kernel/files` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
+- `kernel/fileio` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
+  `kernel/files` (fd tables and `FileKind::Pipe`),
   `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/sysctl`
-  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`).
+  (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`), `kernel/mm` (readable guest page translations and TLB shootdown generations).
 
 ## Invariants and gotchas
 
-- splice and vmsplice put what they read into the output pipe whole even when a writer took the
-  room while the BKL was released (Linux holds the pipe lock throughout), so a pipe can briefly
-  exceed its capacity.
+- A splice reading into a pipe reserves slots across unlocked input I/O. A short read or error
+  releases unused slots for other writers. Poll sees published slots.
 - A splice out of a pipe into a file, socket or FUSE file drains what it wrote only after the
   write, which can release the BKL: code that takes data out of a pipe must first wait while
   `Pipe::splicing` is set (`wait_splice_done`), or the late drain removes bytes it never wrote.
@@ -117,25 +132,10 @@ Outside the module: fd tables, open files and the read, write and vectored paths
 
 ## Confirmed bugs / technical debt
 
-- **splice's checks differ:** access modes (`EBADF`) come before a pipe given an offset
-  (`ESPIPE`), where 6.1 returns `ESPIPE` first; an offset on an unseekable non-pipe is `ESPIPE`
-  (after waiting for room) instead of `EINVAL`; one with an AF_UNIX stream input is ignored and
-  written back advanced.
-- **splice into a file stops quietly at `RLIMIT_FSIZE`:** it returns the short count without
-  `SIGXFSZ`, which Linux raises on its next write while still returning the count.
-- **Pipe I/O with faulting buffers:** a pipe read, readv or read-side vmsplice whose buffer faults
-  consumes what it took (Linux leaves a short-copied buffer in the pipe); a writev whose later
-  iovec faults still writes what precedes it (Linux commits only whole copied pages; a sub-page
-  writev writes nothing); a write copies 64 KiB at a time, so a fault in the first 64 KiB is
-  `EFAULT` and a later one returns a multiple of 64 KiB (Linux returns the bytes up to the fault).
-- **Fidelity gaps**, one per line:
-  - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
-  - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
-  - `F_SETPIPE_SZ` is `EPERM` over `pipe-max-size` even when not growing, and checks `EBUSY`
-    against bytes rather than occupied pages;
-  - every procfs and sysfs file is taken as splicing both ways, so splice reads a per-process
-    file such as `/proc/<pid>/status` into a pipe, which has no `splice_read` on Linux (`EINVAL`
-    on a native 6.8 kernel).
+- `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues).
+- vmsplice does not pin guest pages. If the address space is gone or mutably borrowed, the
+  translation is missing or replaced, or the address space has had a TLB shootdown, the reader
+  gets the slot's snapshot. This can omit later writes even when a shootdown affected another page.
 
 ## Open questions
 

@@ -66,7 +66,7 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
                 p if p > 0 => g.tgid == process,
                 0 => g.pgid == my_pgid,
                 -1 => g.tgid != me && ns.vnr(g.tgid).is_some_and(|v| v > 1),
-                p => g.pgid == -p,
+                p => p.checked_neg().is_some_and(|pgid| g.pgid == pgid),
             };
             (hit && g.tgid != INIT).then_some(g.tgid)
         })
@@ -152,7 +152,7 @@ pub(super) fn pidfd_send_signal(
         FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
         // The process that was opened has been reaped: the pid may already belong to a new one
         FileKind::Directory {
-            node: Node::Pseudo(_, PseudoNode::Pid(pid, None)),
+            node: Node::Pseudo(_, PseudoNode::Pid(proc, None)),
             process,
             ..
         } => {
@@ -163,7 +163,7 @@ pub(super) fn pidfd_send_signal(
                     .is_some_and(|p| Rc::ptr_eq(&p, g))
             };
             // /proc/<tid> of any thread names its process
-            match crate::pseudo::group_of(cx.kr(), *pid) {
+            match crate::pseudo::group_of_id(cx.kr(), *proc) {
                 Some(g) if same(g) => g.borrow().tgid,
                 _ => return Err(Errno::ESRCH),
             }
@@ -356,8 +356,8 @@ pub(super) fn rt_sigaction(
     };
     let sighand = cx.t.group.borrow().sighand.clone();
     // The default action forced when seccomp kills the process cannot be changed again (Linux's
-    // SA_IMMUTABLE)
-    if sighand.borrow().get(sig).immutable {
+    // SA_IMMUTABLE), though querying it with act == 0 is still allowed
+    if act != 0 && sighand.borrow().get(sig).immutable {
         return Err(Errno::EINVAL);
     }
     if oact != 0 {
@@ -373,17 +373,27 @@ pub(super) fn rt_sigaction(
     }
     if let Some(new) = new {
         sighand.borrow_mut().set(sig, new);
-        // Once changed to ignored, pending instances of the same signal are discarded (on the
-        // thread group and on every thread)
+        // Once changed to ignored, pending instances of the same signal are discarded across
+        // every thread group sharing these signal handlers (CLONE_SIGHAND) and all their threads.
         if sighand.borrow().ignores(sig) {
-            let threads = {
-                let mut g = cx.t.group.borrow_mut();
-                g.pending.discard(sig.bit());
-                g.threads.clone()
+            let bit = sig.bit();
+            let k = cx.kr();
+            let discard = |g: &mut crate::process::ThreadGroup| {
+                g.pending.discard(bit);
+                for tid in &g.threads {
+                    if let Some(t) = k.tasks.get(tid) {
+                        t.pending.borrow_mut().discard(bit);
+                    }
+                }
             };
-            for tid in threads {
-                if let Some(t) = cx.kr().tasks.get(&tid) {
-                    t.pending.borrow_mut().discard(sig.bit());
+            if Rc::strong_count(&sighand) <= 2 {
+                discard(&mut cx.t.group.borrow_mut());
+            } else {
+                for group in k.groups.values() {
+                    let mut g = group.borrow_mut();
+                    if Rc::ptr_eq(&g.sighand, &sighand) {
+                        discard(&mut g);
+                    }
                 }
             }
         }
@@ -477,7 +487,7 @@ pub(super) fn rt_sigtimedwait(
     loop {
         if let Some((sig, si)) = signal::take(cx, want) {
             if info != 0 {
-                put(cx, info, si.encode(sig))?;
+                super::copy_result(cx, |cx| put(cx, info, si.encode(sig)))?;
             }
             return Ok(sig.number() as u64);
         }
@@ -520,8 +530,7 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
         FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
         oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
     );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+    cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
 
@@ -636,21 +645,26 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
 
 pub(super) fn sigaltstack(cx: &mut Cx<'_>, sp: u64, uss: u64, uoss: u64) -> SysResult {
     let old = cx.t.altstack;
-    if uss != 0 {
+    let new = if uss != 0 {
         let b: [u8; 24] = get(cx, uss)?;
         let ss_sp = u64::from_le_bytes(b[..8].try_into().unwrap());
         let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
         let size = u64::from_le_bytes(b[16..].try_into().unwrap());
         let mut alt = old;
         alt.change(sp, ss_sp, flags, size)?;
-        cx.t.altstack = alt;
-    }
+        Some(alt)
+    } else {
+        None
+    };
     if uoss != 0 {
         let mut b = [0u8; 24];
         b[..8].copy_from_slice(&old.sp.to_le_bytes());
         b[8..12].copy_from_slice(&old.reported_flags(sp).to_le_bytes());
         b[16..].copy_from_slice(&old.size.to_le_bytes());
         put(cx, uoss, b)?;
+    }
+    if let Some(alt) = new {
+        cx.t.altstack = alt;
     }
     Ok(0)
 }

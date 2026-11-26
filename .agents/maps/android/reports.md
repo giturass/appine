@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/reports.md` for the paired decision history (not yet created; decisions from before the split are D6, D24, D29, and the notification, report and diagnostic parts of D10, D14, D15, D18, D19, D21, D23, D28 and D32 in `.agents/decisions/android/service.md`).
 >
 > Verified: 2026-11-21 (split out of the android/service full mapping of 2026-11-15; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: key listen notifications by `(tag = "listen:<guest>:<host>", id = 1000 + guest port)`)
 
 ## Responsibilities
 
@@ -52,8 +54,9 @@ UI and SAF save picker (`android/settings`); installing `Diagnostics` at process
 - `DiagnosticProvider` — non-exported `FileProvider` subclass exposing only generated Share
   archives under `cache/diagnostic-exports`.
 - Constants: bell notifications at most once a second per tab; kill notification ids from 100000
-  (wrapping after 100000); tab notification ids `200000 + tab id mod 100000`; listen ids
-  `1000 + guest port`; fixed ids 2 (boot failures), 3 (last-run crash/ANR), 4 (BKL stall).
+  (wrapping after 100000); tab notification ids `200000 + tab id mod 100000`; listen keys
+  `(tag = "listen:<guest>:<host>", id = 1000 + guest port)`; fixed ids 2 (boot failures), 3
+  (last-run crash/ANR), 4 (BKL stall).
 
 ## Public entry points
 
@@ -137,8 +140,9 @@ UI and SAF save picker (`android/settings`); installing `Diagnostics` at process
   "N services did not start", with the services listed via ICU's `ListFormatter`).
 - Listens: the first `listen()` on a non-loopback address per (guest port, host port) pair and
   kernel (the kernel queues at most 32; one dropped from a full queue is reported only when the
-  guest listens on that pair again), with remap text when the ports differ; the notification id is
-  `1000 + guest port`.
+  guest listens on that pair again), with remap text when the ports differ; notifications are keyed
+  by `(tag = "listen:<guest>:<host>", id = 1000 + guest port)` (`Notifications.listenKey`) so
+  different host-port remappings of the same guest port do not overwrite each other.
 - Tab notifications (`Notifications.tab`, on the `terminal` channel): one per tab (id
   `200000 + tab id mod 100000`), replaced by the tab's next one: titled with OSC 777's title or a
   status record's title, else the program's title (`sh` when none), with the body, "The terminal
@@ -199,8 +203,6 @@ UI and SAF save picker (`android/settings`); installing `Diagnostics` at process
 ## Open questions
 
 - Should a long stall's notification update its seconds while the stall goes on?
-- Listen notifications are keyed by guest port only, so listens on one guest port mapped to
-  different host ports replace each other's notification: intended?
 
 ## To verify
 

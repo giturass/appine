@@ -96,6 +96,20 @@ pub unsafe fn remove(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
     Ok(())
 }
 
+/// Forwards a non-destructive memory access hint (`MADV_NORMAL`, `MADV_RANDOM`,
+/// `MADV_SEQUENTIAL`, `MADV_WILLNEED`) to host `madvise(2)`.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` is aligned to host pages and lies within host memory owned by this process
+/// that remains mapped for the duration of the call.
+pub unsafe fn advise(ptr: NonNull<u8>, len: usize, advice: i32) -> Result<(), i32> {
+    if unsafe { libc::madvise(ptr.as_ptr().cast(), len, advice) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// A host file mapping: `ptr` points at the requested file offset, and `base`/`len` are the range
 /// actually mapped, passed to [`unmap`] on release.
 pub struct FileMapping {
@@ -305,44 +319,90 @@ pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
 /// result. Returns None when pagemap cannot be read. mincore cannot be used: it reports pages
 /// swapped out (zram on Android) as "absent" too.
 pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
+    page_flags(ptr, len, |entry| entry & (3 << 62) != 0)
+}
+
+/// The number of 4K pages in `[ptr, ptr + len)` currently in swap (bit 62 of `/proc/self/pagemap`).
+/// Measured in bounded windows so large mappings do not allocate large buffers; returns None when
+/// pagemap cannot be read (e.g. SELinux-enforced Android hosts).
+pub fn swapped_pages(ptr: *const u8, len: usize) -> Option<usize> {
     use std::os::unix::fs::FileExt;
-    let pagemap = pagemap()?;
+    const WINDOW_PAGES: usize = 1 << 16;
+    const SWAPPED: u64 = 1 << 62;
+    if len == 0 {
+        return Some(0);
+    }
+    let pm = pagemap()?;
     let page = page_size();
-    let first = ptr as usize / page;
-    let last = (ptr as usize + len).div_ceil(page);
-    let mut raw = vec![0u8; (last - first) * 8];
-    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
-    let touched = |host: usize| {
-        let i = (host - first) * 8;
-        let entry = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
-        entry & (3 << 62) != 0
-    };
+    let start = ptr as usize & !(page - 1);
+    let span = (ptr as usize + len).next_multiple_of(page) - start;
+    let total_host_pages = span / page;
+    let mut raw = vec![0u8; total_host_pages.min(WINDOW_PAGES) * 8];
+    let mut swapped_host_pages = 0usize;
+    let mut at = start;
+    while at < start + span {
+        let n = ((start + span - at) / page).min(WINDOW_PAGES);
+        let buf = &mut raw[..n * 8];
+        pm.read_exact_at(buf, (at / page) as u64 * 8).ok()?;
+        swapped_host_pages += buf
+            .chunks_exact(8)
+            .filter(|e| u64::from_le_bytes((*e).try_into().unwrap()) & SWAPPED != 0)
+            .count();
+        at += n * page;
+    }
+    Some((swapped_host_pages * page / 4096).min(len.div_ceil(4096)))
+}
+
+/// Which 4 KiB pages are private copies in a host file mapping, including swapped-out copies.
+pub fn private_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
+    page_flags(ptr, len, is_private)
+}
+
+fn is_private(entry: u64) -> bool {
+    let (present, swapped, file) = (1 << 63, 1 << 62, 1 << 61);
+    entry & swapped != 0 || entry & (present | file) == present
+}
+
+fn page_flags(ptr: *const u8, len: usize, flag: impl Fn(u64) -> bool) -> Option<Vec<bool>> {
+    let raw = page_entries(ptr, len)?;
+    let page = page_size();
+    let start = ptr as usize % page;
     Some(
         (0..len.div_ceil(4096))
-            .map(|i| touched((ptr as usize + i * 4096) / page))
+            .map(|i| {
+                let at = (start + i * 4096) / page * 8;
+                flag(u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()))
+            })
             .collect(),
     )
 }
 
-/// Whether any host page of `[ptr, ptr + len)` in a private file mapping holds a private copy
-/// (written since it was mapped, so no longer the file's page): `/proc/self/pagemap` shows it
-/// present without the "file page" bit, or swapped. Returns None when pagemap cannot be read.
+/// Whether any host page of a private file mapping has been written privately.
 pub fn has_private_pages(ptr: *const u8, len: usize) -> Option<bool> {
+    Some(
+        page_entries(ptr, len)?
+            .chunks_exact(8)
+            .any(|e| is_private(u64::from_le_bytes(e.try_into().unwrap()))),
+    )
+}
+
+/// Hosts without readable page entries must track private file writes at guest faults.
+pub fn pagemap_readable() -> bool {
+    static READABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READABLE.get_or_init(|| page_entries(&0u8, 1).is_some())
+}
+
+fn page_entries(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     if len == 0 {
-        return Some(false);
+        return Some(Vec::new());
     }
-    let pagemap = pagemap()?;
     let page = page_size();
     let first = ptr as usize / page;
     let last = (ptr as usize + len).div_ceil(page);
-    let mut raw = vec![0u8; (last - first) * 8];
-    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
-    Some(raw.chunks_exact(8).any(|e| {
-        let entry = u64::from_le_bytes(e.try_into().unwrap());
-        let (present, swapped, file) = (entry >> 63 & 1, entry >> 62 & 1, entry >> 61 & 1);
-        present == 1 && file == 0 || swapped == 1
-    }))
+    let mut raw = vec![0; (last - first) * 8];
+    pagemap()?.read_exact_at(&mut raw, first as u64 * 8).ok()?;
+    Some(raw)
 }
 
 /// `/proc/self/pagemap`, opened once.
@@ -1089,6 +1149,80 @@ impl Watch {
     }
 
     /// The fd of the host epoll itself.
+    pub fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.epfd.as_raw_fd()
+    }
+}
+
+/// A host epoll instance used by guest epolls to monitor host-backed descriptors in O(ready)
+/// instead of scanning every idle host descriptor with `ppoll`.
+pub struct HostEpoll {
+    epfd: std::os::fd::OwnedFd,
+}
+
+impl HostEpoll {
+    pub fn new() -> Result<HostEpoll, i32> {
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw < 0 {
+            return Err(last_errno());
+        }
+        Ok(HostEpoll {
+            epfd: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
+        })
+    }
+
+    pub fn add(&self, fd: i32, events: u32, data: u64) -> Result<(), i32> {
+        let mut ev = libc::epoll_event { events, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    pub fn modify(&self, fd: i32, events: u32, data: u64) -> Result<(), i32> {
+        let mut ev = libc::epoll_event { events, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    pub fn remove(&self, fd: i32) -> Result<(), i32> {
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) } < 0
+        {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    /// Non-blocking `epoll_wait(..., 0)`, writing up to `out.len()` `(data, events)` pairs.
+    pub fn wait_now(&self, out: &mut [(u64, u32)]) -> Result<usize, i32> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let n = out.len().min(i32::MAX as usize);
+        let mut stack = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        let mut heap;
+        let raw = if n <= stack.len() {
+            &mut stack[..n]
+        } else {
+            heap = vec![libc::epoll_event { events: 0, u64: 0 }; n];
+            &mut heap[..]
+        };
+        let rc = unsafe { libc::epoll_wait(self.fd(), raw.as_mut_ptr(), n as i32, 0) };
+        if rc < 0 {
+            return Err(last_errno());
+        }
+        let count = rc as usize;
+        for (dst, src) in out[..count].iter_mut().zip(&raw[..count]) {
+            *dst = (src.u64, src.events);
+        }
+        Ok(count)
+    }
+
+    /// The fd of the host epoll itself: readable (`POLLIN`) whenever any registered fd is ready.
     pub fn fd(&self) -> i32 {
         use std::os::fd::AsRawFd;
         self.epfd.as_raw_fd()

@@ -75,9 +75,86 @@ static void drain(const char *step)
     }
 }
 
-int main(void)
+/* The cached ELF and its executable fd have distinct lifetimes. Wait for the new
+ * image before renaming it, so an early close cannot pass as a close at exit. */
+static int watch_exec(int late)
+{
+    unsigned mask = IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE;
+    int ready[2], finish[2], status;
+    char byte;
+    if (link("ino", "d/program") || pipe(ready) || pipe(finish))
+        return 1;
+    int fd = open("d/program", O_PATH | O_CLOEXEC);
+    if (fd < 0)
+        return 1;
+    if (!late) {
+        wd_dir = inotify_add_watch(in, "d", mask);
+        wd_file = inotify_add_watch(in, "d/program", mask);
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(ready[1], STDOUT_FILENO);
+        dup2(finish[0], STDIN_FILENO);
+        close(ready[0]); close(ready[1]); close(finish[0]); close(finish[1]);
+        char *argv[] = {"program", "wait", NULL};
+        syscall(SYS_execveat, fd, "", argv, environ, AT_EMPTY_PATH);
+        _exit(2);
+    }
+    close(fd); close(ready[1]); close(finish[0]);
+    if (pid < 0 || read(ready[0], &byte, 1) != 1)
+        return 1;
+    if (late) {
+        wd_dir = inotify_add_watch(in, "d", mask);
+        wd_file = inotify_add_watch(in, "d/program", mask);
+    }
+    if (wd_dir < 0 || wd_file < 0 || rename("d/program", "d/running"))
+        return 1;
+    drain(late ? "late watch while running" : "exec while running");
+    close(ready[0]); close(finish[1]);
+    if (waitpid(pid, &status, 0) != pid || status != 0)
+        return 1;
+    drain("exec exit after rename");
+    close(in);
+    return unlink("d/running") != 0;
+}
+
+/* Only positive reads report ACCESS. ETXTBSY is checked after opening the file. */
+static int failed_execs(void)
+{
+    int fd = open("d/bad", O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    if (fd < 0 || close(fd))
+        return 1;
+    in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    wd_dir = -1;
+    wd_file = inotify_add_watch(in, "d/bad", IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE);
+    if (wd_file < 0)
+        return 1;
+    char *argv[] = {"bad", NULL};
+    execv("d/bad", argv);
+    if (errno != ENOEXEC)
+        return 1;
+    drain("empty executable");
+    fd = open("d/bad", O_WRONLY);
+    if (fd < 0 || write(fd, "bad", 3) != 3)
+        return 1;
+    drain("writer open");
+    execv("d/bad", argv);
+    if (errno != ETXTBSY || close(fd))
+        return 1;
+    drain("busy executable");
+    execv("d/bad", argv);
+    if (errno != ENOEXEC)
+        return 1;
+    drain("malformed executable");
+    close(in);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     char buf[16];
+    if (argc == 2 && strcmp(argv[1], "wait") == 0)
+        return write(STDOUT_FILENO, "x", 1) != 1 || read(STDIN_FILENO, buf, 1) != 0;
     mkdir("d", 0755);
     in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     wd_dir = inotify_add_watch(in, "d", IN_ALL_EVENTS);
@@ -167,7 +244,13 @@ int main(void)
     rmdir("d/late");
     inotify_rm_watch(in, wd_dir);
     drain("rm_watch");
-    return 0;
+    close(in);
+    for (int late = 0; late < 2; late++) {
+        in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (in < 0 || watch_exec(late))
+            return 1;
+    }
+    return failed_execs();
 }
 C
 gcc -O2 -o ino ino.c

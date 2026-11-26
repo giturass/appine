@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/terminal full mapping of 2026-11-14; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: transparent new-session icon with terminal-background contrast updates)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's labelled import stop action was left out with the retired import button; the transparent new-session icon and terminal-background contrast updates are unchanged)
 
 ## Responsibilities
 

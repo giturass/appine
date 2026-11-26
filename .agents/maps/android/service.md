@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 3 research concerns; 15 claims checked by 3 independent verifiers — 14 confirmed and 1 partial, scoped below; tab-index hash collision recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
+> Maintained: 2026-11-26 (targeted verification of foreground OSC 52 delivery and cleanup on session removal or service teardown)
 
 ## Responsibilities
 
@@ -18,7 +18,7 @@ outlives an Activity:
   was killed (`Tabs`);
 - the ongoing foreground notification (id 1) and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
-  directories, too-long holds of the BKL) and decides whether they become in-tab messages,
+  directories, too-long holds of the BKL), checks login rule inputs and decides whether they become in-tab messages,
   lifecycle actions or notifications delegated to `android/reports`, and the routing of what
   programs ask of the app (bells, notifications, program statuses, clipboard writes and reads,
   browser URL opens via `BrowserBridge`) and of commands the shells' prompt marks see finish;
@@ -44,7 +44,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   the service itself.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
   `onMachineReady(error)`, `onSessionsChanged`, `onBell` (haptics for a bell or program notification
-  in the tab in front), `onClipboardRead`
+  in the tab in front), `onClipboardRead(sessionId)`
   (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
   tab's progress or program status changed), `onSettingsChanged`,
   `onOpenUrl` (guest browser request; true acknowledges Android accepted it), `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
@@ -54,22 +54,31 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
   the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
   ordered with them: saving tabs (their terminals' snapshots included), resolving an `auto` login, changed directories,
-  and a replacement's mirror join and store reset.
+  and a replacement's store reset.
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
-  restore), `current` (written only by `MainActivity`; setting it takes the tab's notification and
-  bell throttle away and, with the terminal Activity listening, marks the tab's statuses seen),
+  restore), `current` (written by `MainActivity` and cleared by `removeSession`/`releaseSessions`;
+  setting it takes the tab's notification and bell throttle away, marks the tab's statuses seen
+  with the terminal Activity listening, and notifies `backgroundImages` to protect the shown tab
+  and schedule the previous started tab for background image trimming),
   `nextSessionId` (counting up from the clock, never wrapped); `sessionEvents` (title changed,
   bell, clipboard write, notification, clipboard read, progress or status changed, a command
   finished, tmux's control mode detached, the shell finished).
+- `BackgroundImageTrim` — pure-Kotlin LRU and dwell-time tracker for background tabs' Kitty image
+  caches: protects `current`, keeps at most `MAX_RETAINED` (2) most recently left started tabs
+  untrimmed for `DELAY_MS` (60 s), evicts older background tabs immediately, and keeps trimmed tab
+  IDs for periodic re-trim while they remain unseen.
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `booting` (boot work is outstanding), `destroyed` (late completions cannot restart the service),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
-  `progress`, `mirrorThread`.
+  `progress`.
 - `GuestActivity` — the last guest CPU sample and activity timestamp used by
   the BUSY running policy; `RunPolicy` in `Settings` defines SLEEP, BUSY and ALWAYS.
+- `ConsoleTracker` — per-kernel monitor serializing console opens/closes with `Native.takeKills`
+  under a monotonic epoch so each console lifetime owns a disjoint `[openedEpoch, closedEpoch]`
+  interval; `close` drains remaining kills before advancing the epoch past the closed console.
 - `BrowserBridge` — per-kernel random-port IPv4 loopback listener with a UUID capability that
   relays guest HTTP(S) open requests to the focused UI.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
@@ -87,8 +96,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (`s-<128-bit SHA-256 prefix of the snapshot>.snap`); `Tab(login, cwd, transcript, snapshot)`
   (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
   transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
-- Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, commands notifying from
-  10 s.
+- Constants: poll 2 s, trim delay 60 s (`TRIM_DELAY_MS = BackgroundImageTrim.DELAY_MS`),
+  background-tab image retention budget 2 (`BackgroundImageTrim.MAX_RETAINED`), periodic save 60 s,
+  save-soon 2 s, commands notifying from 10 s.
 
 ## Public entry points
 
@@ -122,7 +132,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   `start(null)`.
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
-  notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
+  notification and listeners and `Rootfs::probeMirrors` for import-time source selection, android/setup),
   `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
   `ensureGpuCommand` (only when `gpu` is enabled), `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier, gpu)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
@@ -137,8 +147,9 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   lock, write the running marker, restore the killed run's tabs (once), schedule periodic saves,
   start the boot thread, register a default-network callback (routes), post the poll, update the
   notification, `onMachineReady(null)`.
-- On failure: a failed import of a downloaded distro (not Alpine, store not ready) falls back to
-  Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure records
+- On failure: a failed import of a downloaded distro (not Alpine, store not ready) deletes the
+  abandoned cached tarball via `Rootfs.deleteTarball` and falls back to Alpine with a notice; with
+  a `pendingReplace` the store is replaced; any other failure records
   the exception in `Diagnostics`, sets `startError`, updates the wake lock and notification
   ("Cannot start" with the error in its body, unless privacy mode hides it), reports it to the
   listeners, and stops the service as soon as no UI is left and no distro switch is downloading
@@ -155,17 +166,22 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - On the main thread, while a kernel runs: first `bklStall` (it takes no BKL, and the worker
   would wait behind a hold that does not end) reports a too-long hold of the BKL to
   `Notifications`; then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes`
-  and `takeChangedDirs`, then `guestCpuTime`; the poll reschedules itself at once, whether or not
-  the fetch has run.
-- Changed directories are handled on the worker straight away: `Documents.dirsChanged`, then
-  `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
+  and `takeChangedDirs`, checks the login rule inputs, then fetches `guestCpuTime`. The poll
+  reschedules itself without waiting for the fetch.
+- The worker passes changed directories to `Documents.dirsChanged` and polls each kernel's
+  `Documents.AutoRootsWatcher` (refreshing Files roots when `login` is `"auto"` and `/etc/passwd`
+  or the auto home's parent changes the resolved home). Each machine also has its own
+  `Rootfs.LoginRules` captured when its poll is queued. The worker starts a needed refresh in
+  order with shutdown. A separate thread waits for completion (android/setup).
 - The rest is applied on the main thread only if the kernel is still the same: listens (to
-  `Notifications`), kills (in-tab `[appine]` message into the tab whose console with that number
-  is open, else the newest tab that had it, in yellow above the cursor line and skipped on the
-  alternate screen; then `Notifications` unless shown in the tab in front, and always for an Appine
-  bug), then power. Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs
-  whose shell ended do not count; restored tabs not shown yet do), no listeners and no guest
-  processes (init and zombies excluded) → `exitAll()`.
+  `Notifications`), kills (taken with their `ConsoleTracker` epoch by the poll or drained on
+  console close, routed via `sessionForKill` -> `VtSession.ownedConsoleAt` to the unique tab whose
+  `[openedEpoch, closedEpoch]` interval held that console, shown as an in-tab `[appine]` message
+  in yellow above the cursor line and skipped on the alternate screen; then `Notifications` unless
+  shown in the tab in front, and always for an Appine bug), then power. Reboot → `restart()`;
+  halt/poweroff → `exitAll()`; no running sessions (tabs whose shell ended do not count; restored
+  tabs not shown yet do), no listeners and no guest processes (init and zombies excluded) →
+  `exitAll()`.
 
 ### Stopping, restarting, replacing
 
@@ -192,10 +208,12 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   finishes, `replace` if a kernel runs or the start failed, else record it in `pendingReplace`
   while a start or restart is under way (in any other state it is dropped). After a failed start
   the switch keeps the service running without a UI; its failure or cancel then stops it as a
-  failed start does. `replace`: reset the login setting, `transitioning`,
-  `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), join the mirror
-  thread and delete the store, then `start(distro)` — also after "exit all" meanwhile, so the
-  chosen distro is imported (and then stopped) rather than the next start importing Alpine.
+  failed start does. `replace`: reset the login setting, revoke provider URI grants
+  (`Documents.revokeAccess`) and refresh roots (`Documents.rootsChanged`), `transitioning`,
+  `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), delete the
+  store, and revoke grants and refresh roots again before `start(distro)` — also
+  after "exit all" meanwhile, so the chosen distro is imported (and then stopped) rather than the
+  next start importing Alpine.
 - `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
   which a thread outliving it, the download's, would otherwise post again),
   cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
@@ -238,14 +256,23 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 
 ### Memory
 
-- The last listener leaving saves tabs at once and starts a 60 s timer that trims memory (on the
-  worker: `Native.trimMemory`, the kernel's rebuildable caches, then `VtNative.compressAll`, every
-  tab's cold scrollback at once, android/vtcore); a returning listener cancels it. `onTrimMemory` at
-  `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately, and also cuts the Kitty
-  images of every started tab but `current` down to 4 MiB a screen, deleting the oldest
-  (`VtNative.dropImages`, android/vtcore); since Android 14 those levels are no longer sent, so this
-  happens only on Android 11–13. Tabs also compress their own scrollback within seconds of their
-  output, so the trim mostly finds what the last few seconds left.
+- The last listener leaving saves tabs at once and starts a 60 s timer (`trimWhenHidden`) that runs
+  `trimMemory()` on the worker: `Native.trimMemory` (the kernel's rebuildable caches),
+  `VtNative.dropImages` on every started tab other than `current` (cutting each screen's Kitty
+  images down to 4 MiB, deleting the oldest, android/vtcore), and `VtNative.compressAll` (every
+  tab's cold scrollback at once); a returning listener cancels it. `onTrimMemory` at `RUNNING_LOW`
+  and above (except `UI_HIDDEN`) runs `trimMemory()` and `saveTabs()` immediately (for Android
+  11–13 or any cached-background trim Android delivers).
+- While the UI stays visible (important on Android 14+, where foreground services do not receive
+  `RUNNING_*` or cached-background `onTrimMemory` callbacks), `BackgroundImageTrim` trims inactive
+  background tabs' Kitty image caches on tab switches: `current` is never trimmed; up to 2 most
+  recently left started tabs keep their full image cache for 60 s so quick switching back and forth
+  loses nothing; leaving a tab when more than 2 background tabs are pending immediately trims the
+  oldest pending tab on the worker; and any remaining pending background tab is trimmed once 60 s
+  elapse unseen (`trimBackgroundImages`). Already-trimmed tabs stay recorded in `backgroundImages`
+  so the 60 s `periodicSave` re-trims them before saving if a background program emitted new images
+  while unseen. Tabs also compress their own scrollback within seconds of their output, so the trim
+  mostly finds what the last few seconds left.
 
 ### Sessions, saving and restore
 
@@ -268,11 +295,11 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   restored tab logs in as the same user. Restored tabs not shown yet keep their saved transcript,
   snapshot and cwd; the saved current tab is an index among the running tabs (0 when none is current).
 - `Tabs.save` writes temp-then-rename, as `writeSnapshot` did before it; a transcript's or
-  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the time) is skipped when its tabs and current tab hash the
-  same as the last one this process wrote, so the saved time is that of the last save that found a
-  change or was its process's first; transcripts and snapshots no index names any more (and their
-  leftover temporary files) are deleted only after the index step (a kill at any point leaves a
-  consistent set). A
+  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the
+  time) is skipped when its exact serialized layout (`"$current:$entries"`) matches
+  `writtenLayout`, so the saved time is that of the last save that found a change or was its
+  process's first; transcripts and snapshots no index names any more (and their leftover temporary
+  files) are deleted only after the index step (a kill at any point leaves a consistent set). A
   `name` key in an index from versions that could rename tabs is ignored. Triggers: every 60 s, 2 s
   after a tab opens, closes or its shell ends, when the last listener leaves, on memory trim.
 - The `running` marker, holding the process's pid, is written after each successful start and
@@ -292,8 +319,8 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 ### What programs ask of the app
 
 - With privacy mode enabled, `Privacy.locked` excludes the current tab from `inFront` and drops
-  clipboard writes while locked or with no resumed page; clipboard reads then receive an empty
-  answer. With privacy mode off this gate does not restrict delivery. The terminal independently
+  clipboard writes while locked or with no resumed page. Clipboard reads stay queued in their
+  sessions until eligible for delivery or their wait expires. The terminal independently
   guards browser requests and input. Guest programs continue running.
 - `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
   Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
@@ -320,11 +347,10 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   (the program was killed or stopped waiting) takes its notification away, unless a bell or a
   program's notification has replaced it since. A clipboard write sets the clipboard from any tab
   (labelled Appine), or clears it; before Android 13, which shows copies itself, a toast says a
-  program copied text. A clipboard read (OSC 52) from the tab in front goes to the listeners'
-  `onClipboardRead`, where the terminal Activity asks the user; from any other tab it is answered
-  at once with an empty clipboard (`VtSession.answerClipboardRead(null)`): Android lets an app
-  read the clipboard only while it has the focus, and the program would otherwise wait for a
-  timeout.
+  program copied text. For an OSC 52 read from the tab in front, the service tries listeners
+  until one accepts `onClipboardRead(sessionId)`. Other tabs and unclaimed reads wait in
+  `VtSession`. Its 60 s timeout answers empty while waiting. Removing a tab, detaching the
+  machine and destroying the service release the affected sessions and cancel their timers.
 - tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vtcore),
   ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
   (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
@@ -369,7 +395,7 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
   its abandoned handle is shut down on `appine-stop`. A stale kernel handle is harmless
   (the JNI table no longer finds it). A call that must answer while the BKL is stuck (`bklStall`)
   must not take it and runs on the main thread.
-- Results of a poll other than changed directories are dropped if the kernel changed meanwhile
+- Poll results posted to the main thread are dropped if the kernel changed meanwhile
   (reports fetched just before a restart are lost). While a hold of the BKL lasts, the poll keeps
   queueing fetches behind it on the worker, which run back to back once it ends.
 - Android names low-memory kills only where `isLowMemoryKillReportSupported`; elsewhere they are
@@ -380,23 +406,21 @@ kernel API (`android/native`, `kernel/boot`, `kernel/process`, `kernel/bug`).
 - An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path
   that ends `starting` or `transitioning` must check `exiting` (a replacement does so through the
   start it ends with), or the service stops with a kernel still running (or never stops).
-- A thread that outlives the service (a download; the mirror probe posts nothing) posts to the
+- A download thread that outlives the service posts to the
   main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
   destroyed, so a new way of posting it must go through that too. Ongoing notification id 1 must
   not collide with `android/reports`'s notification id ranges.
+- `removeSession` and `releaseSessions` clear `current` when it refers to a removed session and
+  update `backgroundImages` / cancel `trimBackgroundImages`; `trimMemory` and `dropImagesForIds`
+  also verify `it !== active` and `it.tab != 0L` before dispatching `VtNative.dropImages` to the
+  worker, so `current` is never trimmed and closed or unstarted tabs are never passed to native.
 - The marker is rewritten at a start before the first save replaces the old run's index, so a kill
   in between restores the old tabs again; tabs of a killed run kept through a replacement are
   restored into the new distro, where their directories may not exist.
 
 ## Confirmed bugs / technical debt
 
-- **A layout hash collision can skip a tab-index update:** `Tabs.writtenLayout` compares only a
-  32-bit string hash, so different metadata with the same hash can retain the old index and save
-  time. Changing only cwd from `/Aa` to `/BB` with unchanged other fields is one such collision;
-  restore then uses the stale cwd. Artifact cleanup still follows the skipped index update.
-- **A kill report of a shell can reach a new tab:** when a tab's shell itself is killed and a tab
-  opened within the next poll (2 s) gets the freed console number, the report goes to the new tab,
-  whose console is open, rather than the ended one.
+None.
 
 ## Open questions
 

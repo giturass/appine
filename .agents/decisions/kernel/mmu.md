@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mmu"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00)
+> Last distilled: 2026-11-23 (HEAD = cc72b093)
 >
 > Soft-MMU decisions made before kernel/mmu was split from kernel/mm keep their `kernel/mm` tags and live in `.agents/decisions/kernel/mm.md`: D1, D13, D16, D39 and the page-table half of D4.
 
@@ -46,3 +46,19 @@
 - **Tradeoffs**: Maintains one shared in-process snapshot of the bundled libc (shared via `FileMaps` per kernel/mm D47).
 - **Watch out**: Preserve translation invalidation whenever executable mappings change.
 - **Source**: 6b59a1b4
+
+### D6: Soft page tables support 2 MiB L2 superpages with atomic demotion and a 1024-entry `stlb`
+
+- **What**: L2 entries encode 4 KiB-host-aligned 2 MiB superpages via `PTE_SUPER` (bit 3, with `>= 16`-byte aligned tables), `demote_l2` atomically publishes a populated 512-entry L3 table on partial mutation, `store_range` promotes empty/superpage/all-zero-L3 slots while retiring up to 256 empty L3 tables per `appine_mmu` until free, and a 1024-entry `stlb` plus `stlb_used[16]` sits at the tail of `struct appine_cpu`, flushed by `appine_cpu_tlb_flush` and bypassed when `nwatch != 0`.
+- **Why**: 4 KiB-only L3 leaves forced 512 walks per 2 MiB and capped fast-loop spans at 4 KiB across large contiguous model weights and scratch buffers.
+- **Tradeoffs**: Adds 16 KiB of virtual `struct appine_cpu` tail per thread (zero RSS unless touched), retains up to 256 retired L3 tables (<= 1 MiB) per address space until teardown, and allocates one L3 table on partial-mutation demotion.
+- **Watch out**: Any missed `stlb` flush on demotion/unmap/protect, unaligned table pointer colliding with `PTE_SUPER` or watchpoint entry entering `stlb` can leave stale translations or miss watchpoints.
+- **Source**: 42d49fc0
+
+### D7: Read-only non-FUSE file faults fill 16 MiB soft page-table spans
+
+- **What**: `Mm::fault_in` uses `FILE_FAULT_SPAN` (16 MiB, clipped to VMA and EOF) for read-only non-FUSE `PrivateFile` and `Shared` mappings while keeping `LEAF_SPAN` (2 MiB) for anonymous, writable and FUSE `Fill` mappings.
+- **Why**: Filling only one 2 MiB `LEAF_SPAN` per fault serialized multi-threaded scans of 1–4 GiB read-only model mappings on the BKL when `MAP_POPULATE` or `MADV_WILLNEED` was absent, whereas aligned read-only spans now promote to L2 superpages without allocating L3 tables or touching host memory.
+- **Tradeoffs**: Unaligned fixed read-only file mappings can allocate up to 8 L3 leaf tables (32 KiB) on first fault, and writable or FUSE file mappings keep 2 MiB demand granularity.
+- **Watch out**: Relies on file mappings staying outside `Mm::touched_windows`; any future RSS or fork accounting that scans soft PTEs on read-only file mappings must account for 16 MiB fault and `MADV_WILLNEED` prefill spans.
+- **Source**: d0945a96

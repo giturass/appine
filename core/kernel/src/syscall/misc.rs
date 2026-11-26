@@ -599,7 +599,9 @@ fn sleep_rest(cx: &mut Cx<'_>, deadline: Expiry, rem: u64) -> SysResult {
         Ok(()) => Ok(0),
         Err(left) => {
             if rem != 0 {
-                write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
+                super::copy_result(cx, |cx| {
+                    write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)
+                })?;
             }
             cx.t.restart = Some(Restart::Sleep { deadline, rem });
             Err(Errno::ERESTART_RESTARTBLOCK)
@@ -788,12 +790,17 @@ fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     };
     let k = cx.kr();
     Some(if thread {
-        let task = if pid == 0 {
-            Some(cx.task.clone())
+        if pid == 0 {
+            Ok(cx.task.cpu_ns())
+        } else if let Some(t) = k.tasks.get(&pid) {
+            Ok(t.cpu_ns())
+        } else if let Some(g) = k.groups.get(&pid)
+            && let Some((_, cpu)) = g.borrow().leader_exit
+        {
+            Ok(cpu.total_ns)
         } else {
-            k.tasks.get(&pid).cloned()
-        };
-        task.map(|t| t.cpu_ns()).ok_or(Errno::EINVAL)
+            Err(Errno::EINVAL)
+        }
     } else {
         let group = if pid == 0 {
             Some(cx.t.group.clone())
@@ -804,14 +811,41 @@ fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     })
 }
 
-/// clock_settime: the guest cannot change the host's time. The settable clock (`CLOCK_REALTIME`)
-/// returns EPERM, as without `CAP_SYS_TIME`; the other clocks cannot be set in any case.
+/// settimeofday: validates arguments like Linux 6.1 (`EFAULT`, `EINVAL`) and then refuses with
+/// `EPERM` because the guest cannot change the host's time.
+pub(super) fn settimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
+    const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+    let timeval = if tv != 0 {
+        let b: [u8; 16] = get(cx, tv)?;
+        let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(b[8..].try_into().unwrap());
+        Some((sec, usec))
+    } else {
+        None
+    };
+    if tz != 0 {
+        let _: [u8; 8] = get(cx, tz)?;
+    }
+    if let Some((sec, usec)) = timeval
+        && (!(0..=KTIME_SEC_MAX).contains(&sec) || !(0..1_000_000).contains(&usec))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Err(Errno::EPERM)
+}
+
+/// clock_settime: the guest cannot change the host's time. `CLOCK_REALTIME` and valid CPU clocks
+/// return `EPERM` (matching Linux 6.1's `posix_cpu_clock_set`); other clocks return `EINVAL`.
 pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
     read_timespec(cx, tp)?;
-    match clock {
-        CLOCK_REALTIME => Err(Errno::EPERM),
-        _ => Err(Errno::EINVAL),
+    if clock == CLOCK_REALTIME {
+        return Err(Errno::EPERM);
     }
+    if let Some(res) = cpu_clock(cx, clock) {
+        res?;
+        return Err(Errno::EPERM);
+    }
+    Err(Errno::EINVAL)
 }
 
 /// adjtimex (`clock` None) and clock_adjtime: only queries are answered, with the host clock's
@@ -943,7 +977,9 @@ pub(crate) fn do_syslog(
                 cx.wait_object(wake::of(&*log))?;
             }
             let text = log.borrow_mut().syslog_read(len as usize);
-            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            super::copy_result(cx, |cx| {
+                cx.mm().write(UserSlice::new(buf, text.len()), &text)
+            })?;
             Ok(text.len() as u64)
         }
         READ_ALL | READ_CLEAR => {
@@ -951,7 +987,9 @@ pub(crate) fn do_syslog(
                 return Ok(0);
             }
             let text = log.borrow_mut().read_all(len as usize, kind == READ_CLEAR);
-            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            super::copy_result(cx, |cx| {
+                cx.mm().write(UserSlice::new(buf, text.len()), &text)
+            })?;
             Ok(text.len() as u64)
         }
         CLEAR => {
@@ -1160,11 +1198,11 @@ pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -
         .ok_or(Errno::EINVAL)?;
     let mut value = vec![0u8; len];
     cx.mm().read(UserSlice::new(name, len), &mut value)?;
-    *if domain {
-        uts.domainname.borrow_mut()
+    if domain {
+        uts.set_domainname(value);
     } else {
-        uts.hostname.borrow_mut()
-    } = value;
+        uts.set_hostname(value);
+    }
     Ok(0)
 }
 
@@ -1209,15 +1247,6 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
     }
     if let Some(v) = new {
         group.borrow_mut().rlimits[resource as usize] = v;
-        // The fd table allocates new fds by the soft limit of RLIMIT_NOFILE
-        if resource == RLIMIT_NOFILE {
-            let k = cx.kr();
-            for tid in &group.borrow().threads {
-                if let Some(t) = k.tasks.get(tid) {
-                    t.res.borrow().fds.borrow_mut().limit = v.0 as usize;
-                }
-            }
-        }
     }
     Ok(0)
 }
@@ -1273,19 +1302,19 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             let on = cx.t.group.borrow().child_subreaper as i32;
             put(cx, arg, on.to_le_bytes()).map(|()| 0)
         }
-        PR_GET_DUMPABLE => Ok(cx.t.group.borrow().dumpable as u64),
+        PR_GET_DUMPABLE => Ok(u64::from(cx.t.group.borrow().dumpable_mode())),
         PR_SET_DUMPABLE if arg <= 1 => {
-            cx.t.group.borrow_mut().dumpable = arg == 1;
+            cx.t.group.borrow_mut().set_dumpable_mode(arg as u8);
             Ok(0)
         }
         PR_SET_NO_NEW_PRIVS if arg == 1 => {
             unused(1)?;
-            cx.t.group.borrow_mut().no_new_privs = true;
+            cx.task.no_new_privs.set(true);
             Ok(0)
         }
         PR_GET_NO_NEW_PRIVS => {
             unused(0)?;
-            Ok(cx.t.group.borrow().no_new_privs as u64)
+            Ok(cx.task.no_new_privs.get() as u64)
         }
         PR_GET_KEEPCAPS => Ok(cx.cred().keep_caps() as u64),
         PR_SET_KEEPCAPS if arg <= 1 => {
@@ -1308,10 +1337,14 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         PR_GET_SECCOMP => Ok(u64::from(cx.task.seccomp.borrow().mode)),
         PR_SET_SECCOMP => crate::seccomp::prctl_set(cx, arg, args[1]),
         PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
-        PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
+        // Linux's cap_prctl_drop checks CAP_SETPCAP (EPERM) before cap_valid (EINVAL).
+        PR_CAPBSET_DROP => {
             let mut c = cx.cred();
             if !c.capable_here(cap::SETPCAP) {
                 return Err(Errno::EPERM);
+            }
+            if arg > CAP_LAST_CAP {
+                return Err(Errno::EINVAL);
             }
             c.cap_bounding &= !(1 << arg);
             cx.set_cred(c);
@@ -1373,7 +1406,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         }
         // Options handled above whose arguments were refused
         PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_KEEPCAPS | PR_CAPBSET_READ
-        | PR_CAPBSET_DROP | PR_SET_TIMING => Err(Errno::EINVAL),
+        | PR_SET_TIMING => Err(Errno::EINVAL),
         _ => {
             crate::stub::hit(cx, crate::stub::Stub::Prctl(option));
             Err(Errno::EINVAL)
@@ -1471,11 +1504,8 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     put(cx, buf, b).map(|()| 0)
 }
 
-/// membarrier(2). Kicking the other threads that share the address space out of guest code amounts
-/// to a full memory barrier and context synchronization on them (V8 uses the `SYNC_CORE` form
-/// after rewriting code). Global commands also act only on this process: other processes share
-/// only shared mappings with it, and all of Appine's guest threads are in one host process, so a
-/// host memory barrier is added here as well.
+/// membarrier(2). Quiescing an address space orders its threads' guest accesses and provides
+/// context synchronization for the private `SYNC_CORE` command.
 pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
     const QUERY: i32 = 0;
     const GLOBAL: i32 = 1;
@@ -1512,9 +1542,24 @@ pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
             {
                 return Err(Errno::EPERM);
             }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let sync = cx.task.sync.clone();
-            cx.mm().quiesce(&sync);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if cmd == GLOBAL || cmd == GLOBAL_EXPEDITED {
+                // Registration selects the receivers of GLOBAL_EXPEDITED. The caller may be
+                // unregistered. Threads and CLONE_VM processes can share the same address space.
+                let mut seen = std::collections::HashSet::new();
+                for task in cx.kr().tasks.values() {
+                    let res = task.res.borrow();
+                    if seen.insert(std::rc::Rc::as_ptr(&res.mm)) {
+                        let mm = res.mm.borrow();
+                        if cmd == GLOBAL || mm.membarrier & REGISTER_GLOBAL_EXPEDITED != 0 {
+                            mm.quiesce(&cx.task.sync);
+                        }
+                    }
+                }
+            } else {
+                cx.mm().quiesce(&cx.task.sync);
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -1532,10 +1577,12 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
     while done < len {
         let n = (len - done).min(IO_CHUNK);
         appine_hal::fill_random(&mut chunk[..n]).map_err(Errno)?;
-        if let Err(e) = cx.mm().write(
-            UserSlice::new(buf.wrapping_add(done as u64), n),
-            &chunk[..n],
-        ) {
+        if let Err(e) = super::copy_result(cx, |cx| {
+            cx.mm().write(
+                UserSlice::new(buf.wrapping_add(done as u64), n),
+                &chunk[..n],
+            )
+        }) {
             if done == 0 {
                 return Err(e);
             }

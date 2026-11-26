@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint routing-table references to kernel/route)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `NETLINK_GET_STRICT_CHK` header checks and dump filtering, query/attribute validation, `NETLINK_CAP_ACK`/`EXT_ACK` on query/genl errors, single IPv6 `RTM_GETADDR`, and `nlctrl` `GETPOLICY` dumps)
 
 ## Responsibilities
 
@@ -35,15 +35,21 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 ## Key types
 
-- `NetlinkSocket` — protocol, type, `pid`, datagram queue (each with the multicast group it went
-  to, 0 for answers), arrival counter, `overrun`, `rcvtimeo`/`sndtimeo`, namespace,
-  `ext_ack`/`cap_ack`, joined groups, the other `SOL_NETLINK` flags (bit n for option n),
-  `passcred`, `SockOpts`. `Kernel::rtnl_sockets` holds every `NETLINK_ROUTE` socket weakly.
-- `Host` trait (interfaces, stats, routes, `tx_queue_len`, uid; with defaults configure,
-  `peer_net`, links, tables, `all_interfaces`, `init_net`, `net_admin`, netfilter), implemented by
-  `KernelHost` (kernel, credentials, namespace, pid namespace, fds, the namespaces `watched` for
-  notifications and the `notes` a request caused); `Link` (host interface or virtual device);
-  `Snapshot` (a namespace's link, address and route message bodies).
+- `NetlinkSocket` — protocol, type, `pid`, connected `dst_pid`/`dst_group`, reply/notification
+  queue (`VecDeque<NetlinkItem>`: atomic `Datagram(Vec<u8>, group)` entries or resumable
+  `Dump(NetlinkDump)` entries—either `DumpMessages` or `nft::SetElemDump`—packed on demand to
+  each receive buffer) and `queued_bytes` (capped against `SO_RCVBUF`), arrival counter,
+  `overrun`, `rcvtimeo`/`sndtimeo`, namespace, `ext_ack`/`cap_ack`, joined groups, the other
+  `SOL_NETLINK` flags (bit n for option n), `passcred`, `SockOpts`. `Kernel::rtnl_sockets` holds
+  every netlink socket weakly (for unique `nl_pid` checks and peer delivery across protocols, as
+  well as `NETLINK_ROUTE` notifications).
+- `Host` trait (interfaces, stats, routes, `tx_queue_len`, `ip_forward`, `route_localnet`, uid;
+  with defaults configure, `peer_net`, links, tables, `all_interfaces`, `init_net`, `net_admin`,
+  netfilter), implemented by `KernelHost` (kernel, credentials, namespace, pid namespace, fds, the
+  namespaces `watched` for notifications and the `notes` a request caused); `Link` (host interface
+  or virtual device); `Snapshot` (a namespace's link, address and route message bodies);
+  `NotifyCause`, `RtnlNote` and `ConfigureResult` (carrying per-request seq/port/flags and
+  `NLM_F_ECHO` messages).
 
 ## Public entry points
 
@@ -64,25 +70,37 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 ### Sockets
 
 - `socket`: `SOCK_RAW`/`SOCK_DGRAM` with ROUTE, SOCK_DIAG, NETFILTER, KOBJECT_UEVENT or GENERIC
-  (others `EPROTONOSUPPORT`, other types `ESOCKTNOSUPPORT`); ROUTE sockets join `rtnl_sockets`.
+  (others `EPROTONOSUPPORT`, other types `ESOCKTNOSUPPORT`); netlink sockets join `rtnl_sockets`.
   socketpair is `EOPNOTSUPP` (`kernel/net`).
 - bind (Linux's `netlink_bind`): a whole `sockaddr_nl` of `AF_NETLINK` (`EINVAL`); groups need a
   protocol anyone may join (all but `NETLINK_NETFILTER`) or `CAP_NET_ADMIN` over the namespace
   owner, as do rtnetlink's multicast-routing groups (`EPERM`), and are cut to the protocol's
   count (36 for `NETLINK_ROUTE`, 32 for the others); a bound socket must keep its `nl_pid`
-  (`EINVAL`); an unbound one takes the given id or, for 0, the caller's tgid in its pid namespace
-  (ids are not checked for uniqueness); the groups replace the first 32 joined, and getsockname
-  reports them. connect (`netlink_connect`): `AF_UNSPEC` does nothing, otherwise a whole
-  `sockaddr_nl` (`EINVAL`), a port or group needing `CAP_NET_ADMIN` (`EPERM`); the peer is not
-  recorded, and getpeername always reports `{AF_NETLINK, 0, 0}`. connect and send autobind an
-  unbound socket to the tgid. shutdown does nothing; listen and accept `EOPNOTSUPP`.
-- send ignores the destination address, control data and flags, and handles each message
-  synchronously (a message under 16 bytes or overrunning the datagram ends the batch), queuing
-  reply datagrams with group 0; `NETLINK_NETFILTER` hands the whole datagram to nftables (and a
+  (`EINVAL`); an unbound one takes the given id (`EADDRINUSE` if another socket of the same
+  protocol and namespace already holds it) or, for 0, an unused autobind id (the caller's tgid in
+  its pid namespace first, then a distinct negative id starting at `-4097`); the groups replace the
+  first 32 joined, and getsockname reports them. connect (`netlink_connect`): `AF_UNSPEC`
+  disconnects (clearing `dst_pid` and `dst_group`), otherwise a whole
+  `sockaddr_nl` (`EINVAL`), a port or group needing `CAP_NET_ADMIN` (`EPERM`); `dst_pid` and
+  `dst_group` (lowest set bit, 1-based) are recorded and reported by getpeername. connect and send
+  autobind an unbound socket via the same unique allocator. shutdown returns `EOPNOTSUPP`; listen
+  and accept `EOPNOTSUPP`.
+- send validates `msg_name` (`EINVAL` on short or non-`AF_NETLINK` addresses; `EPERM` without
+  `CAP_NET_ADMIN` when targeting a non-zero port or group), falling back to the connected
+  `(dst_pid, dst_group)` when no address is given; control data and flags are ignored. Messages
+  addressed to the kernel `(0, 0)` are handled synchronously (a message under 16 bytes or
+  overrunning the datagram ends the batch), queuing reply datagrams with group 0; unicast
+  `dst_pid != 0` delivers to the matching peer netlink socket (`ECONNREFUSED` if none);
+  `NETLINK_NETFILTER` hands the whole datagram to nftables (and a
   change of the initial namespace's ruleset re-runs the inbound forwarding hooks);
   `NETLINK_KOBJECT_UEVENT` swallows it. recv first takes a pending overrun (`ENOBUFS` once), then
-  pops one datagram (`MSG_PEEK` clones; oversized datagrams are truncated with `MSG_TRUNC` and the
-  rest lost); source `{AF_NETLINK, 0, group mask}`; with `NETLINK_PKTINFO` a pktinfo control
+  dequeues one datagram (`dequeue(max, peek)`): atomic `Datagram` items pop whole (cloned on
+  `MSG_PEEK`), while resumable `Dump` items pack as many consecutive messages from the current
+  section as fit in `min(max, 32768)` bytes on demand (always emitting at least one atomic
+  message so an oversized single message reports `MSG_TRUNC` and its full length without losing
+  subsequent dump entries, and leaving state intact on `MSG_PEEK`, including 0-byte
+  `MSG_PEEK|MSG_TRUNC` probes; advancing a non-empty dump bumps `arrivals` for `EPOLLET`); source
+  `{AF_NETLINK, 0, group mask}`; with `NETLINK_PKTINFO` a pktinfo control
   message (the group, 0 for answers), then with `SO_PASSCRED` the kernel's credentials (pid 0, uid
   and gid 0 as the receiver sees them), cut as `put_cmsg` cuts them; with nothing queued,
   nonblocking, `MSG_DONTWAIT`, `MSG_ERRQUEUE` or an expired `SO_RCVTIMEO` give `EAGAIN` and a
@@ -97,10 +115,12 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   words while they fit, optlen the whole set's size, 0 before any group), and the flags
   `NETLINK_PKTINFO`, `BROADCAST_ERROR`, `NO_ENOBUFS`, `LISTEN_ALL_NSID` (`CAP_NET_BROADCAST` over
   the namespace owner), `CAP_ACK`, `EXT_ACK`, `GET_STRICT_CHK` (reading one needs room for an int,
-  `EINVAL`); `NETLINK_PKTINFO` adds the control message, `NETLINK_CAP_ACK` shapes error acks of
-  device-layer changes, nftables and sock_diag, `NETLINK_EXT_ACK` adds extended acks to
-  device-layer and nftables errors, and `NETLINK_NO_ENOBUFS` affects overruns; the others are only
-  recorded; other names and levels `ENOPROTOOPT`.
+  `EINVAL`); `NETLINK_PKTINFO` adds the control message, `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK`
+  shape error acks across rtnetlink changes and queries, `NETLINK_GENERIC`, nftables and
+  `NETLINK_SOCK_DIAG` (plus `NLMSG_DONE` dump-error extack TLVs), `NETLINK_GET_STRICT_CHK`
+  enforces Linux 6.1/6.8 header/attribute checks and header-based dump filtering, and
+  `NETLINK_NO_ENOBUFS` affects overruns; the others are only recorded; other names and levels
+  `ENOPROTOOPT`.
 
 ### rtnetlink notifications
 
@@ -108,7 +128,9 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   `NETLINK_ROUTE` first collects the namespaces that have a socket in the link, IPv4/IPv6 address
   or IPv4/IPv6 route groups (1, 5, 7, 9, 11), the sender included; for a change request
   (`RTM_NEW`/`DEL`/`SETLINK`, `NEW`/`DELADDR`, `NEW`/`DELROUTE`) `KernelHost::configure`
-  snapshots each of them before and after the device layer runs it, even when it fails (a request
+  snapshots each watched namespace (plus the caller's own namespace when an address or route
+  request sets `NLM_F_ECHO`)
+  before and after the device layer runs it, even when it fails (a request
   can change another namespace: moving a link, a veth's peer); a socket ioctl that may change an
   interface, address or route (`SIOCSIF*`, `SIOCDIFADDR`, `SIOCADDRT`/`SIOCDELRT`) is wrapped the
   same way.
@@ -116,29 +138,59 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
   statistics ignored), addresses gone and new, routes gone and new (an address with the same
   family, prefix length, interface and addresses, or a route with the same family, destination
   length, TOS, table, destination and priority, that changed in place is only new, as `ip route
-  replace` is), links gone. After the sender's borrow ends they are queued on every registered
-  socket of that namespace that joined the group, with seq, port and flags 0, and each such socket
-  is woken.
-- A socket holding 1024 datagrams drops the notification and, unless `NETLINK_NO_ENOBUFS`, sets
-  `overrun`; answers, nftables replies and mq_notify cookies (the other asynchronous messages)
-  are queued without that cap.
+  replace` is), links gone. `Snapshot::changes` attaches Linux 6.1 header metadata from
+  `NotifyCause`: IPv4 `RTM_NEWADDR`/`RTM_DELADDR` and IPv4+IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE`
+  directly caused by the netlink request copy `(req.seq, sender.pid)` and honour `NLM_F_ECHO`,
+  whereas all link notifications (`RTM_NEWLINK`/`RTM_DELLINK`), side-effect kernel notifications
+  (e.g. routes added by `RTM_NEWADDR`) and IPv6 address notifications keep `seq=0, port=0` and
+  are not echoed. `RTM_NEWROUTE` carries `NLM_F_REPLACE` on an in-place replace with `NLM_F_REPLACE`,
+  `NLM_F_CREATE|NLM_F_APPEND` on append, and `NLM_F_CREATE|NLM_F_EXCL` otherwise (including
+  kernel-added routes). Echoed `(msg, group)` datagrams are queued on the sender before the
+  `NLMSG_ERROR` ACK; after the sender's borrow ends, `rtnl_notify` broadcasts each notification to
+  every registered socket of that namespace that joined the group (skipping the sender for already
+  echoed notifications so subscribed senders do not receive duplicates) and wakes them.
+- All queued messages (rtnetlink notifications, query answers, nftables replies, peer unicast
+  deliveries and mq_notify cookies) are charged `len + 256` bytes against `SO_RCVBUF` (an empty
+  queue still accepts one message); overflow drops the message and, unless `NETLINK_NO_ENOBUFS` is
+  set, records `overrun` (`ENOBUFS`).
 
 ### `NETLINK_ROUTE`
 
+- Handled rtnetlink requests require `NLM_F_REQUEST` (and `ty >= NLMSG_MIN_TYPE`); messages without
+  it are skipped and acked with 0 only on `NLM_F_ACK`.
 - Change requests (`NEW`/`DEL`/`SET` for links, addresses, routes) need `CAP_NET_ADMIN` over the
   namespace owner and go to `kernel/netns`'s device layer; other change types Linux 6.1 knows (up
   to `RTM_MAX`) are `EPERM` without it and `EOPNOTSUPP` with it (host interfaces cannot be
   changed; requests that change nothing succeed). Errors are acked through `ack_ext`, successes
   only on `NLM_F_ACK`.
-- Queries: link dumps (filtered by master and kind), single links by index or name (`EINVAL`,
-  `ENODEV`), address dumps (per family, IPv4 first), route dumps (per family) and `ip route get`
-  (both built by `kernel/route`), rule dumps (one datagram; `EAFNOSUPPORT` for a
-  family without rules), nsid (by pid or fd), neighbour dumps (empty) and single neighbour gets
-  (`ENOENT`); others `EOPNOTSUPP`; control messages are acked only on `NLM_F_ACK`.
-- Link, address and route dumps are packed into datagrams of at most 3776 bytes (Linux's
-  `NLMSG_GOODSIZE` on 4 KiB pages, which bounds a dump's first datagram), so readers with a
-  page-sized buffer (Go's `syscall.NetlinkRIB`, behind `net.Interfaces`) get whole messages; dumps
-  are not resumable, so a datagram larger than the reader's buffer is lost.
+- Queries: link dumps (filtered by master and kind; under `NETLINK_GET_STRICT_CHK`, validates
+  16-byte `ifinfomsg` with zeroed fields and strict allowed attributes `IFLA_MASTER`,
+  `IFLA_LINKINFO`, `IFLA_EXT_MASK`, `IFLA_TARGET_NETNSID`), single links by index or name
+  (validating 16-byte `ifinfomsg` and attribute sizes: `ERANGE`/`EINVAL`, `ENODEV`), address dumps
+  (per family, IPv4 first; under `NETLINK_GET_STRICT_CHK`, validates 8-byte `ifaddrmsg`, filters
+  by `ifa_index` with `NLM_F_DUMP_FILTERED` or `ENODEV`, rejects unknown/leftover attributes),
+  single IPv6 `RTM_GETADDR` (validating 8-byte `ifaddrmsg` and 16-byte `IFA_LOCAL`/`IFA_ADDRESS`
+  with `EINVAL`/`ERANGE`/`EADDRNOTAVAIL`; non-IPv6 `EOPNOTSUPP`), route dumps (per family; under
+  `NETLINK_GET_STRICT_CHK`, validates 12-byte `rtmsg` flags/fields and strict attributes, filters
+  by `rtm_table`/`RTA_TABLE`, `rtm_protocol`, `rtm_type`, `RTA_OIF`, and `RTM_F_CLONED`, returning
+  `ENOENT` for missing per-family tables and `ENODEV` for unknown `RTA_OIF`) and `ip route get`
+  (built by `kernel/route`, validating 12-byte `rtmsg` and IPv4/IPv6 attribute lengths: `ERANGE`
+  for short IPv4 `RTA_DST`/`RTA_SRC`/`RTA_FLOW`/u32 attrs and IPv6 `RTA_IIF`/u32 attrs, `EINVAL`
+  for short IPv6 `RTA_DST`/`RTA_SRC`, using leading bytes when oversized), rule dumps (under
+  `NETLINK_GET_STRICT_CHK`, validates 12-byte zeroed `fib_rule_hdr` and no attributes;
+  `NLMSG_DONE` with `-EAFNOSUPPORT` for families without rules), nsid (by pid or fd, validating
+  4-byte `NETNSA_*` attributes with `ERANGE`), neighbour dumps (empty; under
+  `NETLINK_GET_STRICT_CHK`, validates 12-byte `ndmsg` and `NDA_IFINDEX`/`NDA_MASTER`/
+  `NDA_FLAGS_EXT`) and single neighbour gets (validating header length, `ndm_state`/`ndm_type`,
+  family `EAFNOSUPPORT`, `NDA_DST` length `EINVAL` and ifindex `ENODEV`/`EINVAL` before `ENOENT`);
+  others `EOPNOTSUPP`; all query errors honour `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` (dump
+  errors return `NLMSG_DONE` with negative errno and optional extack TLV); control messages are
+  acked only on `NLM_F_ACK`.
+- Link, address, route, rule and neighbour dumps are queued as resumable `DumpMessages` (keeping
+  Linux 6.1's per-family section boundaries and trailing `NLMSG_DONE` section) and packed on
+  demand to each `recv`/`recvmsg` buffer size (capped at 32 KiB), so both small buffers (e.g.
+  512 B) and page-sized buffers (Go's `syscall.NetlinkRIB`, behind `net.Interfaces`) receive whole
+  multipart messages without losing entries.
 - In the initial namespace interfaces and addresses come from the host's `getifaddrs` (MTU fixed,
   MAC from `AF_PACKET` entries, host statistics and queue length) plus its virtual devices; new
   namespaces see only their own devices, with zero statistics and a queue length of 1000.
@@ -146,9 +198,14 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 ### `NETLINK_GENERIC`, `NETLINK_SOCK_DIAG` and the others
 
 - `NETLINK_GENERIC`: `nlctrl` only, modelled on 6.8 (the differential tests run on a 6.8 host,
-  where 6.1 would report a different maxattr): a short header `EINVAL`, unknown families
-  `ENOENT`; `GETPOLICY` only as a dump (`EINVAL` without a family, `ENOENT` for another family,
-  `EOPNOTSUPP` for nlctrl); the `GETFAMILY` dump ends with `NLMSG_DONE` in the same datagram.
+  where 6.1 would report a different maxattr): a short header `EINVAL`, invalid `CTRL_ATTR_*`
+  sizes `ERANGE`, unknown families `ENOENT`, with all errors honouring `NETLINK_CAP_ACK` and
+  `NETLINK_EXT_ACK` (including `NLMSGERR_ATTR_OFFS` for unknown `CTRL_ATTR_OP`); `GETFAMILY`
+  resolves `CTRL_ATTR_FAMILY_NAME` over `CTRL_ATTR_FAMILY_ID` when both are given; `GETPOLICY`
+  (dump only) checks `CTRL_ATTR_FAMILY_ID` before `CTRL_ATTR_FAMILY_NAME` (`EINVAL` without a
+  family, `ENOENT` for another family or unknown `CTRL_ATTR_OP`) and dumps `nlctrl`'s own Linux
+  6.8 operation policies; the `GETFAMILY` and `GETPOLICY` dumps are resumable and share a datagram
+  with `NLMSG_DONE` when both fit in the caller's buffer (splitting across receives otherwise).
 - `NETLINK_SOCK_DIAG` answers as 6.1 does without any family diag module (`sock_diag_rcv_msg`):
   the old `TCPDIAG_GETSOCK`/`DCCPDIAG_GETSOCK` `EOPNOTSUPP`; `SOCK_DIAG_BY_FAMILY` and
   `SOCK_DESTROY` `EINVAL` for a body under two bytes or a family at or past `AF_MAX` (46), else
@@ -192,43 +249,10 @@ layer and namespace ids (`kernel/netns`), nftables (`kernel/nft`); mq_notify (`k
 
 ## Confirmed bugs / technical debt
 
-- **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
-  most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
-  sizes later datagrams to the reader's buffer and continues the dump on the next recv.
 - **Only rtnetlink link, address and route changes are notified:** groups other than rtnetlink's
   link, address and route ones (neighbours, rules, netconf, nsid, other protocols) never receive
   anything; changes made through sysctls (`disable_ipv6`) or to the host's own interfaces (boot
-  namespace) are not notified; notifications carry seq, port and flags 0 (Linux copies the
-  request's seq and port into address and route ones, and new routes carry
-  `NLM_F_CREATE`/`EXCL`), `NLM_F_ECHO` is not honoured, and the queue cap counts datagrams (1024),
-  not `SO_RCVBUF` bytes.
-- **Netlink ids are only recorded:** `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
-  generic-netlink errors; ids are not checked for uniqueness, so a second socket of a process
-  autobinds to the same tgid (Linux picks a negative number) and an explicit id another socket
-  holds is not `EADDRINUSE`.
-- **Netlink sockets differ from Linux's outside requests:** shutdown returns 0 (Linux's
-  `sock_no_shutdown` is `EOPNOTSUPP`); getpeername always reports `{AF_NETLINK, 0, 0}` (Linux
-  reports the connected port and group); handled rtnetlink types run without `NLM_F_REQUEST`,
-  where Linux skips such messages and acks them with 0 on `NLM_F_ACK`; answers, nftables replies
-  and mq_notify cookies queue without limit, where Linux drops replies with `ENOBUFS` beyond
-  `SO_RCVBUF`, so a program sending requests without reading grows the queue without bound.
-- **Netlink requests are not validated as Linux validates them:** `NETLINK_GET_STRICT_CHK` is
-  accepted and ignored (no header checks, no header-based dump filtering), attributes of the wrong
-  size are skipped instead of rejected (`ERANGE`; `EINVAL` for a short IPv6 `RTA_DST` of `ip route
-  get`, while a longer one is used by its first bytes), and a single IPv6 `RTM_GETADDR` is
-  `EOPNOTSUPP` without Linux's header checks (`EINVAL` for a short body); malformed or mis-typed
-  requests, such as a route dump carrying an `ifinfomsg` or an `ip route get` with a short
-  `RTA_FLOW`, are answered with data where Linux returns an error.
-- **Single `RTM_GETNEIGH` requests always answer `ENOENT`:** the header and address are never
-  checked, so a bad state or type, a missing or wrong-size `NDA_DST` (`EINVAL`), an unknown family
-  (`EAFNOSUPPORT`) and an unknown interface index (`ENODEV`) are all reported as "not found", and
-  `ip neigh get` with a wrong device or address family prints a misleading error.
-- **Netlink destination addresses are ignored:** sendto/sendmsg on a netlink socket never looks at
-  `msg_name`, so a message addressed to another port or to multicast groups is handled as a kernel
-  request, without `netlink_sendmsg`'s checks (`EINVAL` for a short or non-`AF_NETLINK` address,
-  `EPERM` for sending to a group or port without `CAP_NET_ADMIN` on rtnetlink).
-- **`nlctrl`'s `GETPOLICY` dump of nlctrl itself is `EOPNOTSUPP`:** Linux returns the policy, and
-  takes `CTRL_ATTR_FAMILY_ID` before the name.
+  namespace) are not notified.
 
 ## Open questions
 

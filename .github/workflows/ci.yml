@@ -73,8 +73,13 @@ jobs:
       - name: Fetch rootfs
         run: scripts/fetch-rootfs
 
+      # Appine turns the guest's raw ICMP sockets into host ping sockets: Ubuntu does not let
+      # regular users create those by default (ping_group_range is "1 0"), while Android and the
+      # Docker container used by local development both allow all groups.
       - name: Test (includes lockstep, guest programs and busybox in the rootfs)
         env:
           APPINE_REQUIRE_ROOTFS: "1"
           APPINE_REQUIRE_MUSL: "1"
-        run: cargo test --workspace
+        run: |
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          cargo test --workspace

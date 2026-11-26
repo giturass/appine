@@ -88,8 +88,9 @@ impl KernelEntry {
 
 /// The root directory, current directory and file-creation mask (the part `CLONE_FS` shares),
 /// plus the mount namespace. On Linux the mount namespace is in the nsproxy, but `CLONE_NEWNS`
-/// cannot be combined with `CLONE_FS` and setns requires the fs not to be shared, so tasks sharing
-/// one fs are always in the same mount namespace and keeping them together is equivalent.
+/// cannot be combined with `CLONE_FS`, `unshare(CLONE_NEWNS)` implies `CLONE_FS`, and `setns`
+/// unshares a shared `FsContext` before switching mount namespaces, so tasks sharing one fs are
+/// always in the same mount namespace and keeping them together is equivalent.
 pub(crate) struct FsContext {
     /// Root directory (chroot).
     pub root: Node,
@@ -139,6 +140,8 @@ pub(crate) struct Task {
     /// The thread's serial number, never repeated: after a tid is reused by a new thread it tells
     /// the old and new thread apart (a POSIX timer on the old one's CPU clock, `crate::itimer`).
     pub serial: u64,
+    /// Creation time, in clock ticks since boot.
+    pub start_ticks: u64,
     /// The thread group it belongs to.
     pub tgid: Tid,
     /// Signals sent to this thread and not yet handled.
@@ -158,6 +161,9 @@ pub(crate) struct Task {
     pub saved_sigmask: Cell<Option<u64>>,
     /// The thread has been asked to exit (whole-group exit, execve ending the other threads).
     pub killed: Cell<bool>,
+    /// This thread has not yet participated in an in-progress group-stop
+    /// ([`ThreadGroup::stop_pending`]).
+    pub stop_pending: Cell<bool>,
     /// The thread stopped before signal delivery because its cgroup is frozen
     /// ([`crate::signal::deliver`]), or waits for its vfork child (which Linux counts as frozen
     /// too): the frozen field of `cgroup.events` looks at it.
@@ -232,11 +238,13 @@ pub(crate) struct Task {
     /// signal (reported to the tracer when a traced thread exits).
     pub exit_status: Cell<ExitStatus>,
     /// Has entered the exit path (may still be stopped at PTRACE_EVENT_EXIT).
-    exit_started: Cell<bool>,
+    pub(crate) exit_started: Cell<bool>,
     /// A vfork child whose parent still waits for it to exec or exit (`TaskState::vfork_done`
     /// pending), readable by other threads: the OOM killer passes it over while it shares its
     /// parent's address space (Linux's `in_vfork`, [`crate::oom`]).
     pub vfork: Cell<bool>,
+    /// Sticky privilege restriction inherited by children and preserved across exec.
+    pub no_new_privs: Cell<bool>,
     /// seccomp state ([`crate::seccomp`]), accessed only while holding the BKL.
     pub seccomp: RefCell<crate::seccomp::Seccomp>,
     /// The thread has seccomp: syscalls must be checked first (`syscall::fast` reads it without
@@ -287,6 +295,8 @@ pub(crate) struct TaskState {
     /// reading the time argument again, and computes what remains from it when a signal
     /// interrupts. Cleared once the locked path has dispatched that call.
     pub fast_sleep: Option<crate::itimer::Expiry>,
+    /// Shared SysV `SEM_UNDO` list identity (`CLONE_SYSVSEM`).
+    pub sem_undo: Rc<crate::ipc::SemUndo>,
 }
 
 impl Task {
@@ -312,6 +322,7 @@ impl Task {
         Ok(Rc::new(Task {
             tid: Cell::new(tid),
             serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / crate::loader::CLOCK_TICKS),
             tgid,
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
@@ -319,6 +330,7 @@ impl Task {
             ns: RefCell::new(ns),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
+            stop_pending: Cell::new(false),
             frozen: Cell::new(false),
             pdeathsig: Cell::new(0),
             cred: RefCell::new(cred),
@@ -350,6 +362,7 @@ impl Task {
             exit_status: Cell::new(ExitStatus::Exited(0)),
             exit_started: Cell::new(false),
             vfork: Cell::new(vfork),
+            no_new_privs: Cell::new(false),
             seccomp: RefCell::default(),
             seccomp_on: AtomicBool::new(false),
             seccomp_allow: [const { AtomicU64::new(0) }; crate::seccomp::CACHE_WORDS],
@@ -372,8 +385,10 @@ impl Task {
         if g.threads
             .iter()
             .all(|tid| k.tasks.get(tid).is_none_or(|t| t.exit_started.get()))
+            && g.exiting.is_none()
         {
-            g.exiting.get_or_insert(status);
+            g.exiting = Some(status);
+            g.single_exit = true;
         }
     }
 
@@ -464,14 +479,23 @@ pub(crate) fn start(
         thread_main(thread_shared, tid, cpu, reused)
     }))
     .map_err(|_| Errno::EAGAIN)?;
-    {
+    let cgroup = {
         let st = task.state.borrow();
         let mut group = st.group.borrow_mut();
         group.threads.push(tid);
-        k.cgroups.task_changed(group.cgroup);
+        if group.stopped {
+            if group.stop_pending > 0 {
+                task.stop_pending.set(true);
+                group.stop_pending += 1;
+            }
+            // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
+            unsafe { task.sync.kicker.kick() };
+        }
         st.mm.borrow_mut().add_user(task.sync.clone());
-    }
+        group.cgroup
+    };
     k.tasks.insert(tid, task);
+    crate::cgroup::task_changed(k, cgroup);
     Ok(())
 }
 
@@ -630,7 +654,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         task.host_tid.set(appine_hal::gettid());
         task.ctxt_base
             .set(appine_hal::thread_ctxt_switches_self().unwrap_or((0, 0)));
-        crate::syscall::host_started(&task, reused);
+        crate::syscall::host_started(&k, &task, reused);
         task.state.borrow().mm.borrow().generations()
     });
     let Some(mut generations) = started else {
@@ -776,6 +800,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             let mut state = task.state.borrow_mut();
             let mut cx = Cx::new(shared, k, &task, &mut state);
             if stepped {
+                // A tracer can suppress SIGTRAP after this single-step exception.
+                cpu.state_mut().clear_exclusive();
                 crate::ptrace::step_done(&mut cx, cpu);
             }
             let flow = handle(&mut cx, cpu, exit);
@@ -783,6 +809,14 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 generations = cx.mm().generations();
             }
             if let Flow::Exit = flow {
+                if !cx.task.exit_started.get() && !cx.kr().stopping {
+                    let status =
+                        cx.t.group
+                            .borrow()
+                            .exiting
+                            .unwrap_or_else(|| cx.task.exit_status.get());
+                    crate::ptrace::exit(&mut cx, cpu, status);
+                }
                 crate::syscall::flush_at_exit(&mut cx);
             }
             fast.refresh(shared, cx.task, cx.t);
@@ -825,10 +859,8 @@ const EC_IABT_LOW: u64 = 0x20;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_SP_ALIGN: u64 = 0x26;
-/// Level 3 translation fault (page not mapped).
-const FSC_TRANSLATION: u64 = 0x07;
-/// Level 3 permission fault.
-const FSC_PERMISSION: u64 = 0x0f;
+const FSC_TRANSLATION_L0: u64 = 0x04;
+const FSC_PERMISSION_L3: u64 = 0x0f;
 /// Alignment fault.
 const FSC_ALIGNMENT: u64 = 0x21;
 
@@ -848,7 +880,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     // without an ESR
     let (sig, info, esr, what) = match exit {
         Exit::InvalidateCode { addr } => {
-            invalidate_code(cx, &[addr & !(PAGE_SIZE - 1), ivau]);
+            let page = addr & !(PAGE_SIZE - 1);
+            if ivau != 0 && ivau != page {
+                invalidate_code(cx, &[page, ivau]);
+            } else {
+                invalidate_code(cx, &[page]);
+            }
             return signal::deliver(cx, cpu, false);
         }
         _ if ivau != 0 => {
@@ -864,11 +901,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             return flow;
         }
         Exit::Kick => return signal::deliver(cx, cpu, false),
+        // Linux's SIGILL for an undefined instruction has no esr_context in the signal frame
         Exit::Undefined { insn } => {
             crate::debug::log(format_args!(
                 "undefined instruction {insn:#010x} at {pc:#x}"
             ));
-            let info = SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL);
+            let info = SigInfo::fault(code::ILL_ILLOPC, pc, 0);
             (Signal::ILL, info, 0, signal::trap::UNDEFINED)
         }
         // Linux's SIGTRAP for a breakpoint has no esr_context in the signal frame
@@ -915,14 +953,10 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 return signal::deliver(cx, cpu, false);
             }
             // Large mappings fill entries on demand: fill them in on first access and re-execute
-            if cx.mm().fault_in(addr, need) {
+            let fault = cx.mm().try_fault_in(addr, need);
+            if fault == Ok(true) {
                 return signal::deliver(cx, cpu, false);
             }
-            let (ec, wnr) = match access {
-                Access::Exec => (EC_IABT_LOW, 0),
-                Access::Read => (EC_DABT_LOW, 0),
-                Access::Write => (EC_DABT_LOW, ESR_WNR),
-            };
             // A FUSE file's mapping reads its pages as they are touched (crate::mm::Fill): read
             // this one with the BKL released and re-execute. A signal arriving before the daemon
             // took the read is delivered first, and the access faults again after it; a page that
@@ -935,36 +969,22 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 },
                 None => false,
             };
-            let past_eof = if unreadable {
+            let past_eof = if unreadable || fault.is_err() {
                 Some(true)
             } else {
-                cx.mm_mut().fault_past_eof(addr)
+                cx.mm_mut().fault_past_eof(addr, need)
             };
             if past_eof == Some(false) {
                 // The file of a shared mapping grew and the new contents are mapped in: re-execute
                 return signal::deliver(cx, cpu, false);
             }
-            if past_eof == Some(true) {
-                let esr = ec << 26 | ESR_IL | wnr | FSC_TRANSLATION;
-                let info = SigInfo::fault(code::BUS_ADRERR, addr, esr);
-                signal::show_unhandled(cx, cpu, Signal::BUS, esr, signal::abort_name(esr));
-                signal::force(cx, Signal::BUS, info);
+            // A grows-down mapping can recover a missing page, but cannot fix a file read error.
+            let backing_error = past_eof == Some(true);
+            if !backing_error && cx.grow_stack(addr) {
                 return signal::deliver(cx, cpu, false);
             }
-            // A grows-down mapping (the main thread's stack, MAP_GROWSDOWN) grows to here:
-            // re-execute
-            if cx.grow_stack(addr) {
-                return signal::deliver(cx, cpu, false);
-            }
-            let mapped = cx.mm().is_mapped(addr);
-            let (code, fsc) = if mapped {
-                (code::SEGV_ACCERR, FSC_PERMISSION)
-            } else {
-                (code::SEGV_MAPERR, FSC_TRANSLATION)
-            };
-            let esr = ec << 26 | ESR_IL | wnr | fsc;
-            let info = SigInfo::fault(code, addr, esr);
-            (Signal::SEGV, info, esr, signal::abort_name(esr))
+            let (sig, info) = page_fault_signal(&cx.mm(), addr, access, backing_error);
+            (sig, info, info.esr, signal::abort_name(info.esr))
         }
         Exit::Fault {
             addr,
@@ -1014,12 +1034,54 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     signal::deliver(cx, cpu, false)
 }
 
-/// Invalidates the translations of each page in `pages` (0 is skipped), and lets the other
-/// threads sharing the address space know.
+/// Classifies an unrecoverable page fault. For SIGSEGV, VMA coverage determines si_code
+/// and the page table determines the ESR.
+fn page_fault_signal(mm: &Mm, addr: u64, access: Access, backing_error: bool) -> (Signal, SigInfo) {
+    let (sig, code) = if backing_error {
+        (Signal::BUS, code::BUS_ADRERR)
+    } else if mm.is_mapped(addr) {
+        (Signal::SEGV, code::SEGV_ACCERR)
+    } else {
+        (Signal::SEGV, code::SEGV_MAPERR)
+    };
+    let fsc = if !backing_error && mm.mmu().translate(addr, 0).is_some() {
+        FSC_PERMISSION_L3
+    } else {
+        translation_fsc(mm.mmu(), addr)
+    };
+    let (ec, wnr) = match access {
+        Access::Exec => (EC_IABT_LOW, 0),
+        Access::Read => (EC_DABT_LOW, 0),
+        Access::Write => (EC_DABT_LOW, ESR_WNR),
+    };
+    (
+        sig,
+        SigInfo::fault(code, addr, ec << 26 | ESR_IL | wnr | fsc),
+    )
+}
+
+/// A populated entry (including PROT_NONE) establishes the tables shared with the faulting
+/// address. The guest walk treats intermediate tables emptied by unmap as absent.
+fn translation_fsc(mmu: &appine_engine::Mmu, addr: u64) -> u64 {
+    if addr < 1 << appine_engine::VA_BITS {
+        for (shift, level) in [(21, 3), (30, 2), (39, 1)] {
+            let span = 1u64 << shift;
+            let lo = addr & !(span - 1);
+            let end = lo + span;
+            if mmu.next_present(lo, end) != end {
+                return FSC_TRANSLATION_L0 + level;
+            }
+        }
+    }
+    FSC_TRANSLATION_L0
+}
+
+/// Invalidates the translations of each page in `pages`, and lets the other threads sharing the
+/// address space know.
 fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
     let sync = cx.task.sync.clone();
     let mut mm = cx.mm_mut();
-    for &page in pages.iter().filter(|&&p| p != 0) {
+    for &page in pages {
         mm.invalidate_code(page, PAGE_SIZE);
     }
     mm.sync(&sync);
@@ -1052,8 +1114,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         k.cpu += cpu;
         group.borrow_mut().cpu += cpu;
         // The main thread: procfs goes on showing it as a zombie thread (ThreadGroup::leader_exit)
+        // and its stopped CPU clock stays readable until the process is reaped
         if tid == tgid {
-            group.borrow_mut().leader_exit = Some((task.comm.get(), cpu));
+            let mut g = group.borrow_mut();
+            g.leader_exit = Some((task.comm.get(), cpu));
+            g.leader_serial = Some(task.serial);
+            g.leader_net = Some(Rc::downgrade(&task.ns.borrow().net));
         }
         let mut st = task.state.borrow_mut();
         // The process's last thread: sample the peak resident memory once before exiting
@@ -1087,10 +1153,26 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         let what = format_args!("kernel panic while the thread was exiting");
         crate::bug::kill(&k, &task, pc, what);
     }
+    // release_mm can store final robust-futex and clear_child_tid values in a mapped
+    // file. Finish their writeback before a waiting parent observes this thread's exit.
+    if task.res.borrow().mm.borrow().has_fills() {
+        {
+            let mut state = task.state.borrow_mut();
+            let mut cx = Cx::new(shared, k, &task, &mut state);
+            if crate::bug::catch(|| crate::syscall::flush_mappings(&mut cx)).is_none() {
+                crate::bug::report(format_args!(
+                    "kernel panic flushing FUSE mappings for thread {tid}"
+                ));
+            }
+        }
+        k = shared.lock();
+    }
     k.tasks.remove(&tid);
     k.release_pid(tid);
     // PI locks this thread held with waiters go to their first waiter (exit_pi_state_list)
-    if crate::bug::catch(|| crate::futex::pi_owners_exited(&k, &mut shared.futexes())).is_none() {
+    if crate::bug::catch(|| crate::futex::pi_owners_exited(&k, &mut shared.futexes(), None))
+        .is_none()
+    {
         crate::bug::report(format_args!(
             "kernel panic while thread {tid} handed over its PI futexes"
         ));
@@ -1098,12 +1180,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     // Its address space's attachments no longer count: a segment marked for removal goes with
     // its last one (Linux's exit_mmap closes them)
     crate::ipc::reap_shm(&mut k);
-    let last = {
+    let (last, cgroup) = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);
-        k.cgroups.task_changed(g.cgroup);
-        g.threads.is_empty()
+        (g.threads.is_empty(), g.cgroup)
     };
+    crate::cgroup::task_changed(&k, cgroup);
     // The child processes this thread created go to a live thread of the process (Linux's
     // forget_original_parent); the last thread's are reparented by finish_group
     if !last {
@@ -1127,6 +1209,8 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         // them (Linux's exit_signals)
         let pending = group.borrow().pending.set();
         crate::signal::retarget(&k, &group, None, pending);
+        // If a group-stop was waiting for this thread, its exit completes its participation
+        crate::signal::participate_group_stop(&k, &group, &task);
     }
     // When a later step fails: if other threads remain, end this process; otherwise it has
     // already ended, so only report
@@ -1140,23 +1224,40 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             crate::bug::kill_process(k, tgid, what);
         }
     };
+    // Take this thread's SysV SEM_UNDO handle; when it is the last sharer (either on group exit or
+    // after unshare(CLONE_SYSVSEM) / clone without CLONE_SYSVSEM), apply its adjustments
+    let sem_undo = crate::bug::catch(|| {
+        std::mem::replace(
+            &mut task.state.borrow_mut().sem_undo,
+            Rc::new(crate::ipc::SemUndo::new()),
+        )
+    });
     // finish_group contains bugs step by step itself; only the few lines reading process state
     // are left for this catch
-    if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
-        failed(&k, "finishing the process");
+    if last {
+        if crate::bug::catch(|| crate::process::finish_group(&mut k, &group, sem_undo)).is_none() {
+            failed(&k, "finishing the process");
+        }
+    } else if let Some(undo) = sem_undo
+        && Rc::strong_count(&undo) == 1
+        && crate::bug::catch(|| crate::ipc::exit(&mut k, undo.id, tgid)).is_none()
+    {
+        failed(&k, "releasing SysV IPC");
     }
     // The fd table goes with its last thread (each holds two references): its message-queue
     // registrations end as its descriptors close (Linux's mqueue_flush_file at exit)
+    let mut fds_gone = false;
     let mq_flush = || {
         let fds = task.res.borrow().fds.clone();
         if Rc::strong_count(&fds) <= 3 {
+            fds_gone = true;
             let t = fds.borrow();
             let files: Vec<_> = t
                 .open_fds()
                 .into_iter()
                 .filter_map(|fd| t.get(fd).ok())
                 .collect();
-            crate::syscall::mqueue_closed(tgid, &files);
+            crate::syscall::mqueue_closed(&group, &files);
         }
     };
     if crate::bug::catch(mq_flush).is_none() {
@@ -1173,21 +1274,24 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     if crate::bug::catch(crate::vfs::fuse::flush_released).is_none() {
         failed(&k, "releasing FUSE files");
     }
-    // After the fd table's unix sockets are closed, only in-flight cycles may remain
-    if last
+    // After the fd table's unix sockets are closed (including a non-last thread that called
+    // unshare(CLONE_FILES)), collect any remaining in-flight cycles
+    if (last || fds_gone || crate::unix::take_deferred())
         && !k.unix_inflight.is_empty()
         && crate::bug::catch(|| crate::unix::collect(&mut k)).is_none()
     {
         failed(&k, "collecting unix sockets");
     }
-    // The last thread using an IPC namespace exited: drop the objects in it
-    k.collect_ipc();
     // The last thread using a mount namespace exited: take down its mounts (the tmpfs in them
     // are deleted with them); detached mounts whose last use was its files or directories go too
     if let Some(vfs) = &vfs
         && crate::bug::catch(|| crate::syscall::collect_unused(&k, vfs)).is_none()
     {
         failed(&k, "collecting mount namespaces");
+    }
+    // Any IPC namespace whose last task, fd, or mount (including mounts torn down above) went away
+    if crate::bug::catch(|| k.collect_ipc()).is_none() {
+        failed(&k, "collecting IPC namespaces");
     }
     // A cgroup may have lost its last process (cgroup.events' populated)
     if crate::bug::catch(|| crate::cgroup::notify_changes(&mut k)).is_none() {
@@ -1222,6 +1326,7 @@ fn add_stats(total: &mut DbtStats, s: &DbtStats) {
     total.blocks_shared += s.blocks_shared;
     total.insns_grouped += s.insns_grouped;
     total.ungrouped += s.ungrouped;
+    total.fast_loops += s.fast_loops;
 }
 
 /// The thread leaves its address space (exit, execve): processes the robust futex list, zeroes
@@ -1256,4 +1361,89 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
         crate::kernel::signal_later(&parent);
     }
     st.mm.borrow_mut().remove_user(&task.sync);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmapped_page_reports_the_missing_translation_level() {
+        let mut mm = Mm::new();
+        let limit = 1 << appine_engine::VA_BITS;
+        // A single populated page in the last slot at every level also exercises end == limit.
+        mm.map_anonymous(limit - PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        for (addr, fsc) in [
+            (0, 0x04),
+            (limit, 0x04),
+            (u64::MAX, 0x04),
+            (limit - (1 << 39), 0x05),
+            (limit - (1 << 30), 0x06),
+            (limit - (1 << 21), 0x07),
+        ] {
+            assert_eq!(
+                page_fault_signal(&mm, addr, Access::Read, false),
+                (
+                    Signal::SEGV,
+                    SigInfo::fault(code::SEGV_MAPERR, addr, 0x9200_0000 | fsc)
+                ),
+                "address {addr:#x}",
+            );
+        }
+    }
+
+    #[test]
+    fn access_error_esr_follows_leaf_permissions() {
+        let mut mm = Mm::new();
+        let addr = 1 << 30;
+        let denied = |mm: &Mm, access, esr| {
+            assert_eq!(
+                page_fault_signal(mm, addr, access, false),
+                (Signal::SEGV, SigInfo::fault(code::SEGV_ACCERR, addr, esr)),
+            );
+        };
+        // Fresh PROT_NONE, then a mapping large enough to stay unpopulated until its first read.
+        mm.map_anonymous(addr, 2 << 20, 0).unwrap();
+        denied(&mm, Access::Read, 0x9200_0004);
+        mm.mprotect(addr, 2 << 20, prot::READ).unwrap();
+        assert_eq!(mm.try_fault_in(addr, prot::WRITE), Ok(false));
+        denied(&mm, Access::Write, 0x9200_0044);
+        assert_eq!(mm.try_fault_in(addr, prot::READ), Ok(true));
+        denied(&mm, Access::Write, 0x9200_004f);
+
+        mm.mprotect(addr, PAGE_SIZE, prot::READ | prot::WRITE)
+            .unwrap();
+        denied(&mm, Access::Exec, 0x8200_000f);
+        mm.mprotect(addr, 2 << 20, 0).unwrap();
+        denied(&mm, Access::Read, 0x9200_0007);
+    }
+
+    #[test]
+    fn past_eof_reports_the_translation_level_in_siginfo_and_the_log() {
+        use crate::mm::flags;
+        use std::os::fd::AsRawFd;
+
+        let mut mm = Mm::new();
+        let file = appine_hal::memfd(c"past-eof").unwrap();
+        let addr = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((file.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert_eq!(mm.fault_past_eof(addr, prot::READ), Some(true));
+        let (sig, info) = page_fault_signal(&mm, addr, Access::Read, true);
+        assert_eq!(
+            (sig, info),
+            (
+                Signal::BUS,
+                SigInfo::fault(code::BUS_ADRERR, addr, 0x9200_0004)
+            )
+        );
+        assert_eq!(signal::abort_name(info.esr), "level 0 translation fault");
+    }
 }

@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/nft.md` for the paired decision history (not yet created; pre-split decisions D4, D5, D8–D11 and the nftables half of D13 stay in `.agents/decisions/kernel/netns.md`).
 >
 > Verified: 2026-11-15 (split out of the kernel/netns full mapping of 2026-11-03; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `filter_with_mark`, `filter_prerouting` and `PRI_NAT_DST` (`-100`) split PREROUTING filter chains around Linux's `NF_IP_PRI_NAT_DST` hook priority)
 
 ## Responsibilities
 
@@ -22,7 +24,8 @@ and netlink transport in `kernel/netlink`.
 ## Public entry points
 
 - `nft::handle` handles one netfilter datagram.
-- `Nft::nat`, `Nft::filter`, `has_nat`, `has_filter` and `tracks` serve namespace and socket callers.
+- `Nft::nat`, `Nft::filter_with_mark`, `Nft::filter_prerouting`, `PRI_NAT_DST`, `has_nat`,
+  `has_filter` and `tracks` serve namespace and socket callers.
 
 ## Data flow / lifecycle
 
@@ -33,22 +36,28 @@ and netlink transport in `kernel/netlink`.
   on a clone, every error is reported, and the clone replaces the ruleset only if all succeeded;
   `NFNL_BATCH_GENID` mismatches `ERESTART`; the generation increases per committed batch.
 - Tables (families inet, ip, ip6, arp, bridge, netdev; only `DORMANT` flag, `OWNER` `EOPNOTSUPP`),
-  chains (base chains with hook, priority, type filter/nat/route, policy; existing chains can only
-  change policy and userdata; rename is silently ignored; `EBUSY` when referenced), rules (raw
-  expressions; position, append, replace — a replaced rule gets a new handle), sets and elements
-  (key length 1..64, `%d` names, anonymous sets dropped when unused; `EBUSY` while referenced).
+  chains (base chains with hook, priority, type filter/nat/route, policy; existing chains can
+  change policy and userdata and be renamed by handle with `CHAIN_HANDLE` + new `CHAIN_NAME`,
+  updating rule and verdict-map references and returning `EEXIST` on collision; `EBUSY` when
+  referenced by rules or verdict-map elements), rules (raw
+  expressions; position, append, replace — replacing preserves the rule's handle), sets and elements
+  (key length 1..64, `%d` names, anonymous sets dropped when unused; `EBUSY` while referenced;
+  verdict-map elements validate jump targets and count toward `CHAIN_USE`).
   Stateful objects and flowtables `EOPNOTSUPP`; `DESTROY*` maps to delete ignoring `ENOENT`.
   `DELTABLE`/`DESTROYTABLE` with family 0 or without a name and handle flush instead (Linux's
   `nft_flush`, what `nft flush ruleset` sends): every table of the family, of all families for 0,
   only those with the name when one is given; matching nothing succeeds. Other requests with
-  family 0 are `EAFNOSUPPORT`. `DELTABLE` ignores `NLM_F_NONREC`; verdict-map references are not
-  counted as chain uses.
+  family 0 are `EAFNOSUPPORT`. `DELTABLE` honours `NLM_F_NONREC` (`EBUSY` when the table still has
+  chains or sets).
 - Validation: expression names must be known (39); jump targets must exist and not be base chains;
   loops `EMLINK`; set references rewritten to names. Arguments are not validated.
 - Queries outside batches: `GETGEN`, dumps of tables, chains, rules (filters by table and chain),
-  sets and elements in 6.8's format, packed into 8 KiB datagrams (a single larger message, and a
-  set-element dump, which is one message, go out unbounded); `nft_compat` revision queries;
-  empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters are 0.
+  sets and elements in 6.8's format, returned as resumable `NetlinkItem::Dump` entries packed on
+  demand to the caller's receive buffer; `GETSETELEM` (`SetElemDump`) splits elements across
+  bounded multipart `NFT_MSG_NEWSETELEM` messages (at most `min(max, 3776)` bytes per chunk)
+  followed by the trailing empty `NFT_MSG_NEWSETELEM` and `NLMSG_DONE`; `nft_compat` revision
+  queries; empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters
+  are 0.
 - An initial-namespace commit re-evaluates port forwarding.
 
 ### Expression evaluation
@@ -60,12 +69,19 @@ and netlink transport in `kernel/netlink`.
   interface's address on PREROUTING), `reject`, `queue` (drop), `limit` (a token bucket per rule
   expression, packets or bytes, `over` inverting) and `quota` (bytes counted per rule expression,
   `over` inverting); a packet's length, for them as for `meta len`, is its headers only. `counter`,
-  `log`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
+  `log`, `notrack`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
   effect. xt targets DNAT, REDIRECT, MARK, ACCEPT, DROP, REJECT (others no-ops) and matches
-  comment, mark, owner, conntrack, state, addrtype, tcp, udp, limit (the same bucket from avg and
-  burst; others never match). Unknown or
+  comment, mark, owner, conntrack (state and masked original destination address, independently
+  invertible, using the destination before DNAT in the evaluating namespace), state, addrtype,
+  tcp, udp, limit (the same bucket from avg and burst), hashlimit (revisions 1–3), and recent
+  (named per-netns address histories with SET, CHECK, UPDATE, REMOVE, masks, expiry, hit counts,
+  TTL checks and optional reaping). Unknown or
   unevaluable expressions break the rule. Jumps to missing chains or deeper than 16 drop; 100,000
   steps accept; chains end in their policy.
+- Native `dynset` adds, updates and deletes set members during evaluation. Limits and quotas
+  keep separate state for each key. Updates refresh timeouts, and lookups and element dumps see
+  live dynamic members. xt hashlimit rules sharing a table name and family in one network namespace
+  use the same keyed state for packet, byte or rate-window matching.
 - `kernel/netns` builds packets and selects hooks at connect/sendto and forwarding probes;
   matching-family base chains run in priority order. `Outcome` returns accept, drop, reject
   with errno or DNAT to that caller. `tracks()` decides whether `SO_ORIGINAL_DST` answers.
@@ -88,19 +104,17 @@ and netlink transport in `kernel/netlink`.
 
 ## Invariants and gotchas
 
+- A named recent list holds at most 100 addresses. Its first installed match chooses the mask.
+  History survives unrelated and rejected batches; increasing timestamp capacity or committing
+  removal of the last referencing rule clears it.
 - Rulesets are per network namespace; requests, including queries, require `CAP_NET_ADMIN`.
 - Evaluation uses synthetic headers, not host packets. Hook placement and verdict application
   must stay consistent with `kernel/netns`; changing either side requires reading both maps.
 
 ## Confirmed bugs / technical debt
 
-- **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
-  xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
-  trigger; byte limits and quotas count headers only, so they let through more than Linux.
-- **nft control-plane gaps:** a replaced rule gets a new handle; chain rename is ignored;
-  `DELTABLE` ignores `NLM_F_NONREC`; chains used only from verdict maps can be deleted (their jumps
-  then drop); no `NLM_F_ECHO` and no monitor notifications; set-element dumps are one unbounded
-  message.
+- Byte limits and quotas count headers only.
+- **nft control-plane gaps:** no `NLM_F_ECHO` and no monitor notifications.
 - POSTROUTING, SNAT and MASQUERADE have no effect; unsupported expression effects are listed above.
 
 ## Open questions

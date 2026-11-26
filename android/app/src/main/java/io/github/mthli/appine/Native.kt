@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.os.Environment
 import java.io.IOException
+import java.util.function.IntConsumer
 
 /**
  * JNI interface of the native library libappine.so, implemented in hosts/android/src/lib.rs.
@@ -63,13 +64,19 @@ internal object Native {
     // that are not UTF-8 written as `%XX`. Each call opens the store separately, which also works
     // while the kernel runs; the caller holds the read lock of [Rootfs.access]. Metadata is
     // `<d|f>\t<bytes>\t<modification time (ms)>\t<permission bits>`. Only directories and regular
-    // files (following symbolic links); anything else, or anything missing, throws
-    // FileNotFoundException.
+    // files (following symbolic links) are exposed; missing paths (`ENOENT`/`ENOTDIR`) throw
+    // `FileNotFoundException`, `EEXIST` throws `FileAlreadyExistsException`, `EACCES` throws
+    // `AccessDeniedException`, and other store/I/O errnos throw `IOException`.
 
     /** Metadata of the directory or regular file a path points at. */
     @JvmStatic
     @Throws(IOException::class)
     external fun browseStat(store: String, path: String): String
+
+    /** The generation of each path, including changes reached through symbolic links. */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseGenerations(store: String, paths: Array<String>): LongArray
 
     /** Lists a directory: entries are `<name>\t<metadata>`, with names written like paths. */
     @JvmStatic
@@ -102,6 +109,11 @@ internal object Native {
     // leading out through a symbolic link is not allowed.
     // New names come from the user and are used as they are; returned names are written as paths
     // are.
+
+    /** Calls [writer] synchronously with a borrowed fd and returns the published, encoded name. */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseImport(store: String, home: String, name: String, uid: Int, gid: Int, writer: IntConsumer): String
 
     /**
      * Creates a file or directory in directory [dir], owned by [uid] and [gid]; when the name is
@@ -265,6 +277,10 @@ internal object Native {
     /** Guest CPU nanoseconds, including exited threads; -1 when unavailable. Takes the BKL. */
     @JvmStatic
     external fun guestCpuTime(machine: Long): Long
+
+    /** Login rule input metadata, including missing files, or null if it cannot be sampled. */
+    @JvmStatic
+    external fun loginRuleInputs(machine: Long): LongArray?
 
     /**
      * Takes the directories whose entries (create, delete, rename) the guest changed, written as

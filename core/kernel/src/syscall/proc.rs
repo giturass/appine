@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use appine_engine::Cpu;
 
-use super::{Flow, SysResult, put, read_path};
+use super::{Flow, SysResult, inotify, put, read_path};
 use crate::cell::RefCell;
 use crate::cred::{Cred, FileCaps, XATTR_NAME_CAPS, cap};
 use crate::errno::Errno;
@@ -19,8 +19,8 @@ use crate::process::{self, ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
-use crate::vfs::store::{Ino, mode};
-use crate::vfs::{Node, Pseudo, Vfs, normalize};
+use crate::vfs::store::{Ino, Stat, mode};
+use crate::vfs::{Dentry, Node, Pseudo, Vfs, normalize};
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -194,7 +194,7 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
         let file = cx.fds().get(w(10) as i32).map_err(|_| Errno::EBADF)?;
         let node = file.borrow().node();
         match node {
-            Some(Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b""))) => Some(id),
+            Some(Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"", 0))) => Some(id),
             _ => return Err(Errno::EBADF),
         }
     } else {
@@ -267,7 +267,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let euid = child_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
         let chrooted = super::ns::chrooted(cx);
-        super::ns::new_user_ns(cx.k(), &mut child_cred, chrooted)?;
+        super::ns::new_user_ns(cx, &mut child_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -333,7 +333,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let fds = if flags & CLONE_FILES != 0 {
         cx.t.fds.clone()
     } else {
-        Rc::new(RefCell::new(cx.fds().clone()))
+        Rc::new(RefCell::new(cx.fds().clone_capped(cx.kr().nr_open)))
     };
     let fs = if flags & CLONE_FS != 0 {
         cx.t.fs.clone()
@@ -384,9 +384,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
-        g.dumpable = parent.dumpable;
+        g.set_dumpable_mode(parent.dumpable_mode());
         g.mm_user_ns = parent.mm_user_ns.clone();
-        g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
         g.cred = child_cred.clone();
@@ -435,6 +434,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         cx.t.altstack
     };
     let vfork_done = (flags & CLONE_VFORK != 0).then(|| Rc::new(Cell::new(false)));
+    let sem_undo = if flags & CLONE_SYSVSEM != 0 {
+        cx.t.sem_undo.clone()
+    } else {
+        Rc::new(crate::ipc::SemUndo::new())
+    };
     let state = TaskState {
         mm: mm.clone(),
         fds,
@@ -450,6 +454,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         vfork_done: vfork_done.clone().map(|d| (d, cx.task.event.clone())),
         restart: None,
         fast_sleep: None,
+        sem_undo,
     };
     let tgid = if thread { cx.tgid() } else { tid };
     let mut ns = cx.ns();
@@ -519,6 +524,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
     // The seccomp mode and filter chain are inherited as on Linux
+    task.no_new_privs.set(cx.task.no_new_privs.get());
     let seccomp = cx.task.seccomp.borrow().clone();
     *task.seccomp.borrow_mut() = seccomp;
     crate::seccomp::publish(&task);
@@ -541,7 +547,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         // CLONE_PIDFD: open the new process's pidfd in the parent (without CLONE_FILES the child
         // does not see it)
         let pidfd = if flags & CLONE_PIDFD != 0 {
-            let fd = cx.fds_mut().install(new_pidfd(tid, &group, 0), true, 0)?;
+            let fd = cx.install_fd(new_pidfd(tid, &group, 0), true)?;
             if let Err(e) = put(cx, args.pidfd, fd.to_le_bytes()) {
                 let _ = cx.fds_mut().close(fd);
                 return Err(e);
@@ -631,9 +637,10 @@ pub(super) fn execve(
     path: u64,
     argv: u64,
     envp: u64,
-) -> Result<(), Errno> {
+    opens: &mut inotify::ExecOpens,
+) -> Result<bool, Errno> {
     let path = read_path(cx, path)?;
-    exec(cx, cpu, AT_FDCWD, path, argv, envp, 0)
+    exec(cx, cpu, AT_FDCWD, path, (argv, envp), 0, opens)
 }
 
 /// execveat: the path is relative to `dirfd`; with `AT_EMPTY_PATH` and an empty path, `dirfd`
@@ -645,12 +652,13 @@ pub(super) fn execveat(
     path: u64,
     (argv, envp): (u64, u64),
     flags: u32,
-) -> Result<(), Errno> {
+    opens: &mut inotify::ExecOpens,
+) -> Result<bool, Errno> {
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    exec(cx, cpu, dirfd, path, argv, envp, flags)
+    exec(cx, cpu, dirfd, path, (argv, envp), flags, opens)
 }
 
 fn exec(
@@ -658,20 +666,12 @@ fn exec(
     cpu: &mut Cpu,
     dirfd: i32,
     path: Vec<u8>,
-    argv: u64,
-    envp: u64,
+    (argv, envp): (u64, u64),
     flags: u32,
-) -> Result<(), Errno> {
+    opens: &mut inotify::ExecOpens,
+) -> Result<bool, Errno> {
     let mut stack_limit = cx.t.group.borrow().rlimits[process::RLIMIT_STACK as usize].0;
     let limit = loader::arg_limit(stack_limit);
-    let mut total = 0;
-    let mut argv = read_strings(cx, argv, &mut total, limit)?;
-    let envp = read_strings(cx, envp, &mut total, limit)?;
-    // The same as Linux since 5.18: an empty argv gets one empty string, so the new program's
-    // argc is at least 1
-    if argv.is_empty() {
-        argv.push(Vec::new());
-    }
     let vfs = cx.vfs()?;
     let files = cx.k().file_maps.clone();
     let cwd = cx.cwd();
@@ -696,9 +696,9 @@ fn exec(
     // Executing through an open regular file (fexecve, /proc/<pid>/fd/<n>): use its host file
     // ([`process::open_open_file`]); deleted files and memfds cannot be opened by inode
     let mut by_file: Option<FileRef> = None;
-    let node = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+    let (node, dentry) = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
-            cwd.clone()
+            (cwd.clone(), None)
         } else {
             let file = cx.fds().get(dirfd)?;
             let f = file.borrow();
@@ -710,28 +710,28 @@ fn exec(
                 comm.clone_from(&exe_at.1);
             }
             let node = f.node().ok_or(Errno::EACCES)?;
-            if matches!(f.kind, FileKind::Regular { .. }) {
+            if f.regular_backing().is_some() {
                 by_file = Some(file.clone());
             }
-            node
+            (node, f.dentry.clone())
         }
     } else {
         let start = super::fs::start_dir(cx, dirfd, &path)?;
         exe_at.0 = start.clone();
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        match vfs.resolve(&view, &cred, &root, &start, &path, follow)? {
+        match vfs.walk(&view, &cred, &root, &start, &path, follow)? {
             // An open file not in the store that /proc/<pid>/fd/<n> leads to: deleted files and
             // memfds can be executed, pipes and the like are EACCES
-            Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(pid, fd)) => {
-                let file = view.open_file(pid, fd).ok_or(Errno::ENOENT)?;
+            (Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(proc, tid, fd)), _) => {
+                let file = view.open_file(proc, tid, fd).ok_or(Errno::ENOENT)?;
                 let f = file.borrow();
                 let node = f.node().ok_or(Errno::EACCES)?;
                 let shown = f.path.as_deref().unwrap_or_default();
                 exe_at.1 = shown.strip_suffix(b" (deleted)").unwrap_or(shown).to_vec();
-                if matches!(f.kind, FileKind::Regular { .. }) {
+                if f.regular_backing().is_some() {
                     by_file = Some(file.clone());
                 }
-                node
+                (node, f.dentry.clone())
             }
             node => node,
         }
@@ -739,22 +739,84 @@ fn exec(
     // Executing a deleted program through /proc/<pid>/exe (re-execing oneself): open the host
     // file that process recorded
     let from = match &node {
-        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(pid)) => {
-            Some(super::fs::exe_file(cx, *pid)?)
+        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(proc)) => {
+            Some(super::fs::exe_file(cx, *proc)?)
         }
         _ => None,
     };
-    let (mut file, mut st, mut nosuid) = match (&from, &by_file) {
-        (Some(exe), _) => process::open_exe_file(&vfs, &cred, exe)?,
-        (None, Some(f)) => process::open_open_file(&vfs, &cred, &f.borrow())?,
-        (None, None) => process::open_node(&vfs, &cred, &node)?,
+    let open_exec = |node: &Node,
+                     dentry: Option<Dentry>,
+                     from: Option<&process::ExeFile>,
+                     fd: Option<&OpenFile>,
+                     opens: &mut inotify::ExecOpens| {
+        let result = match (from, fd) {
+            (Some(exe), _) => process::open_exe_file(&vfs, &cred, exe),
+            (None, Some(f)) => process::open_open_file(&vfs, &cred, f),
+            (None, None) => process::open_node(&vfs, &cred, node),
+        };
+        if let (Err(Errno::FUSE_RETRY), Node::Fuse(_, id)) = (&result, node) {
+            opens.expect_fuse(crate::vfs::fuse::key(*id), dentry);
+            return Err(Errno::FUSE_RETRY);
+        }
+        let (file, st, nosuid) = result?;
+        let key = from
+            .and_then(|e| e.ovl.as_ref().map(|(_, o, _)| crate::vfs::overlay::key(*o)))
+            .or_else(|| inotify::key_of(node))
+            .unwrap_or(st.ino);
+        opens.push(
+            cx.kr(),
+            key,
+            dentry.or_else(|| from?.dentry.clone()),
+            st.nlink == 0 || from.is_some(),
+            fd.and_then(|f| f.watch.as_ref()),
+        );
+        // deny_write_access follows the open and precedes the first read for every executable.
+        if super::fs::open_for_write(cx, st.ino) {
+            return Err(Errno::ETXTBSY);
+        }
+        Ok((file, st, nosuid))
     };
-    let script = parse_shebang(file.head()).is_some();
-    // A file open for writing cannot be executed, a script included (do_open_execat's
-    // deny_write_access, before its interpreter is looked at)
-    if script && super::fs::open_for_write(cx, st.ino) {
-        return Err(Errno::ETXTBSY);
+    let (mut file, mut st, mut nosuid) = open_exec(
+        &node,
+        dentry,
+        from.as_deref(),
+        by_file.as_ref().map(|f| f.borrow()).as_deref(),
+        opens,
+    )?;
+
+    let mut total = 0;
+    let mut argv = read_strings(cx, argv, &mut total, limit)?;
+    let envp = read_strings(cx, envp, &mut total, limit)?;
+    // The same as Linux since 5.18: an empty argv gets one empty string, so the new program's
+    // argc is at least 1
+    if argv.is_empty() {
+        argv.push(Vec::new());
     }
+    // A cached executable still has a guest header read on this mount.
+    let read_header =
+        |file: &loader::Executable, st: &Stat, node: &Node, opens: &mut inotify::ExecOpens| {
+            opens.accessed(cx.kr(), usize::from(!file.head().is_empty()));
+            let mnt = match node {
+                Node::Store(m, _) | Node::Overlay(m, _) => Some(*m),
+                Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(_)) => {
+                    from.as_ref().and_then(|e| e.mnt())
+                }
+                _ => None,
+            };
+            if let Some(mnt) = mnt
+                && let Some(host) = file.host()
+            {
+                vfs.accessed(mnt, st.ino, Some(&host));
+            }
+        };
+    read_header(&file, &st, &node, opens);
+    let script = parse_shebang(file.head()).is_some();
+    let open_interp = |path: &[u8], opens: &mut inotify::ExecOpens| {
+        let (node, dentry) = vfs.walk(&view, &cred, &root, &cwd, path, true)?;
+        let (file, st, nosuid) = open_exec(&node, dentry, None, None, opens)?;
+        read_header(&file, &st, &node, opens);
+        Ok((file, st, nosuid, matches!(node, Node::Overlay(..))))
+    };
 
     // `#!` scripts: switch to the interpreter, and argv becomes [interpreter, argument, script
     // path, original argv[1..]]
@@ -776,13 +838,9 @@ fn exec(
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
-        (file, st, nosuid) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
+        (file, st, nosuid, _) = open_interp(&interp, opens)?;
         exe_at = (cwd.clone(), interp.clone());
         file_path = interp;
-    }
-    // A program open for writing cannot be executed
-    if super::fs::open_for_write(cx, st.ino) {
-        return Err(Errno::ETXTBSY);
     }
     // The absolute path shown in /proc/<pid>/exe and maps, with every symlink resolved: musl
     // expands the main program's `$ORIGIN` from it, and programs started through links such as
@@ -807,7 +865,7 @@ fn exec(
     // setuid and setgid programs (no effect after `PR_SET_NO_NEW_PRIVS` or on a nosuid mount) and
     // the program file's capabilities; for scripts the interpreter counts. No new privileges are
     // gained while traced by a tracer without CAP_SYS_PTRACE
-    let no_new_privs = cx.t.group.borrow().no_new_privs;
+    let no_new_privs = cx.task.no_new_privs.get();
     // Also no effect when the file's owner or group has no mapping in one's own user namespace
     // (bprm_fill_uid)
     let mapped = cred.user_ns.uid_map.borrow().up(st.uid).is_some()
@@ -866,18 +924,32 @@ fn exec(
         ],
         secure,
         stack_limit,
+        arg_limit: limit,
     };
     // An interpreter the caller cannot read makes the process non-dumpable too (would_dump): its
     // owner and group
-    let interp_unreadable = std::cell::Cell::new(None);
-    let mut read_interp = |p: &[u8]| {
-        let (exe, st, _) = process::open_executable(&vfs, &view, &cred, &root, &cwd, p)?;
-        if cred.permission(&st, crate::cred::MAY_READ).is_err() {
-            interp_unreadable.set(Some((st.uid, st.gid)));
-        }
-        Ok(exe)
-    };
-    let prepared = loader::prepare(&file, &mut read_interp).map_err(load_error)?;
+    let mut interp_unreadable = None;
+    let mut interp_overlay = None;
+    let mut header_reads = 0;
+    let prepared = loader::prepare(
+        &file,
+        &mut |path, main_reads| {
+            opens.accessed(cx.kr(), 1 + main_reads);
+            let (exe, st, _, overlay) = open_interp(path, opens)?;
+            interp_overlay = Some(overlay);
+            if cred.permission(&st, crate::cred::MAY_READ).is_err() {
+                interp_unreadable = Some((st.uid, st.gid));
+            }
+            Ok(exe)
+        },
+        &mut header_reads,
+    );
+    if header_reads > 0 {
+        opens.accessed(cx.kr(), 1 + header_reads);
+    }
+    let prepared = prepared.map_err(load_error)?;
+    let interp_open = interp_overlay.map(|overlay| (opens.take_last(), overlay));
+    let exe_open = opens.take_last();
     // The new address space is built with the BKL released: mapping the program's segments and
     // building the initial stack took most of execve's time under the lock, and processes at both
     // ends of a pipe or exec'ing at once in a parallel build used to queue. Meanwhile only the new
@@ -895,8 +967,21 @@ fn exec(
     let (mut mm, image) = built.map_err(load_error)?;
     let view = cx.view(&vfs);
     let interp = interp_label(Some(&*vfs), &view, &cred, &root, &cwd, &image);
-    label_image(&mut mm, &image, (&exe, st.ino), interp);
+    let main_mnt = walked
+        .as_ref()
+        .map(|(n, _)| n.mnt())
+        .or_else(|| (!script).then_some(node.mnt()))
+        .or_else(|| from.as_deref().filter(|_| !script).and_then(|e| e.mnt()));
+    label_image(&mut mm, &image, (&exe, st.ino, main_mnt), interp);
     mm.exe = Some(st.ino);
+    mm.exe_open = Some(exe_open);
+    // An overlay mmap uses the real layer file, so it does not hold the overlay open.
+    if let (Some((interp, false)), Some((_, start, end))) = (&interp_open, &image.interp) {
+        mm.keep_interp_open(*start, *end, interp);
+    }
+    drop(interp_open);
+    // A script is released after switching to its interpreter (last nested script first).
+    opens.close();
     // The process runs in the time namespace for children from here on (entered below); with
     // offsets, the vDSO's clock functions must enter the kernel layer, which adds them
     if cx.task.ns.borrow().time_for_children.offsets_ns() != [0, 0] {
@@ -922,15 +1007,16 @@ fn exec(
     // other threads are gone. A copy is a new owner, so the POSIX record locks this process holds
     // would be lost (crate::locks)
     if Rc::strong_count(&cx.t.fds) > 2 {
-        let copy = cx.fds().clone();
+        let copy = cx.fds().clone_capped(cx.kr().nr_open);
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     let closed = cx.fds_mut().close_on_exec();
     let fds = cx.t.fds.clone();
     crate::locks::closed(cx.k(), &fds, &closed);
-    super::mqueue_closed(cx.tgid(), &closed);
+    super::mqueue_closed(&cx.t.group, &closed);
     super::fuse::flush_all(cx, &closed);
     crate::unix::released(cx.k(), closed);
+    super::fs::evict_unlinked_tmpfs(cx.kr(), &vfs);
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
@@ -964,22 +1050,25 @@ fn exec(
             &file,
             ovl,
         )));
-        // As with Linux's commit_creds, changing the effective IDs or gaining new capabilities
-        // makes the process non-dumpable, and the parent's exit no longer signals it; a
-        // privileged exec likewise no longer signals it. Other execs make it dumpable again
-        // (begin_new_exec), except when the program file or its interpreter is not readable by
-        // the caller (would_dump)
+        // As with Linux's commit_creds and begin_new_exec, changing the effective IDs or gaining
+        // new capabilities sets dumpable to fs.suid_dumpable and clears pdeathsig; a privileged
+        // exec likewise clears pdeathsig. Other execs set SUID_DUMP_USER (1), except when the
+        // program file or its interpreter is not readable by the caller (would_dump), which also
+        // uses fs.suid_dumpable.
+        let suid_dump = crate::coredump::suid_dumpable(cx.kr());
         let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
         let gained = new_cred.cap_permitted & !cred.cap_permitted != 0;
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
             || ids(&new_cred) != ids(&cred)
             || gained
         {
-            g.dumpable = false;
+            g.set_dumpable_mode(suid_dump);
             cx.task.pdeathsig.set(0);
+        } else if cred.permission(&st, crate::cred::MAY_READ).is_ok() && interp_unreadable.is_none()
+        {
+            g.set_dumpable_mode(crate::coredump::SUID_DUMP_USER);
         } else {
-            g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok()
-                && interp_unreadable.get().is_none();
+            g.set_dumpable_mode(suid_dump);
         }
         // The new address space belongs to the caller's user namespace, or to the nearest
         // ancestor where a program file it could not read is owned by mapped IDs (would_dump's
@@ -988,7 +1077,7 @@ fn exec(
         if cred.permission(&st, crate::cred::MAY_READ).is_err() {
             mm_ns = mm_ns.holding(st.uid, st.gid);
         }
-        if let Some((uid, gid)) = interp_unreadable.get() {
+        if let Some((uid, gid)) = interp_unreadable {
             mm_ns = mm_ns.holding(uid, gid);
         }
         g.mm_user_ns = Some(mm_ns);
@@ -1021,6 +1110,10 @@ fn exec(
     }
     let task = cx.task.clone();
     task::release_mm(cx.shared, &task, cx.t);
+    super::fuse::flush_mappings(cx);
+    // Hand over any PI futexes this thread held (robust locks just marked owner-died, plus any
+    // non-robust PI locks with waiters) before switching address spaces (Linux's futex_exec_release)
+    crate::futex::pi_owners_exited(cx.kr(), &mut cx.shared.futexes(), Some(task.tid.get()));
     let mm = mm.into_shared();
     mm.borrow_mut().add_user(task.sync.clone());
     // SAFETY: the new address space is held by the TaskState; the old one may be released by this
@@ -1031,6 +1124,7 @@ fn exec(
     // last one
     crate::ipc::reap_shm(cx.k());
     cx.t.altstack = AltStack::default();
+    cx.t.restart = None;
     cx.task.saved_sigmask.set(None);
     cx.task.comm.set(process::comm_of(&comm));
     let st = cpu.state_mut();
@@ -1045,7 +1139,7 @@ fn exec(
         // SAFETY: cpu belongs to the current thread, which is running
         unsafe { cx.task.sync.kicker.kick() };
     }
-    Ok(())
+    Ok(image.doomed)
 }
 
 /// Reads execve's argv or envp: a NULL-terminated array of string pointers. Returns E2BIG when the
@@ -1131,39 +1225,44 @@ pub(crate) fn interp_label(
     root: &Node,
     cwd: &Node,
     image: &loader::Image,
-) -> Option<(Rc<[u8]>, u64)> {
+) -> Option<(Rc<[u8]>, u64, Option<crate::vfs::MountId>)> {
     let (path, ..) = image.interp.as_ref()?;
     let walked = vfs.and_then(|vfs| Some((vfs, vfs.walk(ps, cred, root, cwd, path, true).ok()?)));
     let Some((vfs, (node, found))) = walked else {
-        return Some((Rc::from(path.as_slice()), 0));
+        return Some((Rc::from(path.as_slice()), 0, None));
     };
     let name = vfs
         .found_path(ps, root, &node, found.as_ref())
         .unwrap_or_else(|_| path.clone());
-    let ino = node.ino().unwrap_or(0);
-    Some((Rc::from(name), ino))
+    let ino = match node {
+        Node::Fuse(_, id) => crate::vfs::fuse::key(id),
+        _ => node.ino().unwrap_or(0),
+    };
+    Some((Rc::from(name), ino, Some(node.mnt())))
 }
 
-/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`). `exe` and `interp` are
-/// the names and the inodes in the store (0 when unknown); for the interpreter's see
-/// [`interp_label`].
+/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`) and records their mounts.
+/// `exe` and `interp` carry the name, the store inode (0 when unknown), and the mount when known;
+/// for the interpreter's see [`interp_label`].
 pub(crate) fn label_image(
     mm: &mut Mm,
     image: &loader::Image,
-    exe: (&Rc<[u8]>, u64),
-    interp: Option<(Rc<[u8]>, u64)>,
+    exe: (&Rc<[u8]>, u64, Option<crate::vfs::MountId>),
+    interp: Option<(Rc<[u8]>, u64, Option<crate::vfs::MountId>)>,
 ) {
-    if image.main.1 <= image.main.0 {
-        return;
+    if image.main.1 > image.main.0 {
+        let len = image.main.1 - image.main.0;
+        mm.label(image.main.0, len, Some(exe.0.clone()), exe.1);
+        if let Some(mnt) = exe.2 {
+            mm.set_mnt(image.main.0, len, mnt);
+        }
     }
-    mm.label(
-        image.main.0,
-        image.main.1 - image.main.0,
-        Some(exe.0.clone()),
-        exe.1,
-    );
-    if let (Some((_, start, end)), Some((name, ino))) = (&image.interp, interp) {
-        mm.label(*start, end - start, Some(name), ino);
+    if let (Some((_, start, end)), Some((name, ino, mnt))) = (&image.interp, interp) {
+        let len = end - start;
+        mm.label(*start, len, Some(name), ino);
+        if let Some(mnt) = mnt {
+            mm.set_mnt(*start, len, mnt);
+        }
     }
 }
 
@@ -1183,13 +1282,14 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
     if others.is_empty() {
         return Ok(());
     }
-    cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
     for tid in &others {
         if let Some(t) = cx.kr().tasks.get(tid) {
             t.killed.set(true);
             signal::wake(t);
         }
     }
+    let cgroup = cx.t.group.borrow().cgroup;
+    crate::cgroup::task_changed(cx.kr(), cgroup);
     while cx.t.group.borrow().threads.len() > 1 {
         if cx.task.killed.get() {
             // Another thread is ending the whole process at the same time
@@ -1209,7 +1309,11 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
             g.threads = vec![tgid];
             // The original main thread has been reaped (release_task in Linux's de_thread)
             g.leader_seccomp = None;
+            g.leader_no_new_privs = false;
             g.leader_exit = None;
+            g.leader_serial = None;
+            g.leader_tracer = None;
+            g.leader_net = None;
             g.children.clone()
         };
         // Children created by other threads were handed to this thread when they exited, and
@@ -1354,10 +1458,10 @@ pub(super) fn wait4(
         return Ok(0);
     };
     if wstatus != 0 {
-        put(cx, wstatus, event.wait_status().to_le_bytes())?;
+        super::copy_result(cx, |cx| put(cx, wstatus, event.wait_status().to_le_bytes()))?;
     }
     if rusage != 0 {
-        put(cx, rusage, usage.encode())?;
+        super::copy_result(cx, |cx| put(cx, rusage, usage.encode()))?;
     }
     Ok(child as u64)
 }
@@ -1419,11 +1523,11 @@ pub(super) fn waitid(
                 .encode(Signal::CHLD),
             None => [0; 128],
         };
-        cx.write_user(UserSlice::new(infop, 128), &info)?;
+        super::copy_result(cx, |cx| cx.write_user(UserSlice::new(infop, 128), &info))?;
     }
     if rusage != 0 {
         let usage = found.map_or(process::Rusage::default(), |f| f.2);
-        put(cx, rusage, usage.encode())?;
+        super::copy_result(cx, |cx| put(cx, rusage, usage.encode()))?;
     }
     Ok(0)
 }
@@ -1485,11 +1589,12 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         }
         // The main thread is traced by the caller: stops and continues are reported as
         // ptrace-stops (below), and as on Linux not reported twice
-        let traced = cx
-            .kr()
-            .tasks
-            .get(&c)
-            .is_some_and(|t| t.trace.borrow().tracer == Some(me));
+        let traced = child.borrow().leader_tracer == Some(me)
+            || cx
+                .kr()
+                .tasks
+                .get(&c)
+                .is_some_and(|t| t.trace.borrow().tracer == Some(me));
         let clone = child.borrow().exit_signal != Signal::CHLD.number();
         if !traced && want.clones.is_some_and(|c| c != clone) {
             continue;
@@ -1618,7 +1723,7 @@ pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
         return Err(if thread { Errno::EINVAL } else { Errno::ESRCH });
     };
     let file = new_pidfd(pid, &group, flags);
-    cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
+    cx.install_fd(file, true).map(|fd| fd as u64)
 }
 
 /// A new pidfd referring to thread group `group` (with pid `tgid`).
@@ -1654,7 +1759,7 @@ pub(super) fn pidfd_getfd(cx: &mut Cx<'_>, pidfd: i32, target: i32, flags: u32) 
     let task = cx.kr().tasks.get(&leader).cloned().ok_or(Errno::ESRCH)?;
     let fds = task.res.borrow().fds.clone();
     let remote = fds.borrow().get(target)?;
-    cx.fds_mut().install(remote, true, 0).map(|fd| fd as u64)
+    cx.install_fd(remote, true).map(|fd| fd as u64)
 }
 
 /// kcmp: whether some resource of two threads is the same one. Returns 0 when the same, otherwise
@@ -1815,13 +1920,13 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEW_MASK & !CLONE_NEW_DONE != 0 {
         return Err(Errno::EPERM);
     }
-    // Compute the new credentials and every check first, and change things only when all pass
-    // (Linux's ksys_unshare commits only at the end)
+    // Compute the new credentials and every fallible check/allocation first, and mutate state only
+    // once all pass (Linux's ksys_unshare commits only at the end)
     let mut new_cred = cx.cred();
     let euid = new_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
         let chrooted = super::ns::chrooted(cx);
-        super::ns::new_user_ns(cx.k(), &mut new_cred, chrooted)?;
+        super::ns::new_user_ns(cx, &mut new_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -1831,22 +1936,35 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     // be unshared again before it is entered
     let pid_ns = if flags & CLONE_NEWPID != 0 {
         let owner = new_cred.user_ns.clone();
-        let ns = super::ns::new_pid_ns(&cx.pid_ns(), &cx.pid_ns_children(), owner)?;
-        super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
-        Some(ns)
+        Some(super::ns::new_pid_ns(
+            &cx.pid_ns(),
+            &cx.pid_ns_children(),
+            owner,
+        )?)
     } else {
         None
     };
     // Each thread's TaskState and TaskRes each hold one reference
     let others = |count: usize| count > 2;
-    if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
-        // As with Linux's dup_fd: copying fails when the highest open fd (rounded up to 64)
-        // exceeds nr_open
-        let highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
-        if highest.next_multiple_of(64) > cx.kr().nr_open {
+    let copy_fds = if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
+        // dup_fd sizes the copy from both installed and reserved descriptors.
+        if cx.fds().copy_len(|_| true).next_multiple_of(64) > cx.kr().nr_open {
             return Err(Errno::EMFILE);
         }
-        let copy = cx.fds().clone();
+        true
+    } else {
+        false
+    };
+    // Allocate the new network namespace before committing anything, so ENOMEM (no free loopback
+    // block) leaves fd tables, fs, credentials, mounts, pid-for-children and semaphores untouched
+    let net_ns = if flags & CLONE_NEWNET != 0 {
+        Some(cx.k().new_net_ns(new_cred.user_ns.clone())?)
+    } else {
+        None
+    };
+    // All fallible checks and allocations succeeded; commit everything now
+    if copy_fds {
+        let copy = cx.fds().clone_capped(cx.kr().nr_open);
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     if flags & CLONE_FS != 0 && others(Rc::strong_count(&cx.t.fs)) {
@@ -1871,14 +1989,14 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         super::ns::count(cx.k(), Counted::Mnt, &new_cred.user_ns, euid, ns);
         cx.shared.fast_changed();
     }
-    if pid_ns.is_some() {
-        *cx.task.pid_ns_children.borrow_mut() = pid_ns;
+    if let Some(ns) = pid_ns {
+        super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
+        *cx.task.pid_ns_children.borrow_mut() = Some(ns);
     }
-    // As with Linux's exit_sem, apply and drop the SysV semaphore undos; this is also needed when
-    // switching IPC namespaces (the old namespace's semaphores can no longer be reached)
+    // As with Linux's exit_sem / unshare_sysvsem: leave the shared undo list, applying and
+    // dropping its adjustments only when this thread was its last sharer
     if flags & (CLONE_SYSVSEM | CLONE_NEWIPC) != 0 {
-        let tgid = cx.tgid();
-        cx.ipc_mut().exit(tgid);
+        crate::ipc::leave_undo(cx);
     }
     // A new UTS namespace copies the old names, a new IPC namespace is empty, and a new network
     // namespace has only lo, down; a new time namespace is only for later children, copying the
@@ -1896,8 +2014,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             ns.cgroup = super::ns::new_cgroup_ns(owner.clone(), root);
             super::ns::count(cx.k(), Counted::Cgroup, owner, euid, ns.cgroup.clone());
         }
-        if flags & CLONE_NEWNET != 0 {
-            ns.net = cx.k().new_net_ns(owner.clone())?;
+        if let Some(net) = net_ns {
+            ns.net = net;
             super::ns::count(cx.k(), Counted::Net, owner, euid, ns.net.clone());
         }
         if flags & CLONE_NEWUTS != 0 {
@@ -1910,7 +2028,6 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             super::ns::count(cx.k(), Counted::Ipc, owner, euid, ns.ipc.clone());
         }
         *cx.task.ns.borrow_mut() = ns;
-        cx.k().collect_ipc();
     }
     Ok(0)
 }
@@ -2033,5 +2150,121 @@ mod tests {
             core_dumped: false,
         };
         assert_eq!(killed.wait_status(), 15);
+    }
+
+    #[test]
+    fn unshare_net_enomem_is_atomic() {
+        use std::sync::Arc;
+
+        use crate::fd::FdTable;
+        use crate::kernel::{Kernel, Shared};
+        use crate::mm::Mm;
+        use crate::nsproxy::NetNs;
+        use crate::signal::SigHandlers;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Arc::new(Shared::new(Kernel::new(crate::process::Tier::Interpreter)));
+        // Exhaust every loopback block so Kernel::new_net_ns returns ENOMEM
+        let mut pins = Vec::new();
+        let owner = crate::cred::UserNs::init();
+        let _cpu = {
+            let mut k = shared.lock();
+            for n in crate::netns::FIRST_BLOCK..=u16::MAX {
+                let bytes = n.to_be_bytes();
+                if bytes[0] == crate::netns::INIT_BLOCK || bytes[0] == crate::forward::OUTSIDE_BLOCK
+                {
+                    continue;
+                }
+                let ns = Rc::new(NetNs {
+                    id: crate::vfs::new_ns_id(),
+                    owner: owner.clone(),
+                    host_net: Some(bytes),
+                    lo: Default::default(),
+                    devs: RefCell::new(crate::netdev::Devices::for_new_ns(
+                        &k.init_ns.net.devs.borrow().conf,
+                    )),
+                    nft: Default::default(),
+                    listeners: Default::default(),
+                });
+                k.net_nss.push(Rc::downgrade(&ns));
+                pins.push(ns);
+            }
+
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::new()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: owner.clone(),
+                    anon: false,
+                }),
+            }));
+            // Hold extra references to fds and fs so unshare would clone them if it mutated early
+            let _fds_share = fds.clone();
+            let _fs_share = fs.clone();
+            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let sem_undo = Rc::new(crate::ipc::SemUndo::new());
+            let undo_id = sem_undo.id;
+            let make_state = || TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: sem_undo.clone(),
+            };
+            let task =
+                Task::new(10, 10, &cpu, make_state(), k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(10);
+            k.groups.insert(10, group.clone());
+            k.tasks.insert(10, task.clone());
+
+            // Seed a SysV SEM_UNDO record to confirm CLONE_SYSVSEM does not run before ENOMEM
+            let ipc_id = k.init_ns.ipc.id;
+            k.ipc_mut(ipc_id).undo.insert((undo_id, 1), vec![1]);
+
+            let orig_user_id = task.cred.borrow().user_ns.id;
+            let orig_mnt_id = fs.borrow().mnt_ns.id;
+            let orig_fds_ptr = Rc::as_ptr(&fds);
+            let orig_fs_ptr = Rc::as_ptr(&fs);
+
+            let mut t = make_state();
+            let mut cx = Cx::new(&shared, k, &task, &mut t);
+            let err = unshare(
+                &mut cx,
+                CLONE_FILES
+                    | CLONE_FS
+                    | CLONE_NEWUSER
+                    | CLONE_NEWNS
+                    | CLONE_NEWPID
+                    | CLONE_SYSVSEM
+                    | CLONE_NEWNET,
+            )
+            .unwrap_err();
+            assert_eq!(err, Errno::ENOMEM);
+            assert_eq!(Rc::as_ptr(&cx.t.fds), orig_fds_ptr);
+            assert_eq!(Rc::as_ptr(&cx.t.fs), orig_fs_ptr);
+            assert_eq!(cx.cred().user_ns.id, orig_user_id);
+            assert_eq!(cx.t.fs.borrow().mnt_ns.id, orig_mnt_id);
+            assert!(cx.task.pid_ns_children.borrow().is_none());
+            assert!(cx.kr().ipc(ipc_id).undo.contains_key(&(undo_id, 1)));
+            drop(cx);
+            cpu
+        };
+        drop(pins);
     }
 }

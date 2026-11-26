@@ -222,6 +222,38 @@ static void test_pattern_and_limit(void)
     write_file("/proc/sys/kernel/core_pattern", "core");
     ok("core_pattern");
 
+    /* Core creation ignores process umask (always 0600) and honors RLIMIT_FSIZE. */
+    pid_t p_umask = fork();
+    CHECK(p_umask >= 0, "fork");
+    if (p_umask == 0) {
+        umask(0777);
+        struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+        CHECK(setrlimit(RLIMIT_CORE, &rl) == 0, "setrlimit");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(p_umask, &status, 0) == p_umask, "waitpid");
+    CHECK(WCOREDUMP(status) && stat(DIR "/core", &st) == 0, "umask core");
+    CHECK((st.st_mode & 0777) == 0600, "core mode %04o expected 0600", st.st_mode & 0777);
+    unlink(DIR "/core");
+    ok("core umask");
+
+    pid_t p_fsize = fork();
+    CHECK(p_fsize >= 0, "fork");
+    if (p_fsize == 0) {
+        struct rlimit rl_core = {RLIM_INFINITY, RLIM_INFINITY};
+        struct rlimit rl_fsize = {4096, 4096};
+        CHECK(setrlimit(RLIMIT_CORE, &rl_core) == 0, "setrlimit core");
+        CHECK(setrlimit(RLIMIT_FSIZE, &rl_fsize) == 0, "setrlimit fsize");
+        *(volatile int *)0 = 1;
+        _exit(0);
+    }
+    CHECK(waitpid(p_fsize, &status, 0) == p_fsize, "waitpid");
+    CHECK(WCOREDUMP(status) && stat(DIR "/core", &st) == 0 && st.st_size > 0 && st.st_size <= 4096,
+          "RLIMIT_FSIZE core: %ld bytes", (long)st.st_size);
+    unlink(DIR "/core");
+    ok("RLIMIT_FSIZE");
+
     /* A limit under one page: nothing is written; one page: truncated still counts as written */
     run_crash(100, &status, addrs);
     CHECK(!WCOREDUMP(status) && stat(DIR "/core", &st) < 0, "core under one page");

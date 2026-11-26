@@ -13,7 +13,7 @@ mod fs;
 mod gpu;
 pub(crate) use gpu::RenderFile;
 mod fuse;
-pub(crate) use fuse::{fill, flush_at_exit};
+pub(crate) use fuse::{fill, fill_for_dump, flush_at_exit, flush_mappings};
 mod inotify;
 mod ipc;
 mod lease;
@@ -37,17 +37,17 @@ mod xattr;
 
 pub(crate) use aio::{AioContext, check_polls as check_aio_polls, released as aio_released};
 pub(crate) use fs::ENTROPY;
-pub(crate) use fs::{close_replaced, create_exclusive, unlink_path, write_at};
+pub(crate) use fs::{close_replaced, create_exclusive, dev_ino, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry, host_change, kernfs_modified};
 pub(crate) use lease::Lease;
 pub(crate) use loopdev::{LoopOpen, Loops};
 pub(crate) use misc::Restart;
 pub(crate) use mount::collect_unused;
 pub(crate) use mqueue::{
-    Limits as MqLimits, MessageQueue, MqDir, closed as mqueue_closed, find as mqueue_find,
+    Limits as MqLimits, MessageQueue, MqDir, MqUsage, closed as mqueue_closed, find as mqueue_find,
 };
 pub(crate) use net::{SocketRef, deliver_dns, unmap_addr};
-pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
+pub(crate) use poll::{Epoll, EpollWatches, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use proc::{interp_label, label_image};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
@@ -138,10 +138,15 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     }
     // seccomp: checked after the entry stop, as on arm64 Linux, including calls the tracer wants
     // skipped (-1). For calls not executed, x0 is already the return value (crate::seccomp)
+    let mut restart_syscall = false;
     if filtered {
         match crate::seccomp::check(cx, cpu, nr) {
             crate::seccomp::Verdict::Run(n) => nr = n,
             crate::seccomp::Verdict::Skip => nr = NO_SYSCALL,
+            crate::seccomp::Verdict::Restart => {
+                nr = NO_SYSCALL;
+                restart_syscall = true;
+            }
             crate::seccomp::Verdict::Exit => return Flow::Exit,
         }
     }
@@ -156,7 +161,14 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         if !crate::ptrace::syscall_exit(cx, cpu) {
             return Flow::Exit;
         }
-        return signal::deliver(cx, cpu, true);
+        crate::ptrace::syscall_stepped(cx);
+        // On arm64 Linux, `in_syscall(regs)` is false for `NO_SYSCALL` so a tracer or seccomp
+        // setting x0 to `-512..-516` must not rewind pc; only a signal-interrupted USER_NOTIF
+        // (`Verdict::Restart`) still applies syscall restart rules.
+        if !restart_syscall {
+            cx.task.sync.entry.forget_syscall(cpu.state());
+        }
+        return signal::deliver(cx, cpu, restart_syscall);
     }
     let mut a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
     // In a new pid namespace: pids in the arguments are translated to global numbers, and pids
@@ -182,6 +194,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // looked up (mount::sweep_overlays)
     let in_syscall = InSyscall::enter(cx.task, nr);
     let mut retries = 0;
+    let mut exec_opens = inotify::ExecOpens::default();
+    let mut exec = None;
     let result = loop {
         let result = match nr {
             // These do not return, or set all registers themselves. When traced they may stop to
@@ -202,15 +216,29 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             crate::bug::TEST_SYSCALL => crate::bug::test_hook(cx, cpu, a[0], a[1]),
             221 => {
                 let tid = cx.tid();
-                match proc::execve(cx, cpu, a[0], a[1], a[2]) {
-                    Ok(()) => return exec_done(cx, cpu, tid),
+                match proc::execve(cx, cpu, a[0], a[1], a[2], &mut exec_opens) {
+                    Ok(doomed) => {
+                        exec = Some((tid, doomed));
+                        Ok(0)
+                    }
                     Err(e) => Err(e),
                 }
             }
             281 => {
                 let tid = cx.tid();
-                match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
-                    Ok(()) => return exec_done(cx, cpu, tid),
+                match proc::execveat(
+                    cx,
+                    cpu,
+                    a[0] as i32,
+                    a[1],
+                    (a[2], a[3]),
+                    a[4] as u32,
+                    &mut exec_opens,
+                ) {
+                    Ok(doomed) => {
+                        exec = Some((tid, doomed));
+                        Ok(0)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -412,7 +440,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             166 => misc::umask(cx, a[0] as u32),
             167 => misc::prctl(cx, a[0] as i32, [a[1], a[2], a[3], a[4]]),
             169 => misc::gettimeofday(cx, a[0], a[1]),
-            170 => Err(Errno::EPERM), // settimeofday: the guest cannot change the host's time
+            170 => misc::settimeofday(cx, a[0], a[1]),
             171 => misc::adjtimex(cx, None, a[0]),
             172 => Ok(cx.tgid() as u64),                // getpid
             173 => Ok(cx.t.group.borrow().ppid as u64), // getppid
@@ -471,10 +499,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             210 => net::shutdown(cx, a[0] as i32, a[1] as i32),
             211 => net::sendmsg(cx, a[0] as i32, a[1], a[2] as u32),
             212 => net::recvmsg(cx, a[0] as i32, a[1], a[2] as u32),
-            214 => {
-                let exec = mem::read_implies_exec(cx);
-                Ok(cx.mm_mut().brk(a[0], exec))
-            }
+            214 => mem::brk(cx, a[0]),
             223 => fs::fadvise64(cx, a[0] as i32, a[2] as i64, a[3] as i32),
             213 => fs::cache_hint(cx, a[0] as i32, a[1] as i64, a[2] as i64, 0, 1),
             215 => mem::munmap(cx, a[0], a[1]),
@@ -572,28 +597,34 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
                     Errno::EINTR => Errno::ERESTARTSYS,
                     _ => Errno::EFAULT,
                 }),
-                None => crate::vfs::fuse::serve(cx),
+                None => crate::vfs::fuse::serve(cx, |k, id| {
+                    exec_opens.fuse_opened(k, crate::vfs::fuse::key(id))
+                }),
             };
             match served {
-                Ok(()) => continue,
+                Ok(()) => {
+                    exec_opens.retry();
+                    continue;
+                }
                 Err(e) => break Err(e),
             }
         }
         break result;
     };
-    // Releases of FUSE files dropped while their connection was borrowed
-    crate::vfs::fuse::flush_released();
-    // Between syscalls nothing holds a FUSE node but what in_use finds
-    fuse::sweep(cx);
-    // A detached mount whose last open file or directory this syscall let go of
-    if let Ok(vfs) = cx.vfs() {
-        mount::collect_released(cx.kr(), &vfs);
+    // A failed exec (including a failed FUSE request) releases the files already opened; on a
+    // successful exec `exec_opens` is already empty.
+    if matches!(nr, 221 | 281) {
+        exec_opens.close();
     }
-    // Removed overlay nodes nothing uses any more
-    mount::sweep_overlays(cx);
-    // Changes to watched cgroup files (crate::cgroup::notify_changes)
-    crate::cgroup::notify_changes(cx.k());
+    post_syscall_sweeps(cx);
     drop(in_syscall);
+    if let Some((old_tid, doomed)) = exec {
+        // Drain any dirty/code/graveyard state accumulated while building the new image (such as
+        // overlapping PT_LOAD segments or vDSO syscall patching) before exec_done.
+        let sync = cx.task.sync.clone();
+        cx.mm_mut().sync(&sync);
+        return exec_done(cx, cpu, old_tid, doomed);
+    }
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
     // before reaping)
@@ -645,6 +676,27 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     crate::ptrace::syscall_stepped(cx);
     // Handle pending signals and syscall restarts before returning to user space, as on Linux
     signal::deliver(cx, cpu, true)
+}
+
+/// Runs the end-of-syscall cleanup sweeps after a handler completes (including successful
+/// `execve`/`execveat`), before `InSyscall` is dropped and before any ptrace or signal stops.
+fn post_syscall_sweeps(cx: &mut Cx<'_>) {
+    // Releases of FUSE files dropped while their connection was borrowed
+    crate::vfs::fuse::flush_released();
+    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)
+    crate::unix::collect_deferred(cx.k());
+    // Between syscalls nothing holds a FUSE node but what in_use finds
+    fuse::sweep(cx);
+    // A detached mount whose last open file or directory this syscall let go of
+    if let Ok(vfs) = cx.vfs() {
+        mount::collect_released(cx.kr(), &vfs);
+    }
+    // IPC namespaces whose last nsfs file, pinned sysctl or mount went away
+    cx.k().collect_ipc();
+    // Removed overlay nodes nothing uses any more
+    mount::sweep_overlays(cx);
+    // Changes to watched cgroup files (crate::cgroup::notify_changes)
+    crate::cgroup::notify_changes(cx.k());
 }
 
 /// The thread is inside BKL system call `nr` while this lives ([`crate::task::Task::syscall`]),
@@ -722,15 +774,23 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
 
 /// execve succeeded (`old_tid` is the tid before): when traced, reports the exec
 /// (`PTRACE_EVENT_EXEC` or SIGTRAP) and the system call exit, and delivers signals before the
-/// first instruction of the new program runs.
-fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flow {
+/// first instruction of the new program runs. A doomed image failed after the point of no return
+/// and dies by forced `SIGSEGV` without reporting a successful exec or syscall exit.
+fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid, doomed: bool) -> Flow {
     crate::ptrace::exec_hw_flush(cx, cpu);
+    if doomed {
+        return match signal::deliver(cx, cpu, false) {
+            Flow::Exit => Flow::Exit,
+            _ => Flow::Exec,
+        };
+    }
     if !crate::ptrace::traced(cx.task) {
         return Flow::Exec;
     }
     if !crate::ptrace::exec(cx, cpu, old_tid) || !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
+    crate::ptrace::syscall_stepped(cx);
     match signal::deliver(cx, cpu, false) {
         Flow::Exit => Flow::Exit,
         _ => Flow::Exec,
@@ -779,6 +839,37 @@ fn write_pair(cx: &Cx<'_>, addr: u64, a: i64, b: i64) -> Result<(), Errno> {
     buf[..8].copy_from_slice(&a.to_le_bytes());
     buf[8..].copy_from_slice(&b.to_le_bytes());
     put(cx, addr, buf)
+}
+
+/// After consuming an event or message, retry its result copy without repeating the operation.
+fn copy_result<T>(
+    cx: &mut Cx<'_>,
+    mut copy: impl FnMut(&Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    retry_user_pages(cx, Errno::EFAULT, |cx| copy(cx))
+}
+
+pub(crate) fn retry_user_pages<T>(
+    cx: &mut Cx<'_>,
+    interrupted: Errno,
+    mut op: impl FnMut(&mut Cx<'_>) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    for _ in 0..=FUSE_RETRIES {
+        match op(cx) {
+            Err(Errno::FUSE_RETRY) => {
+                let page = crate::mm::take_wanted().ok_or(Errno::EFAULT)?;
+                fuse::fill(cx, page).map_err(|e| {
+                    if e == Errno::EINTR {
+                        interrupted
+                    } else {
+                        Errno::EFAULT
+                    }
+                })?;
+            }
+            result => return result,
+        }
+    }
+    Err(Errno::EFAULT)
 }
 
 /// Writes an integer type to guest memory.

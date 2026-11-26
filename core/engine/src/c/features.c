@@ -100,6 +100,11 @@ uint64_t appine_guest_midr(void)
     return host_midr;
 }
 
+uint64_t appine_fpcr_write_mask(void)
+{
+    return fpcr_write_mask();
+}
+
 bool appine_has(uint64_t hwcap)
 {
     return (appine_guest_hwcap() & hwcap) == hwcap;
@@ -112,16 +117,17 @@ bool appine_has2(uint64_t hwcap2)
 
 /*
  * The values returned when EL0 reads the ID register space (op0=3, op1=0, CRn=0), consistent
- * with what Linux emulates for user mode: MIDR is returned as is, MPIDR has only bit 31, and the
- * rest expose only the fields corresponding to HWCAP. key is bits 20:5 of the MRS encoding.
- * Unlike Linux, which raises SIGILL for CRm=1 and for CRm=0 registers other than MIDR, MPIDR and
- * REVIDR, those read 0 here.
+ * with what Linux 6.1 emulates for user mode (`is_emulated` / `emulate_id_reg` in
+ * `arch/arm64/kernel/cpufeature.c`): CRm=0 allows only MIDR_EL1 (op2=0), MPIDR_EL1 (op2=5, bit 31
+ * only) and REVIDR_EL1 (op2=6, reads 0); CRm=1 and all other CRm=0 encodings are rejected
+ * (SIGILL); CRm=2..7 expose the fields corresponding to HWCAP and read 0 otherwise. key is bits
+ * 20:5 of the MRS encoding.
  */
 bool appine_id_register(unsigned key, uint64_t *value)
 {
     unsigned op0 = key >> 14, op1 = (key >> 11) & 7, crn = (key >> 7) & 15;
     unsigned crm = (key >> 3) & 15, op2 = key & 7;
-    if (op0 != 3 || op1 != 0 || crn != 0 || crm > 7)
+    if (op0 != 3 || op1 != 0 || crn != 0 || crm == 1 || crm > 7)
         return false;
     uint64_t h = appine_guest_hwcap(), h2 = appine_guest_hwcap2();
     uint64_t v = 0;
@@ -130,6 +136,10 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v = host_midr;
         else if (op2 == 5)
             v = UINT64_C(1) << 31; /* MPIDR_EL1 */
+        else if (op2 == 6)
+            v = 0; /* REVIDR_EL1 */
+        else
+            return false;
     } else if (crm == 4 && op2 == 0) { /* ID_AA64PFR0_EL1 */
         v = 1 | 1 << 4;                /* EL0 and EL1 support AArch64 only */
         /* FP, AdvSIMD: 0 is the base set, 1 includes half precision, f is absent */

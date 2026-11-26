@@ -114,28 +114,7 @@ fn threads_signals_and_fork() {
     // Mutexes, condition variables, atomics, thread-local storage, signals sent to a given thread,
     // the alternate signal stack, returning after fixing up a memory access fault, SA_RESTART, fork
     // in a multithreaded process, detached threads
-    let Some(program) = build_c_guest("threads") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
-    }
+    run_c_guest("threads");
 }
 
 #[test]
@@ -167,28 +146,14 @@ fn thread_churn_keeps_the_host_heap_intact() {
 fn sockets_polling_and_timers() {
     // AF_UNIX (socketpair, SCM_RIGHTS, SO_PEERCRED, abstract addresses), TCP/UDP loopback, netlink,
     // epoll/eventfd/select, setitimer; none of them needs outside network
-    let Some(program) = build_c_guest("net") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
-    }
+    run_c_guest("net");
+}
+
+#[test]
+fn net_regressions() {
+    // Targeted regressions for kernel/net, kernel/netns, kernel/netlink, kernel/rawicmp and
+    // kernel/nft fixes
+    run_c_guest("net_regressions");
 }
 
 #[test]
@@ -242,36 +207,10 @@ fn bugs_kill_only_the_guest_process() {
 }
 
 #[test]
-fn tcp_filters_refused_by_the_host_are_kept() {
-    // A host with Linux 5d39580f68e6 refuses SO_ATTACH_FILTER on TCP sockets to the app (made so
-    // with a test hook of debug builds, since it depends on the host's kernel): a guest with
-    // CAP_NET_ADMIN still attaches, reads back, replaces and detaches the program, accepted
-    // sockets inherit it, a locked one stays, and one without the capability gets EPERM
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    let Some(program) = build_c_guest("sockfilter") else {
-        return;
-    };
-    for tier in TIERS {
-        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-            .args(["--tier", tier])
-            .env("APPINE_TEST_HOOKS", "1")
-            .arg(&program)
-            .output()
-            .expect("failed to run appine-run");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "tier {tier}: {}{}",
-            stdout(&out),
-            stderr(&out)
-        );
-        assert!(
-            stdout(&out).ends_with("all ok\n"),
-            "tier {tier}: {}",
-            stdout(&out)
-        );
+fn tcp_filters_refused_by_the_host() {
+    if cfg!(debug_assertions) {
+        run_c_guest_with("sockfilter", &[], true);
+        run_c_guest_with("net_regressions", &["filtered-dnat"], true);
     }
 }
 
@@ -896,12 +835,404 @@ fn readv_on_host_stdin_returns_what_has_arrived() {
 }
 
 #[test]
+fn host_stdio_positional_io_and_interruptible_writes() {
+    use std::fs::OpenOptions;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Some(program) = build_c_guest("hoststdio") else {
+        return;
+    };
+    for tier in TIERS {
+        // 1. Regular host files on stdin and stdout support pread/pwrite/preadv/pwritev.
+        let (_, in_path) = output(&format!("hoststdio-in-t{tier}"));
+        let (_, out_path) = output(&format!("hoststdio-out-t{tier}"));
+        std::fs::write(&in_path, b"hello world!").unwrap();
+        std::fs::write(&out_path, b"____________").unwrap();
+        let stdin_file = OpenOptions::new().read(true).open(&in_path).unwrap();
+        let stdout_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--no-pty"])
+            .arg(&program)
+            .arg("regular")
+            .stdin(Stdio::from(stdin_file))
+            .stdout(Stdio::from(stdout_file))
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            b"HELLO WORLD_",
+            "tier {tier}: host regular stdout pwrite/pwritev contents"
+        );
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+
+        // 2. Host pipes reject pread/pwrite with ESPIPE, honour O_NONBLOCK, and allow SIGALRM to
+        // interrupt a blocked write when the host pipe is full.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--no-pty"])
+            .arg(&program)
+            .arg("pipe-intr")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn appine-run");
+        // Keep the pipe read end open without reading so stdout fills and blocks the guest write.
+        let _stdout_keepalive = child.stdout.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("tier {tier}: blocked host pipe write was not interrupted by SIGALRM");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(_stdout_keepalive);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn deleted_held_file_releases_share_on_close() {
+    let Some(program) = build_c_guest("hoststdio") else {
+        return;
+    };
+    let bytes = std::fs::read(&program).unwrap();
+    let (_, empty_dir) = output("share-release-empty");
+    let (_, tar_path) = output("share-release-empty.tar.gz");
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let tar = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_path)
+        .args(["-C"])
+        .arg(&empty_dir)
+        .arg(".")
+        .status()
+        .expect("tar failed");
+    assert!(tar.success());
+
+    for tier in TIERS {
+        let (_, store) = output(&format!("share-release-store-t{tier}"));
+        let _ = std::fs::remove_dir_all(&store);
+        appine_kernel::import_rootfs(&store, &tar_path).unwrap();
+        appine_kernel::write_file(&store, "/hoststdio", &bytes, 0o755, true, 0, 0).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--rootfs"])
+            .arg(&store)
+            .args(["--tier", tier, "/hoststdio", "share-release"])
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+        // Only the program binary and the single shared object (reused in place by /tmp/share_b)
+        // should exist in `objects/`; without releasing the deleted open sharer on close, writing
+        // /tmp/share_b would have copied into a third object.
+        let objects: Vec<_> = std::fs::read_dir(store.join("objects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            objects.len(),
+            2,
+            "tier {tier}: expected 2 objects (binary + in-place settled share_b), got {objects:?}"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+    }
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
+}
+
+fn run_c_guest(name: &str) {
+    run_c_guest_with(name, &[], false);
+}
+
+fn run_c_guest_with(name: &str, args: &[&str], test_hooks: bool) {
+    let Some(program) = build_c_guest(name) else {
+        return;
+    };
+    for tier in TIERS {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_appine-run"));
+        if test_hooks {
+            run.env("APPINE_TEST_HOOKS", "1");
+        }
+        let out = run
+            .args(["--tier", tier])
+            .arg(&program)
+            .args(args)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+        assert!(
+            !stderr(&out).contains("appine: internal error"),
+            "tier {tier}: unexpected internal error in stderr: {}",
+            stderr(&out)
+        );
+    }
+}
+
+fn run_guest_in_empty_rootfs(name: &str) {
+    let Some(program) = build_c_guest(name) else {
+        return;
+    };
+    let bytes = std::fs::read(&program).unwrap();
+    let (_, empty_dir) = output(&format!("{name}-empty"));
+    let (_, tar_path) = output(&format!("{name}-empty.tar.gz"));
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let tar = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_path)
+        .args(["-C"])
+        .arg(&empty_dir)
+        .arg(".")
+        .status()
+        .expect("tar failed");
+    assert!(tar.success());
+    let guest_path = format!("/{name}");
+    for tier in TIERS {
+        let (_, store) = output(&format!("{name}-store-t{tier}"));
+        let _ = std::fs::remove_dir_all(&store);
+        appine_kernel::import_rootfs(&store, &tar_path).unwrap();
+        appine_kernel::write_file(&store, &guest_path, &bytes, 0o755, true, 0, 0).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--rootfs"])
+            .arg(&store)
+            .args(["--tier", tier, &guest_path])
+            .output()
+            .expect("failed to run appine-run");
+        let _ = std::fs::remove_dir_all(&store);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: stdout={} stderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: stdout={} stderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            !stderr(&out).contains("appine: internal error"),
+            "tier {tier}: unexpected internal error in stderr: {}",
+            stderr(&out)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+#[test]
+fn stability_regressions() {
+    run_guest_in_empty_rootfs("stability");
+}
+
+#[test]
+fn isolation_regressions() {
+    run_guest_in_empty_rootfs("isolation");
+}
+
+#[test]
+fn fs_mm_regressions() {
+    run_guest_in_empty_rootfs("fs_mm");
+}
+
+#[test]
+fn ipc_poll_unix_regressions() {
+    run_guest_in_empty_rootfs("ipc_poll_unix");
+}
+
+#[test]
+fn poll_opt_regressions() {
+    run_guest_in_empty_rootfs("poll_opt");
+}
+
+#[test]
+fn sig_ptrace_tty_regressions() {
+    run_guest_in_empty_rootfs("sig_ptrace_tty");
+}
+
+#[test]
+fn sig_ptrace_tty_console_write_after_end() {
+    use appine_kernel::errno::Errno;
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    use std::os::unix::ffi::OsStrExt;
+
+    let hello = build_guest("hello");
+    let path = hello.as_os_str().as_bytes().to_vec();
+    for tier in [Tier::Interpreter, Tier::Dbt] {
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: None,
+            memory_limit: None,
+            low_port_offset: None,
+            always_map_low_ports: false,
+            exception_trace: false,
+        })
+        .unwrap();
+        let id = machine.open_console(24, 80).unwrap();
+        let pid = machine
+            .spawn(&path, &[b"hello".to_vec()], &[], Stdio::Console(id))
+            .unwrap();
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+
+        // Drain all output until EOF (0).
+        let mut buf = [0u8; 256];
+        while machine.read_console(id, &mut buf).unwrap() > 0 {}
+
+        // Writing after the console session ended must fail with EIO and produce no echoes.
+        assert_eq!(
+            machine.write_console(id, b"late input\n"),
+            Err(Errno::EIO),
+            "{tier:?}"
+        );
+        assert_eq!(machine.read_console(id, &mut buf), Ok(0), "{tier:?}");
+    }
+}
+
+#[test]
+fn fs_io_regressions() {
+    run_guest_in_empty_rootfs("fs_io_regressions");
+}
+
+#[test]
+fn mm_mount_pseudo_regressions() {
+    run_guest_in_empty_rootfs("mm_mount_pseudo");
+}
+
+#[test]
+fn mount_proc_sys_regressions() {
+    run_guest_in_empty_rootfs("mount_proc_sys");
+}
+
+#[test]
+fn new_mount_api_no_lift_and_nsfs_pinning() {
+    run_guest_in_empty_rootfs("mount_api");
+}
+
+#[test]
+fn exec_runs_post_syscall_sweeps() {
+    run_guest_in_empty_rootfs("exec_sweep");
+}
+
+#[test]
+fn mm_gap_semantics_and_shared_futex_maps() {
+    run_guest_in_empty_rootfs("mm_fixes");
+}
+
+#[test]
+fn netlink_resumable_and_nft_setelem_dumps() {
+    run_c_guest("netlink_dump");
+}
+
+#[test]
+fn netns_same_port_bind_conflicts_and_routing() {
+    run_guest_in_empty_rootfs("netns_bind");
+}
+
+#[test]
+fn oom_victim_reaping_and_vfork_safety() {
+    run_guest_in_empty_rootfs("oom_reap");
+}
+
+#[test]
+fn overlay_origin_remount() {
+    run_guest_in_empty_rootfs("overlay_origin");
+}
+
+#[test]
+fn overlay_node_eviction_and_mmap_copy_up() {
+    run_guest_in_empty_rootfs("overlay_fixes");
+}
+
+#[test]
+fn ptrace_and_process_vm_cold_fuse_pages() {
+    run_guest_in_empty_rootfs("ptrace_fuse");
+}
+
+#[test]
+fn fuse_mm_writeback_unix_lookup_and_prefault() {
+    run_guest_in_empty_rootfs("fuse_mm_fixes");
+}
+
+#[test]
+fn store_relatime_semantics_and_multichunk_reads() {
+    run_guest_in_empty_rootfs("store_relatime");
+}
+
+#[test]
+fn doomed_elf_fails_to_spawn() {
+    // Minimal 64-bit aarch64 ET_EXEC whose PT_LOAD has p_offset != p_vaddr (mod page),
+    // which loader::load marks as Image::doomed.
+    let mut elf = vec![0u8; 128];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+    elf[24..32].copy_from_slice(&0x400078u64.to_le_bytes()); // e_entry
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    // PT_LOAD at offset 64: p_offset = 1, p_vaddr = 0x400000 (misaligned within page -> doomed)
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+    elf[72..80].copy_from_slice(&1u64.to_le_bytes()); // p_offset
+    elf[80..88].copy_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
+    elf[96..104].copy_from_slice(&16u64.to_le_bytes()); // p_filesz
+    elf[104..112].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+    elf[112..120].copy_from_slice(&4096u64.to_le_bytes()); // p_align
+
+    let (_, path) = output("doomed-elf");
+    std::fs::write(&path, &elf).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .arg(&path)
+        .output()
+        .expect("failed to run appine-run");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "doomed ELF must fail load instead of launching at pc 0: stderr={}",
+        stderr(&out)
+    );
 }
 
 /// Runs a guest program once under each tier, returning (tier, output).

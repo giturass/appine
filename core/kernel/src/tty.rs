@@ -475,6 +475,12 @@ enum Echo {
     MoveBackColumn,
 }
 
+struct InputByte {
+    byte: u8,
+    /// Lookahead already acted on this byte as VSTART or VSTOP.
+    flow_handled: bool,
+}
+
 /// A PTY pair.
 pub struct Tty {
     /// `/dev/pts/<index>`.
@@ -485,7 +491,9 @@ pub struct Tty {
     pub winsize: Winsize,
     /// Master writes the line discipline has not taken yet (Linux's flip buffer): taken as it
     /// gets room, when the slave reads or termios changes.
-    unprocessed: VecDeque<u8>,
+    unprocessed: VecDeque<InputByte>,
+    /// Prefix of `unprocessed` already scanned for VSTART and VSTOP under IXON.
+    lookahead: usize,
     /// The line being edited in canonical mode.
     editing: Vec<u8>,
     /// Lines completed in canonical mode and ready to be read.
@@ -539,6 +547,8 @@ pub struct Tty {
     /// master reads are EIO and poll includes POLLHUP; cleared when a slave is opened again. A
     /// slave never opened does not count, and master reads block as usual.
     pub slave_closed: bool,
+    /// TIOCEXCL on the slave and master respectively.
+    pub exclusive: [bool; 2],
     /// Whether the slave is still locked (unlockpt).
     pub locked: bool,
     /// All masters are closed and it has been hung up (`syscall::tty::hang_up`): open slaves
@@ -585,6 +595,7 @@ impl Tty {
                 ypixel: 0,
             },
             unprocessed: VecDeque::new(),
+            lookahead: 0,
             editing: Vec::new(),
             lines: VecDeque::new(),
             raw: VecDeque::new(),
@@ -607,6 +618,7 @@ impl Tty {
             masters: 0,
             slaves: 0,
             slave_closed: false,
+            exclusive: [false; 2],
             locked: true,
             hung_up: false,
             vhangups: [0; 2],
@@ -635,7 +647,10 @@ impl Tty {
     /// A master write (input from the terminal); returns the signals to send to the foreground
     /// process group. The caller keeps `data` within [`Tty::input_room`].
     pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
-        self.unprocessed.extend(data);
+        self.unprocessed.extend(data.iter().map(|&byte| InputByte {
+            byte,
+            flow_handled: false,
+        }));
         self.process_input();
         self.take_signals()
     }
@@ -644,7 +659,7 @@ impl Tty {
     /// taken yet, and is dropped when there is no room (Linux's `tiocsti` calls `receive_buf`).
     pub fn inject_input(&mut self, c: u8) -> Vec<Signal> {
         if self.ldisc_room() > 0 {
-            self.input_char(c);
+            self.input_char(c, false);
             self.commit_echoes();
             self.arrivals[0] += 1;
         }
@@ -692,11 +707,23 @@ impl Tty {
     fn process_input(&mut self) {
         let mut taken = false;
         while !self.unprocessed.is_empty() && self.ldisc_room() > 0 {
-            let c = self.unprocessed.pop_front().unwrap();
-            self.input_char(c);
+            let input = self.unprocessed.pop_front().unwrap();
+            self.lookahead = self.lookahead.saturating_sub(1);
+            self.input_char(input.byte, input.flow_handled);
             taken = true;
         }
         self.commit_echoes();
+        // Linux scans the raw flip-buffer bytes that could not enter the line discipline.
+        // Keep them for quoting, input mapping and the termios in effect when room opens up.
+        if self.termios.i(IXON) {
+            for i in self.lookahead..self.unprocessed.len() {
+                let c = self.unprocessed[i].byte;
+                if self.flow_char(c, false) {
+                    self.unprocessed[i].flow_handled = true;
+                }
+            }
+            self.lookahead = self.unprocessed.len();
+        }
         if taken {
             self.arrivals[0] += 1;
         }
@@ -706,7 +733,14 @@ impl Tty {
     /// free; in canonical mode with no complete line one byte is always taken, so a full line
     /// still lets its terminator or an erase through (other characters are dropped).
     fn ldisc_room(&self) -> usize {
-        let room = (INPUT_MAX - 1).saturating_sub(self.pending_input());
+        let free = INPUT_MAX.saturating_sub(self.pending_input());
+        // n_tty allows for a three-byte parity mark before reserving its last slot.
+        let slots = if self.termios.i(PARMRK) {
+            free.div_ceil(3)
+        } else {
+            free
+        };
+        let room = slots.saturating_sub(1);
         if room == 0 && self.canonical() && self.lines.is_empty() {
             1
         } else {
@@ -727,7 +761,7 @@ impl Tty {
     /// One byte of input (Linux's `n_tty_receive_buf_standard`): ISTRIP and IUCLC first; after
     /// VLNEXT the byte is literal, with EXTPROC it is queued as it is, and otherwise characters
     /// that may be special ([`Tty::special`]) are told apart from ordinary ones.
-    fn input_char(&mut self, c: u8) {
+    fn input_char(&mut self, c: u8, flow_handled: bool) {
         let t = self.termios;
         let c = if t.i(ISTRIP) { c & 0x7f } else { c };
         let c = if t.i(IUCLC) && t.l(IEXTEN) {
@@ -740,7 +774,7 @@ impl Tty {
         } else if t.l(EXTPROC) {
             self.raw.push_back(c);
         } else if self.special(c) {
-            self.receive_special(c);
+            self.receive_special(c, flow_handled);
         } else {
             self.receive(c);
         }
@@ -764,13 +798,10 @@ impl Tty {
                 || t.l(ISIG) && any(&[VINTR, VQUIT, VSUSP]))
     }
 
-    /// An ordinary character (Linux's `n_tty_receive_char`): restarts output with IXANY, is echoed
-    /// and queued. In canonical mode a full line drops it.
+    /// Handles IXANY, echo and queueing for an ordinary character (Linux's `n_tty_receive_char`).
+    /// With ECHO, even a character discarded on canonical overflow is echoed.
     fn receive(&mut self, c: u8) {
         self.restart_on_any();
-        if !self.fits(c) {
-            return;
-        }
         if self.termios.l(ECHO) {
             self.finish_erasing();
             self.mark_line_start();
@@ -781,19 +812,12 @@ impl Tty {
 
     /// A character that may be special (Linux's `n_tty_receive_char_special`), in this order: flow
     /// control (IXON), signal characters (ISIG), IXANY, CR and NL translation, then in canonical
-    /// mode erasing, VLNEXT, VREPRINT and the line ends; anything left is queued as an ordinary
-    /// character, a newline echoed as itself even with ECHOCTL.
-    fn receive_special(&mut self, mut c: u8) {
+    /// mode erasing, VLNEXT, VREPRINT and the line ends. Remaining characters follow ordinary
+    /// queue limits. When echoed, a newline is shown as itself even with ECHOCTL.
+    fn receive_special(&mut self, mut c: u8, flow_handled: bool) {
         let t = self.termios;
-        if t.i(IXON) {
-            if t.is(c, VSTART) {
-                self.start();
-                return;
-            }
-            if t.is(c, VSTOP) {
-                self.stop();
-                return;
-            }
+        if t.i(IXON) && self.flow_char(c, flow_handled) {
+            return;
         }
         if t.l(ISIG) {
             let sig = [
@@ -868,9 +892,6 @@ impl Tty {
                 return;
             }
         }
-        if !self.fits(c) {
-            return;
-        }
         if t.l(ECHO) {
             self.finish_erasing();
             if c == b'\n' {
@@ -913,15 +934,21 @@ impl Tty {
         }
     }
 
-    /// Whether `c` (doubled when it is 0xff and PARMRK is set) fits in the canonical line being
-    /// edited, which keeps one byte for its terminator; anything fits outside canonical mode.
-    fn fits(&self, c: u8) -> bool {
-        let n = if c == 0xff && self.termios.i(PARMRK) {
-            2
+    /// Recognizes a flow character under IXON. Lookahead acts on the raw byte once, and
+    /// normal input processing consumes a matching special character when the slave makes room.
+    fn flow_char(&mut self, c: u8, flow_handled: bool) -> bool {
+        if self.termios.is(c, VSTART) {
+            if !flow_handled {
+                self.start();
+            }
+        } else if self.termios.is(c, VSTOP) {
+            if !flow_handled {
+                self.stop();
+            }
         } else {
-            1
-        };
-        !self.canonical() || self.editing.len() + n < INPUT_MAX
+            return false;
+        }
+        true
     }
 
     /// Queues `c` (Linux's `put_tty_queue`): to the line being edited in canonical mode, readable
@@ -933,7 +960,10 @@ impl Tty {
             1
         };
         if self.canonical() {
-            self.editing.extend(std::iter::repeat_n(c, n));
+            // Canonical overflow still echoes normally. Store only the bytes that fit
+            // before the terminator, including a partial PARMRK pair at the boundary.
+            let room = (INPUT_MAX - 1).saturating_sub(self.editing.len());
+            self.editing.extend(std::iter::repeat_n(c, n.min(room)));
         } else {
             self.raw.extend(std::iter::repeat_n(c, n));
         }
@@ -1230,25 +1260,40 @@ impl Tty {
         self.output.len() != before
     }
 
-    /// A slave write: goes through output processing into the output queue.
-    pub fn write_output(&mut self, data: &[u8]) {
-        for &c in data {
-            self.output_char(c);
+    /// A slave write: goes through output processing into the output queue while each byte's
+    /// expanded output (e.g. `ONLCR` or `XTABS`) fits within [`OUTPUT_MAX`]. Returns how many
+    /// input bytes were consumed.
+    pub fn write_output(&mut self, data: &[u8]) -> usize {
+        if self.stopped {
+            return 0;
         }
-        self.arrivals[1] += 1;
+        let before = self.output.len();
+        let mut consumed = 0;
+        for &c in data {
+            if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
+                break;
+            }
+            self.output_char(c);
+            consumed += 1;
+        }
+        if self.output.len() > before {
+            self.arrivals[1] += 1;
+        }
+        consumed
     }
 
     /// A slave write by a process group that is not the terminal's foreground one: as
     /// [`Tty::write_output`], and remembers which bytes of the output queue it added.
-    pub fn write_background(&mut self, data: &[u8]) {
+    pub fn write_background(&mut self, data: &[u8]) -> usize {
         let from = self.taken + self.output.len() as u64;
-        self.write_output(data);
+        let consumed = self.write_output(data);
         let to = self.taken + self.output.len() as u64;
         match self.background.back_mut() {
             Some(last) if last.end == from => last.end = to,
             _ if to > from => self.background.push_back(from..to),
             _ => {}
         }
+        consumed
     }
 
     /// One byte of output (Linux's `do_output_char`), following the cursor column: with OPOST, NL
@@ -1443,6 +1488,7 @@ impl Tty {
     /// on the master: Linux's `tty_buffer_flush` of the slave's flip buffer).
     pub fn discard_unprocessed(&mut self) {
         self.unprocessed.clear();
+        self.lookahead = 0;
     }
 
     /// TCOFLUSH on the slave (Linux's `pty_flush_buffer`): drops only the output the master side
@@ -1545,9 +1591,9 @@ impl Tty {
         }
     }
 
-    /// The number of bytes in the output queue (TIOCOUTQ).
-    pub fn output_len(&self) -> usize {
-        self.output.len()
+    /// Bytes taken by the master's line discipline (master FIONREAD excludes packet headers).
+    pub fn master_readable_len(&self) -> usize {
+        self.output.len().min(PASSED_ON)
     }
 
     /// Whether input is read line by line: canonical mode (ICANON) without EXTPROC, which hands
@@ -1588,6 +1634,12 @@ impl Tty {
 /// One end of a PTY, held by an open file; opening and closing maintain the counts of both ends.
 pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
+    /// The opened device node's store inode when opened through `/dev/tty` (5:0) or
+    /// `/dev/console` (5:1): `fstat`, attribute syscalls, `fstatfs`, `/proc/<pid>/fd` and
+    /// `fdinfo` see that device node instead of the underlying devpts slave.
+    pub(crate) dev_ino: Option<crate::vfs::store::Ino>,
+    /// The opened device node's lock key. Direct devpts opens use the instance and inode instead.
+    pub(crate) lock_ino: Option<crate::vfs::store::Ino>,
     /// Whether this is the master.
     pub master: bool,
     /// The devpts mount it was opened through (where the terminal's instance is mounted): the
@@ -1617,11 +1669,20 @@ impl PtyEnd {
         };
         PtyEnd {
             tty,
+            dev_ino: None,
             master,
             mnt: crate::vfs::PTS_MOUNT,
             pin: false,
+            lock_ino: None,
             born,
         }
+    }
+
+    /// Opened through a controlling-terminal device node (`/dev/tty` or `/dev/console`) in the
+    /// store (or behind an overlay node).
+    pub fn with_device(mut self, ino: crate::vfs::store::Ino) -> PtyEnd {
+        self.dev_ino = Some(ino);
+        self
     }
 
     /// Opened through devpts mount `mnt`; with `pin`, the open file is in that mount.
@@ -1770,6 +1831,169 @@ mod tests {
     }
 
     #[test]
+    fn canonical_overflow_echoes_input_and_reserves_the_terminator() {
+        const IMAXBEL: u32 = 0o20000;
+        for bell in [0, IMAXBEL] {
+            for echo in [0, ECHO] {
+                let mut t = Tty::new(0);
+                t.termios.iflag |= bell | PARMRK;
+                t.termios.lflag = t.termios.lflag & !ECHO | echo;
+                t.termios.oflag |= OLCUC;
+                t.write_input(&[b'a'; INPUT_MAX - 2]);
+                t.take_output(OUTPUT_MAX);
+                t.write_input(b"\xffz\n");
+                let expected_echo: &[u8] = if echo != 0 { b"\xffZ\r\n" } else { b"" };
+                assert_eq!(t.take_output(10), expected_echo);
+                let mut line = [0; INPUT_MAX];
+                assert_eq!(t.read(&mut line), Some(INPUT_MAX));
+                assert_eq!(line[..INPUT_MAX - 2], [b'a'; INPUT_MAX - 2]);
+                assert_eq!(&line[INPUT_MAX - 2..], b"\xff\n");
+            }
+        }
+    }
+
+    #[test]
+    fn parmrk_leaves_room_for_a_mark_in_noncanonical_input() {
+        let mut t = Tty::new(0);
+        t.termios.lflag &= !(ICANON | ECHO);
+        t.termios.iflag |= PARMRK;
+        t.write_input(&[b'a'; INPUT_MAX - 4]);
+        t.write_input(b"\xffz");
+        assert_eq!(t.input_len(), INPUT_MAX - 2);
+        let mut buf = [0; INPUT_MAX];
+        assert_eq!(t.read(&mut buf), Some(INPUT_MAX - 2));
+        assert_eq!(&buf[INPUT_MAX - 4..INPUT_MAX - 2], b"\xff\xff");
+        assert_eq!(read_all(&mut t), b"z");
+    }
+
+    #[test]
+    fn hupcl_round_trips_and_vdiscard_is_ordinary_input() {
+        const HUPCL: u32 = 0o2000;
+        const FLUSHO: u32 = 0o10000;
+        let mut t = Tty::new(0);
+        assert_eq!(t.termios.cflag & HUPCL, 0);
+        let mut settings = t.termios;
+        settings.cflag |= HUPCL;
+        t.set_termios(settings);
+        assert_eq!(t.termios.cflag & HUPCL, HUPCL);
+        t.write_input(b"x\x0fy\n");
+        assert_eq!(t.termios.lflag & FLUSHO, 0);
+        assert_eq!(read_all(&mut t), b"x\x0fy\n");
+        assert_eq!(t.take_output(16), b"x^Oy\r\n");
+        settings.cflag &= !HUPCL;
+        settings.lflag |= FLUSHO;
+        t.set_termios(settings);
+        assert_eq!(t.termios.cflag & HUPCL, 0);
+        t.write_output(b"out");
+        assert_eq!(t.take_output(16), b"out");
+    }
+
+    // A completed line fills the line discipline in both canonical and noncanonical mode.
+    const FULL_LINE: [u8; INPUT_MAX - 1] = {
+        let mut line = [b'x'; INPUT_MAX - 1];
+        line[INPUT_MAX - 2] = b'\n';
+        line
+    };
+
+    #[test]
+    fn flow_lookahead_stops_and_starts_before_the_slave_reads() {
+        for canon in [0, ICANON] {
+            for any in [0, IXANY] {
+                let mut t = Tty::new(0);
+                t.termios.lflag = t.termios.lflag & !(ICANON | ECHO) | canon;
+                t.termios.iflag |= any;
+                t.packet = true;
+
+                t.write_input(&FULL_LINE);
+                t.write_input(b"\x13");
+                assert_eq!(t.take_pktstatus(), Some(pkt::STOP));
+                assert_eq!(t.write_output(b"blocked"), 0);
+                t.write_input(b"a");
+                assert_eq!(t.take_pktstatus(), None);
+                t.write_input(b"\x11");
+                assert_eq!(t.take_pktstatus(), Some(pkt::START));
+                assert_eq!(t.write_output(b"ok"), 2);
+                t.write_input(b"\x13");
+                assert_eq!(t.take_pktstatus(), Some(pkt::STOP));
+
+                // Only the ordinary byte can restart output during the drain (IXANY).
+                let mut buf = [0; INPUT_MAX];
+                assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
+                assert_eq!(&buf[..FULL_LINE.len()], &FULL_LINE);
+                assert_eq!(t.take_pktstatus(), (any != 0).then_some(pkt::START));
+                assert_eq!(t.output_room() > 0, any != 0);
+                t.write_input(b"\n");
+                assert_eq!(read_all(&mut t), b"a\n");
+            }
+        }
+    }
+
+    #[test]
+    fn lookahead_keeps_input_for_quoting_termios_changes_and_flushes() {
+        let mut t = Tty::new(0);
+        t.termios.lflag &= !ECHO;
+        t.packet = true;
+
+        t.write_input(&FULL_LINE);
+        t.write_input(b"\x16\x13\n");
+        assert_eq!(t.take_pktstatus(), Some(pkt::STOP));
+        let mut buf = [0; INPUT_MAX];
+        t.read(&mut buf);
+        assert_eq!(read_all(&mut t), b"\x13\n");
+        t.write_input(&FULL_LINE);
+        t.write_input(b"\x11\n");
+        assert_eq!(t.take_pktstatus(), Some(pkt::START));
+        let mut settings = t.termios;
+        settings.cc[VSTART] = b'q';
+        t.set_termios(settings);
+        t.read(&mut buf);
+        assert_eq!(read_all(&mut t), b"\x11\n");
+
+        t.write_input(&FULL_LINE);
+        t.write_input(b"abc");
+        t.discard_unprocessed();
+        t.write_input(b"\x13");
+        assert_eq!(t.output_room(), 0);
+    }
+
+    #[test]
+    fn lookahead_ignores_disabled_flow_chars_and_tracks_ixon_enable() {
+        let mut t = Tty::new(0);
+        t.termios.lflag &= !ECHO;
+        t.packet = true;
+
+        // Disabled VSTOP/VSTART (0) must never match NUL bytes waiting in unprocessed.
+        let mut settings = t.termios;
+        settings.cc[VSTOP] = 0;
+        settings.cc[VSTART] = 0;
+        t.set_termios(settings);
+        t.take_pktstatus();
+        t.write_input(&FULL_LINE);
+        t.write_input(b"\x00\n");
+        assert_eq!(t.take_pktstatus(), None);
+        assert!(t.output_room() > 0);
+        let mut buf = [0; INPUT_MAX];
+        assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
+        assert_eq!(read_all(&mut t), b"\x00\n");
+
+        // Bytes queued while IXON is off must still trigger flow control if IXON turns on.
+        let mut t = Tty::new(0);
+        t.termios.lflag &= !ECHO;
+        t.termios.iflag &= !IXON;
+        t.packet = true;
+        t.write_input(&FULL_LINE);
+        t.write_input(b"\x13");
+        assert!(t.output_room() > 0);
+        let mut on = t.termios;
+        on.iflag |= IXON;
+        t.set_termios(on);
+        assert_eq!(t.output_room(), 0);
+        assert_eq!(t.take_pktstatus(), Some(pkt::DOSTOP | pkt::STOP));
+        assert_eq!(t.read(&mut buf), Some(FULL_LINE.len()));
+        assert_eq!(t.take_pktstatus(), None);
+    }
+
+    #[test]
     fn signals_flush_input_and_echo() {
         let mut t = Tty::new(0);
         t.write_input(b"partial");
@@ -1907,7 +2131,32 @@ mod tests {
         assert_eq!(t.take_output(64), b"^C");
         t.write_output(&vec![b'x'; PASSED_ON + 10]);
         t.flush_output();
-        assert_eq!(t.output_len(), PASSED_ON);
+        assert_eq!(t.output.len(), PASSED_ON);
+    }
+
+    #[test]
+    fn fionread_counts_data_in_each_line_discipline() {
+        let mut t = Tty::new(0);
+        t.termios.lflag &= !ECHO;
+        t.packet = true;
+        t.write_input(b"line\x04partial");
+        assert_eq!(t.input_len(), 4);
+        assert_eq!(t.master_readable_len(), 0);
+        t.write_input(b"\x13\x11");
+        assert_eq!(t.pktstatus, pkt::START);
+        for size in [10, 5000, 20000] {
+            t.write_output(&vec![b'x'; size]);
+            assert_eq!(t.master_readable_len(), size.min(PASSED_ON));
+            t.take_output(size - 3);
+            assert_eq!(t.master_readable_len(), 3);
+            t.take_output(3);
+        }
+        t.set_termios(Termios {
+            lflag: 0,
+            ..t.termios
+        });
+        t.write_input(&[b'x'; INPUT_MAX]);
+        assert_eq!(t.input_len(), INPUT_MAX - 1);
     }
 
     #[test]
@@ -2012,5 +2261,40 @@ mod tests {
             ypixel: 0,
         };
         assert_eq!(Winsize::decode(&w.encode()), w);
+    }
+
+    #[test]
+    fn slave_write_clamps_onlcr_and_xtabs_to_output_max() {
+        let mut t = Tty::new(0);
+        // ONLCR: each '\n' expands to "\r\n" (2 bytes), so at most OUTPUT_MAX / 2 newlines fit.
+        let nls = vec![b'\n'; OUTPUT_MAX];
+        let consumed = t.write_output(&nls);
+        assert_eq!(consumed, OUTPUT_MAX / 2);
+        assert_eq!(t.output.len(), OUTPUT_MAX);
+        assert_eq!(t.write_output(b"\n"), 0);
+        assert_eq!(t.output.len(), OUTPUT_MAX);
+
+        // With 1 byte left, a '\n' (needs 2 bytes) must not overshoot OUTPUT_MAX.
+        t.take_output(1);
+        assert_eq!(t.output.len(), OUTPUT_MAX - 1);
+        assert_eq!(t.write_output(b"\n"), 0);
+        assert_eq!(t.output.len(), OUTPUT_MAX - 1);
+        assert_eq!(t.write_output(b"x"), 1);
+        assert_eq!(t.output.len(), OUTPUT_MAX);
+
+        // XTABS: each '\t' from column 0 expands to 8 spaces, so at most OUTPUT_MAX / 8 tabs fit.
+        t.clear_output();
+        let mut tio = t.termios;
+        tio.oflag |= XTABS;
+        t.set_termios(tio);
+        t.write_output(b"\r");
+        t.clear_output();
+        let tabs = vec![b'\t'; OUTPUT_MAX];
+        let consumed = t.write_output(&tabs);
+        assert_eq!(consumed, OUTPUT_MAX / 8);
+        assert_eq!(t.output.len(), OUTPUT_MAX);
+        t.take_output(7);
+        assert_eq!(t.write_output(b"\t"), 0);
+        assert_eq!(t.output.len(), OUTPUT_MAX - 7);
     }
 }

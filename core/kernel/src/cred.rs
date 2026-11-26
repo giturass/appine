@@ -353,12 +353,18 @@ impl Cred {
         old
     }
 
-    /// setgroups(2): allowed only when the user namespace's gid_map has been written and
-    /// setgroups is not denied (`userns_may_setgroups`).
-    pub fn setgroups(&mut self, mut groups: Vec<u32>) -> Result<(), Errno> {
+    /// Whether `setgroups(2)` is permitted (Linux's `may_setgroups`): requires `CAP_SETGID` in our
+    /// own user namespace, a written `gid_map`, and `/proc/<pid>/setgroups` not set to `"deny"`.
+    pub fn may_setgroups(&self) -> bool {
         let ns = &self.user_ns;
-        let allowed = ns.setgroups.get() && !ns.gid_map.borrow().extents().is_empty();
-        if !self.capable_here(cap::SETGID) || !allowed {
+        self.capable_here(cap::SETGID)
+            && ns.setgroups.get()
+            && !ns.gid_map.borrow().extents().is_empty()
+    }
+
+    /// setgroups(2): allowed only when [`Self::may_setgroups`] holds.
+    pub fn setgroups(&mut self, mut groups: Vec<u32>) -> Result<(), Errno> {
+        if !self.may_setgroups() {
             return Err(Errno::EPERM);
         }
         groups.sort_unstable();
@@ -366,16 +372,20 @@ impl Cred {
         Ok(())
     }
 
-    /// capset(2): the permitted set can only shrink, the effective set cannot exceed the
-    /// permitted set, and the inheritable set cannot exceed the old inheritable and permitted sets
-    /// (the bounding set with `CAP_SETPCAP`). Ambient capabilities not in the new permitted and
-    /// inheritable sets are dropped along with them.
+    /// capset(2): bits above [`cap::LAST`] ([`CAP_FULL`]) are ignored as on Linux; the permitted
+    /// set can only shrink, the effective set cannot exceed the permitted set, and the inheritable
+    /// set cannot exceed the old inheritable and permitted sets (the bounding set with
+    /// `CAP_SETPCAP`). Ambient capabilities not in the new permitted and inheritable sets are
+    /// dropped along with them.
     pub fn capset(
         &mut self,
         effective: u64,
         permitted: u64,
         inheritable: u64,
     ) -> Result<(), Errno> {
+        let effective = effective & CAP_FULL;
+        let permitted = permitted & CAP_FULL;
+        let inheritable = inheritable & CAP_FULL;
         let inh_limit = self.cap_inheritable
             | if self.capable_here(cap::SETPCAP) {
                 CAP_FULL
@@ -525,14 +535,16 @@ impl Cred {
     /// Permission check for file access (`generic_permission`): `mask` is a combination of
     /// `MAY_*`.
     pub fn permission(&self, st: &Stat, mask: u32) -> Result<(), Errno> {
-        let class = if self.fsuid == st.uid {
-            st.mode >> 6
+        let allowed = if self.fsuid == st.uid {
+            mask & !(st.mode >> 6) & 7 == 0
+        } else if let Some(acl) = &st.access_acl {
+            crate::vfs::acl::allows(acl, self, st, mask & 7)
         } else if self.in_group(st.gid) {
-            st.mode >> 3
+            mask & !(st.mode >> 3) & 7 == 0
         } else {
-            st.mode
+            mask & !st.mode & 7 == 0
         };
-        if mask & !class & 7 == 0 {
+        if allowed {
             return Ok(());
         }
         if st.kind() == mode::S_IFDIR {
@@ -577,17 +589,38 @@ impl Cred {
         Ok(())
     }
 
-    /// The credentials access(2) uses: checks with the real user and group IDs, and capabilities
-    /// depend on whether the real user ID is root (in our own namespace).
+    /// Whether `self`'s capabilities are a subset of `other`'s (Linux 6.1's
+    /// `cred_cap_issubset(other, self)`): within the same user namespace `self.cap_permitted` must
+    /// be contained in `other.cap_permitted`; across user namespaces `other` must be in an
+    /// ancestor whose direct child on the path to `self.user_ns` is owned by `other.euid`.
+    pub fn caps_subset_of(&self, other: &Cred) -> bool {
+        if self.user_ns.id == other.user_ns.id {
+            return self.cap_permitted & !other.cap_permitted == 0;
+        }
+        let mut ns = self.user_ns.clone();
+        while let Some(parent) = ns.parent.clone() {
+            if parent.id == other.user_ns.id && ns.owner == other.euid {
+                return true;
+            }
+            ns = parent;
+        }
+        false
+    }
+
+    /// The credentials access(2) uses (Linux 6.1's `access_override_creds`): checks with the real
+    /// user and group IDs, and unless `SECBIT_NO_SETUID_FIXUP` is set, capabilities depend on
+    /// whether the real user ID is root (in our own namespace).
     pub fn for_access(&self) -> Cred {
         let mut c = self.clone();
         c.fsuid = self.ruid;
         c.fsgid = self.rgid;
-        c.cap_effective = if Some(self.ruid) == self.root_uid() {
-            self.cap_permitted
-        } else {
-            0
-        };
+        if self.securebits & secbit::NO_SETUID_FIXUP == 0 {
+            c.cap_effective = if Some(self.ruid) == self.root_uid() {
+                self.cap_permitted
+            } else {
+                0
+            };
+        }
         c
     }
 
@@ -609,7 +642,9 @@ impl Cred {
         {
             perm &= !mode::S_ISGID;
         }
-        perm &= !umask;
+        if dir.default_acl.is_none() {
+            perm &= !umask;
+        }
         if is_dir {
             perm &= 0o1777;
             if setgid_dir {
@@ -1014,6 +1049,8 @@ pub(crate) struct UserNs {
     /// The creator had `CAP_SETFCAP` in its effective set (Linux's `parent_could_setfcap`): only
     /// then may a process inside map the parent's uid 0 into it.
     pub parent_could_setfcap: bool,
+    /// The creator's soft message-queue limit, applied to charges in the parent namespace.
+    pub mq_max: Cell<u64>,
 }
 
 impl UserNs {
@@ -1042,6 +1079,7 @@ impl UserNs {
             gid_map: RefCell::new(IdMap::identity()),
             setgroups: Cell::new(true),
             parent_could_setfcap: true,
+            mq_max: Cell::new(u64::MAX),
         })
     }
 
@@ -1058,6 +1096,7 @@ impl UserNs {
             gid_map: RefCell::new(IdMap::default()),
             setgroups: Cell::new(parent.setgroups.get()),
             parent_could_setfcap: could_setfcap,
+            mq_max: Cell::new(u64::MAX),
         })
     }
 
@@ -1099,6 +1138,7 @@ mod tests {
             mtime_ns: 0,
             ctime_ns: 0,
             blocks: None,
+            ..Stat::default()
         }
     }
 
@@ -1506,5 +1546,117 @@ mod tests {
             (1000, 100, 0o1755)
         );
         assert_eq!(u.new_owner(&dir, 0o6777, 0, true), (1000, 50, 0o2777));
+    }
+
+    #[test]
+    fn for_access_honours_no_setuid_fixup() {
+        let mut c = Cred::root();
+        c.set_securebits(secbit::NO_SETUID_FIXUP).unwrap();
+        c.setresuid(Some(1000), Some(1000), Some(1000)).unwrap();
+        c.cap_effective = 1 << cap::DAC_OVERRIDE;
+        c.cap_permitted = 1 << cap::DAC_OVERRIDE;
+        // With SECBIT_NO_SETUID_FIXUP, access(2) keeps cap_effective for a non-root real uid
+        let acc = c.for_access();
+        assert_eq!(acc.fsuid, 1000);
+        assert_eq!(acc.cap_effective, 1 << cap::DAC_OVERRIDE);
+
+        // Without SECBIT_NO_SETUID_FIXUP, non-root real uid clears cap_effective
+        c.securebits = 0;
+        assert_eq!(c.for_access().cap_effective, 0);
+    }
+
+    #[test]
+    fn caps_subset_of_distinguishes_owned_and_foreign_user_namespaces() {
+        let init = UserNs::init();
+        let child_u1000 = UserNs::child(&init, 1000, false);
+        let grandchild = UserNs::child(&child_u1000, 2000, false);
+
+        let root_init = Cred::root();
+        let u1000_init = user(1000, 1000);
+
+        let mut in_child = u1000_init.clone();
+        in_child.enter_user_ns(child_u1000.clone());
+        let mut in_grandchild = u1000_init.clone();
+        in_grandchild.enter_user_ns(grandchild);
+
+        // Owner entering its own child or descendant namespace is a subset (keeps dumpable)
+        assert!(in_child.caps_subset_of(&u1000_init));
+        assert!(in_grandchild.caps_subset_of(&u1000_init));
+
+        // Foreign euid (root entering uid 1000's namespace) is NOT a subset (clears dumpable)
+        let mut root_in_child = root_init.clone();
+        root_in_child.enter_user_ns(child_u1000);
+        assert!(!root_in_child.caps_subset_of(&root_init));
+
+        // Entering a parent user namespace is NOT a subset
+        assert!(!root_init.caps_subset_of(&in_child));
+    }
+
+    #[test]
+    fn capset_masks_bits_above_last_cap() {
+        let high = !CAP_FULL;
+        assert_ne!(high, 0);
+
+        // Root passing all-ones masks off bits above cap::LAST instead of failing with EPERM
+        let mut root = Cred::root();
+        root.capset(u64::MAX, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(root.cap_effective, CAP_FULL);
+        assert_eq!(root.cap_permitted, CAP_FULL);
+        assert_eq!(root.cap_inheritable, CAP_FULL);
+
+        // Unprivileged caller passing only reserved bits succeeds and stores 0
+        let mut u = user(1000, 100);
+        u.capset(high, high, high).unwrap();
+        assert_eq!(
+            (u.cap_effective, u.cap_permitted, u.cap_inheritable),
+            (0, 0, 0)
+        );
+        u.capset(high, 0, 0).unwrap();
+        assert_eq!(u.cap_effective, 0);
+
+        // Disallowed valid capability bits still return EPERM even when combined with reserved bits
+        let last_bit = 1u64 << cap::LAST;
+        let before = u.clone();
+        assert_eq!(u.capset(0, high | last_bit, 0), Err(Errno::EPERM));
+        assert_eq!(u.capset(high | last_bit, 0, 0), Err(Errno::EPERM));
+        assert_eq!(u.capset(0, 0, high | last_bit), Err(Errno::EPERM));
+        assert_eq!(u, before);
+
+        // Bounding set limit still applies to valid bits while ignoring reserved bits
+        let mut bounded = Cred::root();
+        bounded.cap_bounding &= !last_bit;
+        assert_eq!(
+            bounded.capset(CAP_FULL, CAP_FULL, u64::MAX),
+            Err(Errno::EPERM)
+        );
+        bounded
+            .capset(u64::MAX, u64::MAX, u64::MAX & !last_bit)
+            .unwrap();
+        assert_eq!(bounded.cap_inheritable, CAP_FULL & !last_bit);
+    }
+
+    #[test]
+    fn may_setgroups_checks_capability_and_userns_state() {
+        let root = Cred::root();
+        assert!(root.may_setgroups());
+
+        // Without CAP_SETGID, may_setgroups is false even in init_user_ns
+        let mut no_cap = root.clone();
+        no_cap.cap_effective &= !(1 << cap::SETGID);
+        assert!(!no_cap.may_setgroups());
+
+        // Child userns before gid_map is written: not allowed
+        let child_ns = UserNs::child(&root.user_ns, 0, true);
+        let mut in_child = root.clone();
+        in_child.enter_user_ns(child_ns.clone());
+        assert!(!in_child.may_setgroups());
+
+        // After writing gid_map with setgroups allowed: allowed
+        *child_ns.gid_map.borrow_mut() = IdMap(vec![(0, 0, 1)]);
+        assert!(in_child.may_setgroups());
+
+        // After denying setgroups: disallowed again
+        child_ns.setgroups.set(false);
+        assert!(!in_child.may_setgroups());
     }
 }

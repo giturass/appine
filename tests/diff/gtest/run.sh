@@ -5,7 +5,8 @@
 # <suite> is starnix (Fuchsia Starnix's tests, built by scripts/build-starnix-tests) or gvisor
 # (gVisor's, built by scripts/build-gvisor-tests); scripts/difftest installs each at
 # /usr/lib/<suite>-tests. Each test runs in its own process (one crash does not take the rest with
-# it) under a 60 s timeout (SIGKILL), and only "<test> ok|failed|skipped|exit <code>" is printed.
+# it) under a 60 s timeout (SIGKILL), printing "<test> ok|failed|skipped|exit <code>".
+# Selected groups set GTEST_FAILURE_DETAILS=1 to include assertion output for failed tests.
 # A test killed by the timeout is followed by "  hang:" lines, one per thread of its processes
 # (pid, thread, name, state and /proc/<pid>/task/<tid>/syscall, the syscall it waits in), taken
 # about 50 s into it; a test that ends by itself drops them, so a slow but passing test still
@@ -26,8 +27,7 @@
 #   tun_test;
 # - devices neither side has: input_test, uinput_test, udev_test, touch_standby_test,
 #   custom_artifact_test, ext4_write_test;
-# - nothing to compare: cache_flush_test has no tests on arm64, and uio_test's one test is
-#   process_vm_readv's recorded deviation (the kernel/ptrace map).
+# - nothing to compare: cache_flush_test has no tests on arm64.
 suite=$1
 skip=$2
 shift 2
@@ -119,7 +119,11 @@ for bin in "$@"; do
         code=$?
         out=$(cat gtest.out)
         case $out in
-        *"[       OK ] $t"*) r=ok ;;
+        *"[       OK ] $t"*)
+            # Teardown can fail after GoogleTest prints the case result.
+            r=ok
+            [ "$code" = 0 ] || r="exit $code"
+            ;;
         *"[  SKIPPED ] $t"*) r=skipped ;;
         *"[  FAILED  ] $t"*) r=failed ;;
         *) r="exit $code" ;;
@@ -128,7 +132,8 @@ for bin in "$@"; do
         # A normal gtest run exiting 0 or 1 always prints a result line; when it falls through here
         # on one side only, record both the on-disk size and captured length plus the file's head
         # so the failure diff distinguishes a truncated/empty file from a command-substitution loss.
-        if [ "$r" = "exit 0" ] || [ "$r" = "exit 1" ]; then
+        if [ "$r" = "exit 0" ] || [ "$r" = "exit 1" ] ||
+            { [ "$r" = failed ] && [ "${GTEST_FAILURE_DETAILS:-0}" = 1 ]; }; then
             echo "  out: file=$(wc -c <gtest.out)B cap=${#out}B"
             tr '\0' '?' <gtest.out | sed 's/^/  out: /' | head -n 30
         fi

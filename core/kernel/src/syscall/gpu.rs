@@ -150,7 +150,7 @@ fn create(cx: &mut Cx<'_>, file: &RenderFile, arg: u64) -> SysResult {
     let mapped = cx.unlocked(|| ctx.create(id, blob, size))?;
     req[8..12].copy_from_slice(&id.to_le_bytes());
     req[12..16].copy_from_slice(&id.to_le_bytes());
-    put(cx, arg, req)?;
+    super::copy_result(cx, |cx| put(cx, arg, req))?;
     file.buffers.borrow_mut().insert(id, mapped);
     Ok(0)
 }
@@ -193,12 +193,9 @@ fn submit(cx: &mut Cx<'_>, file: &RenderFile, arg: u64, size: usize) -> SysResul
     let fence = cx.unlocked(|| ctx.submit(ring, &command, flags & 2 != 0, buffers))?;
     if let Some(fence) = fence {
         let f = OpenFile::new(FileKind::GpuFence(fence), oflags::O_RDONLY);
-        let fd = cx.fds_mut().install(f, true, 0)?;
-        if let Err(e) = put(
-            cx,
-            arg.checked_add(28).ok_or(Errno::EFAULT)?,
-            fd.to_le_bytes(),
-        ) {
+        let fd = cx.install_fd(f, true)?;
+        let out_addr = arg.checked_add(28).ok_or(Errno::EFAULT)?;
+        if let Err(e) = super::copy_result(cx, |cx| put(cx, out_addr, fd.to_le_bytes())) {
             cx.fds_mut().close(fd)?;
             return Err(e);
         }

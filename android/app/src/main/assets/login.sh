@@ -13,7 +13,7 @@
 # it is not added back. With a password set, escalating asks for the password, following the
 # distro's convention; without one (adduser -D) it does not ask. The rule is rewritten at every
 # login according to the password at that time, and, while Appine runs, within a few seconds of the
-# guest changing /etc (passwd replaces /etc/shadow): the app then runs this script with
+# account files changing (including in-place writes): the app then runs this script with
 # --refresh-rules as $1, which only rewrites the rules.
 # On a system the app imported from Alpine, the login shell is bash (root's, and that of the
 # accounts busybox's adduser makes after it): the app puts bash's packages in
@@ -30,16 +30,27 @@
 # The install commands all read from /dev/null: what the user types before the prompt appears is
 # left for the login shell.
 #
-# Ctrl-C does not end the login: the script catches SIGINT itself (child processes are still
-# interrupted), and pressing it while sudo installs skips installing this time.
-# Caught rather than ignored: an ignored SIGINT is inherited by child processes, and apt-get could
-# not be stopped; the default is restored after exec
+# Ctrl-C must not end the login or interrupt short setup commands (passwd lookup, group checks,
+# shadow reads, rules publication, or the su --help probe): SIGINT is ignored by default and only
+# caught around the cancellable package-lock waits and apt installs (setting interrupted=1 while
+# letting the child be interrupted). Before exec into the user's shell or su, SIGINT is restored to
+# default so interactive Ctrl-C works normally.
 set -u
 interrupted=
-trap 'interrupted=1' INT
+trap '' INT
 want=${1:-auto}
 dir=${2:-}
 user=root
+
+# Runs "$@" with SIGINT caught in this shell (and default in the child) so Ctrl-C interrupts a
+# long-running install or lock wait and records it in interrupted, then ignores SIGINT again.
+cancellable() {
+    trap 'interrupted=1' INT
+    "$@"
+    cancellable_rc=$?
+    trap '' INT
+    return "$cancellable_rc"
+}
 
 # The first regular user created
 first() {
@@ -64,6 +75,9 @@ if [ -f /etc/alpine-release ]; then
     group=wheel
     tool=doas
     rules=/etc/doas.d/30-appine.conf
+    wheel_conf=/etc/doas.d/20-wheel.conf
+    stock_wheel_rule='permit persist :wheel'
+    wheel_rule='permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel'
 else
     group=sudo
     tool=sudo
@@ -71,14 +85,20 @@ else
 fi
 ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
 
+# Only a regular file containing the original rule alone is eligible for replacement.
+has_stock_wheel_rule() {
+    [ -f "$wheel_conf" ] && [ ! -L "$wheel_conf" ] &&
+        [ "$(cat "$wheel_conf" 2>/dev/null)" = "$stock_wheel_rule" ]
+}
+
 # Runs "$@" holding the lock that every login's installs of bundled packages share, so they run one
 # after another: whatever the command installs, it checks first whether a login that held the lock
-# before has installed it already
+# before has installed it already. Uses a braced group rather than a subshell so interrupted=1 set
+# during a cancelled lock or apk wait propagates back to the caller, while closing fd 9 on exit.
 locked() {
-    (
-        flock 9
-        "$@"
-    ) 9>/run/appine-install.lock
+    {
+        cancellable flock 9 && "$@"
+    } 9>/run/appine-install.lock
 }
 
 # apk add, offline (without reading the repository index). When another apk holds apk's lock (the
@@ -89,7 +109,7 @@ apk_add() {
     case $apk_errors in
     *'Unable to lock database'*)
         echo "appine: another apk is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
-        apk add -q --wait 3600 --no-network --repositories-file /dev/null "$@" </dev/null
+        cancellable apk add -q --wait 3600 --no-network --repositories-file /dev/null "$@" </dev/null
         ;;
     *)
         printf '%s\n' "$apk_errors" >&2
@@ -142,7 +162,7 @@ apt_update() {
     apt_errors=$(mktemp) || return 1
     waiting=
     while :; do
-        if apt-get update </dev/null 2>"$apt_errors"; then
+        if cancellable apt-get update </dev/null 2>"$apt_errors"; then
             status=0
             break
         fi
@@ -152,7 +172,7 @@ apt_update() {
             echo "appine: another apt is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
             waiting=1
         fi
-        sleep 2
+        cancellable sleep 2
         [ -z "$interrupted" ] || break
     done
     grep -q 'Could not get lock' "$apt_errors" || cat "$apt_errors" >&2
@@ -177,9 +197,18 @@ ensure_shell() {
 # passwords at that time. No password means a shadow field that is empty or only "!" or "*"
 # (adduser -D writes "!"); passwd -l puts "!" in front of a hash, and that account still has a
 # password. Without a shadow entry, or without a readable /etc/shadow, an account counts as having
-# a password. The file is written beside and renamed into place, so a login and a refresh running
-# at once never leave it half written (doas reads only *.conf, sudo skips names with a dot)
-refresh_rules() {
+# a password. Serialize the reads and publication across logins and the service refresh so an
+# older decision cannot overwrite a newer one. Readers see only complete files.
+refresh_rules() (
+    # An unprivileged reader could otherwise take this lock exclusively and stall revocation.
+    umask 077
+    exec 9>/run/appine-rules.lock || exit 1
+    flock 9 || exit 1
+    # Upgrade an unmodified stock wheel rule so `doas -s` preserves busybox ash's ENV hook.
+    if [ "$group" = wheel ] && has_stock_wheel_rule; then
+        wt=$rules.wheel.$$
+        printf '%s\n' "$wheel_rule" >"$wt" && chmod 0644 "$wt" && mv -f "$wt" "$wheel_conf" || rm -f "$wt"
+    fi
     nopass=
     if [ -f "$admins" ]; then
         while read -r u; do
@@ -194,22 +223,25 @@ refresh_rules() {
             echo "# Written by Appine at each login and when /etc changes: administrators without a password ($admins)."
             for u in $nopass; do
                 if [ "$group" = wheel ]; then
-                    echo "permit nopass $u"
+                    echo "permit nopass setenv { ENV=/etc/profile.d/appine.ashrc } $u"
                 else
                     echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
                 fi
             done
-        } >"$tmp" && chmod 0440 "$tmp" && mv -f "$tmp" "$rules"
-        rm -f "$tmp"
+        } >"$tmp" && chmod 0440 "$tmp" && mv -f "$tmp" "$rules" || {
+            # The previous file may still grant an account that now needs a password.
+            rm -f "$tmp" "$rules"
+            exit 1
+        }
     else
         rm -f "$rules"
     fi
-}
+)
 
-# Only the rules: the app asks for this when the guest changed /etc
+# Only the rules: the service retries failed refreshes on its next poll.
 if [ "$want" = --refresh-rules ]; then
     refresh_rules
-    exit 0
+    exit $?
 fi
 
 if [ -d /var/cache/appine/procps ]; then
@@ -246,6 +278,10 @@ if [ "$user" = root ]; then
     ensure_shell "$shell"
     [ -x "$shell" ] || shell=/bin/sh
     export SHELL="$shell" HOME="$home"
+    case ${shell##*/} in
+    zsh) [ -z "${ZDOTDIR+x}" ] && [ -r /etc/appine/zsh/.zshenv ] && export ZDOTDIR=/etc/appine/zsh ;;
+    esac
+    trap - INT
     exec "$shell" -l
 fi
 
@@ -257,8 +293,12 @@ if ! grep -Fqsx -- "$user" "$admins"; then
     if [ "$group" = wheel ]; then
         addgroup "$user" wheel
         mkdir -p /etc/doas.d
-        grep -Fqsx 'permit persist :wheel' /etc/doas.d/20-wheel.conf ||
-            echo 'permit persist :wheel' >>/etc/doas.d/20-wheel.conf
+        if has_stock_wheel_rule; then
+            printf '%s\n' "$wheel_rule" >"$wheel_conf"
+        elif ! grep -Fqsx "$wheel_rule" "$wheel_conf" &&
+            ! grep -Fqsx "$stock_wheel_rule" "$wheel_conf"; then
+            printf '%s\n' "$wheel_rule" >>"$wheel_conf"
+        fi
     else
         usermod -aG sudo "$user"
     fi
@@ -276,6 +316,7 @@ fi
 # retried at every later login
 installed=/var/lib/appine/$tool-installed
 tried=
+interrupted=
 if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
     tried=1
     if [ "$group" = wheel ]; then
@@ -288,8 +329,9 @@ if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
         # finished installing. While another apt runs, apt-get install waits for dpkg's lock itself
         # (an hour at most), saying so
         echo "appine: installing sudo so that $user can become root (Ctrl-C skips it until the next login)"
-        apt_update &&
-            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
+        if apt_update && [ -z "$interrupted" ]; then
+            cancellable env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
+        fi
     fi
 fi
 if command -v "$tool" >/dev/null; then
@@ -313,7 +355,14 @@ refresh_rules
 shell=$(field "$user" 7 /etc/passwd)
 ensure_shell "$shell"
 set --
-[ -x "$shell" ] || set -- -s /bin/sh
+zdot=
+if [ -x "$shell" ]; then
+    case ${shell##*/} in
+    zsh) [ -r /etc/appine/zsh/.zshenv ] && zdot='[ -z "${ZDOTDIR+x}" ] && export ZDOTDIR=/etc/appine/zsh; ' ;;
+    esac
+else
+    set -- -s /bin/sh
+fi
 
 # Run as a login shell (reads /etc/profile); su sets HOME, SHELL, USER and LOGNAME. su -l is not
 # used: it always goes to the home directory. The restored directory is entered as this account (a
@@ -321,7 +370,7 @@ set --
 # home directory
 cd /
 q=$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")
-cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\" -l"
+cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; ${zdot}exec \"\$SHELL\" -l"
 # util-linux's su (Debian) starts a new session for the -c command (to stop TIOCSTI from pushing
 # input into root's terminal): the shell has no controlling terminal and no job control, and on
 # Ctrl-C su ends the whole session, closing the tab. Its --session-command starts no new session;
@@ -329,6 +378,9 @@ cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\"
 # reading the terminal as root. busybox su (Alpine) never starts a new session and has no such
 # option
 if su --help 2>&1 | grep -q -- --session-command; then
-    exec su "$@" --session-command="$cmd" "$user"
+    set -- "$@" --session-command="$cmd" "$user"
+else
+    set -- "$@" "$user" -c "$cmd"
 fi
-exec su "$@" "$user" -c "$cmd"
+trap - INT
+exec su "$@"

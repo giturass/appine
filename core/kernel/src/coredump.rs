@@ -16,18 +16,33 @@
 //! count too, as with Linux's `has_dumped`), the wait status has `WCOREDUMP`, and the `si_code` of
 //! SIGCHLD and waitid is `CLD_DUMPED`.
 
+use std::rc::Rc;
+
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::FileRef;
-use crate::kernel::{Cx, Tid, wake};
+use crate::kernel::{Cx, Kernel, Tid, wake};
 use crate::mm::{DumpRegion, Mm};
 use crate::process::{CpuTime, RLIMIT_CORE, Signal, ThreadGroup};
 use crate::ptrace::{HwDebug, Regs};
 use crate::signal::SigInfo;
-use crate::task::Task;
+use crate::task::{FsContext, Task};
 use appine_engine::{CpuState, PAGE_SIZE, prot};
 
 /// Maximum length of `core_pattern` (Linux's `CORENAME_MAX_SIZE`).
 pub(crate) const PATTERN_MAX: usize = 128;
+
+/// `/proc/sys/fs/suid_dumpable` sysctl path relative to `/proc`.
+pub(crate) const SUID_DUMPABLE: &[u8] = b"sys/fs/suid_dumpable";
+/// Linux's `SUID_DUMP_*` modes (`include/linux/sched/coredump.h`).
+pub(crate) const SUID_DUMP_DISABLE: u8 = 0;
+pub(crate) const SUID_DUMP_USER: u8 = 1;
+pub(crate) const SUID_DUMP_ROOT: u8 = 2;
+
+/// Current value of `/proc/sys/fs/suid_dumpable` (0, 1 or 2).
+pub(crate) fn suid_dumpable(k: &Kernel) -> u8 {
+    crate::pseudo::recorded_value(k, SUID_DUMPABLE).clamp(0, 2) as u8
+}
 
 /// Signals whose default action produces a core (Linux's `SIG_KERNEL_COREDUMP_MASK`): SIGQUIT,
 /// SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS.
@@ -68,13 +83,15 @@ impl ThreadCore {
 /// written.
 pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInfo) -> bool {
     let group = cx.t.group.clone();
-    {
+    let dumpable = {
         let g = group.borrow();
+        let mode = g.dumpable_mode();
         // As on Linux, nothing is written when the limit is below ELF's minimum core (one page)
-        if g.rlimits[RLIMIT_CORE as usize].0 < PAGE_SIZE || !g.dumpable {
+        if g.rlimits[RLIMIT_CORE as usize].0 < PAGE_SIZE || mode == SUID_DUMP_DISABLE {
             return false;
         }
-    }
+        mode
+    };
     let k = cx.kr();
     if k.core_pattern.first() == Some(&b'|') {
         crate::debug::log(format_args!(
@@ -82,6 +99,7 @@ pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInf
         ));
         return false;
     }
+    let need_suid_safe = dumpable == SUID_DUMP_ROOT;
     // Wait for the other threads to exit; on exit they leave their registers in group.core
     group.borrow_mut().core = Some(Vec::new());
     while group.borrow().threads.len() > 1 {
@@ -91,7 +109,22 @@ pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInf
     let mut threads = vec![ThreadCore::of(cx.task, state)];
     threads.extend(others);
     let name = core_name(cx, sig);
-    match write(cx, &name, &threads, sig, info) {
+    // Linux 6.1 `do_coredump`: with `SUID_DUMP_ROOT` (2), a non-pipe pattern must be an absolute
+    // path so a user cannot redirect a root-owned core file via cwd.
+    if need_suid_safe && name.first() != Some(&b'/') {
+        let log = cx.kr().klog.clone();
+        crate::klog::printk(
+            &log,
+            crate::klog::level::WARNING,
+            format_args!(
+                "Unsafe core_pattern used with fs.suid_dumpable=2.\n\
+                 Pipe handler or fully qualified core dump path required.\n\
+                 Set kernel.core_pattern before fs.suid_dumpable."
+            ),
+        );
+        return false;
+    }
+    match write(cx, &name, need_suid_safe, &threads, sig, info) {
         Ok(()) => true,
         Err(e) => {
             crate::debug::log(format_args!(
@@ -158,8 +191,8 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 .map(|e| String::from_utf8_lossy(&e.path).replace('/', "!"))
                 .unwrap_or_default(),
             b'c' => g.rlimits[RLIMIT_CORE as usize].0.to_string(),
-            // The dumpable mode (Linux's get_dumpable: 1 for a process that may dump)
-            b'd' => (g.dumpable as u32).to_string(),
+            // The dumpable mode (Linux's get_dumpable: 0, 1 or 2)
+            b'd' => g.dumpable_mode().to_string(),
             // Unknown specifiers: output nothing, as on Linux
             _ => String::new(),
         };
@@ -173,63 +206,110 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
 }
 
 /// Writes the core file in the process's current directory (or at the name if it is an absolute
-/// path). As on Linux, a file with the same name is unlinked first, then a new one is created with
-/// 0600 (`O_EXCL | O_NOFOLLOW`); once created it counts as written, and it is truncated when the
-/// writes reach `RLIMIT_CORE` or fail.
+/// path). A regular dump unlinks any file of the same name first; a `SUID_DUMP_ROOT` dump
+/// (`need_suid_safe`) keeps `O_EXCL` without unlinking and temporarily overrides `fsuid` to root.
+/// Creation always uses fixed mode `0600` ignoring the process's `umask`. Once created the core
+/// counts as written, and writes stop when reaching `RLIMIT_CORE`, `RLIMIT_FSIZE`, or an I/O error.
 fn write(
     cx: &mut Cx<'_>,
     name: &[u8],
+    need_suid_safe: bool,
     threads: &[ThreadCore],
     sig: Signal,
     info: &SigInfo,
 ) -> Result<(), Errno> {
     let mm = cx.t.mm.clone();
-    let (regions, notes) = {
-        let mm = mm.borrow();
-        let filter = cx.t.group.borrow().coredump_filter;
-        let regions = mm.dump_regions(filter);
-        let notes = notes(cx, &mm, &regions, threads, sig, info);
-        (regions, notes)
-    };
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_CORE as usize].0;
-    let (header, data_offset) = elf_header(&regions, &notes);
-    let _ = crate::syscall::unlink_path(cx, name);
-    let file = crate::syscall::create_exclusive(cx, name, 0o600)?;
-    let mut w = CoreWriter {
-        file,
-        limit,
-        written: 0,
-        end: 0,
-        stopped: false,
-    };
-    w.put(cx, 0, &header);
-    let mut offset = data_offset;
+    let filter = cx.t.group.borrow().coredump_filter;
+    let mut regions = mm.borrow().dump_regions(filter);
     let mut page = vec![0u8; PAGE_SIZE as usize];
-    for r in regions.iter().filter(|r| r.size > 0) {
-        // Untouched pages of anonymous and shared memory are left as holes (Linux's FOLL_DUMP)
-        let resident = if r.sparse {
-            mm.borrow().residency(r.start, r.size).ok()
-        } else {
-            None
-        };
-        let mut addr = r.start;
-        while addr < r.start + r.size && !w.stopped {
-            let index = ((addr - r.start) / PAGE_SIZE) as usize;
-            let touched = resident
-                .as_ref()
-                .is_none_or(|v| v.get(index) == Some(&true));
-            if touched && mm.borrow().dump_page(addr, &mut page) {
-                w.put(cx, offset, &page);
-            }
-            addr += PAGE_SIZE;
-            offset += PAGE_SIZE;
+    for r in regions.iter_mut().filter(|r| r.check_elf) {
+        if !read_page(cx, r.start, &mut page) || !page.starts_with(b"\x7fELF") {
+            r.size = 0;
         }
     }
-    // When it ends in a hole, the file still needs its full length
-    if w.end < offset {
-        w.put(cx, offset - 1, &[0]);
+    let notes = notes(cx, &mm.borrow(), &regions, threads, sig, info);
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_CORE as usize].0;
+    let (header, data_offset) = elf_header(&regions, &notes);
+    let old_cred = need_suid_safe.then(|| {
+        let old = cx.cred();
+        let mut root_fs = old.clone();
+        root_fs.fsuid = 0;
+        cx.set_cred(root_fs);
+        old
+    });
+    let res = match create_core_file(cx, name, need_suid_safe) {
+        Ok(file) => {
+            let mut w = CoreWriter {
+                file,
+                limit,
+                written: 0,
+                end: 0,
+                stopped: false,
+            };
+            w.put(cx, 0, &header);
+            let mut offset = data_offset;
+            for r in regions.iter().filter(|r| r.size > 0) {
+                // Untouched pages of anonymous and shared memory are left as holes (Linux's
+                // FOLL_DUMP)
+                let resident = if r.sparse {
+                    mm.borrow().residency(r.start, r.size).ok()
+                } else {
+                    None
+                };
+                let mut addr = r.start;
+                while addr < r.start + r.size && !w.stopped {
+                    let index = ((addr - r.start) / PAGE_SIZE) as usize;
+                    let touched = resident
+                        .as_ref()
+                        .is_none_or(|v| v.get(index) == Some(&true));
+                    if touched && read_page(cx, addr, &mut page) {
+                        w.put(cx, offset, &page);
+                    }
+                    addr += PAGE_SIZE;
+                    offset += PAGE_SIZE;
+                }
+            }
+            // When it ends in a hole, the file still needs its full length
+            if w.end < offset {
+                w.put(cx, offset - 1, &[0]);
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    if let Some(old) = old_cred {
+        cx.set_cred(old);
     }
-    Ok(())
+    res
+}
+
+/// Creates the core file with fixed mode `0600` (`O_EXCL | O_NOFOLLOW`), ignoring the process's
+/// `umask` without mutating any `FsContext` shared via `CLONE_FS`.
+fn create_core_file(cx: &mut Cx<'_>, name: &[u8], need_suid_safe: bool) -> Result<FileRef, Errno> {
+    if !need_suid_safe {
+        let _ = crate::syscall::unlink_path(cx, name);
+    }
+    let old_fs = cx.t.fs.clone();
+    let core_fs = {
+        let f = old_fs.borrow();
+        Rc::new(RefCell::new(FsContext {
+            root: f.root.clone(),
+            cwd: f.cwd.clone(),
+            umask: 0,
+            mnt_ns: f.mnt_ns.clone(),
+        }))
+    };
+    cx.set_fs(core_fs);
+    let created = crate::syscall::create_exclusive(cx, name, 0o600);
+    cx.set_fs(old_fs);
+    created
+}
+
+fn read_page(cx: &mut Cx<'_>, addr: u64, page: &mut [u8]) -> bool {
+    if cx.mm().has_fills() && crate::syscall::fill_for_dump(cx, addr).is_err() {
+        return false;
+    }
+    cx.mm().dump_page(addr, page)
 }
 
 /// Writes to the core file. As with Linux's `dump_emit`, writing stops once the bytes written
@@ -542,6 +622,7 @@ mod tests {
                 end: 0x12000,
                 prot: prot::READ | prot::EXEC,
                 size: 0x1000,
+                check_elf: false,
                 sparse: false,
                 file: Some((0, std::rc::Rc::from(&b"/bin/x"[..]))),
             },
@@ -550,6 +631,7 @@ mod tests {
                 end: 0x23000,
                 prot: prot::READ | prot::WRITE,
                 size: 0x3000,
+                check_elf: false,
                 sparse: true,
                 file: None,
             },

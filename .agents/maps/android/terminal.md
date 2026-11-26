@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream gesture ownership with retained Material controls and continuous terminal backgrounds)
+> Maintained: 2026-11-26 (targeted verification of upstream's deferred OSC 52 reads, clipboard dialog lifecycle and search-bar extra-key routing alongside the retained Material controls and continuous terminal backgrounds; upstream's file-import integration is not carried)
 
 ## Responsibilities
 
@@ -59,8 +59,9 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   `startViewer`; keeps the activity and its toast callback, with no service or session state.
 - `SearchBarView` — a 48 dp search bar with a tonal `EditText` (without suggestions, IME action
   Search), the count ("selected/total") and 48 dp vector previous/next/close controls; it
-  shows the count it is given (`setCount`) and sends text changes, steps and closing to a
-  `Target` (`search`, `step`, `close`).
+  shows the count it is given (`setCount`), exposes `hasInputFocus`, handles extra-key actions
+  (`extraKey`, `extraText`, backed by pure `SearchExtraKeys`) while focused, and sends text
+  changes, steps and closing to a `Target` (`search`, `step`, `close`).
 - `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
@@ -142,14 +143,13 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   and are consumed, including over the keys. The whole content column is hidden
   from accessibility while the list is open, and restored when it closes.
 
-- The list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
+- Ctrl+Shift+W, the list’s close buttons, `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
   waits at its prompt as the prompt marks tell, `VtSession.busy`, android/vt's Shell integration),
   else after a confirmation dialog ("Close this tab?" for one tab, else "Close N tabs?", counting
   all of them); a shell without prompt marks always counts as busy. Several tabs are closed with the
   current one last, so no other tab is shown (and its shell started) on the way, and closing all
-  ends like closing the last tab. Ctrl+Shift+W closes the current tab without asking, even while its
-  shell runs, and in an ended tab any input with a line break (Enter) closes it.
+  ends like closing the last tab. In an ended tab any input with a line break (Enter) closes it.
 - The close dialog's button closes only the tabs still open, and dismissing it or the clipboard
   question gives the terminal the focus.
 - Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
@@ -203,16 +203,19 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ### Extra-key integration
 
-- `android/keys` supplies `ExtraKeysView` and modifier state. `MainActivity.Keys` closes the
-  tab list and forwards keys/text to `VtView`; `Host` exposes `ctrl`, `alt`, `shift` and
-  `modifiersUsed`. Search focus does not redirect extra keys into the search field.
+- `android/keys` supplies `ExtraKeysView` and modifier state. `MainActivity.Keys` checks
+  `Privacy.locked`, closes the tab list and routes via `SearchExtraKeys`: while `SearchBarView`
+  has input focus (`hasInputFocus`), extra keys go to `SearchBarView.extraKey`/`extraText` (and
+  consume one-shot modifiers) so nothing leaks to the terminal; otherwise they go to `VtView`.
+  Opening or closing search cancels active extra-key repeats (`ExtraKeysView.cancelPresses`).
+  `Host` exposes `ctrl`, `alt`, `shift` and `modifiersUsed`.
 - `TerminalLayout` owns insets and IME translation; the key view chooses its own row layout.
 
 ### Hardware-keyboard shortcuts
 
 - Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
   matching key release, when the key event (from a hardware keyboard, or an IME sending key events)
-  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the current one,
+  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W asks to close a busy tab and closes an idle one immediately,
   Ctrl+Shift+F opens the search bar (these once per press; repeats are swallowed), Ctrl+Tab and
   Ctrl+Shift+Tab show the next and the previous one, going round and repeating while held (and
   swallowed when there is nothing to switch to), and Ctrl+Shift+↑ and ↓ scroll to the previous and
@@ -253,8 +256,11 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   key while searching, or the same one again when the activity comes back, see Binding and choosing a tab) or
   a restart closes it too, as a search belongs to the tab it was opened in.
 - Tapping the terminal (or pressing a mouse on it) while the bar is open gives the keyboard back to
-  the terminal and leaves the bar and its marks; the extra keys always go to the terminal, the
-  bar's text focused or not.
+  the terminal and leaves the bar and its marks, at which point extra keys resume targeting the
+  terminal. While the search bar has focus, extra keys act on it instead (Esc closes, `↑`/`↓` step
+  matches, `←`/`→`/Home/End move or Shift-extend the selection, symbols replace any selection or
+  insert at the cursor, and Ctrl/Alt combos or terminal-only keys like Tab/F1–F12/PgUp/PgDn are
+  consumed without reaching the terminal).
 - The search bar's `↑`, `↓` and `×` click listeners request the same `KEYBOARD_TAP` feedback
   as the tab bar and extra keys; Enter, Escape and the IME's Search action bypass those listeners.
 
@@ -286,11 +292,15 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
   hint names the localized "Allow other apps to access files" setting in all five locales,
   matching Settings' consent dialog.
   The lookup result returns on the UI thread and is ignored if its activity is destroyed or locked.
-- A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
-  the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
-  text and, when there is some, asks ("Let the program read the clipboard?", up to 300 characters
-  shown, Allow and Deny), one question at a time, whose answer covers every read queued meanwhile;
-  an empty clipboard, or one without text, is answered at once (`VtSession.answerClipboardRead`).
+- The service offers a tab's first OSC 52 read to the activity. Pending reads belong to the
+  session (`android/vt`). The activity retries after showing the tab, resuming, gaining window
+  focus, unlocking privacy or dismissing a clipboard question. Only the current service tab in
+  a resumed, focused, unlocked activity may read the first clipboard item's text.
+- Empty or non-text content receives an empty answer immediately. For text, one `showPrivate`
+  dialog previews up to 300 characters and asks Allow or Deny for that session's batch.
+  Returning text requires Allow while resumed and unlocked. Switching tabs, stopping, or
+  pausing with privacy mode enabled denies an open question. A deferred dismissal callback
+  checks the dialog's identity before answering.
 
 ## Dependencies (inbound / outbound)
 
@@ -364,7 +374,7 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 - No activity handles `density`: every view is sized in dp when built. Settings and the license
   pages also recreate for dark mode (android/settings and android/licenses).
 - The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
-  including delayed IME/paste callbacks; pausing cancels activity toasts and denies the open clipboard
+  including delayed IME/paste callbacks; pausing with privacy mode enabled cancels activity toasts and denies the open clipboard
   question. Dialogs use `showPrivate`.
 - An activity the system recreates (a configuration change it does not handle, or after killing
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
@@ -379,16 +389,10 @@ assets are `android/build`; authentication is `android/privacy`, notice UI `andr
 
 ## Open questions
 
-- Should Ctrl+Shift+W ask before closing a running shell, as `×` does, and should "Close other
-  tabs" with one other tab name it rather than ask "Close this tab?"?
-- Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
-  empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
-  every time)?
-- Should a clipboard question left open when the activity is destroyed be answered then? Until
-  the tab's queued reads are answered it asks for no later read.
+- Should "Close other tabs" name the tab when only one other tab is open?
+- Should the clipboard question offer to remember the answer for the tab (Ghostty asks every time)?
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
-  rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
-  while it has the keyboard, rather than on the terminal?
+  rather than wait for a step, as Ghostty does?
 
 ## To verify
 

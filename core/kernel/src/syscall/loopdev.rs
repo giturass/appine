@@ -12,7 +12,9 @@
 //! Appine has no disk filesystems. What it is for: LTP acquires its test device this way (and runs
 //! on tmpfs over it), `losetup` works, and tools such as mkfs can write images through it.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use super::{IO_CHUNK, SysResult, get, put};
@@ -70,6 +72,10 @@ const BLKPG: u32 = 0x1269;
 const BLKBSZGET: u32 = 0x8008_1270;
 const BLKBSZSET: u32 = 0x4008_1271;
 const BLKGETSIZE64: u32 = 0x8008_1272;
+const BLKTRACESETUP: u32 = 0xc048_1273;
+const BLKTRACESTART: u32 = 0x1274;
+const BLKTRACESTOP: u32 = 0x1275;
+const BLKTRACETEARDOWN: u32 = 0x1276;
 const BLKDISCARD: u32 = 0x1277;
 const BLKIOMIN: u32 = 0x1278;
 const BLKIOOPT: u32 = 0x1279;
@@ -80,6 +86,19 @@ const BLKSECDISCARD: u32 = 0x127d;
 const BLKROTATIONAL: u32 = 0x127e;
 const BLKZEROOUT: u32 = 0x127f;
 const BLKGETDISKSEQ: u32 = 0x8008_1280;
+const BLKREPORTZONE: u32 = 0xc010_1282;
+const BLKRESETZONE: u32 = 0x4010_1283;
+const BLKGETZONESZ: u32 = 0x8004_1284;
+const BLKGETNRZONES: u32 = 0x8004_1285;
+const BLKOPENZONE: u32 = 0x4010_1286;
+const BLKCLOSEZONE: u32 = 0x4010_1287;
+const BLKFINISHZONE: u32 = 0x4010_1288;
+const IOC_PR_REGISTER: u32 = 0x4018_70c8;
+const IOC_PR_RESERVE: u32 = 0x4010_70c9;
+const IOC_PR_RELEASE: u32 = 0x4010_70ca;
+const IOC_PR_PREEMPT: u32 = 0x4018_70cb;
+const IOC_PR_PREEMPT_ABORT: u32 = 0x4018_70cc;
+const IOC_PR_CLEAR: u32 = 0x4010_70cd;
 
 /// The page size, the largest logical block size.
 const PAGE: u32 = 4096;
@@ -256,6 +275,48 @@ pub(super) fn flush_target(dev: &LoopRef) -> Option<FileRef> {
     l.backing
         .clone()
         .filter(|_| l.flags & LO_FLAGS_READ_ONLY == 0)
+}
+
+/// Resolves a `sync_file_range` range on a loop device (possibly stacked on another loop device)
+/// to a backing host regular file, clamping to the device size. Returns `None` when the device is
+/// unbound, read-only, or the offset lies at or past the end.
+pub(super) fn sync_range(dev: &LoopRef, offset: i64, len: i64) -> Option<(FileRef, i32, i64, i64)> {
+    let mut cur = dev.clone();
+    let mut off = u64::try_from(offset).ok()?;
+    let mut rem = u64::try_from(len).ok()?;
+    loop {
+        let (backing, base, size) = {
+            let l = cur.borrow();
+            if l.flags & LO_FLAGS_READ_ONLY != 0 || off >= l.size {
+                return None;
+            }
+            (l.backing.clone()?, l.offset, l.size)
+        };
+        let avail = size - off;
+        let span = if rem == 0 { avail } else { rem.min(avail) };
+        if span == 0 {
+            return None;
+        }
+        let next_off = base.checked_add(off)?;
+        let raw = match &backing.borrow().kind {
+            FileKind::Regular { file, .. } => {
+                if next_off.checked_add(span)? > i64::MAX as u64 {
+                    return None;
+                }
+                file.as_raw_fd()
+            }
+            FileKind::Device {
+                block: Some(open), ..
+            } => {
+                cur = open.dev.clone();
+                off = next_off;
+                rem = span;
+                continue;
+            }
+            _ => return None,
+        };
+        return Some((backing, raw, next_off as i64, span as i64));
+    }
 }
 
 // ---- ioctl ----
@@ -453,8 +514,18 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, file: &FileRef, request: u32, arg: u64) -> 
             l.block_size = size;
             Ok(0)
         }
-        // Everything else, including the zone, tracing and persistent-reservation ioctls of the
-        // block layer, which Linux answers differently
+        // Non-zoned block devices report 0 zone size / count (Linux 6.1's blkdev_common_ioctl)
+        // and reject zone report / management requests with ENOTTY.
+        BLKGETZONESZ | BLKGETNRZONES => done(put(cx, arg, 0u32.to_le_bytes())),
+        BLKREPORTZONE | BLKRESETZONE | BLKOPENZONE | BLKCLOSEZONE | BLKFINISHZONE => {
+            Err(Errno::ENOTTY)
+        }
+        // Block tracing is not configured (Linux 6.1's !CONFIG_BLK_DEV_IO_TRACE stub).
+        BLKTRACESETUP | BLKTRACESTART | BLKTRACESTOP | BLKTRACETEARDOWN => Err(Errno::ENOTTY),
+        // Loop devices expose no persistent-reservation ops (pr_ops == NULL -> EOPNOTSUPP).
+        IOC_PR_REGISTER | IOC_PR_RESERVE | IOC_PR_RELEASE | IOC_PR_PREEMPT
+        | IOC_PR_PREEMPT_ABORT | IOC_PR_CLEAR => Err(Errno::EOPNOTSUPP),
+        // Any other request reaches lo_ioctl's default arm, which returns EINVAL.
         _ => Err(Errno::EINVAL),
     }
 }
@@ -666,9 +737,10 @@ pub(super) fn control_ioctl(cx: &mut Cx<'_>, request: u32, arg: u64) -> SysResul
 /// The loop devices of a kernel, by number.
 pub(crate) struct Loops {
     devices: BTreeMap<u32, LoopRef>,
-    /// The last disk sequence number handed out (Linux's global `diskseq`, which also advances
-    /// each time a device is bound).
-    seq: u64,
+    /// The last disk sequence number handed out (Linux's global `diskseq`, which advances when a
+    /// device is created, bound or unbound). Shared with each [`Loop`] so autoclear unbinds in
+    /// [`LoopOpen::drop`] can advance it without a kernel reference.
+    seq: Rc<Cell<u64>>,
 }
 
 impl Loops {
@@ -680,11 +752,22 @@ impl Loops {
             .collect()
     }
 
+    /// Non-panicking [`Loops::backing_files`] for mount-usage and collection scans.
+    pub fn try_backing_files(&self) -> Option<Vec<FileRef>> {
+        let mut out = Vec::new();
+        for l in self.devices.values() {
+            if let Some(f) = &l.try_borrow().ok()?.backing {
+                out.push(f.clone());
+            }
+        }
+        Some(out)
+    }
+
     /// The devices that exist from boot, `loop0` to `loop7`.
     pub(crate) fn new() -> Loops {
         let mut loops = Loops {
             devices: BTreeMap::new(),
-            seq: 0,
+            seq: Rc::new(Cell::new(0)),
         };
         for n in 0..LOOP_MIN_COUNT {
             loops.insert(n);
@@ -694,14 +777,13 @@ impl Loops {
 
     fn insert(&mut self, n: u32) -> LoopRef {
         let seq = self.next_seq();
-        let dev = Rc::new(RefCell::new(Loop::new(n, seq)));
+        let dev = Rc::new(RefCell::new(Loop::new(n, seq, self.seq.clone())));
         self.devices.insert(n, dev.clone());
         dev
     }
 
-    fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
+    fn next_seq(&self) -> u64 {
+        bump_seq(&self.seq)
     }
 
     /// The device numbers, in order (the directories of `/sys/block`).
@@ -845,14 +927,22 @@ pub(crate) struct Loop {
     rotational: bool,
     /// Disk sequence number (`BLKGETDISKSEQ`).
     seq: u64,
+    /// Shared kernel diskseq counter (see [`Loops::seq`]).
+    seq_gen: Rc<Cell<u64>>,
     /// Open files of the device (`disk_openers`).
     opens: u32,
     /// An `O_EXCL` open holds the device.
     claimed: bool,
 }
 
+fn bump_seq(counter: &Cell<u64>) -> u64 {
+    let next = counter.get() + 1;
+    counter.set(next);
+    next
+}
+
 impl Loop {
-    fn new(number: u32, seq: u64) -> Loop {
+    fn new(number: u32, seq: u64, seq_gen: Rc<Cell<u64>>) -> Loop {
         Loop {
             number,
             backing: None,
@@ -868,6 +958,7 @@ impl Loop {
             read_ahead: READ_AHEAD,
             rotational: true,
             seq,
+            seq_gen,
             opens: 0,
             claimed: false,
         }
@@ -879,7 +970,7 @@ impl Loop {
     }
 
     /// Unbinds the device (`__loop_clr_fd`) and returns the backing file, to be dropped once the
-    /// device is no longer borrowed.
+    /// device is no longer borrowed. Advances `diskseq` (`disk_force_media_change`).
     fn clear(&mut self) -> Option<FileRef> {
         self.offset = 0;
         self.sizelimit = 0;
@@ -887,6 +978,7 @@ impl Loop {
         self.flags = 0;
         self.file_name = [0; LO_NAME_SIZE];
         self.block_size = 512;
+        self.seq = bump_seq(&self.seq_gen);
         self.backing.take()
     }
 }

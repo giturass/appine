@@ -3,9 +3,9 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/hal.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
+> Verified: 2026-11-23 (full verification: 10 claims checked by 2 independent verifiers across `lib.rs` and `net.rs` — 8 confirmed and 2 partial, both corrected below; no bugs found)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `get_filter` for `SO_GET_FILTER`, whose optlen counts instructions)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-page private copy detection and pagemap availability)
 
 ## Responsibilities
 
@@ -13,8 +13,8 @@
 layer. It wraps the host syscalls the kernel needs, with one implementation for Android (bionic)
 and Linux (glibc), the only hosts it builds for, returning raw host errnos:
 
-- memory: anonymous and reserved mappings, file mappings, discard and hole punching, msync,
-  residency queries;
+- memory: anonymous and reserved mappings, file mappings, discard, hole punching and non-destructive
+  madvise hints, msync, residency queries;
 - files and storage: `*at` calls on the object directory, positional and plain I/O, `sendfile`
   copies, `fallocate`, the fsync family, `flock`, `ioctl`, `statvfs`, fd limits, randomness;
 - host statistics: process memory usage, host meminfo, CPU set and sysfs, per-thread CPU time and
@@ -54,7 +54,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 ## Public entry points
 
 - Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `remove`,
-  `map_file`,
+  `advise`, `map_file`,
   `map_file_read_only`, `map_file_over`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
   `touched_pages`, `has_private_pages`, `cachestat`.
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`,
@@ -92,13 +92,14 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   only shared read-only ones are read-only), rounding the offset down to the host page (16K on some
   devices) and the length up; `map_file_read_only` serves shared read-only mappings;
   `map_file_over` maps a file shared over an existing host range with `MAP_FIXED`, replacing the
-  old mapping in one step (the kernel moves a shared file mapping to another object this way).
-- `discard` is `MADV_DONTNEED` and `remove` `MADV_REMOVE` (the host punches the hole in the file or
-  shared memory behind a writable shared mapping), both on host-page-aligned ranges; residency
-  comes from `mincore` (`resident_pages`, `page_residency`)
+  old mapping in one step. Store shared mappings now retain a stable backing object.
+- `discard` is `MADV_DONTNEED`, `remove` is `MADV_REMOVE` (the host punches the hole in the file or
+  shared memory behind a writable shared mapping), and `advise` forwards non-destructive `madvise`
+  hints (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`), all on host-page-aligned
+  ranges; residency comes from `mincore` (`resident_pages`, `page_residency`)
   or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched;
-  `has_private_pages`, whether a private file mapping has a page present without the file bit or
-  swapped, a copy written since it was mapped), all in 4K units (pages within one 16K host page
+  `private_pages` and `has_private_pages`, per-page and aggregate checks for present non-file or
+  swapped pages; `pagemap_readable` selects guest write tracking when entries are unavailable), all in 4K units (pages within one 16K host page
   share a result, so `resident_pages` may count 4K pages just outside the range); `cachestat` maps
   the file in chunks to count cached pages.
 - `memory_usage` reads `/proc/self/status`; `host_meminfo` copies host `/proc/meminfo` (falling
@@ -155,8 +156,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 - Sockets are created `SOCK_NONBLOCK|SOCK_CLOEXEC` (`accept4` likewise); addresses, options and
   control bytes pass through raw (shared arm64 Linux ABI; `sockaddr` writes the Linux layout);
-  `sendmsg` always adds `MSG_NOSIGNAL`; `recvmsg` clamps the address to 128 bytes and returns the
-  full length with `MSG_TRUNC`; `getsockopt` sizes its buffer by optlen in bytes, so options whose
+  `sendmsg` always adds `MSG_NOSIGNAL`; `recvmsg` clamps the address to 128 bytes and forwards
+  caller `flags` unchanged (returning the full datagram length when the caller passes `MSG_TRUNC`);
+  `getsockopt` sizes its buffer by optlen in bytes, so options whose
   optlen means something else need their own call: `get_filter` sizes `SO_GET_FILTER`'s buffer by
   its count of 8-byte instructions; `accept` and `sockname` do not clamp, which is safe because only
   `AF_INET`/`AF_INET6` host sockets exist (AF_UNIX and netlink never reach the hal) and Linux caps
@@ -164,8 +166,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `interfaces()` walks `getifaddrs` (one entry per name, index from `if_nametoindex`, flags from
   the first entry, MTU fixed at 65536 for loopback and 1500 otherwise, MAC from `AF_PACKET` entries,
   IPv4/IPv6 addresses with prefix lengths; no broadcast or scope), sorted by index.
-- `routes()` parses host `/proc/net/route` and `/proc/net/ipv6_route` (`None` when unreadable, as on
-  Android), dropping reject/anycast/cache/local and multicast routes; `source_for(dst)` connects a
+- `routes()` parses host `/proc/net/route` (returning `None` when it is unreadable, as on Android)
+  and optionally `/proc/net/ipv6_route` (omitting IPv6 routes if unreadable), filtering `RTF_REJECT`
+  on IPv4 and `RTF_REJECT`/anycast/cache/local/multicast on IPv6; `source_for(dst)` connects a
   UDP socket and reads its local address; `tx_queue_len` reads sysfs.
 - `dns_query`: on Android `android_res_nsend` on the default network (API 29), up to 30 s,
   then cancel and `ETIMEDOUT`; the answer is returned whatever its rcode. The first query and the

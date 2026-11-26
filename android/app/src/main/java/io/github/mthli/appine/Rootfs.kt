@@ -20,17 +20,18 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.thread
 import kotlin.concurrent.write
 
 /**
  * Importing and configuring the rootfs (the android/setup map): the first run imports the Alpine in
  * the APK, and Settings can switch to Debian (downloaded only when chosen; the version and sha256
  * are fixed here, and as with `scripts/fetch-rootfs` only a tarball whose digest matches is
- * accepted). After the import the configuration files are written, mirror speeds are probed in the
- * background, and the fastest one is written into the package manager's sources, once: from then on
- * the sources are the user's to edit.
+ * accepted). During import, mirror probes run alongside local setup. The importer writes package
+ * sources using the best available result before publishing the store for the guest to edit.
  */
 internal object Rootfs {
     private const val TAG = "Rootfs"
@@ -98,7 +99,7 @@ internal object Rootfs {
     /** An account in `/etc/passwd`. */
     data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
-    /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([dirsChanged]). */
+    /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([LoginRules]). */
     private const val REFRESH_RULES = "--refresh-rules"
 
     /** The most bytes and time a probe downloads. */
@@ -125,6 +126,9 @@ internal object Rootfs {
      * the store holds the write lock.
      */
     val access = ReentrantReadWriteLock()
+    /** Read and advanced under access so a staged import cannot publish into a replacement store. */
+    var generation = 0L
+        private set
 
     fun store(context: Context): File = File(context.filesDir, "rootfs")
 
@@ -166,6 +170,7 @@ internal object Rootfs {
         distro: Distro,
         progress: (Long, Long) -> Unit = { _, _ -> },
         store: File = store(context),
+        startMirrorProbes: (Distro) -> Map<String, Future<Double?>> = { emptyMap() },
     ) {
         if (isReady(store)) return
         // The next launch resumes this distro if the app is killed before the store is in place,
@@ -182,8 +187,15 @@ internal object Rootfs {
         } else {
             download(context, distro, progress)
         }
-        Native.importRootfs(tmp.path, tarball.path)
-        configure(context, tmp.path, distro)
+        val probes = startMirrorProbes(distro)
+        try {
+            Native.importRootfs(tmp.path, tarball.path)
+            configure(context, tmp.path, distro)
+            val (path, content) = sources(distro, selectMirror(distro, probes))
+            write(tmp.path, path, content)
+        } finally {
+            probes.values.forEach { it.cancel(true) }
+        }
         // Sync before the rename: otherwise after a power loss the store could be in place while
         // its files are empty; after the rename, sync the directory too, so what is later written
         // into the store does not fall back into rootfs.tmp on a power loss and get deleted as an
@@ -194,12 +206,20 @@ internal object Rootfs {
         tarball.delete()
     }
 
-    private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+    fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+
+    /**
+     * Deletes any cached tarball (and partial download) for [distro]: called when abandoning a
+     * failed import and falling back to Alpine, so the downloaded tarball does not stay in cache.
+     */
+    fun deleteTarball(context: Context, distro: Distro) {
+        val file = tarball(context, distro)
+        file.delete()
+        File(file.path + ".part").delete()
+    }
 
     @Throws(IOException::class)
     private fun configure(context: Context, store: String, distro: Distro) {
-        val (sources, content) = sources(distro, distro.mirrors[0])
-        write(store, sources, content)
         write(store, "/etc/hostname", "localhost\n")
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
@@ -323,22 +343,101 @@ internal object Rootfs {
         write(store, "/etc/profile.d/appine.ashrc", asset(context, "ashrc.sh"))
         write(store, "/etc/profile.d/appine.bashrc", asset(context, "bashrc.sh"))
         write(store, "/etc/profile.d/appine.zshrc", asset(context, "zshrc.sh"))
+        write(store, "/etc/appine/zsh/.zshenv", ZSHENV)
         if (distro == Distro.ALPINE) write(store, "/etc/bash/appine.sh", BASH_HOOK)
         write(store, "/etc/profile.d/appine.sh", asset(context, "profile.sh"))
+        ensureShellRcHooks(store, distro)
     }
 
     /**
      * `/etc/bash/appine.sh` on Alpine, whose `/etc/bash/bashrc` reads every `.sh` file in
      * `/etc/bash` in every interactive bash (a login one too, through
-     * `/etc/profile.d/00-bashrc.sh`): bash's prompt
-     * marks for a nested bash, which reads no profile. Debian's `/etc/bash.bashrc` reads no such
-     * directory, so a nested bash there has no marks.
+     * `/etc/profile.d/00-bashrc.sh`): bash's prompt marks for a nested bash, which reads no
+     * profile. On Debian, [ensureShellRcHooks] appends [DEBIAN_BASH_HOOK] to `/etc/bash.bashrc`
+     * once per store.
      */
     private const val BASH_HOOK = """# Written by Appine beside /etc/profile.d/appine.sh, and replaced together with it: Alpine's
 # /etc/bash/bashrc reads this file in every interactive bash, so a nested bash (bash, su without
 # -l) marks its prompts too.
 if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 """
+
+    private const val DEBIAN_BASH_HOOK = """# Added by Appine so nested interactive bash shells keep prompt marks and titles.
+if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
+"""
+
+    private const val ZSH_RC_HOOK = """# Added by Appine so interactive zsh shells keep prompt marks and titles.
+if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/profile.d/appine.zshrc; fi
+"""
+
+    /**
+     * `/etc/appine/zsh/.zshenv`, pointed to via `ZDOTDIR` by `login.sh` for login `zsh` sessions.
+     * Unsets `ZDOTDIR` immediately so user startup files and child processes never see it, sources
+     * `~/.zshenv`, and on Debian (where `/etc/zsh/zprofile` does not read `/etc/profile`) sources
+     * `/etc/profile.d/appine.sh` in sh emulation for interactive login shells.
+     */
+    private const val ZSHENV = """# Written by Appine beside /etc/profile.d/appine.sh, and replaced together with it.
+'builtin' 'unset' 'ZDOTDIR'
+{
+    'builtin' 'typeset' __appine_zshenv="${'$'}{HOME}/.zshenv"
+    [[ ! -r "${'$'}__appine_zshenv" ]] || 'builtin' 'source' '--' "${'$'}__appine_zshenv"
+} always {
+    if [[ -o 'interactive' ]]; then
+        if [[ -o 'login' ]]; then
+            if [[ ! -f /etc/alpine-release ]] && [[ -r /etc/profile.d/appine.sh ]]; then
+                'builtin' 'emulate' 'sh' '-c' '. /etc/profile.d/appine.sh'
+            fi
+        elif [[ -r /etc/profile.d/appine.zshrc ]]; then
+            'builtin' 'source' '--' /etc/profile.d/appine.zshrc
+        fi
+    fi
+    'builtin' 'unset' '__appine_zshenv'
+}
+"""
+
+    private const val DEBIAN_BASHRC_HOOK_DONE = "/var/lib/appine/debian-bashrc-hook-done"
+    private const val ZSH_RC_HOOK_DONE = "/var/lib/appine/zsh-rc-hook-done"
+
+    @Throws(IOException::class)
+    private fun appendRcHook(
+        store: String,
+        path: String,
+        doneMarker: String,
+        needle: String,
+        hook: String,
+    ): Boolean {
+        val current = runCatching { Native.readFile(store, path) }.getOrNull() ?: return false
+        val text = current.decodeToString()
+        if (!text.contains(needle)) {
+            val sep = if (text.isEmpty() || text.endsWith("\n")) "\n" else "\n\n"
+            write(store, path, text + sep + hook)
+        }
+        write(store, doneMarker, "")
+        return true
+    }
+
+    /**
+     * Installs interactive rc hooks once per store when the shell's own system rc file is present,
+     * so nested non-login bash (Debian) and zsh (Alpine/Debian, once zsh is installed) receive
+     * prompt marks and titles without conflicting with package installation or re-adding hooks a
+     * user removed.
+     */
+    @Throws(IOException::class)
+    private fun ensureShellRcHooks(store: String, distro: Distro) {
+        if (distro == Distro.DEBIAN && Native.readFile(store, DEBIAN_BASHRC_HOOK_DONE) == null) {
+            appendRcHook(store, "/etc/bash.bashrc", DEBIAN_BASHRC_HOOK_DONE, "/etc/profile.d/appine.bashrc", DEBIAN_BASH_HOOK)
+        }
+        if (Native.readFile(store, ZSH_RC_HOOK_DONE) == null) {
+            val appended = appendRcHook(store, "/etc/zsh/zshrc", ZSH_RC_HOOK_DONE, "/etc/profile.d/appine.zshrc", ZSH_RC_HOOK)
+            if (!appended &&
+                runCatching { Native.readFile(store, "/etc/zsh/zprofile") }.getOrNull() != null &&
+                !exists(store, "/etc/zsh/zshrc")
+            ) {
+                write(store, "/etc/zsh/zshrc", ZSH_RC_HOOK, overwrite = false)
+                write(store, ZSH_RC_HOOK_DONE, "")
+            }
+        }
+    }
 
     private const val BASH_STARTUP_DONE = "/var/lib/appine/bash-startup-done"
 
@@ -457,38 +556,23 @@ esac
         }
     }
 
-    /**
-     * Probes the mirrors of [distro] concurrently and puts the fastest into the package manager's
-     * sources ([useMirror]); when every probe fails, nothing changes. Run once, right after an
-     * import. Blocks for a few seconds; call it on a background thread. Debian's mirrors are
-     * written as host names only, and probed with https.
-     */
-    fun chooseMirror(context: Context, distro: Distro) {
-        val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
-        val speeds = distro.mirrors.zip(probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" }))
-        val best = speeds.filter { it.second != null }.maxByOrNull { it.second!! }?.first ?: return
-        Log.i(TAG, "mirror speeds: $speeds, using $best")
-        runCatching { useMirror(context, distro, best) }
-            .onSuccess { if (!it) Log.i(TAG, "the package sources are not as imported, leaving them alone") }
-            .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+    /** Only completed measurements count. Distro order breaks ties and puts the official fallback first. */
+    private fun selectMirror(distro: Distro, probes: Map<String, Future<Double?>>): String {
+        val speeds = probes.filterValues { it.isDone }.mapValues { (_, result) ->
+            runCatching { result.get() }.getOrNull()
+        }
+        val mirror = distro.mirrors.maxBy { speeds[it] ?: -1.0 }
+        if (probes.isNotEmpty()) Log.i(TAG, "mirror speeds at import: $speeds, using $mirror")
+        return mirror
     }
 
-    /**
-     * Makes [mirror] the one in the package manager's sources of [distro], only while the sources
-     * file is still exactly what the import wrote ([configure], with the official mirror): once it
-     * was changed, by this or by the user, it is left alone, and false is returned. It can be
-     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
-     * caches are invalidated with it (the kernel/store map).
-     */
-    @Throws(IOException::class)
-    fun useMirror(context: Context, distro: Distro, mirror: String): Boolean {
-        val store = store(context).path
-        val official = distro.mirrors[0]
-        val (path, imported) = sources(distro, official)
-        val old = Native.readFile(store, path) ?: return false
-        if (String(old) != imported) return false
-        if (mirror != official) write(store, path, sources(distro, mirror).second)
-        return true
+    /** Starts throughput probes for an import. Debian lists host names and probes them over HTTPS. */
+    fun probeMirrors(distro: Distro): Map<String, Future<Double?>> {
+        val urls = distro.mirrors.map { mirror ->
+            val base = if (distro == Distro.ALPINE) mirror else "https://$mirror"
+            "$base/${distro.probe}"
+        }
+        return distro.mirrors.zip(startProbes(urls)).toMap()
     }
 
     /**
@@ -497,23 +581,24 @@ esac
      */
     private fun fastest(urls: List<String>): List<String> {
         if (urls.size < 2) return urls
-        val speeds = probeAll(urls)
+        val probes = startProbes(urls)
+        val speeds = try {
+            probes.map { runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull() }
+        } finally {
+            probes.forEach { it.cancel(true) }
+        }
         Log.i(TAG, "download speeds: ${urls.zip(speeds)}")
         return urls.indices.sortedByDescending { speeds[it] ?: -1.0 }.map { urls[it] }
     }
 
-    /**
-     * Probes [urls] concurrently and returns each one's speed (bytes per ms), null for failures.
-     * Blocks for a few seconds.
-     */
-    private fun probeAll(urls: List<String>): List<Double?> {
+    /** Submits one independent measurement per URL, in input order. */
+    private fun startProbes(urls: List<String>): List<Future<Double?>> {
         val pool = Executors.newFixedThreadPool(urls.size)
-        val results = urls.map { url -> pool.submit<Double?> { probe(url) } }
-        val speeds = results.map {
-            runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull()
+        try {
+            return urls.map { url -> pool.submit<Double?> { probe(url) } }
+        } finally {
+            pool.shutdown()
         }
-        pool.shutdownNow()
-        return speeds
     }
 
     /**
@@ -613,6 +698,22 @@ netns = "host"
         Native.writeFile(store, path, bytes, 493 /* 0755 */, overwrite)
     }
 
+    private const val DOAS_WHEEL_PATH = "/etc/doas.d/20-wheel.conf"
+    private const val OLD_DOAS_WHEEL_RULE = "permit persist :wheel"
+    private const val DOAS_WHEEL_RULE = "permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel"
+
+    /**
+     * Upgrades an unmodified Appine `/etc/doas.d/20-wheel.conf` on Alpine so `doas -s` preserves
+     * busybox ash's `ENV` hook without touching user-customized doas rules.
+     */
+    @Throws(IOException::class)
+    private fun ensureDoasEnv(store: String) {
+        val current = runCatching { Native.readFile(store, DOAS_WHEEL_PATH) }.getOrNull() ?: return
+        if (current.decodeToString().trimEnd('\n') == OLD_DOAS_WHEEL_RULE) {
+            write(store, DOAS_WHEEL_PATH, "$DOAS_WHEEL_RULE\n")
+        }
+    }
+
     /**
      * On Alpine, puts the doas package bundled with the app into the store
      * (`/var/cache/appine/doas.apk`): the login script installs it offline when a regular user
@@ -622,8 +723,10 @@ netns = "host"
     @Throws(IOException::class)
     fun ensureLoginTools(context: Context) {
         if (installed(context) != Distro.ALPINE) return
+        val store = store(context).path
         val data = context.assets.open("doas.apk").use { it.readBytes() }
-        write(store(context).path, "/var/cache/appine/doas.apk", data)
+        write(store, "/var/cache/appine/doas.apk", data)
+        ensureDoasEnv(store)
     }
 
     /**
@@ -663,22 +766,34 @@ netns = "host"
         "2085a60332217920354a7979b98becad8a114e413724c1180954e3424d7157c5",
         "921a9cbb766e8427950aa5ff7a55e253f7e62b3b25997fcad6410beabb62643c",
         "3257013eafeb90230ae0d6772e73d8af87be62f8d6f74460dd4189ea56271021",
+        "a8ab98eda14fd8438be521001373eb177b37c0d7229b288a2ae46298ff55b972",
+        "bc9b601ec28f299ce3277bdc9187660e756b2ad47d12fa8d29dd5bda96f632c1",
+        "2d5e818130b598104b81a5265e27d3e98b2459cfc109e2c77685e7725dc26860",
     )
 
     /**
      * Replaces the profile the app wrote into a previously imported store with the current one
      * ([writeProfile], with the files of ash's, bash's and zsh's marks), if it is an earlier version left
      * unchanged. A change to `ashrc.sh`, `bashrc.sh` or `zshrc.sh` alone reaches no existing store: change
-     * `profile.sh` with it.
+     * `profile.sh` with it. Also installs interactive rc hooks once per store when the shell's
+     * system rc file is present ([ensureShellRcHooks]).
      */
     @Throws(IOException::class)
-    fun updateProfile(context: Context) {
-        val store = store(context).path
+    fun updateProfile(
+        context: Context,
+        store: String = store(context).path,
+        distro: Distro = installed(context) ?: Distro.ALPINE,
+    ) {
+        if (distro == Distro.ALPINE) ensureDoasEnv(store)
         val path = "/etc/profile.d/appine.sh"
         val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
             hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
-        if (earlier) writeProfile(context, store, installed(context) ?: Distro.ALPINE)
+        if (earlier) {
+            writeProfile(context, store, distro)
+        } else {
+            ensureShellRcHooks(store, distro)
+        }
     }
 
     /**
@@ -828,17 +943,31 @@ netns = "host"
     }
 
     /**
-     * The guest changed the entries of [dirs] ([Native.takeChangedDirs], polled by the service):
-     * when `/etc` is among them (passwd, chpasswd and adduser replace `/etc/shadow`, addgroup and
-     * deluser `/etc/group`), the login's NOPASSWD rules are rewritten from the passwords and groups
-     * now, by `login.sh --refresh-rules` run as root on the running [machine], so a password set in
-     * a running session counts without a new tab. Returns the refresh's pid (it is not waited for:
-     * the guest's init reaps it), or -1 when nothing needed refreshing.
+     * Per-machine state, polled by the service worker. A guest waiting on the rules lock must
+     * not block the worker or shutdown. Only a completed refresh acknowledges its input sample.
      */
-    fun dirsChanged(context: Context, machine: Long, dirs: Array<String>): Int {
-        if ("/etc" !in dirs) return -1
-        val argv = ConsolePty.argv(ConsolePty.script(context), REFRESH_RULES)
-        return Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+    class LoginRules(private val machine: Long) {
+        @Volatile
+        private var appliedInputs: LongArray? = null
+        private var pendingRefresh: Thread? = null
+
+        fun poll(context: Context): Thread? {
+            if (pendingRefresh?.isAlive == true) return null
+            val inputs = Native.loginRuleInputs(machine)
+            if (inputs != null && inputs.contentEquals(appliedInputs)) return null
+            appliedInputs = null
+            val pid = try {
+                val argv = ConsolePty.argv(ConsolePty.script(context), REFRESH_RULES)
+                Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+            } catch (e: IOException) {
+                Log.w(TAG, "cannot start login rule refresh", e)
+                return null
+            }
+            pendingRefresh = thread(name = "appine-login-rules") {
+                if (Native.waitFor(machine, pid) == 0) appliedInputs = inputs
+            }
+            return pendingRefresh
+        }
     }
 
     /**
@@ -988,6 +1117,7 @@ netns = "host"
 
     /** Deletes the app's store (distro switch, rootfs reset). The kernel must be stopped first. */
     fun reset(context: Context) = access.write {
+        generation++
         File(context.filesDir, "rootfs.tmp").deleteRecursively()
         if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
     }

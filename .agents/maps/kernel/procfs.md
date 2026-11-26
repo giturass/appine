@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: split /proc/sys sysctls into kernel/sysctl and sysfs into kernel/sysfs)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: fdinfo permissions, namespace-link ownership, devpts root mode and per-thread stat start times)
 
 ## Responsibilities
 
@@ -31,8 +31,8 @@ contracts remain here.
 
 Outside the module: `/proc/sys` sysctls (`kernel/sysctl`); `/sys` (`kernel/sysfs`); the `Pseudo`
 trait, the walker, mounts and mountinfo order and magic-link resolution (`kernel/vfs`);
-open/read/write dispatch for pseudo nodes (`kernel/files`, whose `open_pseudo` and `refresh_pseudo`
-behaviour this map describes as procfs sees it); maps and `/proc/<pid>/mem` semantics
+open dispatch (`kernel/files`, `open_pseudo`) and read/write/lseek dispatch (`kernel/fileio`,
+`refresh_pseudo`) for pseudo nodes (whose behaviour this map describes as procfs sees it); maps and `/proc/<pid>/mem` semantics
 (`kernel/mm`, `kernel/ptrace`); smaps, pagemap and the Rss figures (`kernel/oom`); id maps,
 `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children`, state letters and
 the kernel-entry record behind `syscall` (`kernel/process`); `/proc/kmsg`, `/proc/version` and ABI
@@ -44,19 +44,22 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 - `PseudoNode` — every synthetic node: devpts (`PtsRoot(dev)`, `Pts(dev, n)`, `PtsPtmx(dev)`),
   procfs (`ProcRoot`, `Global`, `SelfLink`, `ThreadSelf`, `Static(path)` for `/proc/sysvipc` plus
-  `kernel/sysctl`'s `/proc/sys`, `Pid(pid, tid)`, `Entry(pid, tid, Entry)`, `Net`, `Fd`, `OpenFd`
+  `kernel/sysctl`'s `/proc/sys`, `Pid(ProcId, tid)`, `Entry(ProcId, tid, Entry)`, `Net`, `Fd(ProcId, tid, fd)`, `OpenFd`
   (the open file an fd link reaches when it is not in the store), `OpenExe` (a deleted program),
-  `FdInfo`, `Ns` (the magic link), `NsFile(kind, id)` (the nsfs file), plus `kernel/sysctl`'s
+  `FdInfo(ProcId, tid, fd)`, `Ns` (the magic link), `NsFile(kind, id)` (the nsfs file), plus `kernel/sysctl`'s
   `NetConf`/`NetSysctl`), `kernel/sysfs`'s `Sys*` variants, `Cgroup(id, name)` (an empty name is
-  the directory), and mqueue (`MqRoot`, `Mq`). Nodes are plain values, resolved again on every call.
+  the directory), and mqueue (`MqRoot`, `Mq`). Process-scoped variants carry `ProcId { pid, serial }`,
+  pinning each handle to one thread-group instance even if the pid is later reused; nodes remain plain
+  values resolved on each call.
 - Tables: `GLOBALS` (15 top-level files), `ENTRIES` (34 per-process names), `TASK_ENTRIES` (the 30
   allowed under `task/<tid>`), `NsKind::ALL` (10), `PROC_NET` (18), and the `sysvipc/` entries of
   `STATIC`.
 - `View` — a read-only view of the kernel for one reading thread (`tid`, `tgid`), taken under the
   BKL, with optional replacement credentials (`cred`, an opener's); implements `Pseudo`.
-  `Offline` serves an empty root before boot.
+  `Offline::Boot` serves empty synthetic roots for boot and host spawns.
+  `Offline::HostStat` reports synthetic child lookups as unavailable to host metadata samples.
 - `FileKind::Proc` — an open synthetic file: mount, node, snapshot `data`, `fresh` flag, a weak
-  address space for `mem`, the namespace reference of an nsfs file, the kernel-log reader for
+  address space for `mem`, `pagemap` and `environ`, the namespace reference of an nsfs file, the kernel-log reader for
   `/proc/kmsg`, the opener's credentials (`opener`, Linux's `f_cred`) and change state
   (`fd::ProcEvent`: a shared counter, what the file last reported and when its contents were
   made).
@@ -67,10 +70,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `Pseudo for View`: `lookup`, `missing`, `parent`, `name`, `kind`, `readlink`, `follow`,
   `follow_dentry`, `magic`, `protected_symlinks`, `searched`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unwritable_error`,
-  `open_unwritable`, `unreadable`, `pollable`, `write`, `written`, `read_pagemap`,
-  `read_mem`, `write_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `comm_str`,
-  `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED` belong to `kernel/sysctl`;
-  `CGROUP_POINT` belongs to `kernel/sysfs`.)
+  `open_unwritable`, `unreadable`, `pollable`, `poll_event`, `has_iter`, `write`, `read_pagemap`,
+  `access_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `group_of_id`,
+  `gone`, `comm_str`, `mark_deleted`, `uptime_ns`. (`sysctl_kind`/`recorded_value`/`RECORDED`
+  belong to `kernel/sysctl`; `CGROUP_POINT` belongs to `kernel/sysfs`.)
 
 ## Data flow / lifecycle
 
@@ -95,22 +98,26 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `ENTRIES` order. `task/<n>` resolves for a live thread of the group or an exited main thread
   (`leader_exit`).
 - Inode numbers hash the node (low bit set); roots are 1 (except the mqueue root); devpts `ptmx`
-  is 2 and terminal n is n+3; nodes under a pid mix in the thread group's serial, so a reused pid
-  gets new inodes (`node_ino`, used by stat and getdents; `ino_of` alone, used by epoll fdinfo and
-  inotify, omits the serial); nsfs files use the namespace id. Inodes are stable within one run.
-- Modes: directories 0555 (0755 on sysfs, a cgroup's from its mkdir); `fd/<n>` links by the open
-  mode as `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`); other
-  symlinks 0777; `mem` 0600; `syscall`, `pagemap`, `auxv` and `/proc/kmsg` 0400; sysctls follow
-  `kernel/sysctl`; other writable files 0644; everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are
-  0555, `environ` 0444, `comm` and `projid_map` read-only); cgroup files their `FILES` modes;
-  devpts nodes the terminal's mode and `ptmxmode`.
-- Owners: per-process nodes (`Pid`, `Entry`, `Fd`, including the `fd/`, `fdinfo/`, `ns/`, `net/`
-  directories) belong to the euid/egid of the thread (under `task/<tid>`) or the main thread, or
+  is 2 and terminal n is n+3; nodes under a pid carry `ProcId { pid, serial }`, so both `node_ino`
+  and `ino_of` mix in the thread group's serial and a reused pid gets new inodes; nsfs files use
+  the namespace id in both `node_ino` and `ino_of`. Inodes are stable within one run.
+- Because process-scoped nodes carry `ProcId { pid, serial }`, a held `/proc/<pid>` dirfd, `O_PATH`
+  fd or open process file never resolves to a new process reusing that pid: once the pinned thread
+  group is reaped, lookups and directory listings under it fail with `ENOENT` and offset-0 reads of
+  open files fail with `ESRCH`.
+- Directories default to 0555. Sysfs directories and the devpts root are 0755. Process and thread
+  `fd/`, `fdinfo/` and `ns/` directories are 0500. Cgroup nodes use their current attributes.
+  `fd/<n>` links use the open mode (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`).
+  Other symlinks are 0777. `mem` is 0600. `syscall`, `pagemap`, `auxv`, `environ` and `/proc/kmsg`
+  are 0400. Sysctls follow `kernel/sysctl`. Other writable files, including `comm`, are 0644 and
+  other regular files are 0444. Devpts device nodes use the terminal's mode or `ptmxmode`.
+- Owners: `Pid`, `Entry`, `Fd`, `FdInfo` and `Ns` belong to the named thread's euid/egid, or
   to root of those credentials' user namespace when the process is not dumpable; `net.*` sysctls
-  follow `kernel/sysctl`; cgroups belong to their creator; terminals to their owner; the entries
-  inside `fdinfo/`, `ns/` and `net/`, reopened open files and everything else to root.
-- Stat reports `st_blksize` 1024 for procfs and devpts paths, 4096 elsewhere (slave and master
-  fds included). Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2
+  follow `kernel/sysctl`; cgroup nodes have individual owners; terminals to their owner; the entries
+  inside `net/`, nsfs files, reopened open files and everything else to root.
+- Stat reports `st_blksize` 1024 for procfs and devpts paths, PTY masters and devpts slave fds.
+  Other synthetic filesystems report 4096.
+  Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2
   plus threads, an exited main thread included); sizes are 0 except sysfs and cgroup2 files
   (4096).
 - Names path resolution does not find (`View::missing`, Starnix's `not_found`) are counted as
@@ -127,9 +134,12 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   files refuse any write intent (`EPERM`, before DAC); `/proc/sys` uses `kernel/sysctl`'s
   permission rules instead of DAC; other nodes check DAC against the synthetic stat. Then: for
   `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap`, the process must exist
-  (found through any of its threads with `group_of`, else `ESRCH`) and the named thread pass one
+  (found through `group_of_id` matching the pinned `ProcId`, else `ESRCH`) and the named thread pass one
   ptrace check with filesystem credentials and no read/attach distinction (`EACCES`, as Linux's
-  `proc_mem_open`); `mem` and `pagemap` also need a live thread (`ESRCH`); writing `setgroups`
+  `proc_mem_open`); `mem` and `pagemap` also need a live thread (`ESRCH`) and pin a weak reference
+  to its address space (`Mm`) at open, while `environ` pins a weak `Mm` when live (leaving `None`
+  for a zombie so open succeeds and reads EOF). Once the old address space is freed after exit or
+  `execve`, an open `environ` fd returns EOF at every offset. Writing `setgroups`
   needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
   nodes on nodev mounts `EACCES`, then the cgroup device filter; `O_DIRECT` `EINVAL`; directories
   open read-only (`EISDIR` for a write mode); write modes on ro mounts `EROFS`.
@@ -145,26 +155,36 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   write-only files (`kernel/sysctl`, empty), a `NetConf` file whose generation fails (empty, the
   error reported by the first read) and `/proc/<pid>/syscall` (empty: it shows the thread when
   read, so `/proc/self/syscall` shows the read). Only a read or pread at offset 0 can regenerate:
-  the first one keeps a fresh snapshot unless its change counter moved, later ones regenerate with
+  the first one keeps a fresh snapshot unless its change counter moved or the pinned process has
+  been reaped (`pseudo::gone`, yielding `ESRCH`), later ones regenerate with
   the opener's credentials and the current reader's namespaces, root and cgroup root; reads
-  elsewhere use the current snapshot, so a first read at a non-zero offset leaves the snapshot
-  fresh (only a write marks it stale). The opener's credentials include their user namespace, which
+  elsewhere use the current snapshot while the pinned address space for `environ` is live.
+  A first read at a non-zero offset leaves the snapshot fresh (only a write marks it stale). The opener's credentials include their user namespace, which
   translates the ids shown; pid numbers follow the mount's pid namespace. lseek
   (`SEEK_SET`/`CUR`/`END` against the snapshot length) never regenerates. `pagemap`, `mem` and
-  `/proc/kmsg` are computed at read time (`mem` from the address space held weakly since open,
-  readable until it is freed; `pagemap` from the address space of the thread looked up by tid at
-  each read); nsfs files cannot be read (`EINVAL`), nor can write-only files.
-- Writes pass each call's buffer (each 64 KiB chunk, each iovec) to `pseudo::write` with the
-  writer's credentials and namespaces (the id maps, `setgroups`, `timens_offsets` and cgroup
-  migration also check the opener's), apply immediately, do not advance the position (except
-  `mem`), and mark the snapshot stale. Per-process numbers use `proc_number`/`kstrto` (first 12
-  bytes, base 0, `EINVAL`/`ERANGE`).
-- Change notifications (`fd::ProcEvent`): epoll accepts the files with a Linux poll operation
-  (`pseudo::pollable`: global procfs files, `/proc/sys`, `/proc/sysvipc`, `/proc/<pid>/net`,
-  mounts, mountinfo, every sysfs and cgroup2 file; other per-process files and nsfs are `EPERM`).
-  mounts and mountinfo poll as `POLLIN|POLLRDNORM`, plus `POLLERR|POLLPRI` once the mount table
-  has changed since the open or since the last change a poll or epoll reported (reading does not
-  take it in); one counter (`Vfs::mount_events`) serves every mount namespace. sysfs (`kernel/sysfs`)
+  `/proc/kmsg` are computed at read time (`mem` and `pagemap` from the address space held weakly
+  since open, returning empty/EOF once freed or replaced by execve). Memory transfers fill missing
+  FUSE pages one at a time, retaining the byte count across fills. Nsfs files cannot be read
+  (`EINVAL`), nor can write-only files.
+- Writes pass each chunk or iovec (one gathered input for `/proc/sys` sysctls, `kernel/sysctl`) to
+  `pseudo::write` with the writer's credentials and namespaces (the id maps, `setgroups`,
+  `timens_offsets` and cgroup migration also check the opener's), apply Linux 6.1 position rules —
+  `mem`, `uid_map`/`gid_map` (`map_write`: requires offset 0 and `< 4096` bytes, else `EINVAL`),
+  `setgroups` (`proc_setgroups_write`: requires offset 0, else `EINVAL`), cgroup2 files
+  (`kernfs_fop_write_iter`) and advancing sysctls advance the open position; `timens_offsets`
+  requires offset 0 and `< 4096` bytes (`EINVAL` otherwise) while keeping position unchanged;
+  `comm`, `oom_score_adj` (consuming at most `PROC_NUMBUF - 1` = 12 bytes via `proc_number`/
+  `kstrto`) and `coredump_filter` (consuming the full count via `kstrto`) leave the open position
+  unchanged — and mark the snapshot stale.
+- Change notifications (`fd::ProcEvent`, built by `pseudo::poll_event`): epoll accepts the files
+  with a Linux poll operation (`pseudo::pollable`: global procfs files, `/proc/sys`,
+  `/proc/sysvipc`, `/proc/<pid>/net`, mounts, mountinfo, every sysfs and cgroup2 file; other
+  per-process files and nsfs are `EPERM`).
+  mounts and mountinfo poll as `POLLIN|POLLRDNORM`, plus `POLLERR|POLLPRI` once the target
+  thread's mount namespace (`Vfs::mount_events_of`, scoped per mount namespace and untouched by
+  propagation-only changes) has changed since the open or since the last change a poll or epoll
+  reported (reading does not take it in). `/proc/sys/kernel/{hostname,domainname}` similarly wake
+  pollers with `POLLERR|POLLPRI` on per-name UTS changes (`kernel/sysctl`). sysfs (`kernel/sysfs`)
   and cgroup2 files poll as always readable and writable, plus `POLLERR|POLLPRI` before their first
   read from the start. Cgroup change observation, the four notifying files and their inotify keys
   belong to `kernel/cgroup`; the shared open/read path consumes its counters. Other synthetic files
@@ -196,33 +216,47 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   filesystem credentials (6.1's `do_task_stat`), others getting 1 for the code bounds and 0 for the
   rest (0 everywhere for a process without an address space); fault counters, `kstkesp`,
   `kstkeip`, `wchan`, `processor`, priority and policy are 0; the `signal` field is the thread's
-  and the group's pending sets; start time is the process's, in clock ticks plus the reader's
+  and the group's pending sets. Field 22 uses the named thread's creation time in ticks plus the reader's
   time-namespace boottime offset; the thread's or the group's CPU times depending on the view
   (`/proc/<tid>` the group's); `tty_nr` from the controlling terminal.
 - `status`: the thread's ids (the main thread's for `/proc/<pid>`) translated into the reader's
   user namespace (the reading thread's credentials, or the opener's when regenerated),
   `NStgid`/`NSpid`/`NSpgid`/`NSsid` from the instance's namespace down, capabilities,
-  `NoNewPrivs`, `Seccomp`, signal masks (`SigPnd` the thread's, `ShdPnd` the group's); memory
-  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
-  `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
-  exe/lib/PTE/swap 0; omitted with no live task); `FDSize` the open fds rounded up to 64;
-  `Cpus_allowed_list` is the thread's affinity (the main thread's in the process's `status`)
-  within the online CPUs. `statm` is `size rss 0 0 0 rss 0`.
+  the thread's `NoNewPrivs` (saved when the leader exits), `Seccomp`, signal masks (`SigPnd` the thread's, `ShdPnd` the group's); memory
+  lines follow Linux 6.1's `vm_stat_account` / `task_mem` (`VmPeak` = `VmSize`, `VmHWM` from max RSS, `VmRSS` the sum of
+  `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmData` the private writable non-stack
+  mappings, `VmStk` the grows-down mappings, `VmExe` the page-aligned code span capped by executable
+  non-writable mappings, `VmLib` the remaining executable non-writable mappings, `VmPTE` allocated
+  soft-MMU page-table bytes and `VmSwap` exact pagemap swap when readable, otherwise zero; omitted
+  with no live task); `FDSize` the open fds rounded up to 64;
+  `Cpus_allowed` and `Cpus_allowed_list` show the thread's affinity (the main thread's in the
+  process's `status`) clamped to the cgroup's effective cpuset as a hex mask (`cpu_mask_of`) and
+  CPU list. `statm` is
+  `size resident shared text 0 data 0` (matching Linux 6.1's `task_statm`: `resident` = `RssAnon +
+  RssFile + RssShmem`, `shared` = `RssFile + RssShmem`, `text` = page-aligned code span, `data` =
+  `VmData + VmStk` in pages).
 - `maps` and `smaps` escape a newline in a mapped file's path as `\012` (Linux's
   `seq_file_path`); file mappings show device `08:01`; smaps counts anonymous resident pages as
   dirty, file pages as clean, and copy-on-write-shared pages as shared with a divided Pss.
 - `cmdline`/`environ` copy the argument and environment ranges of the current mm (empty over
-  1 MiB or when unreadable); `comm` is read-only; `limits` lists the rlimits. The thread name is
+  1 MiB or when unreadable); `comm` is writable (0644) for tasks in the writer's thread group
+  (Linux's `comm_write`: up to 15 bytes up to the first NUL verbatim, `EINVAL` across thread groups,
+  `ESRCH` once exited); `limits` lists the rlimits. The thread name is
   bytes, not text: `comm` and `stat` give it as set, `status` escapes only a newline and a
   backslash (Linux's `proc_task_name`).
-- `fd/` lists the fds of the table of the thread the directory's pid names: the main thread's
-  for `/proc/<pid>` and under `task/<tid>` (even for a thread with its own table), the thread's
-  for `/proc/<tid>`; listing and lookup in `fd/` and `fdinfo/` and reading or following `fd/N`
-  need the ptrace read check with filesystem credentials (`EACCES`, Linux's `proc_fd_permission`
-  and `proc_fd_access_allowed`), as do `root`, `cwd`, `exe`, `ns/*` and `stat`'s layout fields,
-  always against the credentials of the directory's pid (the main thread's under `task/<tid>`);
-  `fd/N` links show the path stored at open with
-  ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags` (octal, with
+- `fd/` and `fdinfo/` list and inspect the fd table of the thread named: the main thread's for
+  `/proc/<pid>`, and thread `tid`'s own table for `/proc/<tid>` and `/proc/<pid>/task/<tid>` (even
+  when the thread unshared or cloned without `CLONE_FILES`); nodes under `task/<tid>/fd` and
+  `task/<tid>/fdinfo` retain `tid`, so `..` leads back under `task/<tid>`. Listing and lookup in
+  `fd/` and `fdinfo/` and reading or following `fd/N` need the ptrace read check with filesystem
+  credentials (`EACCES`, Linux's `proc_fd_permission` and `proc_fd_access_allowed`), as do `root`,
+  `cwd`, `exe`, `ns/*` and `stat`'s layout fields, checked against the target thread's credentials
+  (`tid.unwrap_or(proc.pid)`); named fd links resolve their tracked parent and name against the reader's root.
+  Renames follow the opened name. Unlinking it appends ` (deleted)` even with other hard links.
+  An original `O_TMPFILE` fd keeps its `#<ino> (deleted)` name after linking.
+  Reopening a deleted regular store file via `fd/N` with `O_PATH` pins its backing object.
+  Stat and subsequent reopens keep the original inode across source-fd close and reuse.
+  Synthetic descriptors and unreachable paths use their recorded description; `fdinfo/N` has `pos`, `flags` (octal, with
   `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that open file
   (`kernel/locks`'s `fd_locks`; only for files or fd tables that have taken locks) and per-kind
   lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times, signalfd
@@ -230,8 +264,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 - `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
   link is gone or, for a program found through an overlay, once that name is removed; following
   it reaches the program itself even after a rename (an overlay program through its overlay node)
-  and a deleted program through the host file recorded at execve (`OpenExe`), which a removed
-  overlay program only runs from: opening it is `ENOENT`.
+  and a deleted program through the host file recorded at execve (`OpenExe`). Opening a removed
+  overlay program retains the overlay mount and inode. An O_PATH reopen pins the object too.
 - `mounts`/`mountinfo` come from the mount table (`kernel/mount`) for the thread's namespace and
   root (an exited thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type
   as `Vfs::type_of` gives it (`fuse.<subtype>` for a FUSE mount with a subtype); mountinfo's
@@ -240,7 +274,8 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `lazytime` (`Vfs::sb_flags`), which `mounts` puts after its `ro` (the mount's or the instance's)
   as `show_vfsmnt` does; `cgroup` is the path relative to the reader's cgroup-namespace root;
   `net/` uses the target's network namespace.
-- Writable: `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
+- Writable: `comm` (same thread group only, `EINVAL` otherwise, up to 15 bytes verbatim),
+  `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
@@ -275,9 +310,13 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   `sysrq-trigger`, `zoneinfo`, `pressure/*`, `kallsyms`.
 - `/proc/<pid>/net/*` (`arp`, `dev`, `icmp`, `icmp6`, `if_inet6`, `ipv6_route`, `netstat`, `raw`,
   `raw6`, `route`, `snmp`, `sockstat`, `sockstat6`, `tcp`, `tcp6`, `udp`, `udp6`, `unix`) uses the
-  target task's network namespace: sockets from every fd table plus in-flight AF_UNIX sockets,
-  filtered by namespace, uids mapped for the reader; host interface counters and routes only in
-  the initial namespace (new namespaces show zeros); `arp` is a header line.
+  target task's network namespace (falling back to `ThreadGroup::leader_net` or a live thread's
+  network namespace when the main thread has exited as a zombie leader, before the initial
+  namespace): sockets from every fd table plus in-flight AF_UNIX sockets,
+  filtered by namespace, with each socket's creation-time `fsuid` (`sock_i_uid`, or the accepting
+  task's `fsuid` for accepted sockets) mapped for the reader; host interface counters and routes only in
+  the initial namespace (new namespaces show zeros); `snmp` reflects the namespace's IPv4
+  `ip_forward` (`1` enabled, `2` disabled); `arp` is a header line.
 
 ### devpts, nsfs and mqueue nodes
 
@@ -291,7 +330,7 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   option's uid/gid or the opener's fsuid/fsgid, its mode the option's mode; chmod, chown and
   utimensat are stored on the terminal (on the root and `ptmx` they are `EACCES`). Nodes exist
   while the terminal does; readdir lists `ptmx` and every live terminal. Devices 136:n and 5:2;
-  the root is 0555 (Linux 0755). fstat on a master fd always reports inode 2, mode 0666, rdev 5:2
+  the root is 0755. fstat on a master fd always reports inode 2, mode 0666, rdev 5:2
   on the root filesystem's device, uid/gid 0 and zero times, whatever the instance and
   `ptmxmode`; a slave fd reports its terminal.
 - nsfs: following `/proc/<pid>/ns/*` (after the ptrace-read check; `ENOENT` when the namespace has
@@ -306,10 +345,10 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ### Inbound
 
-- `kernel/files` (pseudo open/read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
+- `kernel/files` (pseudo open) and `kernel/fileio` (pseudo read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
   stat/getdents, chmod/chown/utimensat on devpts nodes); `kernel/mount` (synthetic mounts, devpts
   options and `mount_events`); `kernel/ns` (unshare/setns, nsfs files); `kernel/poll` (epoll
-  refusal and readiness); the machine (`Offline` before boot); `kernel/signal` (`mark_deleted` for
+  refusal and readiness); the machine (`Offline` for startup and metadata sampling); `kernel/signal` (`mark_deleted` for
   unhandled-exception reports); `kernel/net` (`sockets`, `socket_ino`); `kernel/sysctl` and
   `kernel/sysfs` (shared `View`, `FileKind::Proc` snapshot/regeneration, `tree_*` helpers and
   missing-path accounting).
@@ -320,12 +359,12 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
   (`/sys` tables, CPU/net/loop/GPU views).
 - Kernel state: thread groups and tasks, credentials (`permission`, `may_ptrace`, `capable`,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
-  ranges, pagemap, forced writes), the kernel-entry record (`TaskSync`), `signal`, `tty` (`Tty`
+  ranges, pagemap, forced reads and writes for `mem`), the kernel-entry record (`TaskSync`), `signal`, `tty` (`Tty`
   owner/mode/times, `new_pty`), `net`/`route`/`netdev`/`unix`/`traffic`, `ipc` `/proc/sysvipc`,
   `mqueue` nodes, `seccomp`, `klog`, `loadavg`, the VFS (`reach`, `path_of`), the locks
   (`proc_locks` and `fd_locks`, `kernel/locks`), the mount table (`mounts_from`, devpts options;
   `kernel/mount`), the OOM killer (`proc_score`), unimplemented-path counting (`stub::record`).
-- `kernel/cgroup`: cgroup directory lookup and metadata use `Cgroups` and `file_mode`;
+- `kernel/cgroup`: cgroup directory lookup and metadata use `Cgroups` and `Cgroup::attrs`;
   `content` delegates to `file`, `proc_cgroup` and `proc_cgroups`; `write` supplies a `Writer`
   with the writer's namespaces and the opener's credentials. Device filtering and change
   observation are called by the file syscalls, not owned by this adapter.
@@ -334,19 +373,19 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ## Invariants and gotchas
 
+- Both leader stat paths use `ThreadGroup::start_ticks`, including after leader exit or takeover
+  by execve. Both worker paths use `Task::start_ticks`.
 - Content always reflects the kernel at generation time; nothing is cached across opens, and a
   regeneration uses the opener's credentials but the current reader's namespaces.
 - `/proc/<pid>/net` uses the target's network namespace (while `/proc/sys` uses the reader's,
   `kernel/sysctl`).
 - Cgroup node adapters must preserve `kernel/cgroup`'s directory modes, controller-dependent
   file visibility and opener-credential checks; policy changes belong in that module.
-- Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts and
+- Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts, cgroup2 and
   mqueue, xattrs, links) fail on them.
-- `dev_ino` (epoll fdinfo) and inotify use `ino_of`, which omits the thread group's serial and the
-  mount's device, so they can disagree with stat for pid nodes, later procfs instances and nsfs
-  files.
-- A lookup under `task/<tid>/fd` (or `fdinfo`) drops the tid: the node is the process's, and `..`
-  from it leads to `/proc/<pid>/fd`.
+- `fdinfo`'s `ino:`, epoll `tfd:` `ino`/`sdev`, and inotify watch `ino`/`sdev` all resolve mount
+  devices via `Vfs::dev_of` (and `Fs::Nsfs.dev()` for nsfs files) and inode numbers via
+  `node_ino`/`ino_of`, matching `stat` across later procfs instances and nsfs files.
 - The kernel-entry record behind `syscall` is published with atomics and no sequence lock: a
   thread entering and leaving the kernel while another reads it could mix two entries, which only a
   thread shown as `running` can do.
@@ -356,42 +395,12 @@ IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); the mount table (
 
 ## Confirmed bugs / technical debt
 
-- **Per-thread fd views are wrong:** `task/<tid>/fd` and `fdinfo` show the group leader's table even
-  when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
-- **Change notifications are partial:** a mount change in any namespace marks every mounts and
-  mountinfo reader (Linux counts per namespace), as do propagation-type changes (Linux does not
-  touch the namespace for them); synthetic files outside mounts/mountinfo/cgroup2 report no inotify
-  events (opens, reads, writes).
-- **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555, `comm`
-  read-only, `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
-  procfs mount options are ignored; many standard files are absent; `status` has no `Cpus_allowed`
-  mask line.
-- **Socket owners in `/proc/net/*` can differ from Linux:** the uid column is the fsuid of the
-  first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
-  (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
-  sockets only in `SCM_RIGHTS` messages show 0.
+- **Inotify on synthetic files is partial:** synthetic files outside cgroup2's four notifying files
+  report no inotify events (opens, reads, writes).
+- **Fidelity gaps:** Procfs ignores mount options and omits many standard files.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
-- **Access checks under `task/<tid>` use the process's credentials:** `fd/`, `fdinfo/`, the magic
-  links and `stat`'s layout fields check the directory pid's (the main thread's) credentials,
-  while owners and the open-time check of `mem` and `maps` use the thread's; with per-thread
-  credentials (a thread that changed its ids) the two can disagree.
-- **Per-thread values that are the process's:** `task/<tid>/stat`'s start time is the process's
-  (Appine keeps none per thread); `/proc/<pid>/net/*` of a process whose main thread has gone (a
-  zombie, or one whose other threads live) shows the initial network namespace rather than the
-  process's.
-- **pagemap follows the tid, not the address space opened:** it looks the thread up at each read,
-  so after an execve it shows the new image (Linux pins the address space at open, as `mem` does),
-  and a reused tid would show another process's mappings without a new ptrace check.
-- **Writes never advance a synthetic file's position** (except `mem`): repeated writes on one
-  descriptor keep taking effect, where Linux refuses a second id-map write (`EINVAL`; Appine's is
-  `EPERM`, the map being set).
-- **A reaped process's held directory behaves like a live or missing one:** through a kept
-  `/proc/<pid>` fd, lookups give `ENOENT` (Linux `ESRCH`), listing still succeeds (Linux
-  `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as
-  the fd is resolved by number, it shows the new process once the pid is reused, defeating monitors
-  that hold `/proc/<pid>` fds to avoid pid-reuse races.
 
 ## Open questions
 

@@ -15,11 +15,23 @@ internal class ConsolePty(
     private val script: String,
     val login: String,
     private val cwd: String? = null,
+    private val tracker: ConsoleTracker? = null,
 ) {
     /** The console number in the kernel, -1 before the shell starts. */
     @Volatile
     var console = -1
         private set
+
+    /** Monotonic epoch recorded when [console] was opened (0 until opened with a tracker). */
+    @Volatile
+    var openedEpoch = 0L
+        private set
+
+    /** Monotonic epoch recorded when [console] was closed (0 while open or untracked). */
+    @Volatile
+    var closedEpoch = 0L
+        private set
+
     private var pid = -1
 
     /**
@@ -27,7 +39,13 @@ internal class ConsolePty(
      * Throws `IOException` when either fails (the console may then be open: [close] it).
      */
     fun start(columns: Int, rows: Int): Int {
-        console = Native.openConsole(machine, rows, columns)
+        if (tracker != null) {
+            val (id, opened) = tracker.open { Native.openConsole(machine, rows, columns) }
+            console = id
+            openedEpoch = opened
+        } else {
+            console = Native.openConsole(machine, rows, columns)
+        }
         pid = Native.spawn(machine, console, "/bin/sh", argv(script, login, cwd), ENVIRONMENT)
         return pid
     }
@@ -37,7 +55,15 @@ internal class ConsolePty(
 
     /** Closes the console: the session leader gets SIGHUP. */
     fun close() {
-        if (console >= 0) Native.closeConsole(machine, console)
+        if (console < 0) return
+        if (tracker != null) {
+            tracker.close(
+                close = { Native.closeConsole(machine, console) },
+                onClosed = { closedEpoch = it },
+            )
+        } else {
+            Native.closeConsole(machine, console)
+        }
     }
 
     companion object {

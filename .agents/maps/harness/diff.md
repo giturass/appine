@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the split; latest change: retry `apk add` up to 3 times during difftest store creation)
+> Maintained: 2026-11-26 (targeted verification only since the split; latest change: arm64 musl startup and the hosted ProcSelfAuxv.EntryValues exclusion)
 
 ## Responsibilities
 
@@ -21,8 +21,8 @@ benchmarks, surveys and crash testing remain `harness`.
 - difftest's per-case directives, matched on any line: `# docker-run-options:`,
   `# appine-options:` and `# difftest-files:`; outputs `target/difftest/<case>.{native,appine,
   appine.err}`, failure copies `failed/<time>-t<tier>-<case>.*`, timings
-  `durations-t<tier>.txt` (`<case> <seconds>`), the run lock `.lock` (a symbolic link naming the
-  run's pid), lane claims
+  `durations-t<tier>.txt` (`<case> <seconds>`), an exclusive lock on the output directory,
+  the legacy `.lock` symlink naming the run's pid, lane claims
   `.slot-<n>`, lane stores `<store>-w<n>` (marked `.cloned`); the image `appine-difftest`,
   labelled with the exported directory list.
 - Suite tarballs: `target/starnix-tests/starnix-tests-<commit12>.tar` and
@@ -34,17 +34,18 @@ benchmarks, surveys and crash testing remain `harness`.
 - `scripts/difftest [-t tier] [-r] [-s store] [-j n] [-R] [case…]`.
 - `scripts/build-starnix-tests`; `scripts/build-gvisor-tests [--list | --all]`.
 - Case suite driver: `tests/diff/gtest/run.sh <suite> <skip> <program>…` with optional `ONLY`.
+  `tests/diff/gtest/selected.sh <group>` runs rows from `gvisor.filters` through that driver.
 
 ## Data flow / lifecycle
 
 ### Differential tests
 
-- One run at a time: a run creates `target/difftest/.lock`, a symbolic link naming its pid made in
-  one step, before touching the store; it waits while the run it names is alive (`ps -p`, which
-  also finds another user's process), takes over a lock whose run is gone (or an earlier version's
-  lock directory, with or without its pid file) by moving it aside first, so that of two waiters
-  finding the same dead run the one that moved away the other's new lock puts it back, and
-  removes it on exit; its lanes run under it.
+- Before touching the store or reclaiming a PID lock, the top-level shell opens
+  `target/difftest` and takes an exclusive `flock` on that descriptor through host Perl.
+  Contenders wait in the kernel. Lanes inherit the descriptor; the lock is released when its
+  last copy closes. For older runners the shell also publishes its PID as `.lock`, waits for a
+  live PID in a symlink or legacy lock directory, reclaims stale entries and removes its link
+  on exit.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined, the repository at its own path) for
   the store import, the tool check, the export and the cases, while the store's package and suite
@@ -65,14 +66,15 @@ benchmarks, surveys and crash testing remain `harness`.
   (those that exist, `/tmp` and `/var/tmp` empty; docker provides `/dev`, `/proc` and `/sys`, and
   each case makes `/root`) are exported from inside Appine and imported as the docker image
   `appine-difftest`, labelled with that list, replacing the previous image: on the first run, with
-  `-r`, after a package or suite install, when the image is missing, when its label changed or
-  when its suite versions differ from the store's (which also remakes the lane clones).
+  `-r`, after package installation, when the image is missing, when its label changed or when an
+  installed suite version differs from the image. An image already carrying the selected suite
+  can be reused when installing it in another store.
 - Each case script runs with stderr merged into stdout on both sides, after `/root` (`$HOME`) and
   `/tmp` are removed and made again empty (modes 700 and 1777), so caches and files earlier runs
   left in the store do not make the sides differ: natively with `docker run` (seccomp unconfined,
-  `PATH`, `HOME=/root`) plus the case's `# docker-run-options:` (62 of the 93 cases, 40 of them
-  `--privileged`), and as `/bin/sh -c` under `appine-run` plus its `# appine-options:` (two
-  cases); an `exit N` line is appended to each output. A case passes when the two outputs are
+  `PATH`, `HOME=/root`) plus the case's `# docker-run-options:` (including capabilities, devices
+  and AppArmor settings), and as `/bin/sh -c` under `appine-run` plus its `# appine-options:`
+  (two cases); an `exit N` line is appended to each output. A case passes when the two outputs are
   byte-identical and `appine-run`'s own stderr has no `appine: internal error` line; scripts
   normalise varying output themselves. A script of 128 KB or more (prefix and packed files
   included) fails, which is why `compat` is split into `compat` to `compat9`.
@@ -80,11 +82,11 @@ benchmarks, surveys and crash testing remain `harness`.
   base64-encoded, unpacked by the guest's busybox into `/tmp/difftest-files/<dir>` before the case
   runs on either side. `line-discipline` uses it for Starnix's PTY scenarios and trace generator
   (`tests/diff/line-discipline`, BSD-licensed, copied unchanged with its source commit in a
-  README) and runs all 83 of them, each under a 300 s timeout; the eleven suite cases use it for
+  README) and runs all 83 of them, each under a 300 s timeout; the suite cases use it for
   the shared gtest runner.
 - Lanes (`-j`, default 4 on macOS, 1 elsewhere): each lane claims a slot and uses that slot's store
-  clone (APFS clone, or a copy with `--reflink=auto`; remade only when unmarked or on a rebuild),
-  cases go slowest first by recorded time, and each lane prints its report in one write; failures
+  clone (APFS clone, or a copy with `--reflink=auto`; remade when its `.cloned` image ID differs
+  or on a rebuild), cases go slowest first by recorded time, and each lane prints its report in one write; failures
   are copied to `failed/`. Only parallel runs record durations, and only for cases that passed.
 - A case name without `tests/diff/<name>.sh` is a failure, and so is every requested case that no
   lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
@@ -116,24 +118,27 @@ benchmarks, surveys and crash testing remain `harness`.
   does not compile shows only when a program needing it fails to link). `tests/gvisor/compat`
   supplies glibc names musl lacks (forced include), headers that defer kernel headers to musl's
   where both define the same structures, and a `RunfilePath` that finds helper programs in
-  `/usr/lib/gvisor-tests/bin`. Only the programs named in the `gvisor-*` cases (the list `--list`
-  prints and whose hash names the tarball) and every helper (targets not ending in `_test`) are
+  `/usr/lib/gvisor-tests/bin`. Only the programs named in the `gvisor-*` scripts or in
+  `tests/diff/gtest/gvisor.filters` (the list `--list` prints and whose hash names the tarball) and every helper (targets not ending in `_test`) are
   built, older tarballs removed; `--all` builds every program that builds for arm64 into
   `target/gvisor-tests/all/` for a full run by hand (too large for the difftest image on the
   development VM).
 - Each builder does nothing while its tarball's name exists, so a local change to `tests/starnix`
   or `tests/gvisor` takes effect only after the tarball is deleted (CI keys its caches on them).
-- Seven Starnix cases cover 65 of its built programs by subsystem (`starnix-mm`, `-process`,
+- Seven Starnix cases cover 66 of its built programs by subsystem (`starnix-mm`, `-process`,
   `-signal`, `-fs`, `-proc`, `-io`, and `-overlay`, which runs overlayfs_test and fs_test's
   `OverlayFs` tests with `TEST_TMPDIR` on a tmpfs, since Linux refuses docker's overlay root as an
-  upper layer), and four gVisor cases 43 of its programs (`gvisor-process`, `-fs`, `-net`,
-  `-unix`). Each calls the shipped `tests/diff/gtest/run.sh` once (difftest reads the suite from
+  upper layer), and the six original gVisor cases cover 53 programs (`gvisor-process`, `-fs`, `-net`,
+  `-unix`, `-mm` for cross-process transfers and memory management, and `-io` for copy_file_range,
+  preadv2 and pwritev2). Each of these cases calls the shipped
+  `tests/diff/gtest/run.sh` once (difftest reads the suite from
   that one call) with the suite, its skip filter and its program list, and optionally `ONLY`, a
   gtest filter of the only tests to run; the runner lists each program's tests (minus disabled
   ones) and runs each in its own process under `timeout -s KILL 60`, stdin from `/dev/null` and
   its output in a file (a crash or hang, a test ignoring `SIGTERM`, a child keeping the output open
   or a test reading stdin does not take the rest with it), printing `<test> ok|failed|skipped|exit
-  <code>` (when a test exits 0 or 1 without matching a gtest result line, it follows with `out:`
+  <code>` (a pass requires exit 0 even if teardown fails after GoogleTest prints OK; on an unexpected
+  exit 0 or 1 the runner follows with `out:`
   lines giving the on-disk byte count, captured length and first 30 lines of `gtest.out`), with
   core files off, the shell's crash reports filtered out and `/tmp` set back to 1777
   at the end. Tests stay in the foreground (a background one would inherit `SIGINT` and `SIGQUIT`
@@ -143,13 +148,22 @@ benchmarks, surveys and crash testing remain `harness`.
   `/proc/<pid>/task/<tid>/syscall`. They follow the test's line only when the timeout killed it
   (exit 137), so a slow test that passes prints the same on both sides; on the native side Yama
   makes most of those files unreadable, as the watcher is no ancestor.
-- Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
+- Nine further gVisor cases select program-specific `ONLY` and `SKIP` filters from
+  `gvisor.filters`. Each group sets its measured native Docker options. The seven regular groups
+  and two slow groups run through `selected.sh`, which prints each program name and checks its
+  expected pass count. A row can set `TEST_TMPDIR` for its program. `memfd_test` uses
+  `/dev/shm` so its ordinary tmpfs seal test runs. For a failed assertion it also prints the
+  first 30 lines of the captured GoogleTest output. The pass-count check excludes these diagnostic
+  lines. An empty group, missing binary, skip or failure makes the selection fail even when native Linux and Appine
+  print identical output. The program list across all fifteen
+  gVisor groups determines the selected tarball.
+- Legacy skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
   (it fails on the native side because of docker, the VM or a newer kernel, answers differently
-  only on CI's runner, depends on timing, or hangs on both sides), or a gVisor test that sleeps
-  10 s or more by design (left out for CI time). The runner's header lists the programs in no case and why: those that would reboot,
+  only on CI's runner, depends on timing, or hangs on both sides), or a slow gVisor test assigned
+  to its own group. The runner's header lists the programs in no case and why: those that would reboot,
   suspend or set the clock of the VM, features Appine does not have (bpf maps and other program
-  types, perf, userfaultfd, tun), devices neither side has, and two with nothing to compare.
+  types, perf, userfaultfd, tun), devices neither side has, and cache_flush_test with no arm64 tests.
 
 ## Dependencies (inbound / outbound)
 
@@ -166,13 +180,32 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ## Invariants and gotchas
 
-- Difftest compares the two sides only with each other: a failure identical on both sides passes.
+- Difftest accepts identical failures in ordinary cases. Groups using `selected.sh` additionally require
+  a successful native selection.
+- `gvisor-inet-ports` checks ephemeral binds at the start of a fresh container, before TCP
+  passive closes leave ports in TIME_WAIT. Moving the upstream isolated loopback binary into
+  a guest `unshare -n` changes the comparison: its active-close tests failed on both Appine
+  tiers in that configuration.
 - CI's native side is not the development VM's: a 7.x kernel (overlayfs defaulting to
   `redirect_dir=on`, Linux 5d39580f68e6's `CAP_NET_ADMIN` check that `appine-run`'s host sockets
   then fail), a CPU with SVE and AArch32 at EL0, and runner settings (`rmem_default` and `rmem_max`
   of 1 MiB, `fs.suid_dumpable` 2, docker's stack limit). Cases print only what both kernels give
   (relations instead of such values, explicit mount options), the suite cases skip the rest, and
   6.1's answers that newer kernels changed are checked by `tests/guest` programs instead.
+- `ProcSelfAuxv.EntryValues` stays excluded from the shared selection. On the hosted arm64
+  kernel, Linux supplies `AT_HWCAP3` (29) in both auxv copies. During startup, musl 1.2.6's
+  `__set_thread_area` rewrites that stack entry to `(AT_IGNORE, 0)`. Procfs retains the
+  kernel's original. gVisor reads procfs into a map, checks key uniqueness, then walks the
+  stack after `environ`. The membership check fails for `AT_IGNORE`. The value lookup inserts
+  that key with value zero, so its value matches but the final size check fails. Running the
+  shipped binary on the runner's `7.0.0-1017-azure` kernel under QEMU Neoverse-N2 gave 23
+  stack entries and 24 map keys. Musl also masks some `AT_HWCAP` and `AT_HWCAP2` bits, so the
+  value check can fail on CPUs advertising those bits. The archived hosted runs retained only
+  per-test results. `EntryPresence` and `Platform` passed on both sides.
+- Appine's Linux 6.1 auxv uses `AT_HWCAP` and `AT_HWCAP2` with guest feature bits that musl
+  preserves. The loader saves the same words it writes to the initial stack, and procfs exports
+  those saved words. The guest test in `mm_mount_pseudo.c` checks both copies in order through
+  `AT_NULL` and checks for EOF immediately after it.
 - The native side of a case using loop devices (`loop`) shares the host's devices: it takes
   whatever loop-control hands out, makes its own node for it (a new device has no node in the
   container's `/dev`), prints no device numbers, and waits for an autoclear device to be unbound
@@ -200,8 +233,7 @@ benchmarks, surveys and crash testing remain `harness`.
 
 ## Confirmed bugs / technical debt
 
-- **Three waiters can still run together:** when one moves aside a lock another waiter has just
-  made and a third makes its own before it is put back, the moved one's run goes on without it.
+None recorded.
 
 ## Open questions
 

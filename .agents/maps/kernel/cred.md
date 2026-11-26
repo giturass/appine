@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint sysctl references to kernel/sysctl)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `setgroups` and `PR_CAPBSET_DROP` check permissions (`EPERM`) before argument validation (`EINVAL`/`EFAULT`), matching Linux 6.1)
 
 ## Responsibilities
 
@@ -34,8 +34,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   `cap_permitted`, `cap_inheritable`, `cap_bounding`, `cap_ambient` (u64), `securebits`,
   `user_ns`. All ids are kernel (initial-namespace) ids. Kept per thread (`Task.cred`), as on
   Linux; the thread group keeps a copy of its main thread's (`ThreadGroup.cred`), which is what
-  other processes go by and outlives the main thread. `dumpable` and `no_new_privs` stay per
-  thread group; umask lives in the fs context, not here.
+  other processes go by and outlives the main thread. `dumpable` belongs to the thread group and umask to the fs context.
+  Each task holds its own sticky `no_new_privs`, inherited from the calling thread on clone or fork
+  and preserved across exec.
 - `cap` constants (`LAST` = 40, `CAP_FULL`), `secbit` (NOROOT, NO_SETUID_FIXUP, KEEP_CAPS,
   NO_CAP_AMBIENT_RAISE and their locks), `MAY_EXEC`/`MAY_WRITE`/`MAY_READ`.
 - `FileCaps` — parsed `security.capability` (permitted, inheritable, effective).
@@ -43,7 +44,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   program, converted length, `allow` bitmap, original bytes, log and wait-killable flags, `prev`,
   user count, optional `Notif`); `Chain` (a thread's handle on its newest filter); `Notif`/
   `Knotif` (notification queue; states Init, Sent, Replied); `Listener` (the notify fd's object);
-  `Verdict` (`Run(nr)`, `Skip`, `Exit`). `Task::seccomp_on` and `seccomp_allow` are lock-free copies
+  `Verdict` (`Run(nr)`, `Skip`, `Restart`, `Exit`). `Task::seccomp_on` and `seccomp_allow` are lock-free copies
   for the fast path.
 
 ## Public entry points
@@ -52,9 +53,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   forms, `getgroups`, `setgroups`; `capget`, `capset`; prctl `PR_*KEEPCAPS`, `PR_*SECUREBITS`,
   `PR_CAPBSET_READ/DROP`, `PR_CAP_AMBIENT`, `PR_*NO_NEW_PRIVS`.
 - Checks: `Cred::capable` (initial namespace), `capable_here` (own namespace), `ns_capable`,
-  `capable_wrt` (with respect to an inode's owner), `permission`, `owns`, `may_delete`,
-  `new_owner`, `for_access`, `searches_all`, `in_group`, `may_signal`, `may_ptrace`; id
-  translation `uid_in`/`uid_out`/`gid_in`/`gid_out`.
+  `capable_wrt` (with respect to an inode's owner), `caps_subset_of`, `permission`, `owns`,
+  `may_delete`, `new_owner`, `for_access`, `searches_all`, `in_group`, `may_signal`, `may_ptrace`;
+  id translation `uid_in`/`uid_out`/`gid_in`/`gid_out`.
 - Exec: `Cred::exec` with `FileCaps` from the program file.
 - Seccomp: `seccomp(2)` (277), prctl `PR_SET/GET_SECCOMP`, `seccomp::check` (syscall entry),
   `always_allowed` (fast path), the notify-fd ioctls, `get_filter`/`get_metadata` (ptrace),
@@ -84,20 +85,27 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   file's process info.
 - Set syscalls map guest ids through the caller's user namespace (`-1` means unchanged; unmapped
   `EINVAL`), apply Linux 6.1's rules with `capable_here` (`CAP_SETUID`/`CAP_SETGID` in the caller's
-  own namespace), and commit through `update`, which — like `commit_creds` — clears the process's
-  dumpable flag and the calling thread's pdeathsig when effective or filesystem ids change or
+  own namespace), and commit through `update`, which — like `commit_creds` — sets the process's
+  dumpable mode to `/proc/sys/fs/suid_dumpable` (0/1/2) and clears the calling thread's pdeathsig
+  when effective or filesystem ids change or
   permitted grows. The capability prctls commit without these side effects, as Linux's do not
-  trigger them. `unshare(CLONE_NEWUSER)` and setns into a user namespace (both single-threaded
-  only) replace the credential without them either (correct for unshare, as in Linux).
+  trigger them. `unshare(CLONE_NEWUSER)` (single-threaded only) replaces the credential without
+  them (as in Linux); `setns` into a user namespace sets `dumpable` to `fs.suid_dumpable` and
+  clears `pdeathsig` when the new
+  credentials' capabilities are not a subset of the old ones (`!new.caps_subset_of(&old)`, i.e.
+  entering a foreign user namespace, matching Linux's `commit_creds`). Both `0` (`SUID_DUMP_DISABLE`)
+  and `2` (`SUID_DUMP_ROOT`) leave `ThreadGroup.dumpable = false` so procfs ownership and ptrace
+  checks treat them as non-user-dumpable.
 - Capability fixups on uid changes (`cap_emulate_setxuid`, root meaning uid 0 of the credential's
   namespace): leaving root on all three uids clears permitted and effective unless `KEEP_CAPS`
   and always clears ambient; euid root → non-root clears effective, non-root → root sets
   effective = permitted; `setfsuid` drops or raises the filesystem capabilities;
   `SECBIT_NO_SETUID_FIXUP` disables all of it.
 - `setfsuid`/`setfsgid` never fail: bad values are ignored and the old value is returned.
-  `getgroups` (negative size `EINVAL`, 0 returns the count, too small `EINVAL`); `setgroups` (size
-  0..65536, mapped ids, then `CAP_SETGID` and the namespace's setgroups permission with a written
-  gid map, else `EPERM`; stored sorted).
+  `getgroups` (negative size `EINVAL`, 0 returns the count, too small `EINVAL`); `setgroups` checks
+  `CAP_SETGID` and the namespace's setgroups permission with a written gid map (`Cred::may_setgroups`,
+  `EPERM`) before size `0..=65536` (`EINVAL`), full user-list read (`EFAULT`), and gid mapping
+  (`EINVAL`), then stores the list sorted.
 
 ### Capabilities
 
@@ -105,10 +113,12 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   `ns_capable` in a given namespace (including the parent-owner rule); `capable_wrt` additionally
   requires the inode's uid and gid to be mapped in the caller's namespace.
 - `capset`: v1 (one word) or v2/v3 (two); unknown versions write v3 back and fail `EINVAL`; null
-  data is a probe; another pid `EPERM`; new permitted ⊆ old permitted, effective ⊆ new permitted,
+  data is a probe; another pid `EPERM`; bits above `cap::LAST` (`CAP_FULL`) are masked and ignored
+  before checking; new permitted ⊆ old permitted, effective ⊆ new permitted,
   inheritable ⊆ old inheritable ∪ (`CAP_SETPCAP` ? all : old permitted) and ⊆ old inheritable ∪
   bounding; ambient is then masked to permitted ∩ inheritable.
-- prctl: bounding drop needs `CAP_SETPCAP`; ambient raise needs the capability in permitted and
+- prctl: bounding drop checks `CAP_SETPCAP` (`EPERM`) before capability range `<= 40` (`EINVAL`);
+  ambient raise needs the capability in permitted and
   inheritable and no `NO_CAP_AMBIENT_RAISE`; securebits need `CAP_SETPCAP`, cannot change locked
   bits or unlock; keepcaps fails when locked.
 
@@ -135,8 +145,9 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   ambient; `KEEP_CAPS` is cleared; secureexec = setid or (non-root real uid and (file effective or
   permitted ⊄ ambient)).
 - After the transition: secureexec sets `AT_SECURE` and caps the stack rlimit at 8 MB; dumpable is
-  cleared when ids differ or permitted grew, else set from whether the caller can read the program
-  file and its interpreter; pdeathsig is cleared in those cases. The address space's user namespace
+  set to `fs.suid_dumpable` when ids differ, permitted grew, or the caller cannot read the program
+  file or its interpreter, else set to `1` (`SUID_DUMP_USER`); pdeathsig is cleared on id/cap
+  changes or secureexec. The address space's user namespace
   (`ThreadGroup::mm_user_ns`, Linux's `mm->user_ns`, kept by fork) is the caller's, raised for a
   file it cannot read to the nearest ancestor where that file's owner and group are mapped
   (`UserNs::holding`, `would_dump`). A setuid or setgid program, or one whose file capabilities
@@ -147,20 +158,21 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ### Access decisions
 
-- `permission(stat, mask)`: owner class if fsuid matches, group if fsgid or a supplementary group
-  matches, else other; if the class allows everything requested, allow; otherwise directories
+- `permission(stat, mask)`: owner class if fsuid matches, otherwise a store access ACL checks named users and group entries under its mask;
+  without one the owning group or other class applies; if the class allows everything requested, allow; otherwise directories
   allow with `CAP_DAC_READ_SEARCH` (no write) or `CAP_DAC_OVERRIDE`, non-directories allow with
   `CAP_DAC_READ_SEARCH` (read only) or `CAP_DAC_OVERRIDE` (no exec, or some exec bit set), all via
-  `capable_wrt`; else `EACCES`. No ACLs, immutable or append flags.
+  `capable_wrt`; else `EACCES`. Immutable and append flags are unsupported.
 - `owns`: fsuid is the owner, or `CAP_FOWNER` in the caller's namespace with the owner mapped there
   (Linux's `inode_owner_or_capable`; the group need not be mapped). `may_delete`: write and search
   on the directory, then for sticky directories the owner of file or directory or `CAP_FOWNER`
   (`EPERM`). `new_owner` (Linux 6.1's `vfs_prepare_mode` and `inode_init_owner`) takes the mode
   and the umask: uid fsuid; gid the directory's when it is setgid, else fsgid; in a setgid
   directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable file before
-  the umask applies; a directory keeps only its permissions and the sticky bit and inherits the
-  setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids, effective capabilities
-  to permitted only when the real uid is root in the namespace. `searches_all`: `CAP_DAC_READ_SEARCH`
+  the umask applies when the parent has no default ACL; a directory keeps only its permissions and the sticky bit and inherits the
+  setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids; unless
+  `SECBIT_NO_SETUID_FIXUP` is set, effective capabilities become permitted when the real uid is
+  root in the namespace and 0 otherwise (Linux's `access_override_creds`). `searches_all`: `CAP_DAC_READ_SEARCH`
   or `CAP_DAC_OVERRIDE` in the initial namespace (gates the no-BKL resolver).
 - `may_signal` (Linux `kill_ok_by_cred`): sender's real or effective uid equals the target's real
   or saved uid, or `CAP_KILL` over the target's namespace; callers add same group and SIGCONT
@@ -177,13 +189,14 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 ### seccomp
 
 - Installing (`seccomp(2)`/prctl, Linux order): flag combinations `EINVAL`; length 0 or over 4096
-  `EINVAL`; without no_new_privs (read from the thread group) or `CAP_SYS_ADMIN` in the caller's
+  `EINVAL`; without the caller's no_new_privs or `CAP_SYS_ADMIN` in the caller's
   namespace `EACCES`; the classic and seccomp checkers (aligned loads of `seccomp_data`, forward
   jumps, packet loads and MOD rejected); mode must be disabled or filter; a second listener
   `EBUSY`; total converted length plus 4 per filter over 32768 `ENOMEM`; TSYNC requires every other
   thread to be disabled or on an ancestor chain (else that thread's tid in the caller's pid
   namespace, or `ESRCH` with `TSYNC_ESRCH` or when the caller cannot see it). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
-  pushed; TSYNC copies the chain to other threads; the listener fd is close-on-exec.
+  pushed. Successful TSYNC copies the chain to other threads and sets their no_new_privs if
+  the caller has it. The listener fd is close-on-exec.
 - Filters belong to threads, are copied by clone/fork and kept across execve; an exiting leader's
   chain is held until the group is reaped.
 - At syscall entry (after a `PTRACE_SYSCALL` entry stop): disabled, `PTRACE_O_SUSPEND_SECCOMP` and
@@ -195,8 +208,10 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
   most severe action wins (ties: the newer filter). Actions: ERRNO (capped at 4095), TRAP (`SIGSYS`
   with syscall/arch/address), TRACE (`PTRACE_EVENT_SECCOMP` stop and re-check, or `ENOSYS` without
   a tracer), USER_NOTIF, LOG, ALLOW, KILL_THREAD (or KILL_PROCESS when it is the last live
-  thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions go to
-  Appine's debug log only (stderr with `APPINE_LOG`); USER_NOTIF is never logged.
+  thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions
+  (including `USER_NOTIF` and `TRACE` when `SECCOMP_FILTER_FLAG_LOG` is set, filtered by
+  `actions_logged`) emit Linux-style `audit: type=1326` records at `KERN_NOTICE` to the guest
+  kernel log (`klog`) in addition to Appine's host debug stderr (`APPINE_LOG`).
 - User notifications: the waiting thread is woken by replies, ends on fatal signals, and returns
   `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a signal
   costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
@@ -213,7 +228,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ### Inbound
 
-- `kernel/vfs` and `kernel/files` (every permission and ownership check, file-cap removal),
+- `kernel/vfs`, `kernel/files` and `kernel/fileio` (permission/ownership checks and file-cap removal),
   `kernel/xattr` (xattr capability rules), `kernel/process` (fork/clone copies, setpriority/ioprio
   `PRIO_USER`, `RLIMIT_NPROC`), `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal`
   (kill), `kernel/ptrace` (ptrace access), `kernel/procfs` (status lines, ownership), `kernel/sysctl`
@@ -225,7 +240,7 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 - User namespaces and id maps (`kernel/ns`); `Stat` and modes (`kernel/store`); ptrace stops (`kernel/ptrace`),
   `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check (`kernel/vdso`); fd tables; the kernel's
-  waits and wake objects; `appine_hal::fill_random` (notification ids); the debug log.
+  waits and wake objects; `appine_hal::fill_random` (notification ids); the guest kernel log (`klog`) and host debug log.
 
 ## Invariants and gotchas
 
@@ -242,22 +257,11 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/c
 
 ## Confirmed bugs / technical debt
 
-- **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
-  kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
-  although `SECCOMP_FILTER_FLAG_LOG` asks for it.
-- **`for_access` ignores `SECBIT_NO_SETUID_FIXUP`**, so access(2) answers differ for
-  capability-only sandboxes.
-- **Errno order differences.** setgroups reports `EINVAL`/`EFAULT` before the permission check's
-  `EPERM`; capset does not mask bits above `CAP_LAST_CAP` (`EPERM` instead of silently ignoring
-  them); `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
-- **setns into a foreign user namespace keeps dumpable.** Entering a namespace not owned by the
-  caller's euid skips Linux's dumpable and pdeathsig reset (until the next execve).
+None.
 
 ## Open questions
 
-- `no_new_privs` is kept per thread group, while Linux keeps it per thread (prctl sets only the
-  caller's; seccomp TSYNC spreads it): does anything set it on one thread only and rely on the
-  others staying free of it?
+None.
 
 ## To verify
 

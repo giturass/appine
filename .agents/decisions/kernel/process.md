@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-24 (HEAD = 231480cb). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -33,7 +33,7 @@
 - **D24** — With `CLONE_PARENT` the child takes the creating thread group's exit signal, while ptrace still picks the fork or clone event from the requested signal, as on Linux (14dede6)
 - **D25** — A thread-targeted POSIX timer signal is sent only while its task still exists in the timer's process and is otherwise dropped, though a thread of the same process reusing that number still receives it (d98f60b)
 - **D26** — Marking a robust lock owner-died translates its address with copy-on-write broken (or the page faulted in) before the compare-and-swap loop, since a plain translate does not break copy-on-write (kernel/mm's rule for writers through translate) (e4d3386)
-- **D27** — `set_policy` follows `__sched_setscheduler`'s checks (reset-on-fork only with a kept policy, clamps against the current ones, `KEEP_PARAMS` validating only, nice only for `SCHED_OTHER` and `SCHED_BATCH`, `EPERM` beyond `RLIMIT_NICE` or for clearing reset-on-fork without `CAP_SYS_NICE`) and `KCMP_IO` compares I/O priority contexts, though the policy is still applied before the nice check (70c1bc6, dcacfb6)
+- **D27** — `set_policy` follows `__sched_setscheduler`'s checks (reset-on-fork only with a kept policy, clamps against the current ones, `KEEP_PARAMS` validating only, nice only for `SCHED_OTHER` and `SCHED_BATCH`, `EPERM` beyond `RLIMIT_NICE` or for clearing reset-on-fork without `CAP_SYS_NICE`) and `KCMP_IO` compares I/O priority contexts; `sched_setattr` now validates policy before nice and commits only after both succeed (D61) (70c1bc6, dcacfb6)
 - **D28** — `Kernel::ucounts` charges a new namespace to (namespace, euid) and each (parent, owner) pair up to the initial namespace, and clone, unshare and open_tree return `ENOSPC` at a `max_*_namespaces` limit before creating anything, so a new namespace kind must be checked and counted where it is created, and dead namespaces leave the counts only at the next check (6d05aa9)
 - **D29** — When the first stage of `task::exit` panics, a second `bug::catch` still completes `vfork_done` and calls `remove_user` before the kill, while the rest of the stage is skipped and a salvage over borrowed state is only reported (6d1d9c0)
 - **D30** — wait applies one eligibility rule (`__WCLONE` and `__WALL` by exit signal, zombies only for waits taking exits), #! nests five deep, tids wrap to 300 below `PID_MAX`, `appine-run` forwards its first stop signal and kills everything on one at least a second later, and the periodic checks stop through `Shared::stop_checks` with SeqCst on both sides (5d23297)
@@ -81,8 +81,8 @@
 - **What**: kernel/process owns tasks, processes, the BKL, syscall dispatch, the fast path, waits, scheduling and accounting, while bug containment, kill reports, test hooks and the BKL watchdog belong to `kernel/bug`, time and periodic checks to `kernel/time`, machine lifecycle and PID 1 to `kernel/boot`, and the existing exec, namespace, futex and credential boundaries remain.
 - **Why**: Even after five splits, `kernel/process.md` remained 42,070 B (91.3% of one read) while still carrying standalone bug-containment and BKL-watchdog files.
 - **Tradeoffs**: Shared files (`kernel.rs`, `machine.rs`, `syscall/mod.rs`) carry explicit exceptions in `.agents/MODULES.md`, cross-boundary changes consult several maps, pre-split decisions stay here, and vDSO construction belongs to `kernel/vdso`.
-- **Watch out**: BKL acquisition and task entry/exit paths must keep updating `Hold` and calling `kernel::doing`/`done` and `bug::catch` as `kernel/bug` requires, alongside preserving `fast_sleep` handover, BKL charging, vfork freezer accounting and open map bugs (`sched_setattr` policy-before-nice ordering and wake-up matching outside `bug::catch`).
-- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5
+- **Watch out**: BKL acquisition and task entry/exit paths must keep updating `Hold` and calling `kernel::doing`/`done` and `bug::catch` as `kernel/bug` requires, alongside preserving `fast_sleep` handover, BKL charging and vfork freezer accounting.
+- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53, D54, D61 and D63); cf029f9a, 8a17e4a9; d053be24; 60790c14; 39e55b4b; e4d7bbe5
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -192,6 +192,54 @@
 - **Watch out**: The measured saving depends on compiler code generation.
 - **Source**: b65799c8
 
+### D59: Thread-exit DBT stat aggregation sums `DbtStats::fast_loops`
+
+- **What**: `add_stats` in `core/kernel/src/task.rs` sums `DbtStats::fast_loops` alongside the other Tier 1 counters when a thread exits.
+- **Why**: Process-wide Tier 1 statistics must include strip-mined fast loops compiled on exiting threads.
+- **Tradeoffs**: None beyond one addition per exiting thread.
+- **Watch out**: Keep `add_stats` updated whenever new fields are added to `DbtStats`.
+- **Source**: 49585f4e
+
+### D60: Condense the `kernel/process` map in place rather than splitting scheduling
+
+- **What**: `.agents/maps/kernel/process.md` is tightened in place to stay comfortably under one read instead of extracting another small child module for scheduling or fast-path syscalls.
+- **Why**: The map reached 80.0% of one read despite six prior child splits, and condensing verbose descriptions preserved all verified facts without multiplying module boundaries.
+- **Tradeoffs**: Scheduling syscalls stay documented inside `kernel/process` rather than in a standalone module.
+- **Watch out**: Further growth in clone, exit or scheduling semantics could push the map back toward 80%, making `kernel/sched` the cleanest next extraction candidate.
+- **Source**: 4fcd3e13
+
+### D61: `sched_setattr` validates policy before nice and commits only after both succeed
+
+- **What**: `sched_setattr` validates policy and permissions with `set_policy(..., false)` before running `setpriority`, committing `t.sched` (and `apply_host` when `!keep_params`) only after `setpriority` succeeds.
+- **Why**: Applying `set_policy` before `setpriority` left policy and `SCHED_RESET_ON_FORK` mutated whenever `RLIMIT_NICE` rejected the requested nice value.
+- **Tradeoffs**: None, because `setpriority` does not depend on `t.sched`.
+- **Watch out**: Keep `setpriority` independent of uncommitted `t.sched` changes so validation remains atomic on error.
+- **Source**: 849bf98a
+
+### D62: `invalidate_code` allows explicit guest page-0 invalidation
+
+- **What**: `invalidate_code` in `core/kernel/src/task.rs` no longer filters out address `0`, restricting the `ivau != 0` sentinel check to the site that merges the `ivau_page` side-channel with an explicit `Exit::InvalidateCode`.
+- **Why**: Filtering `0` inside `invalidate_code` dropped pure Tier 0 `Exit::InvalidateCode { addr: 0 }` invalidations on guest page 0 (such as single-stepped `ic ivau` with `mmap_min_addr = 0`).
+- **Tradeoffs**: `struct appine_cpu::ivau_page` still uses `0` as "none", which only affects Tier 1 `ic ivau` (where Tier 1 invalidates page 0 directly).
+- **Watch out**: Callers of `invalidate_code` must never pass `0` expecting a no-op sentinel.
+- **Source**: 0e02d7cd
+
+### D63: `Bkl::drop` contains wake-up matching and drops the unlocked global wake fallback
+
+- **What**: `Bkl::drop` wraps `k.flush_wakeups()` in `bug::catch` (waking every waiter in `k.waiters` directly on panic before unlocking) and `note_wake` returns early when `HELD == 0` instead of writing to process-global `WAKE`/`WAKE_OBJECTS`.
+- **Why**: A panic in `flush_wakeups` skipped unlocking the BKL, and unlocked wake requests fed a process-global fallback that could leak into another kernel instance.
+- **Tradeoffs**: Any non-test code calling `request_wake*` without holding the BKL is silently ignored instead of waking later.
+- **Watch out**: Every production caller of `request_wake*` must hold the BKL.
+- **Source**: 15347732
+
+### D64: Task and group lifecycle hooks coordinate group stops, sibling ptrace exits, syscall stepping and zombie-leader clocks
+
+- **What**: `ThreadGroup::{stop_pending, leader_serial}` and `Task::{stop_pending, exit_started}` support calling `participate_group_stop` in `task::start`/`task::exit`, `ptrace::exit` in `task::run`'s `Flow::Exit` arm, and `ptrace::syscall_stepped` on skipped syscalls and `exec_done` in `syscall/mod.rs`.
+- **Why**: Multi-thread group-stop notification, sibling `PTRACE_EVENT_EXIT`, syscall single-stepping and zombie-leader CPU clocks need shared task/group fields and lifecycle hooks rather than duplicated tracking across `signal`, `ptrace` and `time`.
+- **Tradeoffs**: Slightly widens `ThreadGroup` and `Task` and couples `task::run`'s exit path to `ptrace::exit`.
+- **Watch out**: Keep `Task::exit_started` synchronized between `exit`/`exit_group` and `task::run` so a traced thread never emits `PTRACE_EVENT_EXIT` twice, and keep `leader_serial` cleared alongside `leader_exit` on leader replacement.
+- **Source**: 13dd5ae4
+
 ## Superseded
 
 - ~~Deadlines stay plain `Instant`s (D15 in part, 96cd8bd)~~ → replaced by **D19** in 63b9e59 (2026-11-07)
@@ -203,3 +251,4 @@
 - ~~Comparing observations at each checkpoint under D47~~ → narrowed by **D47 and kernel/cgroup D2** in 0f5c5132 (2026-11-17).
 - ~~Spawning a separate `bkl-watchdog-log` thread per ended stall under D38 in d20fd3c~~ → replaced by **D38** in 1e6c63a9 (2026-11-21).
 - ~~D14 ownership of bug containment and the BKL watchdog (dd6c288, d2b1dc3, 8a17e4a9)~~ → replaced by **D14** and kernel/bug **D1** in e4d7bbe5 (2026-11-22).
+- ~~`sched_setattr` applies policy before validating nice (D27's caveat, 70c1bc6, dcacfb6)~~ → replaced by **D61** in 849bf98a (2026-11-23, no SUPERSEDES declared).

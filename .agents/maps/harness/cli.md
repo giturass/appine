@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the harness full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: joined Android DNS preloading and root-owned shared-storage fixtures)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's regression coverage for Unix reply addresses, queued signals and overlay executable reopens alongside the retained root-owned shared-storage fixtures)
 
 ## Responsibilities
 
@@ -45,10 +45,11 @@ benchmarks are `harness`, differential testing `harness/diff`.
   failure, "the inode store already exists" for an existing one); anything after it is ignored.
 - Without `--rootfs` the program is a host file and the guest has no filesystem (dynamically linked
   programs fail to load); with `--rootfs` the path is resolved in the store.
-- A PTY is used by default when fds 0 and 1 are both terminals (then the host terminal goes raw,
-  continuing with a message if it cannot, and `SIGWINCH` resizes the guest console); `--pty`
-  forces one (24×80 unless both are terminals), `--no-pty` gives the guest the host's stdio.
-  Through the PTY, guest stdout and stderr both reach fd 1.
+- A PTY is used by default when stdin and stdout are both terminals. `--pty` forces one and
+  `--no-pty` gives the guest the host's stdio. With a PTY, terminal input goes raw and is
+  restored on exit. A raw-mode error is reported and execution continues. `SIGWINCH` updates
+  the guest's window size from the output terminal, falling back to the input terminal. With
+  neither, it defaults to 24×80. Guest stdout and stderr both reach fd 1.
 - On Android, a recognized interactive shell with a PTY starts the system DNS loader in a
   background thread (joined before exit). Command and script invocations load it on demand. Set
   `APPINE_PRELOAD_ANDROID_DNS=0` to disable preloading.
@@ -91,6 +92,8 @@ benchmarks are `harness`, differential testing `harness/diff`.
   loop block sizes), and one network test (`apk add`, `git clone`, Python imports
   at Tier 1 in a store of its own, gated by `APPINE_NETWORK_TESTS=1`, run only by `full.yml`).
   Most cases run under both tiers.
+- In debug builds the host-refused TCP filter check runs `sockfilter` and the filtered DNAT
+  variant of `net_regressions` on both tiers, using hook 14 to force the restricted-host path.
 - Without a store or `musl-gcc` the tests skip with a message (each rootfs test that skips says
   so), unless `APPINE_REQUIRE_ROOTFS=1` / `APPINE_REQUIRE_MUSL=1` (set in CI); bug-injection and
   BKL-watchdog tests run only in debug builds and return silently otherwise. No cargo test sends
@@ -126,6 +129,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
 
 ## Invariants and gotchas
 
+- Each receive, signal-wait or child-wait output in `fs_mm_regressions` that needs a FUSE fault maps a distinct fixture
+  inode. Private mappings of the same file page share the initial read, which can leave later
+  calls without a daemon callback. `fs_io_regressions` checks FIFO close events across dup and unlink/reopen on store and overlay paths.
 - Default builds enable borrow-check; runners detect kernel bugs on stderr via
   `appine: internal error`, even when guest exit status otherwise looks successful.
 - Required-rootfs/musl switches make missing prerequisites fail rather than silently skip;
@@ -136,17 +142,9 @@ benchmarks are `harness`, differential testing `harness/diff`.
   `LD_LIBRARY_PATH='/system/lib64:/data/data/com.termux/files/usr/lib'`; its linker stub omits
   `android_res_*` symbols.
 
-## Confirmed bugs / technical debt
-
-- **A forced PTY on a terminal with piped stdout is half set up.** Raw mode needs both fds to be
-  terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
-  stops `appine-run` itself), line-buffers input and echoes it while the guest echoes into the
-  pipe; the size stays 24×80.
-
 ## Open questions
 
-- Should `--import` install the stop handlers (SIGINT now ends it by default), and is a forced PTY
-  with only one side a terminal meant to be supported?
+- Should `--import` install the stop handlers (SIGINT now ends it by default)?
 
 ## To verify
 

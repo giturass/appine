@@ -500,8 +500,16 @@ impl Pending {
 
 /// Sends a signal to one thread (tkill, SIGPIPE and so on).
 pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) {
+    try_send_to_task(k, task, sig, info);
+}
+
+/// Like [`send_to_task`], returning `false` if a real-time signal could not be queued because
+/// `RLIMIT_SIGPENDING` was exceeded (other than `SI_TIMER`, which overrides the limit like Linux
+/// 6.1's preallocated `send_sigqueue`, and `SI_USER`/`SI_KERNEL`, which fall back to setting the
+/// pending bit without `SigInfo`).
+pub(crate) fn try_send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) -> bool {
     let Some(group) = k.groups.get(&task.tgid).cloned() else {
-        return;
+        return true;
     };
     let blocked = task.sigmask.get() & sig.bit() != 0;
     let traced = crate::ptrace::traced(task);
@@ -510,21 +518,23 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
         if target.is_some() {
             group_exit(k, &group, killed_by(sig));
         }
-        return;
+        return true;
     }
     // Side effects such as SIGCONT resuming the process happen even if the signal is then dropped
     // (Linux's prepare_signal)
     prepare(k, &group, sig);
     let Some(info) = target else {
-        return;
+        return true;
     };
     // A blocked signal is made pending even if currently ignored: the disposition may change
     // before it is unblocked. It is also made pending for a traced thread, since the tracer must
     // see it
     if !blocked && group.borrow().sighand.borrow().ignores(sig) && !traced {
-        return;
+        return true;
     }
-    let room = sig.is_realtime() && queue_room(k, &group.borrow());
+    let Some(room) = rt_queue_room(k, &group.borrow(), sig, &info) else {
+        return false;
+    };
     task.pending.borrow_mut().add(sig, info, room);
     if !blocked {
         wake(task);
@@ -533,6 +543,7 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
         // only those waiting for them (wake::SIGNAL)
         request_wake_on(wake::SIGNAL);
     }
+    true
 }
 
 /// Sends a signal to every process in a process group (terminal-generated signals, kill with a
@@ -554,6 +565,12 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
     send_group(k, tgid, sig, info, false);
 }
 
+/// Like [`send_to_group`], returning `false` if a real-time signal could not be queued due to
+/// `RLIMIT_SIGPENDING`.
+pub(crate) fn try_send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) -> bool {
+    send_group(k, tgid, sig, info, false)
+}
+
 /// A timer counting process CPU time expired: as on Linux the signal is sent to the process, but a
 /// running thread is woken to handle it. Linux notices the expiry in the clock interrupt of the
 /// thread consuming CPU, so that thread handles it; CPU profilers rely on this to sample a thread
@@ -562,9 +579,9 @@ pub(crate) fn send_cpu_timer(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) 
     send_group(k, tgid, sig, info, true);
 }
 
-fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) {
+fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) -> bool {
     let Some(group) = k.groups.get(&tgid).cloned() else {
-        return;
+        return true;
     };
     let threads: Vec<Rc<Task>> = group
         .borrow()
@@ -573,7 +590,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         .filter_map(|t| k.tasks.get(t).cloned())
         .collect();
     let Some(leader) = threads.first() else {
-        return;
+        return true;
     };
     let blocked = leader.sigmask.get() & sig.bit() != 0;
     let traced = crate::ptrace::traced(leader);
@@ -582,20 +599,20 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         if target.is_some() {
             group_exit(k, &group, killed_by(sig));
         }
-        return;
+        return true;
     }
     prepare(k, &group, sig);
     let Some(info) = target else {
-        return;
+        return true;
     };
     let ignored = group.borrow().sighand.borrow().ignores(sig);
     if ignored && !blocked && !traced {
-        return;
+        return true;
     }
-    {
-        let room = sig.is_realtime() && queue_room(k, &group.borrow());
-        group.borrow_mut().pending.add(sig, info, room);
-    }
+    let Some(room) = rt_queue_room(k, &group.borrow(), sig, &info) else {
+        return false;
+    };
+    group.borrow_mut().pending.add(sig, info, room);
     // Linux's wants_signal: a thread that blocks the signal, or sits in a ptrace stop, does not
     // take it; another one is chosen
     let unmasked =
@@ -618,6 +635,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         // Every thread blocks it: threads waiting in sigtimedwait or signalfd must recheck
         None => request_wake_on(wake::SIGNAL),
     }
+    true
 }
 
 /// Before a signal is sent to `group` (Linux's `send_signal_locked`, `sig_task_ignored`): when
@@ -634,13 +652,21 @@ fn for_target(
 ) -> Option<SigInfo> {
     info.retarget_uid(&group.cred);
     let ns = &group.pid_ns;
+    let mut force = info.code == code::SI_KERNEL;
+    if info.sender != 0 {
+        if let Some(vnr) = ns.vnr(info.sender) {
+            // Translate kernel-populated sender pid into the target's pid namespace (preserving
+            // caller-supplied si_pid in InfoFields::User)
+            if let InfoFields::Kill { pid, .. } = &mut info.fields {
+                *pid = vnr;
+            }
+        } else {
+            info.hide_sender();
+            force = true;
+        }
+    }
     if ns.level == 0 {
         return Some(info);
-    }
-    let mut force = info.code == code::SI_KERNEL;
-    if info.sender != 0 && !ns.sees(info.sender) {
-        info.hide_sender();
-        force = true;
     }
     let ignored = unkillable(group)
         && (!blocked && !traced || sig == Signal::KILL)
@@ -657,17 +683,20 @@ fn unkillable(group: &ThreadGroup) -> bool {
 /// Ends the whole thread group (exit_group, a fatal signal, a SIGKILL not from execve): records
 /// the exit status and makes every thread exit the next time it enters the kernel.
 pub(crate) fn group_exit(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, status: ExitStatus) {
-    let mut g = group.borrow_mut();
-    if g.exiting.is_none() {
-        g.exiting = Some(status);
-    }
-    k.cgroups.task_changed(g.cgroup);
-    for tid in &g.threads {
-        if let Some(t) = k.tasks.get(tid) {
-            t.killed.set(true);
-            wake(t);
+    let cgroup = {
+        let mut g = group.borrow_mut();
+        if g.exiting.is_none() {
+            g.exiting = Some(status);
         }
-    }
+        for tid in &g.threads {
+            if let Some(t) = k.tasks.get(tid) {
+                t.killed.set(true);
+                wake(t);
+            }
+        }
+        g.cgroup
+    };
+    crate::cgroup::task_changed(k, cgroup);
 }
 
 fn killed_by(sig: Signal) -> ExitStatus {
@@ -697,22 +726,29 @@ fn prepare(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, sig: Signal) {
         clear(Signal::CONT.bit());
     } else if sig == Signal::CONT {
         clear(STOP_SIGNALS);
-        let resumed = {
+        let (was_stopped, notify_cont) = {
             let mut g = group.borrow_mut();
             let was = std::mem::take(&mut g.stopped);
+            let pending = std::mem::take(&mut g.stop_pending);
+            let notify = was && pending == 0;
             if was {
                 g.stop_report = None;
-                g.cont_report = true;
+                if notify {
+                    g.cont_report = true;
+                }
             }
-            was
+            (was, notify)
         };
-        if resumed {
+        if notify_cont {
             notify_parent(k, group, code::CLD_CONTINUED, Signal::CONT.number());
+        }
+        if was_stopped {
             request_wake();
         }
         // Traced threads no longer join the group-stop; those in PTRACE_LISTEN must report again
-        // (crate::ptrace)
+        // (crate::ptrace). Clear any pending stop participation on every thread.
         for t in group.borrow().threads.iter().filter_map(|t| k.tasks.get(t)) {
+            t.stop_pending.set(false);
             let mut trace = t.trace.borrow_mut();
             trace.group_stop = None;
             if trace.listening {
@@ -773,6 +809,20 @@ pub(crate) fn can_queue(k: &Kernel, tgid: Tid, sig: Signal) -> bool {
 /// `RLIMIT_SIGPENDING` (Linux counts per user).
 fn queue_room(k: &Kernel, group: &ThreadGroup) -> bool {
     (queued(k, group) as u64) < group.rlimits[RLIMIT_SIGPENDING as usize].0
+}
+
+/// Decides whether `sig` queues its `SigInfo` under Linux 6.1's `__send_signal_locked`
+/// `RLIMIT_SIGPENDING` rules: `Some(true)` queues with info (`SI_TIMER` overrides the limit like
+/// Linux's preallocated `send_sigqueue`), `Some(false)` sets only the pending bit (standard
+/// signals, or `SI_USER`/`SI_KERNEL` RT overflow), and `None` drops the RT signal on overflow.
+fn rt_queue_room(k: &Kernel, group: &ThreadGroup, sig: Signal, info: &SigInfo) -> Option<bool> {
+    if !sig.is_realtime() {
+        return Some(false);
+    }
+    if info.code == code::SI_TIMER || queue_room(k, group) {
+        return Some(true);
+    }
+    matches!(info.code, code::SI_USER | code::SI_KERNEL).then_some(false)
 }
 
 /// The number of real-time signals queued in the thread group (SigQ in `/proc/<pid>/status`).
@@ -979,8 +1029,7 @@ fn class_name(esr: u64) -> &'static str {
     }
 }
 
-/// The name arm64 Linux's `fault_info` gives an abort's fault status code, for the codes Appine
-/// synthesizes (crate::task) and the other translation and permission levels.
+/// The name arm64 Linux's `fault_info` gives an abort's fault status code.
 pub(crate) fn abort_name(esr: u64) -> &'static str {
     match esr & 0x3f {
         0x04 => "level 0 translation fault",
@@ -1097,13 +1146,26 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         // (crate::ptrace). As in Linux's get_signal, this is done before each signal is dequeued:
         // a thread PTRACE_ATTACHed while stopped first reports the group-stop, then the SIGSTOP
         // that ATTACH sent
-        if let Flow::Exit = wait_while_stopped(cx) {
+        if let Flow::Exit = wait_while_stopped(cx, cpu) {
             return Flow::Exit;
         }
-        if crate::ptrace::traced(cx.task)
-            && (!crate::ptrace::group_stop(cx, cpu) || !crate::ptrace::trap(cx, cpu))
-        {
-            return Flow::Exit;
+        if crate::ptrace::traced(cx.task) {
+            use crate::ptrace::StopResult;
+            // Re-loop after a group-stop or interrupt trap: if the tracer detached while the
+            // group is still stopped, the thread re-enters wait_while_stopped silently instead
+            // of dequeuing the SIGSTOP that PTRACE_ATTACH queued.
+            let stop = match crate::ptrace::group_stop(cx, cpu) {
+                StopResult::None => crate::ptrace::trap(cx, cpu),
+                other => other,
+            };
+            match stop {
+                StopResult::Killed => return Flow::Exit,
+                StopResult::Stopped => {
+                    cpu.state_mut().clear_exclusive();
+                    continue;
+                }
+                StopResult::None => {}
+            }
         }
         let Some((sig, info)) = dequeue(cx) else {
             break;
@@ -1113,6 +1175,8 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         // signals forced by seccomp do not stop either (SA_IMMUTABLE)
         let immutable = cx.t.group.borrow().sighand.borrow().get(sig).immutable;
         let (sig, info) = if crate::ptrace::traced(cx.task) && !immutable {
+            // A tracer may suppress the signal, so there may be no frame on resume.
+            cpu.state_mut().clear_exclusive();
             match crate::ptrace::signal_stop(cx, cpu, sig, info) {
                 Ok(Some(delivered)) => delivered,
                 Ok(None) => continue,
@@ -1181,6 +1245,9 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         }
         // Decided by the first signal taken, even if its frame cannot be written (Linux's do_signal
         // forgets the syscall before handling it)
+        if matches!(restart, Some((Errno::ERESTART_RESTARTBLOCK, _))) {
+            cx.t.restart = None;
+        }
         restart = None;
         // The mask temporarily swapped by sigsuspend or ppoll: the frame saves the original,
         // restored when the handler returns
@@ -1235,11 +1302,12 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
     }
     // No handler interrupted: the svc being re-executed becomes restart_syscall, which continues
     // the remaining part
-    if !handled
-        && let Some((Errno::ERESTART_RESTARTBLOCK, cont)) = restart
-        && cpu.state().pc == cont - 4
-    {
-        cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
+    if !handled && let Some((Errno::ERESTART_RESTARTBLOCK, cont)) = restart {
+        if cpu.state().pc == cont - 4 {
+            cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
+        } else {
+            cx.t.restart = None;
+        }
     }
     Flow::Continue
 }
@@ -1258,7 +1326,11 @@ pub(crate) fn retarget(
         if set == 0 {
             break;
         }
-        let Some(t) = k.tasks.get(&tid).filter(|_| Some(tid) != except) else {
+        let Some(t) = k
+            .tasks
+            .get(&tid)
+            .filter(|t| Some(tid) != except && t.trace.borrow().stop.is_none())
+        else {
             continue;
         };
         let takes = set & !t.sigmask.get();
@@ -1273,7 +1345,7 @@ pub(crate) fn retarget(
 /// becomes ptrace-traced while stopped also leaves, to stop in a ptrace-stop instead
 /// ([`deliver`]). While its cgroup is frozen it also waits here until thawed (Linux's
 /// `do_freezer_trap`), traced threads too; meanwhile it is recorded as stopped (`cgroup.events`).
-fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
+fn wait_while_stopped(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let flow = loop {
         if cx.task.killed.get() {
             break Flow::Exit;
@@ -1284,6 +1356,10 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
         };
         if !stopped && !frozen {
             break Flow::Continue;
+        }
+        cpu.state_mut().clear_exclusive();
+        if stopped {
+            participate_group_stop(cx.kr(), &cx.t.group, cx.task);
         }
         // The last thread stopping completes the freeze (cgroup.events' frozen)
         if frozen {
@@ -1354,31 +1430,86 @@ pub(crate) fn pgrp_orphaned(k: &Kernel, pgid: Tid) -> bool {
     })
 }
 
-/// Stops the whole thread group (the default action of stop signals): notifies the parent and
-/// kicks the other threads so that they stop too. Traced threads (including this one) record that
-/// they must join this group-stop (crate::ptrace).
+/// Stops the whole thread group (the default action of stop signals): marks every running thread
+/// to join the stop and kicks siblings so they stop too. The parent is notified with
+/// `CLD_STOPPED` only once all threads have entered the stop ([`participate_group_stop`]). If the
+/// group is already stopped, the thread re-enters the stop silently without notifying the parent
+/// again, matching Linux 6.1's `do_signal_stop`.
 fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     let group = cx.t.group.clone();
+    if let Some(stop_sig) = {
+        let g = group.borrow();
+        g.stopped.then_some(g.stop_signal)
+    } {
+        let mut trace = cx.task.trace.borrow_mut();
+        if trace.tracer.is_some() {
+            trace.group_stop = Some(stop_sig);
+        }
+        return;
+    }
     let threads = {
         let mut g = group.borrow_mut();
         g.stopped = true;
         g.stop_signal = sig;
-        g.stop_report = Some(sig);
         g.cont_report = false;
         g.threads.clone()
     };
+    let mut pending = 0usize;
     for t in threads.iter().filter_map(|t| cx.kr().tasks.get(t)) {
-        {
+        if t.exit_started.get() {
+            continue;
+        }
+        let already_traced_stop = {
             let mut trace = t.trace.borrow_mut();
             if trace.tracer.is_some() {
                 trace.group_stop = Some(sig);
             }
-        }
-        if !Rc::ptr_eq(t, cx.task) {
-            wake(t);
+            trace.stop.is_some()
+        };
+        if !already_traced_stop {
+            t.stop_pending.set(true);
+            pending += 1;
+            if !Rc::ptr_eq(t, cx.task) {
+                wake(t);
+            }
         }
     }
-    notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
+    group.borrow_mut().stop_pending = pending;
+    if pending == 0 {
+        complete_group_stop(cx.kr(), &group);
+    }
+}
+
+/// Completes `task`'s participation in an in-progress group-stop (Linux's
+/// `task_participate_group_stop`): decrements `ThreadGroup::stop_pending` and notifies the parent
+/// with `CLD_STOPPED` once every thread has stopped.
+pub(crate) fn participate_group_stop(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, task: &Task) {
+    if !task.stop_pending.replace(false) {
+        return;
+    }
+    let completed = {
+        let mut g = group.borrow_mut();
+        if !g.stopped || g.stop_pending == 0 {
+            return;
+        }
+        g.stop_pending -= 1;
+        g.stop_pending == 0
+    };
+    if completed {
+        complete_group_stop(k, group);
+    }
+}
+
+fn complete_group_stop(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let sig = {
+        let mut g = group.borrow_mut();
+        if g.threads.is_empty() || g.exiting.is_some() {
+            return;
+        }
+        g.stop_report = Some(g.stop_signal);
+        g.stop_signal
+    };
+    notify_parent(k, group, code::CLD_STOPPED, sig.number());
 }
 
 // ---- Signal frames ----
@@ -1483,8 +1614,10 @@ const FPSIMD_MAGIC: u32 = 0x4650_8001;
 const FPSIMD_SIZE: usize = 528;
 const ESR_MAGIC: u32 = 0x4553_5201;
 const ESR_SIZE: usize = 16;
-/// The exception level and AArch32 bits of pstate: in a signal frame they must be EL0t, AArch64.
+/// The exception level, AArch32 and DAIF interrupt-mask bits of pstate: in a signal frame they
+/// must all be 0 (EL0t, AArch64, interrupts unmasked; Linux's `valid_native_regs`).
 const PSTATE_MODE: u64 = 0x1f;
+const PSTATE_DAIF: u64 = 0x3c0;
 
 /// Builds the signal frame on the guest stack and makes the CPU start executing the handler.
 fn setup_frame(
@@ -1497,6 +1630,7 @@ fn setup_frame(
 ) -> Result<(), Errno> {
     let alt = cx.t.altstack;
     let st = cpu.state_mut();
+    st.clear_exclusive();
     let mut top = st.sp;
     if act.flags & sa::ONSTACK != 0 && alt.size != 0 && !alt.on_stack(st.sp) {
         top = alt.sp.wrapping_add(alt.size);
@@ -1573,9 +1707,10 @@ fn w64(b: &mut [u8], off: usize, v: u64) {
 }
 
 /// rt_sigreturn: restores registers, the signal mask and the alternate stack from the signal
-/// frame on the stack. An invalid frame changes nothing, returns 0 and forces a SIGSEGV at the
-/// stack pointer (arm64's `arm64_notify_segfault`), which a handler may catch.
+/// frame on the stack. An invalid frame returns 0 and forces a SIGSEGV at the stack pointer
+/// (arm64's `arm64_notify_segfault`), which a handler may catch.
 pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
+    cpu.state_mut().clear_exclusive();
     if restore_frame(cx, cpu).is_err() {
         crate::debug::log(format_args!("rt_sigreturn: bad signal frame"));
         let sp = cpu.state().sp;
@@ -1589,10 +1724,12 @@ pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         force(cx, Signal::SEGV, SigInfo::fault(code, sp, 0));
         cpu.state_mut().x[0] = 0;
     }
-    // PTRACE_SYSCALL: stop at exit, and the tracer sees the restored registers (crate::ptrace)
+    // PTRACE_SYSCALL: stop at exit, and the tracer sees the restored registers (crate::ptrace);
+    // a single-stepped rt_sigreturn reports at syscall return rather than one instruction late.
     if crate::ptrace::traced(cx.task) && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
+    crate::ptrace::syscall_stepped(cx);
     // The restored mask may have unblocked pending signals; x0 is the restored value, not
     // treated as a syscall return value
     deliver(cx, cpu, false)
@@ -1606,12 +1743,13 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
     let mut b = vec![0u8; FRAME_SIZE];
     cx.mm().read(UserSlice::new(frame, FRAME_SIZE), &mut b)?;
     let pstate = r64(&b, PSTATE);
-    if pstate & PSTATE_MODE != 0 {
+    if pstate & (PSTATE_MODE | PSTATE_DAIF) != 0 {
         return Err(Errno::EINVAL);
     }
     // Parse the records in __reserved first, and change no state until the whole frame is known
     // to be valid
     let mut fpsimd = None;
+    let mut esr = false;
     let mut off = 0;
     loop {
         if off + 8 > RESERVED_SIZE {
@@ -1629,7 +1767,7 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
             FPSIMD_MAGIC if size == FPSIMD_SIZE && fpsimd.is_none() => {
                 fpsimd = Some(RESERVED + off);
             }
-            ESR_MAGIC => {}
+            ESR_MAGIC if size == ESR_SIZE && !esr => esr = true,
             _ => return Err(Errno::EINVAL),
         }
         off += size;
@@ -1644,7 +1782,7 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
     st.pc = r64(&b, PC);
     crate::ptrace::set_pstate(st, pstate);
     st.fpsr = r32(&b, fp + 8) as u64;
-    st.fpcr = r32(&b, fp + 12) as u64;
+    st.fpcr = u64::from(r32(&b, fp + 12)) & appine_engine::fpcr_write_mask();
     for (i, v) in st.v.iter_mut().enumerate() {
         v[0] = r64(&b, fp + 16 + 16 * i);
         v[1] = r64(&b, fp + 24 + 16 * i);
@@ -1848,5 +1986,351 @@ mod tests {
             "Tainted: G        W  O      "
         );
         assert_eq!(tainted_text(1), "Tainted: P                  ");
+    }
+
+    #[test]
+    fn for_target_translates_si_pid_across_pid_namespaces() {
+        use crate::cred::UserNs;
+        use crate::pidns::PidNs;
+
+        let root_ns = PidNs::init();
+        let mid_ns = PidNs::child(&root_ns, UserNs::init());
+        let leaf_ns = PidNs::child(&mid_ns, UserNs::init());
+        let sibling_ns = PidNs::child(&root_ns, UserNs::init());
+
+        // Global tid 42 is pid 1 in leaf_ns and pid 7 in mid_ns (not visible in sibling_ns).
+        PidNs::register(&leaf_ns, 42, &[1, 7]).unwrap();
+
+        let make_group = |tgid: Tid, ns: &Rc<PidNs>| {
+            let mut g = ThreadGroup::new(tgid, 1, Rc::new(RefCell::new(SigHandlers::default())));
+            g.pid_ns = ns.clone();
+            g
+        };
+        let pid_of = |info: SigInfo| match info.fields {
+            InfoFields::Kill { pid, .. } | InfoFields::User { pid, .. } => pid,
+            _ => unreachable!(),
+        };
+
+        // Kernel-populated Kill from leaf_ns (local pid 1, global 42) to root_ns, mid_ns, sibling_ns.
+        let sent = SigInfo::kill(code::SI_USER, 1, 0).from(42);
+        let to_root =
+            for_target(&make_group(10, &root_ns), Signal::USR1, sent, false, false).unwrap();
+        assert_eq!(pid_of(to_root), 42);
+        let to_mid =
+            for_target(&make_group(20, &mid_ns), Signal::USR1, sent, false, false).unwrap();
+        assert_eq!(pid_of(to_mid), 7);
+        let to_sibling = for_target(
+            &make_group(30, &sibling_ns),
+            Signal::USR1,
+            sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(to_sibling), 0);
+
+        // User-supplied InfoFields::User preserves caller si_pid when visible, hides when invisible.
+        let user_sent = SigInfo {
+            code: -1,
+            fields: InfoFields::User {
+                errno: 0,
+                pid: 999,
+                uid: 0,
+                rest: [0; 24],
+            },
+            ..SigInfo::default()
+        }
+        .from(42);
+        let u_root = for_target(
+            &make_group(10, &root_ns),
+            Signal::USR1,
+            user_sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(u_root), 999);
+        let u_sibling = for_target(
+            &make_group(30, &sibling_ns),
+            Signal::USR1,
+            user_sent,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pid_of(u_sibling), 0);
+    }
+
+    fn spawn_test_tasks(
+        k: &mut Kernel,
+        group: &Rc<RefCell<ThreadGroup>>,
+        specs: &[(Tid, u64)],
+    ) -> (Vec<Cpu>, Vec<Rc<Task>>) {
+        use crate::fd::FdTable;
+        use crate::mm::Mm;
+        use crate::task::{FsContext, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let tgid = group.borrow().tgid;
+        let mm = Mm::new().into_shared();
+        let fds = Rc::new(RefCell::new(FdTable::new()));
+        let fs = Rc::new(RefCell::new(FsContext {
+            root: Node::ROOT,
+            cwd: Node::ROOT,
+            umask: 0o022,
+            mnt_ns: Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: crate::cred::UserNs::init(),
+                anon: false,
+            }),
+        }));
+        let mut cpus = Vec::with_capacity(specs.len());
+        let mut tasks = Vec::with_capacity(specs.len());
+        for &(tid, mask) in specs {
+            let cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+            let state = TaskState {
+                mm: mm.clone(),
+                fds: fds.clone(),
+                fs: fs.clone(),
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+            };
+            let task = Task::new(tid, tgid, &cpu, state, k.init_ns.clone(), mask, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(tid);
+            k.tasks.insert(tid, task.clone());
+            cpus.push(cpu);
+            tasks.push(task);
+        }
+        (cpus, tasks)
+    }
+
+    #[test]
+    fn retarget_skips_ptrace_stopped_threads() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut cpus = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            let (cpus, tasks) = spawn_test_tasks(
+                &mut k,
+                &group,
+                &[(10, Signal::USR1.bit()), (11, 0), (12, 0)],
+            );
+            // Thread 11 is in a ptrace stop; retarget must skip it and wake thread 12 instead.
+            tasks[1].trace.borrow_mut().stop = Some(crate::ptrace::Stop::Signal(Signal::TRAP));
+
+            retarget(&k, &group, Some(10), Signal::USR1.bit());
+            cpus
+        };
+
+        // Thread 12 was kicked (immediate Exit::Kick); thread 11 was not kicked.
+        assert!(!matches!(cpus[1].run(), appine_engine::Exit::Kick));
+        assert!(matches!(cpus[2].run(), appine_engine::Exit::Kick));
+    }
+
+    #[test]
+    fn group_stop_waits_for_all_threads_before_notifying_parent() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let parent = Rc::new(RefCell::new(ThreadGroup::new(
+            2,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            10,
+            2,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        k.groups.insert(2, parent.clone());
+        k.groups.insert(10, group.clone());
+        let (_cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(10, 0), (11, 0)]);
+
+        // Start a group-stop across 2 live threads: neither stop_report nor CLD_STOPPED yet.
+        {
+            let mut g = group.borrow_mut();
+            g.stopped = true;
+            g.stop_signal = Signal::STOP;
+            g.stop_pending = 2;
+        }
+        tasks[0].stop_pending.set(true);
+        tasks[1].stop_pending.set(true);
+
+        // First thread stops: parent must NOT be notified while sibling is still running.
+        participate_group_stop(&k, &group, &tasks[0]);
+        assert_eq!(group.borrow().stop_pending, 1);
+        assert_eq!(group.borrow().stop_report, None);
+
+        // Second thread stops: now stop_report is set and parent is notified.
+        participate_group_stop(&k, &group, &tasks[1]);
+        assert_eq!(group.borrow().stop_pending, 0);
+        assert_eq!(group.borrow().stop_report, Some(Signal::STOP));
+
+        // Cancelling an in-progress group-stop via SIGCONT does not set cont_report.
+        {
+            let mut g = group.borrow_mut();
+            g.stopped = true;
+            g.stop_pending = 1;
+            g.stop_report = None;
+            g.cont_report = false;
+        }
+        tasks[0].stop_pending.set(true);
+        prepare(&k, &group, Signal::CONT);
+        assert!(!group.borrow().stopped);
+        assert_eq!(group.borrow().stop_pending, 0);
+        assert!(!group.borrow().cont_report);
+        assert!(!tasks[0].stop_pending.get());
+    }
+
+    #[test]
+    fn rt_signals_at_rlimit_sigpending_match_linux_6_1() {
+        use crate::kernel::Shared;
+
+        let shared = Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            10,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        group.borrow_mut().rlimits[RLIMIT_SIGPENDING as usize] = (1, 1);
+        k.groups.insert(10, group.clone());
+
+        let rt = |n| Signal::new(34 + n).unwrap();
+        let block_all = (0..6).fold(0u64, |m, n| m | rt(n).bit());
+        let (_cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(10, block_all)]);
+
+        // Fill the single RLIMIT_SIGPENDING slot with a queued RT signal.
+        let q_info = SigInfo {
+            code: -1, // SI_QUEUE
+            fields: InfoFields::Queue {
+                pid: 10,
+                uid: 0,
+                value: 111,
+            },
+            ..SigInfo::default()
+        };
+        assert!(try_send_to_group(&k, 10, rt(0), q_info));
+        assert!(!can_queue(&k, 10, rt(0)));
+
+        // 1. POSIX timer (SI_TIMER) overrides RLIMIT_SIGPENDING and preserves its SigInfo.
+        let timer_info = SigInfo {
+            code: code::SI_TIMER,
+            fields: InfoFields::Timer {
+                id: 7,
+                overrun: 2,
+                value: 4242,
+            },
+            ..SigInfo::default()
+        };
+        assert!(try_send_to_group(&k, 10, rt(1), timer_info));
+        assert!(try_send_to_task(&k, &tasks[0], rt(1), timer_info));
+
+        // 2. Non-SI_USER/SI_KERNEL RT signals (SI_MESGQ, CLD_EXITED, POLL_IN) fail instead of
+        //    setting the pending bit with corrupted SI_USER info.
+        for (sig, info) in [
+            (
+                rt(2),
+                SigInfo {
+                    code: -3, // SI_MESGQ
+                    fields: InfoFields::Queue {
+                        pid: 10,
+                        uid: 0,
+                        value: 7777,
+                    },
+                    ..SigInfo::default()
+                },
+            ),
+            (rt(3), SigInfo::child_event(11, 0, code::CLD_EXITED, 33)),
+            (
+                rt(4),
+                SigInfo {
+                    code: 1, // POLL_IN
+                    fields: InfoFields::Poll { band: 1, fd: 5 },
+                    ..SigInfo::default()
+                },
+            ),
+        ] {
+            assert!(!try_send_to_group(&k, 10, sig, info));
+            assert_eq!(group.borrow().pending.set() & sig.bit(), 0);
+        }
+
+        // 3. SI_USER (kill / pdeathsig) still sets the pending bit without SigInfo.
+        let kill_info = SigInfo::kill(code::SI_USER, 10, 0).from(10);
+        assert!(try_send_to_group(&k, 10, rt(5), kill_info));
+        assert_ne!(group.borrow().pending.set() & rt(5).bit(), 0);
+
+        // Verify dequeued SigInfo values.
+        assert_eq!(group.borrow_mut().pending.take(rt(0)).code, -1);
+        for got in [
+            group.borrow_mut().pending.take(rt(1)),
+            tasks[0].pending.borrow_mut().take(rt(1)),
+        ] {
+            assert_eq!(got.code, code::SI_TIMER);
+            assert_eq!(got.fields, timer_info.fields);
+        }
+        assert_eq!(group.borrow_mut().pending.take(rt(5)), SigInfo::default());
+    }
+
+    #[test]
+    fn restore_frame_masks_fpcr() {
+        use crate::kernel::{Cx, Shared};
+        use crate::mm::flags;
+        use std::sync::Arc;
+
+        let shared = Arc::new(Shared::new(Kernel::new(crate::process::Tier::Interpreter)));
+        let mut k = shared.lock();
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            20,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        k.groups.insert(20, group.clone());
+        let (mut cpus, tasks) = spawn_test_tasks(&mut k, &group, &[(20, 0)]);
+        let mut cpu = cpus.pop().unwrap();
+        let task = tasks.into_iter().next().unwrap();
+        let mut state = task.state.borrow_mut();
+
+        let stack = state
+            .mm
+            .borrow_mut()
+            .mmap(
+                0,
+                2 * appine_engine::PAGE_SIZE,
+                appine_engine::prot::READ | appine_engine::prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let frame = stack + 0x100;
+        let mut buf = vec![0u8; FRAME_SIZE];
+        w32(&mut buf, RESERVED, FPSIMD_MAGIC);
+        w32(&mut buf, RESERVED + 4, FPSIMD_SIZE as u32);
+        w32(&mut buf, RESERVED + 8, 0x1f); // fpsr
+        w32(&mut buf, RESERVED + 12, u32::MAX); // fpcr with reserved/unwritable bits set
+        state
+            .mm
+            .borrow()
+            .write(UserSlice::new(frame, buf.len()), &buf)
+            .unwrap();
+        cpu.state_mut().sp = frame;
+
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        restore_frame(&mut cx, &mut cpu).unwrap();
+        assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());
+        assert_eq!(cpu.state().fpsr, 0x1f);
     }
 }

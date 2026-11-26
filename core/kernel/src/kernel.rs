@@ -25,6 +25,7 @@
 //! on locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
 //! only by FUTEX_WAKE, signals and the ending of the thread group.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
@@ -57,6 +58,12 @@ pub(crate) const INIT: Tid = 1;
 
 /// The largest tid, the same as the upper bound of `pid_max` on 64-bit Linux.
 pub(crate) const PID_MAX: Tid = 4 << 20;
+
+/// Lowest value `/proc/sys/kernel/pid_max` accepts (Linux 6.1's `pid_max_min`:
+/// `max(RESERVED_PIDS + 1, num_possible_cpus() * PIDS_PER_CPU_MIN)`).
+pub(crate) fn pid_max_min() -> Tid {
+    (crate::pidns::RESERVED_PIDS + 1).max(appine_hal::host_cpus().len() as Tid * 8)
+}
 
 /// Maximum length of the host name and domain name (`__NEW_UTS_LEN`).
 pub(crate) const UTS_LEN: usize = 64;
@@ -110,13 +117,6 @@ pub(crate) mod wake {
     }
 }
 
-/// Wake-ups requested without the BKL (there should be none; kept as a fallback): handed to the
-/// next thread that releases any BKL. Normal requests are recorded per thread ([`PENDING`]).
-static WAKE: AtomicU32 = AtomicU32::new(0);
-
-/// Objects requested to be woken without the BKL (the fallback of [`WAKE`]).
-static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
-
 thread_local! {
     /// Events to signal, recorded while holding the BKL ([`signal_later`]).
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
@@ -152,10 +152,6 @@ type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
 /// Pid 1 of a pid namespace waiting for the processes in the namespace to be reaped: the
 /// namespace, the process, and the process groups that may become orphaned.
 type HeldReaper = (Rc<crate::pidns::PidNs>, Rc<RefCell<ThreadGroup>>, Vec<Tid>);
-
-/// An open file holding a flock(2) lock (a weak reference; the lock is released with it when it is
-/// closed), whether the lock is exclusive, and the process that took it (`/proc/locks`).
-pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool, Tid);
 
 /// The kernel layer's global state.
 pub(crate) struct Kernel {
@@ -194,25 +190,34 @@ pub(crate) struct Kernel {
     pub consoles: BTreeMap<u32, crate::terminal::Console>,
     /// flock(2) locks: for each inode, the open files holding a lock and whether it is exclusive.
     /// Once an open file is closed its weak reference dies and the lock is released with it.
-    pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
+    pub flocks: crate::locks::Flocks,
     /// fcntl(2) record locks.
     pub locks: crate::locks::Locks,
     /// The boot-time UTS, IPC, network, cgroup and time namespaces ([`crate::nsproxy`]).
     pub init_ns: crate::nsproxy::NsProxy,
+    /// Queue capacity by user, including unlinked queues held open.
+    pub mq_usage: crate::syscall::MqUsage,
     /// The System V IPC objects and POSIX message queues of each IPC namespace, by namespace id;
-    /// namespaces that no thread uses any more are dropped ([`Kernel::collect_ipc`]).
+    /// namespaces with no remaining holders are dropped ([`Kernel::collect_ipc`]).
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
+    /// Shared with every [`crate::nsproxy::IpcNs`] of this kernel; set by `Drop for IpcNs` so
+    /// [`Kernel::collect_ipc`] skips scanning `ipcs` when nothing dropped.
+    ipc_dead: Rc<Cell<bool>>,
     /// The cgroup tree ([`crate::cgroup`]).
     pub cgroups: crate::cgroup::Cgroups,
     /// Ids of loaded eBPF programs ([`crate::bpf`]).
     pub bpf: crate::bpf::Registry,
     /// Newly created network namespaces ([`crate::nsproxy::NetNs`]): host loopback addresses still
     /// in use are avoided when allocating.
-    net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
+    pub(crate) net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
     /// Addresses bound by AF_UNIX sockets.
     pub unix: crate::unix::Names,
     /// AF_UNIX channels with open files in their messages (for `unix::collect`).
     pub unix_inflight: Vec<Weak<RefCell<crate::unix::Channel>>>,
+    /// SCM_RIGHTS held by sendmsg before the first bytes are queued.
+    pub unix_sending: Vec<Weak<crate::unix::SendingRights>>,
+    /// Dequeued SCM_RIGHTS being copied to a receiver's control buffer.
+    pub unix_receiving: Vec<Weak<crate::unix::PendingRights>>,
     /// Named pipes (FIFOs) currently open: all opens of one inode share one pipe object.
     pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
     /// The loop devices (`syscall::loopdev`).
@@ -263,6 +268,9 @@ pub(crate) struct Kernel {
     /// `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing at once;
     /// it applies to root too.
     pub threads_max: usize,
+    /// `/proc/sys/kernel/pid_max`: exclusive upper bound on allocated tids/pids across all pid
+    /// namespaces (default [`PID_MAX`], minimum [`pid_max_min`]).
+    pub pid_max: Tid,
     /// The app's memory limit and the OOM killer ([`crate::oom`]).
     pub oom: crate::oom::Oom,
     /// Guest processes the kernel layer ended (kernel bugs, host faults in the engine, the OOM
@@ -287,6 +295,8 @@ pub(crate) struct Kernel {
     /// Threads waiting on files watched with `EPOLLEXCLUSIVE` (the exclusive gates of
     /// `syscall::poll`), checked by the timer thread.
     pub ex_gates: Vec<crate::syscall::ExGate>,
+    /// Object-to-epoll subscriptions for event-driven epoll readiness tracking (`syscall::poll`).
+    pub epoll_watches: Rc<RefCell<crate::syscall::EpollWatches>>,
     /// Open files with `O_ASYNC` set (the fasync of `syscall::poll`).
     pub fasync: Vec<crate::syscall::Fasync>,
     /// AIO contexts with a pending poll that signals an eventfd, completed by the timer thread
@@ -380,18 +390,22 @@ impl Kernel {
             },
             ptys: BTreeMap::new(),
             consoles: BTreeMap::new(),
-            flocks: BTreeMap::new(),
+            flocks: crate::locks::Flocks::default(),
             locks: crate::locks::Locks::default(),
             init_ns: init_ns.clone(),
             net_nss: Vec::new(),
             cgroups: Default::default(),
             bpf: Default::default(),
+            mq_usage: Default::default(),
             ipcs: BTreeMap::from([(
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),
             )]),
+            ipc_dead: init_ns.ipc.dead.clone(),
             unix: Default::default(),
             unix_inflight: Vec::new(),
+            unix_sending: Vec::new(),
+            unix_receiving: Vec::new(),
             fifos: BTreeMap::new(),
             loops: crate::syscall::Loops::new(),
             seals: BTreeMap::new(),
@@ -417,6 +431,7 @@ impl Kernel {
             nr_open: crate::fd::MAX_FDS,
             mount_max: 100_000,
             threads_max: crate::process::default_threads_max(),
+            pid_max: PID_MAX,
             oom: Default::default(),
             code_groups: Default::default(),
             load: crate::loadavg::LoadAvg::new(Instant::now()),
@@ -425,6 +440,7 @@ impl Kernel {
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
             ex_gates: Vec::new(),
+            epoll_watches: Rc::default(),
             fasync: Vec::new(),
             aio_polls: Vec::new(),
             icmp_taps: Vec::new(),
@@ -471,7 +487,9 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         for (n, &tid) in levels.iter().rev().zip(set_tid) {
-            if !(1..PID_MAX).contains(&tid) || tid != 1 && n.level > 0 && n.reaper.get().is_none() {
+            if !(1..self.pid_max).contains(&tid)
+                || tid != 1 && n.level > 0 && n.reaper.get().is_none()
+            {
                 return Err(Errno::EINVAL);
             }
             if !cred.ns_capable(&n.owner, cap::SYS_ADMIN)
@@ -495,12 +513,23 @@ impl Kernel {
     }
 
     /// Allocates a tid not taken by a thread or a thread group (zombies included): the numbers
-    /// after the last one below `PID_MAX`, then from 300 again (Linux's `RESERVED_PIDS` in
+    /// after the last one below `pid_max`, then from 300 again (Linux's `RESERVED_PIDS` in
     /// `alloc_pid`).
     pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
-        for _ in 0..PID_MAX {
-            let tid = if self.next_tid >= PID_MAX {
-                crate::pidns::RESERVED_PIDS
+        let max = self.pid_max;
+        let min = if max <= crate::pidns::RESERVED_PIDS {
+            INIT + 1
+        } else {
+            crate::pidns::RESERVED_PIDS
+        };
+        let steps = if self.next_tid >= max {
+            max - min
+        } else {
+            (max - self.next_tid) + self.next_tid.saturating_sub(min)
+        };
+        for _ in 0..steps {
+            let tid = if self.next_tid >= max {
+                min
             } else {
                 self.next_tid
             };
@@ -524,6 +553,7 @@ impl Kernel {
         let ns = Rc::new(crate::nsproxy::IpcNs {
             id: crate::vfs::new_ns_id(),
             owner,
+            dead: self.ipc_dead.clone(),
         });
         let ipc = crate::ipc::Ipc {
             mq_dir: crate::cell::RefCell::new(crate::syscall::MqDir::new(creator.0, creator.1)),
@@ -543,15 +573,16 @@ impl Kernel {
         owner: Rc<crate::cred::UserNs>,
     ) -> Result<Rc<crate::nsproxy::NetNs>, Errno> {
         self.net_nss.retain(|w| w.strong_count() > 0);
-        let used: Vec<[u8; 2]> = self
+        let used: std::collections::HashSet<[u8; 2]> = self
             .net_nss
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
             .collect();
-        // 127.255.0.0/16 is reserved for virtual addresses in the boot-time namespace
-        // (crate::netns::INIT_BLOCK), 127.254.0.0/16 for connections forwarded in from outside
-        // (crate::forward::OUTSIDE_BLOCK)
-        let net = (1..=u16::MAX)
+        // 127.0.0.0/24 and 127.0.1.0/24 stay reserved for initial-namespace loopback (127.0.0.1,
+        // DNS stub 127.0.0.53, Debian's 127.0.1.1); 127.255.0.0/16 is reserved for virtual
+        // addresses in the boot-time namespace (crate::netns::INIT_BLOCK), and 127.254.0.0/16 for
+        // connections forwarded in from outside (crate::forward::OUTSIDE_BLOCK).
+        let net = (crate::netns::FIRST_BLOCK..=u16::MAX)
             .map(u16::to_be_bytes)
             .find(|n| {
                 n[0] != crate::netns::INIT_BLOCK
@@ -590,10 +621,14 @@ impl Kernel {
         &mut self.ipcs.get_mut(&id).expect("IPC namespace in use").1
     }
 
-    /// IPC namespaces that no thread uses any more: drops the objects in them (Linux's
-    /// `free_ipc_ns`; for shared memory segments still mapped, the mappings keep the memory).
+    /// Drops the objects of IPC namespaces with no remaining references (Linux's `free_ipc_ns`;
+    /// for shared memory segments still mapped, the mappings keep the memory). Returns immediately
+    /// unless an [`crate::nsproxy::IpcNs`] dropped since the last sweep.
     pub fn collect_ipc(&mut self) {
-        self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
+        while self.ipc_dead.get() {
+            self.ipc_dead.set(false);
+            self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
+        }
     }
 
     /// New thread or process `tid` is in pid namespace `ns`: allocates its number at each level
@@ -607,7 +642,7 @@ impl Kernel {
         if ns.level == 0 {
             return Ok(());
         }
-        crate::pidns::PidNs::register(ns, tid, set_tid)?;
+        crate::pidns::PidNs::register_with_max(ns, tid, set_tid, self.pid_max)?;
         self.pid_nss.insert(tid, ns.clone());
         Ok(())
     }
@@ -675,7 +710,7 @@ impl Kernel {
     /// Writes `ns_last_pid`: allocation then starts from `pid + 1` (skipping those taken), or
     /// from 300 after the largest number.
     pub fn set_last_pid(&mut self, pid: Tid) {
-        self.next_tid = (pid.saturating_add(1)).clamp(INIT + 1, PID_MAX);
+        self.next_tid = (pid.saturating_add(1)).clamp(INIT + 1, self.pid_max);
     }
 
     /// The open files in all fd tables. An open file in several fd tables appears that many times.
@@ -702,15 +737,12 @@ impl Kernel {
     }
 
     fn flush_wakeups(&self) {
-        let (mut channels, mut objects) = PENDING.with_borrow_mut(std::mem::take);
-        let stray = WAKE.swap(0, Ordering::AcqRel);
-        if stray != 0 {
-            channels |= stray;
-            let mut more = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-            objects.append(&mut more);
-        }
+        let (channels, objects) = PENDING.with_borrow_mut(std::mem::take);
         if channels == 0 {
             return;
+        }
+        if !objects.is_empty() {
+            self.epoll_watches.borrow_mut().notify_objects(&objects);
         }
         for (event, interest, wanted) in &self.waiters {
             let hit = interest & channels & wake::ALL != 0
@@ -931,7 +963,20 @@ impl Drop for Bkl<'_> {
         if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
         }
-        self.0.flush_wakeups();
+        // Any IPC namespace whose last holder (task, nsfs file, pinned sysctl, or mount) dropped
+        // while the BKL was held is reaped here so its SharedMemory unmaps flush below
+        if k.ipc_dead.get() && crate::bug::catch(|| k.collect_ipc()).is_none() {
+            crate::bug::report(format_args!("kernel panic while collecting IPC namespaces"));
+        }
+        // Contain wake-up matching so a panic can never skip releasing the BKL; on failure, wake
+        // all waiters directly so none remain parked forever
+        let k: &Kernel = &self.0;
+        if crate::bug::catch(|| k.flush_wakeups()).is_none() {
+            crate::bug::report(format_args!("kernel panic while flushing wake-ups"));
+            for (event, ..) in &k.waiters {
+                signal_later(event);
+            }
+        }
         self.1.held.store(false, Ordering::Relaxed);
         // SAFETY: self.0 is not used after this
         unsafe { ManuallyDrop::drop(&mut self.0) };
@@ -1214,11 +1259,12 @@ impl<'a> Cx<'a> {
     }
 
     /// Grows the grows-down mapping (the main thread's stack, `MAP_GROWSDOWN`) right above `addr`
-    /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK`
-    /// ([`Mm::grow_down`]).
+    /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK` and within
+    /// `RLIMIT_MEMLOCK` when locked ([`Mm::grow_down_limited`]).
     pub fn grow_stack(&self, addr: u64) -> bool {
         let limit = self.stack_limit();
-        self.mm_mut().grow_down(addr, limit)
+        let memlock = self.memlock_limit();
+        self.mm_mut().grow_down_limited(addr, limit, memlock)
     }
 
     /// Reads guest memory as the kernel does (`copy_from_user`, [`Mm::read`]); an unmapped address
@@ -1274,9 +1320,20 @@ impl<'a> Cx<'a> {
         self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0
     }
 
+    /// The current `RLIMIT_MEMLOCK` for locked-memory checks (`u64::MAX` with `CAP_IPC_LOCK`).
+    pub fn memlock_limit(&self) -> u64 {
+        if self.cred().capable(crate::cred::cap::IPC_LOCK) {
+            u64::MAX
+        } else {
+            self.t.group.borrow().rlimits[crate::process::RLIMIT_MEMLOCK as usize].0
+        }
+    }
+
     fn grow_for(&self, range: UserSlice) -> bool {
         let limit = self.stack_limit();
-        self.mm_mut().grow_for(range.addr, range.len, limit)
+        let memlock = self.memlock_limit();
+        self.mm_mut()
+            .grow_for_limited(range.addr, range.len, limit, memlock)
     }
 
     /// Syscall entry: when SP is already below the bottom of the main thread's stack (the program
@@ -1292,8 +1349,25 @@ impl<'a> Cx<'a> {
         // Other threads' stacks are in the mmap area, much farther from the main thread's stack:
         // no need to check
         if crate::loader::STACK_TOP - sp <= limit {
-            self.mm_mut().grow_down(sp, limit);
+            let memlock = self.memlock_limit();
+            self.mm_mut().grow_down_limited(sp, limit, memlock);
         }
+    }
+
+    /// Soft descriptor limit of the calling process, even when it shares its fd table.
+    pub fn nofile(&self) -> usize {
+        self.t.group.borrow().nofile()
+    }
+
+    /// Installs a new descriptor for the calling process.
+    pub fn install_fd(&self, file: FileRef, cloexec: bool) -> Result<i32, Errno> {
+        self.fds_mut()
+            .install_capped(file, cloexec, 0..self.nofile(), self.kr().nr_open)
+    }
+
+    /// Reserves a new descriptor for the calling process.
+    pub fn reserve_fd(&self) -> Result<i32, Errno> {
+        self.fds_mut().reserve(0..self.nofile(), self.kr().nr_open)
     }
 
     /// fd table.
@@ -1355,6 +1429,7 @@ impl<'a> Cx<'a> {
             tid: self.tid(),
             tgid: self.tgid(),
             cred: None,
+            opening: false,
         }
     }
 
@@ -1631,27 +1706,21 @@ pub(crate) fn request_wake_object(object: wake::Object) {
     note_wake(wake::OBJECTS, Some(object));
 }
 
-/// Records a wake request ([`request_wake`] and the like): on this thread while holding the BKL,
-/// otherwise (which should not happen) in the global fallback.
+/// Records a wake request ([`request_wake`] and the like) on the current thread while holding the
+/// BKL. Requests made without the BKL (standalone unit tests exercising kernel objects directly)
+/// are ignored rather than stored in a cross-kernel global fallback.
 fn note_wake(channels: u32, object: Option<wake::Object>) {
-    if HELD.get() != 0 {
-        PENDING.with_borrow_mut(|(c, objects)| {
-            *c |= channels;
-            if let Some(o) = object
-                && !objects.contains(&o)
-            {
-                objects.push(o);
-            }
-        });
+    if HELD.get() == 0 {
         return;
     }
-    if let Some(o) = object {
-        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-        if !objects.contains(&o) {
+    PENDING.with_borrow_mut(|(c, objects)| {
+        *c |= channels;
+        if let Some(o) = object
+            && !objects.contains(&o)
+        {
             objects.push(o);
         }
-    }
-    WAKE.fetch_or(channels, Ordering::Relaxed);
+    });
 }
 
 /// Signals `event` only after the BKL is released. The woken thread will take the BKL right away:
@@ -1667,7 +1736,7 @@ pub(crate) fn signal_later(event: &Arc<Event>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::process::Tier;
 
@@ -1684,6 +1753,18 @@ mod tests {
         // Nothing took 300 (no task was created): after the largest number it is free again
         k.set_last_pid(PID_MAX);
         assert_eq!(k.alloc_tid(), Ok(crate::pidns::RESERVED_PIDS));
+
+        // Lowering pid_max wraps allocation below the new bound and rejects set_tid >= pid_max
+        k.pid_max = 303;
+        k.set_last_pid(301);
+        assert_eq!(k.alloc_tid(), Ok(302));
+        assert_eq!(k.alloc_tid(), Ok(300));
+        assert_eq!(k.alloc_tid(), Ok(301));
+        assert_eq!(k.alloc_tid(), Ok(302));
+        let pid_ns = crate::pidns::PidNs::init();
+        let cred = crate::cred::Cred::root();
+        assert_eq!(k.choose_pid(&pid_ns, &cred, &[303]), Err(Errno::EINVAL));
+        assert_eq!(k.choose_pid(&pid_ns, &cred, &[302]), Ok(302));
     }
 
     /// Two kernels in one host process: wake-ups requested while A holds its lock are not taken by
@@ -1695,9 +1776,11 @@ mod tests {
         let b = Shared::new(Kernel::new(Tier::Interpreter));
         let event = Arc::new(Event::new().unwrap());
         a.lock().waiters.push((event.clone(), wake::LOCK, None));
-        // Releasing the lock may also have processed requests other tests made without the BKL
-        // (the global fallback), so count from here
-        event.clear();
+        // Requests made without holding the BKL are ignored rather than leaking into a later
+        // kernel's lock release
+        request_wake_on(wake::LOCK);
+        drop(a.lock());
+        assert!(!event.is_signaled());
         let k = a.lock();
         request_wake_on(wake::LOCK);
         std::thread::scope(|s| {
@@ -1706,5 +1789,297 @@ mod tests {
         assert!(!event.is_signaled());
         drop(k);
         assert!(event.is_signaled());
+    }
+
+    fn populated_ipc_ns(k: &mut Kernel) -> Rc<crate::nsproxy::IpcNs> {
+        use crate::cred::Cred;
+        use crate::ipc::{IPC_CREAT, Msg, MsgQueue, SemSet, ShmSeg};
+        use crate::mm::SharedMemory;
+        let ns = k.new_ipc_ns(k.init_ns.ipc.owner.clone(), (0, 0));
+        let root = Cred::root();
+        let owner = (&root, root.user_ns.as_ref());
+        let ipc = k.ipc_mut(ns.id);
+        let msg_id = ipc
+            .msg
+            .get_or_create(
+                10,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || Ok(MsgQueue::new(16384)),
+            )
+            .unwrap();
+        ipc.msg.get_mut(msg_id).unwrap().1.msgs.push_back(Msg {
+            mtype: 1,
+            text: vec![0xaa; 64],
+        });
+        ipc.sem
+            .get_or_create(
+                20,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || SemSet::new(2),
+            )
+            .unwrap();
+        ipc.shm
+            .get_or_create(
+                30,
+                IPC_CREAT | 0o600,
+                owner,
+                16,
+                |_| Ok(()),
+                || {
+                    Ok(ShmSeg {
+                        mem: SharedMemory::new(4096)?,
+                        size: 4096,
+                        atime: 0,
+                        dtime: 0,
+                        ctime: 0,
+                        cpid: 1,
+                        lpid: 1,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!((ipc.msg.len(), ipc.sem.len(), ipc.shm.len()), (1, 1, 1));
+        ns
+    }
+
+    pub(crate) fn nsfs_ipc_file(ns: Rc<crate::nsproxy::IpcNs>) -> FileRef {
+        use crate::cred::Cred;
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::nsproxy::NsRef;
+        use crate::pseudo::{NsKind, PseudoNode};
+        let id = ns.id;
+        OpenFile::new(
+            FileKind::Proc {
+                mnt: crate::vfs::PROC_MOUNT,
+                node: PseudoNode::NsFile(NsKind::Ipc, id),
+                data: Vec::new(),
+                fresh: false,
+                mm: None,
+                ns: Some(NsRef::Ipc(ns)),
+                klog: None,
+                opener: Rc::new(Cred::root()),
+                event: None,
+            },
+            oflags::O_RDONLY,
+        )
+    }
+
+    /// Closing the last `/proc/<pid>/ns/ipc` fd pinning an IPC namespace whose processes have
+    /// already exited reaps its `Kernel::ipcs` entry and SysV objects without waiting for any
+    /// unrelated process to exit.
+    #[test]
+    fn closing_last_nsfs_fd_reaps_ipc_namespace() {
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let (init_id, ns_id) = {
+            let mut k = shared.lock();
+            let init_id = k.init_ns.ipc.id;
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+
+            let mut fds = FdTable::new();
+            let fd = fds.install(nsfs_ipc_file(ns), false, 0..64).unwrap();
+            // All processes in the namespace exited, leaving only the open nsfs fd
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+
+            // Closing the last nsfs fd drops the last IpcNs reference; releasing the BKL reaps it
+            drop(fds.close(fd).unwrap());
+            (init_id, ns_id)
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns_id));
+        assert!(k.ipcs.contains_key(&init_id));
+    }
+
+    /// Unmounting the last nsfs bind mount (or tearing down a mount namespace holding an mqueue or
+    /// nsfs mount) pinning an IPC namespace immediately frees its `Kernel::ipcs` entry.
+    #[test]
+    fn unmounting_last_pinned_mount_reaps_ipc_namespace() {
+        use crate::nsproxy::NsRef;
+        use crate::pseudo::{NsKind, PseudoNode};
+        use crate::vfs::{Fs, INIT_MNT_NS, Node, PROC_MOUNT, ROOT_MOUNT, store::ROOT};
+        use std::collections::HashSet;
+
+        let dir = std::env::temp_dir().join(format!(
+            "appine-ipc-reap-mnt-{}-{}",
+            std::process::id(),
+            crate::vfs::new_ns_id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Vfs::open(&dir).unwrap();
+        let (pin_ino, _) = vfs
+            .store()
+            .create_file(ROOT, b"ipc-pin", 0o444, 0, 0)
+            .unwrap();
+        let point = (
+            Node::Store(ROOT_MOUNT, pin_ino),
+            Some((Node::ROOT, b"ipc-pin".to_vec())),
+        );
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let (ns1_id, ns2_id) = {
+            let mut k = shared.lock();
+
+            // Case 1: bind-mounted nsfs file in the boot mount namespace
+            let ns1 = populated_ipc_ns(&mut k);
+            let ns1_id = ns1.id;
+            let mnt_id = vfs.add_mount(
+                Fs::Nsfs,
+                Node::Pseudo(PROC_MOUNT, PseudoNode::NsFile(NsKind::Ipc, ns1_id)),
+                point,
+                0,
+                b"nsfs".to_vec(),
+                Some(Fs::Nsfs.dev()),
+            );
+            vfs.update_mount(mnt_id, |m| m.pin = Some(NsRef::Ipc(ns1)));
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns1_id));
+
+            // Unmounting and collecting drops the mount and its pin; collect_ipc reaps it
+            vfs.umount_tree(mnt_id);
+            vfs.collect(&HashSet::new());
+            k.collect_ipc();
+            assert!(!k.ipcs.contains_key(&ns1_id));
+
+            // Case 2: mqueue mount inside a non-initial mount namespace torn down on collect
+            let (child_mnt_ns, remapped) = vfs.copy_ns(INIT_MNT_NS, k.init_ns.ipc.owner.clone());
+            let child_root_mnt = remapped[&ROOT_MOUNT];
+            let mq_dir = vfs.store().mkdir(ROOT, b"mq", 0o755, 0, 0).unwrap();
+            let mq_point = (
+                Node::Store(child_root_mnt, mq_dir),
+                Some((Node::Store(child_root_mnt, ROOT), b"mq".to_vec())),
+            );
+            let ns2 = populated_ipc_ns(&mut k);
+            let ns2_id = ns2.id;
+            let mq_mnt = vfs.add_mount(
+                Fs::Mqueue,
+                Node::Pseudo(0, PseudoNode::MqRoot(ns2_id)),
+                mq_point,
+                0,
+                b"mqueue".to_vec(),
+                Some(vfs.mq_dev(ns2_id)),
+            );
+            vfs.update_mount(mq_mnt, |m| m.pin = Some(NsRef::Ipc(ns2)));
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns2_id));
+
+            // Dropping the last reference to the mount namespace tears down its mounts on collect;
+            // Bkl::drop reaps ns2 as at the end of a syscall or exit
+            drop(child_mnt_ns);
+            vfs.collect(&HashSet::new());
+            (ns1_id, ns2_id)
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns1_id));
+        assert!(!k.ipcs.contains_key(&ns2_id));
+        drop(k);
+        drop(vfs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the last `O_PATH` or open fd on a pinned IPC sysctl (`/proc/sys/kernel/shmmax`)
+    /// reaps the IPC namespace once no other holder remains.
+    #[test]
+    fn dropping_last_ipc_sysctl_fd_reaps_ipc_namespace() {
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::pseudo::{PinnedIpc, PseudoNode};
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut k = shared.lock();
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+            let file = OpenFile::new(
+                FileKind::Path(Node::Pseudo(
+                    crate::vfs::PROC_MOUNT,
+                    PseudoNode::IpcSysctl(b"sys/kernel/shmmax", PinnedIpc(ns)),
+                )),
+                oflags::O_PATH,
+            );
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+            drop(file);
+            ns_id
+        };
+        assert!(!shared.lock().ipcs.contains_key(&ns_id));
+    }
+
+    /// Breaking an `AF_UNIX` `SCM_RIGHTS` cycle carrying the last IPC nsfs fd reaps the IPC
+    /// namespace.
+    #[test]
+    fn scm_rights_gc_reaps_pinned_ipc_namespace() {
+        use crate::fd::{FileKind, OpenFile, oflags};
+        use crate::net::Socket;
+        use crate::unix::{Link, Packet, SendingRights, Ucred, UnixSocket};
+
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut k = shared.lock();
+            let ns = populated_ipc_ns(&mut k);
+            let ns_id = ns.id;
+            let nsfs = nsfs_ipc_file(ns);
+
+            let (a, b) = UnixSocket::pair(1, Ucred::of(1, 0, 0));
+            let to_b = match &a.link {
+                Link::Stream { tx, .. } => tx.clone(),
+                _ => unreachable!(),
+            };
+            let sock = |s| {
+                OpenFile::new(
+                    FileKind::Socket(Rc::new(RefCell::new(Socket::Unix(s)))),
+                    oflags::O_RDWR,
+                )
+            };
+            let (a_file, b_file) = (sock(a), sock(b));
+            let fds = SendingRights::track(&mut k, vec![b_file.clone(), nsfs])
+                .unwrap()
+                .into_packet(&mut k, &to_b);
+            to_b.borrow_mut().push(Packet {
+                data: b"x".to_vec(),
+                off: 0,
+                fds,
+                cred: Ucred::of(1, 0, 0),
+                from: Vec::new(),
+                outq: None,
+            });
+            drop((a_file, b_file, to_b));
+
+            // Still pinned inside the cyclic SCM_RIGHTS packet
+            k.collect_ipc();
+            assert!(k.ipcs.contains_key(&ns_id));
+
+            crate::unix::collect(&mut k);
+            ns_id
+        };
+        assert!(!shared.lock().ipcs.contains_key(&ns_id));
+    }
+
+    /// `ipc_dead` is per-kernel: another kernel releasing its BKL cannot steal the flag for a dead
+    /// IPC namespace belonging to this kernel.
+    #[test]
+    fn ipc_reap_stays_with_its_kernel() {
+        let a = Shared::new(Kernel::new(Tier::Interpreter));
+        let b = Shared::new(Kernel::new(Tier::Interpreter));
+        let ns_id = {
+            let mut ka = a.lock();
+            let owner = ka.init_ns.ipc.owner.clone();
+            let ns = ka.new_ipc_ns(owner, (0, 0));
+            let ns_id = ns.id;
+            drop(ns);
+            // Another kernel takes and drops its BKL while `a` still holds its own
+            std::thread::scope(|s| {
+                s.spawn(|| drop(b.lock())).join().unwrap();
+            });
+            assert!(ka.ipcs.contains_key(&ns_id));
+            ns_id
+        };
+        assert!(!a.lock().ipcs.contains_key(&ns_id));
     }
 }

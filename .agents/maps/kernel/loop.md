@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose loop-device claims its independent verifiers checked; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint /sys/block references to kernel/sysfs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: advance `BLKGETDISKSEQ` on unbind, return Linux 6.1 errors for zone/tracing/PR ioctls, and support `sync_file_range`)
 
 ## Responsibilities
 
@@ -26,8 +26,8 @@ Appine has no disk filesystems.
 
 Root: `core/kernel/src/syscall/loopdev.rs`.
 
-Outside the module: device-number dispatch at open, nodev and the cgroup device filter, fd tables,
-the read/write paths of the backing file and the `IoPath` routing (`kernel/files`); the `Device`
+Outside the module: device-number dispatch at open, nodev and the cgroup device filter, fd tables
+(`kernel/files`), the read/write paths of the backing file and `IoPath` routing (`kernel/fileio`); the `Device`
 kinds and the boot `/dev` nodes (`kernel/vfs`); the `/sys/block` directory itself (`kernel/sysfs`);
 remount's writer check over backing files (`kernel/mount`); epoll's refusal of the device
 (`kernel/poll`).
@@ -43,11 +43,13 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 
 ## Public entry points
 
-- From `kernel/files`: `open` (a block node of major 7), `read`, `write`, `seek`, `flush_target`
-  (fsync), `ioctl` (the loop and block requests), `control_ioctl` (`LOOP_CTL_*` on
-  `/dev/loop-control`).
+- From `kernel/files`: `open` (a block node of major 7), `ioctl` (the loop and block requests),
+  `control_ioctl` (`LOOP_CTL_*` on
+  `/dev/loop-control`). From `kernel/fileio`: `read`, `write`, `seek`, `flush_target` (fsync),
+  `sync_range` (`sync_file_range`).
 - `Loops::numbers`, `sysfs_exists`, `sysfs_read` (`kernel/sysfs`'s `/sys/block` view);
-  `Loops::backing_files` (remount's writer check, `kernel/files`' `opens_of`).
+  `Loops::backing_files` / `try_backing_files` (`kernel/mount`'s remount writer check, `umount2`
+  busy check, and detached-mount collection, plus `kernel/fileio`'s `opens_of`).
 
 ## Data flow / lifecycle
 
@@ -75,8 +77,8 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
   `LOOP_SET_CAPACITY` or a `LOOP_SET_STATUS` that changes offset or limit.
 - `LOOP_CLR_FD` with other openers only sets autoclear; otherwise it unbinds at once (6.1; later
   kernels defer it to the close). The last opener's release unbinds an autoclear device.
-  Unbinding resets offset, limit, size, flags, name and block size but keeps the disk read-only
-  state, as Linux does.
+  Unbinding resets offset, limit, size, flags, name and block size, advances `diskseq`
+  (`BLKGETDISKSEQ`), and keeps the disk read-only state, as Linux does.
 - `LOOP_SET_STATUS(64)` needs write mode or `CAP_SYS_ADMIN` (`EPERM`), may set and clear
   autoclear and only set partscan; `LOOP_GET_STATUS(64)` reports the backing file's device, inode
   and rdev as stat shows them (`EOVERFLOW` when the old structure cannot hold them or the offset;
@@ -99,25 +101,30 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
   `CAP_SYS_ADMIN`), read-ahead (setting it `EACCES` without `CAP_SYS_ADMIN`), `BLKBSZSET`
   (`EACCES` without it, `EBUSY` while another open holds the claim, `EINVAL` below the logical
   block size), `BLKZEROOUT` (writes zeros), `BLKFLSBUF` (`EACCES` unprivileged), `BLKSECTGET`,
-  `BLKROTATIONAL`, `BLKGETDISKSEQ`, and 0 for `BLKIOOPT`, `BLKALIGNOFF` and `BLKDISCARDZEROES`;
-  `BLKDISCARD` and `BLKSECDISCARD` are `EOPNOTSUPP` (no discard), the discard and zero-out requests
-  `EBADF` without write mode, `HDIO_GETGEO` `ENOTTY` (`EINVAL` with a null argument, as are the
-  read-ahead gets), `BLKRRPART` and `BLKPG` `EINVAL` (no partitions) or `EACCES` (`BLKPG` reads
-  its argument first, `EFAULT`); anything else `EINVAL`, as the loop driver answers.
+  `BLKROTATIONAL`, `BLKGETDISKSEQ`, and 0 for `BLKIOOPT`, `BLKALIGNOFF`, `BLKDISCARDZEROES`,
+  `BLKGETZONESZ` and `BLKGETNRZONES`; `BLKDISCARD`, `BLKSECDISCARD` and the persistent-reservation
+  ioctls (`IOC_PR_*`) are `EOPNOTSUPP` (the discard and zero-out requests `EBADF` without write
+  mode), zone report/management (`BLKREPORTZONE`, `BLKRESETZONE`, `BLKOPENZONE`, `BLKCLOSEZONE`,
+  `BLKFINISHZONE`) and block-tracing (`BLKTRACE*`) ioctls are `ENOTTY`, `HDIO_GETGEO` `ENOTTY`
+  (`EINVAL` with a null argument, as are the read-ahead gets), `BLKRRPART` and `BLKPG` `EINVAL`
+  (no partitions) or `EACCES` (`BLKPG` reads its argument first, `EFAULT`); anything else
+  `EINVAL`, as the loop driver answers.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files`: open of block nodes, the read, write, lseek, fsync and ioctl dispatch
-  (`IoPath::Loop`, `kernel/vfs`'s `Device::Loop` and `Device::LoopControl`), `rehome` and
+- `kernel/files`: open of block nodes and ioctl dispatch (`kernel/vfs`'s `Device::Loop` and
+  `Device::LoopControl`); `kernel/fileio`: read, write, lseek and fsync dispatch (`IoPath::Loop`),
+  `rehome` and
   `opens_of` over backing files.
 - `kernel/sysfs`: `/sys/block/loop<N>/`.
-- `kernel/mount`: `backing_files` for the read-only remount's writer check.
+- `kernel/mount`: `backing_files` / `try_backing_files` for read-only remount's writer check,
+  `umount2`'s busy check, and detached-mount collection.
 
 ### Outbound
 
-- `kernel/files`: the backing file's read and write paths, fd lookup; `kernel/vfs`: the `Device`
+- `kernel/files`: fd lookup; `kernel/fileio`: the backing file's read and write paths; `kernel/vfs`: the `Device`
   numbers and `/dev` node creation in the boot `/dev`, stat of the backing file.
 - Credentials: `CAP_SYS_ADMIN` checks.
 
@@ -140,6 +147,3 @@ remount's writer check over backing files (`kernel/mount`); epoll's refusal of t
 - **No block layer:** no partitions (partscan is only a flag); no discard, and `fallocate` on the
   device is `ENODEV` (Linux punches or zeroes); mmap is `ENODEV` (Linux maps block devices);
   `O_DIRECT` alignment is not enforced.
-- **Error and sequence gaps:** zone, tracing and persistent-reservation ioctls are `EINVAL` where
-  Linux answers `ENOTTY` or `EOPNOTSUPP`; `BLKGETDISKSEQ` advances only when a device is created
-  or bound, not when it is unbound.

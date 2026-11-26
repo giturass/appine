@@ -12,7 +12,6 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use appine_engine::PAGE_SIZE;
 
@@ -30,8 +29,7 @@ use crate::signal::SigAction;
 use crate::syscall::SocketRef;
 use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
-use crate::uaccess::UserSlice;
-use crate::vfs::dev::rdev;
+use crate::vfs::dev::{LOOP_MAJOR, rdev};
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Fs, MountId, Node, Pseudo, Vfs};
 
@@ -294,7 +292,6 @@ const PROC_NET: [&[u8]; 18] = [
 const SYS_GPU: &[&[u8]] = &[
     b"bus/",
     b"bus/platform/",
-    b"dev/",
     b"dev/char/",
     b"dev/char/226:128/",
     b"dev/char/226:128/device/",
@@ -308,7 +305,7 @@ const SYS_GPU: &[&[u8]] = &[
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 129] = [
+const STATIC: [&[u8]; 133] = [
     b"sys/",
     b"sys/debug/",
     b"sys/debug/exception-trace",
@@ -334,7 +331,9 @@ const STATIC: [&[u8]; 129] = [
     b"sys/fs/pipe-max-size",
     b"sys/fs/pipe-user-pages-hard",
     b"sys/fs/pipe-user-pages-soft",
+    PROTECTED_FIFOS,
     b"sys/fs/protected_hardlinks",
+    PROTECTED_REGULAR,
     b"sys/fs/protected_symlinks",
     b"sys/fs/suid_dumpable",
     b"sys/kernel/",
@@ -397,6 +396,8 @@ const STATIC: [&[u8]; 129] = [
     b"sys/kernel/unprivileged_bpf_disabled",
     b"sys/kernel/version",
     b"sys/net/",
+    b"sys/net/bridge/",
+    b"sys/net/bridge/bridge-nf-call-iptables",
     b"sys/net/core/",
     b"sys/net/core/somaxconn",
     b"sys/net/ipv4/",
@@ -440,14 +441,19 @@ const STATIC: [&[u8]; 129] = [
     b"sysvipc/shm",
 ];
 
+/// `/proc/sys/fs/protected_{fifos,regular}` paths shared with `syscall::fs::may_create_in_sticky`.
+pub(crate) const PROTECTED_FIFOS: &[u8] = b"sys/fs/protected_fifos";
+pub(crate) const PROTECTED_REGULAR: &[u8] = b"sys/fs/protected_regular";
+
 /// The sysctls procfs only records, so that `sysctl -p` setups, benchmark scripts and checkers find
 /// them: (path relative to `/proc`, mode, default, lowest and highest value accepted), the range
 /// being that of Linux 6.1's handler (any int for `proc_dointvec`). A write keeps the value in
-/// `Kernel::sysctls` and changes nothing else, except `debug.exception-trace`, which
-/// crate::signal reads ([`recorded_value`]); `kernel.randomize_va_space` starts at 0 because
-/// Appine places mappings at fixed addresses, and `debug.exception-trace` at arm64's 0
+/// `Kernel::sysctls` and changes nothing else, except those read via [`recorded_value`]
+/// (`debug.exception-trace`, `fs.suid_dumpable`, `fs.protected_fifos`, `fs.protected_regular`,
+/// `vm.dirty_writeback_centisecs`); `kernel.randomize_va_space` starts at 0 because Appine places
+/// mappings at fixed addresses, and `debug.exception-trace` at arm64's 0
 /// (`show_unhandled_signals`; x86 starts at 1).
-pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
+pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 42] = {
     const INT_MIN: i64 = i32::MIN as i64;
     const INT_MAX: i64 = i32::MAX as i64;
     // LONG_MAX / HZ for the hung-task times (HZ 250, as on distribution arm64 kernels)
@@ -456,6 +462,8 @@ pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
         (b"sys/debug/exception-trace", 0o644, 0, INT_MIN, INT_MAX),
         (b"sys/fs/overflowgid", 0o644, 65534, 0, 65535),
         (b"sys/fs/overflowuid", 0o644, 65534, 0, 65535),
+        (PROTECTED_FIFOS, 0o644, 1, 0, 2),
+        (PROTECTED_REGULAR, 0o644, 2, 0, 2),
         (b"sys/fs/suid_dumpable", 0o644, 0, 0, 2),
         (b"sys/kernel/core_pipe_limit", 0o644, 0, INT_MIN, INT_MAX),
         (b"sys/kernel/hung_task_all_cpu_backtrace", 0o644, 0, 0, 1),
@@ -575,10 +583,12 @@ pub(crate) fn recorded_value(k: &Kernel, path: &[u8]) -> i64 {
 /// `cpu<n>` is a [`PseudoNode::SysCpu`]; network interfaces (btop reads the traffic counters),
 /// each interface a [`PseudoNode::SysNet`]; overlayfs's module parameters (containerd adds
 /// `index=off` when `index` exists, BuildKit `redirect_dir=off` when `redirect_dir` does).
-const SYS_STATIC: [&[u8]; 23] = [
+const SYS_STATIC: [&[u8]; 25] = [
     b"block/",
     b"class/",
     b"class/net/",
+    b"dev/",
+    b"dev/block/",
     b"devices/",
     b"devices/system/",
     b"devices/system/cpu/",
@@ -607,15 +617,19 @@ const SYS_NET_DIR: &[u8] = b"class/net/";
 /// `/sys/block`: the loop devices are under it.
 const SYS_BLOCK_DIR: &[u8] = b"block/";
 
+/// `/sys/dev/block`: links to block devices by major and minor number.
+const SYS_DEV_BLOCK_DIR: &[u8] = b"dev/block/";
+
 /// The directories and files under `/sys/block/loop<n>` (paths relative to the device directory),
-/// with values from [`crate::syscall::Loops::sysfs_read`]; `loop/` exists only while the device is
-/// bound. On Linux the device directories are symlinks into `/sys/devices/virtual/block`; here
-/// they are directories, as for `/sys/class/net`.
-const BLOCK_FILES: [&[u8]; 22] = [
+/// with driver attributes from [`crate::syscall::Loops::sysfs_read`]. The `loop/` directory exists
+/// only while the device is bound. Linux links to `/sys/devices/virtual/block` from `/sys/block`.
+/// Appine uses plain directories, as for `/sys/class/net`.
+const BLOCK_FILES: [&[u8]; 23] = [
     b"dev",
     b"removable",
     b"ro",
     b"size",
+    b"uevent",
     b"loop/",
     b"loop/autoclear",
     b"loop/backing_file",
@@ -806,6 +820,114 @@ const HOST_CPU_FILES: [&[u8]; 68] = [
     b"cpufreq/scaling_setspeed",
 ];
 
+/// A process identity pinned by procfs nodes: `pid` (a thread id, usually the tgid) plus the
+/// thread group's non-reusable [`ThreadGroup::serial`], so a held `/proc/<pid>` directory or
+/// open file never resolves to a new process that later reuses the same pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ProcId {
+    pub pid: Tid,
+    pub serial: u64,
+}
+
+impl ProcId {
+    fn of(pid: Tid, group: &ThreadGroup) -> ProcId {
+        ProcId {
+            pid,
+            serial: group.serial,
+        }
+    }
+}
+
+macro_rules! pinned_ns {
+    ($(#[$meta:meta])* $name:ident($inner:ty)) => {
+        $(#[$meta])*
+        #[derive(Clone)]
+        pub(crate) struct $name(pub(crate) Rc<$inner>);
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.0.id).finish()
+            }
+        }
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.id == other.0.id
+            }
+        }
+
+        impl Eq for $name {}
+
+        impl Hash for $name {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.id.hash(state);
+            }
+        }
+    };
+}
+
+pinned_ns!(
+    /// A network namespace pinned on a `/proc/sys/net/*` node at lookup time (Linux's
+    /// `sysctl_table_root::lookup`), so an open descriptor keeps reading and writing that namespace
+    /// even after the process changes network namespaces or passes the fd across namespaces.
+    PinnedNet(crate::nsproxy::NetNs)
+);
+
+pinned_ns!(
+    /// An IPC namespace pinned on a SysV/mqueue sysctl node at lookup time, so an open descriptor
+    /// keeps reading and writing that namespace even when read or written from another IPC
+    /// namespace.
+    PinnedIpc(crate::nsproxy::IpcNs)
+);
+
+pinned_ns!(
+    /// A UTS namespace pinned on `/proc/sys/kernel/{hostname,domainname}` at lookup time, so an
+    /// open descriptor keeps reading and writing that namespace even after `unshare(CLONE_NEWUTS)`
+    /// or passing the fd across namespaces.
+    PinnedUts(crate::nsproxy::UtsNs)
+);
+
+pinned_ns!(
+    /// A pid namespace pinned on `/proc/sys/kernel/ns_last_pid` at lookup time, so an open
+    /// descriptor keeps reading and writing that namespace even when inherited or passed into
+    /// another pid namespace.
+    PinnedPid(PidNs)
+);
+
+/// Whether `path` in [`STATIC`] is a per-network-namespace sysctl file; excludes the
+/// `/proc/sys/net/` directories themselves so relative lookups after `unshare(CLONE_NEWNET)`
+/// resolve in the caller's current network namespace (matching Linux's `net_ctl_header_lookup`).
+fn is_net_sysctl_path(path: &[u8]) -> bool {
+    !path.ends_with(b"/") && path.starts_with(b"sys/net/")
+}
+
+/// Whether `path` in [`STATIC`] is a per-IPC-namespace sysctl file (SysV IPC or POSIX mqueue
+/// limits); excludes the `sys/fs/mqueue/` directory itself.
+fn is_ipc_sysctl_path(path: &[u8]) -> bool {
+    !path.ends_with(b"/")
+        && (path.starts_with(b"sys/fs/mqueue/")
+            || matches!(
+                path,
+                b"sys/kernel/msgmax"
+                    | b"sys/kernel/msgmnb"
+                    | b"sys/kernel/msgmni"
+                    | b"sys/kernel/sem"
+                    | b"sys/kernel/shmall"
+                    | b"sys/kernel/shmmax"
+                    | b"sys/kernel/shmmni"
+            ))
+}
+
+/// Whether `path` in [`STATIC`] is a per-UTS-namespace sysctl file.
+fn is_uts_sysctl_path(path: &[u8]) -> bool {
+    matches!(path, b"sys/kernel/hostname" | b"sys/kernel/domainname")
+}
+
+/// Whether `path` in [`STATIC`] is a per-pid-namespace sysctl file.
+fn is_pid_sysctl_path(path: &[u8]) -> bool {
+    path == b"sys/kernel/ns_last_pid"
+}
+
 /// A node in a synthetic filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoNode {
@@ -825,24 +947,37 @@ pub(crate) enum PseudoNode {
     /// `/proc/thread-self`.
     ThreadSelf,
     /// A directory or file under `/proc/sys` or `/proc/sysvipc`, with values from [`STATIC`].
+    /// Per-namespace sysctl paths use [`NetStatic`], [`IpcSysctl`], [`UtsSysctl`] and
+    /// [`PidSysctl`] so their namespace stays pinned to the lookup/open namespace.
     Static(&'static [u8]),
+    /// A static file under `/proc/sys/net/`, pinned to its lookup network namespace.
+    NetStatic(&'static [u8], PinnedNet),
+    /// A per-IPC-namespace sysctl under `/proc/sys/kernel/` or `/proc/sys/fs/mqueue/`, pinned to
+    /// its lookup IPC namespace.
+    IpcSysctl(&'static [u8], PinnedIpc),
+    /// A per-UTS-namespace sysctl (`/proc/sys/kernel/hostname` or `domainname`), pinned to its
+    /// lookup UTS namespace.
+    UtsSysctl(&'static [u8], PinnedUts),
+    /// A per-pid-namespace sysctl (`/proc/sys/kernel/ns_last_pid`), pinned to its lookup pid
+    /// namespace.
+    PidSysctl(&'static [u8], PinnedPid),
     /// `/proc/<pid>`; with `Some(tid)` as the second item it is `/proc/<pid>/task/<tid>`.
-    Pid(Tid, Option<Tid>),
+    Pid(ProcId, Option<Tid>),
     /// `/proc/<pid>/<entry>` (including those in the task subdirectories).
-    Entry(Tid, Option<Tid>, Entry),
+    Entry(ProcId, Option<Tid>, Entry),
     /// `/proc/<pid>/net/<name>` (including those in the task subdirectories), with names from
     /// [`PROC_NET`].
-    Net(Tid, Option<Tid>, &'static [u8]),
-    /// `/proc/<pid>/fd/<n>`.
-    Fd(Tid, i32),
+    Net(ProcId, Option<Tid>, &'static [u8]),
+    /// `/proc/<pid>/fd/<n>` (or `/proc/<pid>/task/<tid>/fd/<n>`).
+    Fd(ProcId, Option<Tid>, i32),
     /// The open file reached by following `/proc/<pid>/fd/<n>` (for those not in the store:
     /// pipes, host fds).
-    OpenFd(Tid, i32),
+    OpenFd(ProcId, Option<Tid>, i32),
     /// The program file reached by following `/proc/<pid>/exe`, when it has been deleted and
     /// cannot be opened by inode ([`crate::process::ExeFile`]).
-    OpenExe(Tid),
-    /// `/proc/<pid>/fdinfo/<n>`.
-    FdInfo(Tid, i32),
+    OpenExe(ProcId),
+    /// `/proc/<pid>/fdinfo/<n>` (or `/proc/<pid>/task/<tid>/fdinfo/<n>`).
+    FdInfo(ProcId, Option<Tid>, i32),
     /// `/sys`.
     SysRoot,
     /// A directory or file under `/sys`, with values from [`SYS_STATIC`].
@@ -859,12 +994,14 @@ pub(crate) enum PseudoNode {
     /// `/sys/block/loop<n>` (empty path), or a directory or file under it (paths from
     /// [`BLOCK_FILES`]).
     SysBlock(u32, &'static [u8]),
+    /// `/sys/dev/block/7:<n>`, a relative symlink to `/sys/block/loop<n>`.
+    SysDevBlock(u32),
     /// A cgroup directory (empty name), or a file in it (names from [`crate::cgroup::FILES`]): the
     /// cgroup id and the file name.
-    Cgroup(u64, &'static [u8]),
+    Cgroup(u64, &'static [u8], u64),
     /// `/proc/<pid>/ns/<kind>` (including those in the task subdirectories): a magic link to a
     /// namespace.
-    Ns(Tid, Option<Tid>, NsKind),
+    Ns(ProcId, Option<Tid>, NsKind),
     /// The namespace reached by following `/proc/<pid>/ns/<kind>` (a file in Linux's nsfs), by id.
     NsFile(NsKind, u64),
     /// The root directory of an mqueue filesystem: the POSIX message queues of an IPC namespace
@@ -873,12 +1010,12 @@ pub(crate) enum PseudoNode {
     /// A queue in an mqueue filesystem: the IPC namespace and the queue's inode number.
     Mq(u64, u64),
     /// `/proc/sys/net/ipv4/conf/<dir>` (first item false) or `ipv6/conf/<dir>` (empty name), or an
-    /// entry under it (names from the [`crate::netconf`] tables); follows the reader's network
+    /// entry under it (names from the [`crate::netconf`] tables), pinned to its lookup network
     /// namespace ([`crate::netdev::conf_read`]).
-    NetConf(bool, crate::netdev::ConfDir, &'static [u8]),
+    NetConf(bool, crate::netdev::ConfDir, &'static [u8], PinnedNet),
     /// A sysctl under `/proc/sys/net/` (one in [`crate::netconf::SYSCTLS`], with paths like
-    /// `ipv4/tcp_keepalive_time`), following the reader's network namespace.
-    NetSysctl(&'static str),
+    /// `ipv4/tcp_keepalive_time`), pinned to its lookup network namespace.
+    NetSysctl(&'static str, PinnedNet),
 }
 
 /// The cgroup2 mount point `fs/cgroup` in sysfs (an empty directory when nothing is mounted).
@@ -936,11 +1073,17 @@ pub(crate) struct View<'a> {
     /// Credentials to read with instead of the process's: an open file's opener's, when its
     /// content is generated again ([`crate::fd::FileKind::Proc`]).
     pub cred: Option<Rc<Cred>>,
+    /// An open walk can reopen an unlinked overlay object through its source descriptor.
+    pub opening: bool,
 }
 
-/// The view used before the kernel has started (resolving the first program's path): the
-/// synthetic filesystems have only empty root directories.
-pub(crate) struct Offline;
+/// A host path lookup without a guest task to resolve synthetic nodes.
+pub(crate) enum Offline {
+    /// Boot and host-spawned programs see empty synthetic root directories.
+    Boot,
+    /// An observation cannot treat a synthetic path as a missing store file.
+    HostStat,
+}
 
 impl Pseudo for Offline {
     fn parent(&self, _: &PseudoNode) -> Option<PseudoNode> {
@@ -950,7 +1093,10 @@ impl Pseudo for Offline {
         Vec::new()
     }
     fn lookup(&self, _: MountId, _: &PseudoNode, _: &[u8]) -> Result<PseudoNode, Errno> {
-        Err(Errno::ENOENT)
+        Err(match self {
+            Self::Boot => Errno::ENOENT,
+            Self::HostStat => Errno::EOPNOTSUPP,
+        })
     }
     fn kind(&self, _: &PseudoNode) -> Result<u32, Errno> {
         Ok(mode::S_IFDIR)
@@ -973,19 +1119,19 @@ impl<'a> View<'a> {
             .map_or(Node::ROOT, |t| t.res.borrow().fs.borrow().root.clone())
     }
 
-    fn group(&self, pid: Tid) -> Option<Rc<RefCell<ThreadGroup>>> {
-        group_of(self.k, pid).cloned()
+    fn group(&self, proc: ProcId) -> Option<Rc<RefCell<ThreadGroup>>> {
+        group_of_id(self.k, proc).cloned()
     }
 
-    /// The thread a pid directory stands for: the thread itself when `pid` is a thread id, so the
-    /// main thread for a process, and none once that has exited (procfs then shows it as a
+    /// The thread a pid directory stands for: the thread itself when `proc.pid` is a thread id, so
+    /// the main thread for a process, and none once that has exited (procfs then shows it as a
     /// zombie).
-    fn leader(&self, pid: Tid) -> Option<Rc<Task>> {
-        let g = self.group(pid)?;
+    fn leader(&self, proc: ProcId) -> Option<Rc<Task>> {
+        let g = self.group(proc)?;
         let threads = g.borrow().threads.clone();
         threads
             .iter()
-            .find(|&&t| t == pid)
+            .find(|&&t| t == proc.pid)
             .and_then(|t| self.k.tasks.get(t).cloned())
     }
 
@@ -995,19 +1141,14 @@ impl<'a> View<'a> {
         self.vfs.proc_pid_ns(mnt).unwrap_or_else(PidNs::init)
     }
 
-    /// The last number allocated in the reader's pid namespace (`ns_last_pid`, `loadavg`; Linux
-    /// uses the reader's namespace, not the mount's).
+    /// The last number allocated in the reader's pid namespace (`loadavg`; Linux uses the reader's
+    /// namespace, not the mount's).
     fn last_pid(&self) -> Tid {
-        let ns = self.k.pid_ns_of(self.tgid);
-        if ns.level == 0 {
-            self.k.last_pid()
-        } else {
-            ns.last_pid()
-        }
+        last_pid_in(self.k, &self.k.pid_ns_of(self.tgid))
     }
 
-    /// The reader's UTS and IPC namespaces (of the thread `self` points to):
-    /// `/proc/sys/kernel/hostname`, the System V IPC limits and `/proc/sysvipc` follow them.
+    /// The reader's namespace proxy (of the thread `self` points to): used to pin per-namespace
+    /// sysctls at lookup (`net`, `ipc`, `uts`) and to view `/proc/sysvipc`.
     pub(crate) fn ns(&self) -> crate::nsproxy::NsProxy {
         self.k
             .tasks
@@ -1015,18 +1156,27 @@ impl<'a> View<'a> {
             .map_or_else(|| self.k.init_ns.clone(), |t| t.ns.borrow().clone())
     }
 
-    /// The interface with index `index` in the reader's network namespace (the host's or lo, and
-    /// virtual devices).
-    fn interface(&self, index: u32) -> Option<appine_hal::net::Interface> {
-        crate::netdev::interfaces(&self.ns().net)
+    /// The network namespace of sysfs mount `mnt`: the mounting process's (Linux tags each sysfs
+    /// superblock with its mounter's network namespace), or the initial network namespace for the
+    /// boot mount.
+    pub(crate) fn sys_net_ns(&self, mnt: MountId) -> Rc<crate::nsproxy::NetNs> {
+        self.vfs
+            .sys_net_ns(mnt)
+            .unwrap_or_else(|| self.k.init_ns.net.clone())
+    }
+
+    /// The interface with index `index` in sysfs mount `mnt`'s network namespace (the host's or
+    /// lo, and virtual devices).
+    fn interface(&self, mnt: MountId, index: u32) -> Option<appine_hal::net::Interface> {
+        crate::netdev::interfaces(&self.sys_net_ns(mnt))
             .into_iter()
             .find(|i| i.index == index)
     }
 
-    /// Whether the interface with index `index` in the reader's network namespace is a bridge,
-    /// and whether it is a bridge port.
-    fn bridge_roles(&self, index: u32) -> (bool, bool) {
-        crate::netdev::views(&self.ns().net)
+    /// Whether the interface with index `index` in sysfs mount `mnt`'s network namespace is a
+    /// bridge, and whether it is a bridge port.
+    fn bridge_roles(&self, mnt: MountId, index: u32) -> (bool, bool) {
+        crate::netdev::views(&self.sys_net_ns(mnt))
             .into_iter()
             .find(|v| v.index == index)
             .map_or((false, false), |v| {
@@ -1034,12 +1184,30 @@ impl<'a> View<'a> {
             })
     }
 
-    /// The directory under `/proc/sys/net/ipv*/conf` still exists (the interface was not
+    /// The directory under `/proc/sys/net/ipv*/conf` still exists in `net` (the interface was not
     /// removed).
-    fn conf_dir_exists(&self, dir: crate::netdev::ConfDir) -> bool {
+    fn conf_dir_exists_in(net: &crate::nsproxy::NetNs, dir: crate::netdev::ConfDir) -> bool {
         match dir {
-            crate::netdev::ConfDir::Dev(i) => self.interface(i).is_some(),
+            crate::netdev::ConfDir::Dev(i) => crate::netdev::interfaces(net)
+                .into_iter()
+                .any(|iface| iface.index == i),
             _ => true,
+        }
+    }
+
+    /// Wraps a [`STATIC`] path, pinning the lookup's network, IPC, UTS or pid namespace when the
+    /// entry is a per-namespace sysctl file.
+    fn static_node(&self, path: &'static [u8]) -> PseudoNode {
+        if is_net_sysctl_path(path) {
+            PseudoNode::NetStatic(path, PinnedNet(self.ns().net))
+        } else if is_ipc_sysctl_path(path) {
+            PseudoNode::IpcSysctl(path, PinnedIpc(self.ns().ipc))
+        } else if is_uts_sysctl_path(path) {
+            PseudoNode::UtsSysctl(path, PinnedUts(self.ns().uts))
+        } else if is_pid_sysctl_path(path) {
+            PseudoNode::PidSysctl(path, PinnedPid(self.k.pid_ns_of(self.tgid)))
+        } else {
+            PseudoNode::Static(path)
         }
     }
 
@@ -1073,31 +1241,28 @@ impl<'a> View<'a> {
     }
 
     /// `/proc/<pid>/task/<tid>` uses the given thread, otherwise the representative thread.
-    fn task(&self, pid: Tid, tid: Option<Tid>) -> Option<Rc<Task>> {
+    fn task(&self, proc: ProcId, tid: Option<Tid>) -> Option<Rc<Task>> {
         match tid {
             Some(t) => {
-                let tgid = self.group(pid)?.borrow().tgid;
+                let tgid = self.group(proc)?.borrow().tgid;
                 self.k.tasks.get(&t).cloned().filter(|t| t.tgid == tgid)
             }
-            None => self.leader(pid),
+            None => self.leader(proc),
         }
     }
 
-    fn pid_exists(&self, pid: Tid, tid: Option<Tid>) -> bool {
-        match (self.group(pid), tid) {
-            (None, _) => false,
-            (Some(_), None) => true,
-            // An exited main thread stays, as a zombie, until the process is reaped
-            (Some(g), Some(t)) => {
-                let g = g.borrow();
-                g.threads.contains(&t) || (t == g.tgid && g.leader_exit.is_some())
-            }
-        }
+    fn pid_exists(&self, proc: ProcId, tid: Option<Tid>) -> bool {
+        pid_exists_in(self.k, proc, tid)
     }
 
-    /// An open file of some process.
-    pub(crate) fn open_file(&self, pid: Tid, fd: i32) -> Option<crate::fd::FileRef> {
-        let task = self.leader(pid)?;
+    /// An open file of thread `tid` (or the representative thread of `proc`).
+    pub(crate) fn open_file(
+        &self,
+        proc: ProcId,
+        tid: Option<Tid>,
+        fd: i32,
+    ) -> Option<crate::fd::FileRef> {
+        let task = self.task(proc, tid)?;
         let res = task.res.borrow();
         res.fds.borrow().get(fd).ok()
     }
@@ -1113,11 +1278,15 @@ impl Pseudo for View<'_> {
         Some(match node {
             PtsRoot(_) | ProcRoot | SysRoot | MqRoot(_) => return None,
             // A child cgroup's parent is its parent cgroup; the root has none
-            Cgroup(id, b"") => Cgroup(self.k.cgroups.get(*id)?.parent?, b""),
+            Cgroup(id, b"", 0) => Cgroup(self.k.cgroups.get(*id)?.parent?, b"", 0),
             Mq(ns, _) => MqRoot(*ns),
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
-            Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
+            Static(path)
+            | NetStatic(path, _)
+            | IpcSysctl(path, _)
+            | UtsSysctl(path, _)
+            | PidSysctl(path, _) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
             Sys(path) => tree_parent(&SYS_STATIC, path)
                 .or_else(|| tree_parent(SYS_GPU, path))
                 .map_or(SysRoot, Sys),
@@ -1131,25 +1300,26 @@ impl Pseudo for View<'_> {
                 .or_else(|| tree_parent(&PORT_FILES, path))
                 .map_or(SysNet(*n, b""), |p| SysNet(*n, p)),
             SysBrif(n, _) => SysNet(*n, b"brif/"),
+            SysDevBlock(_) => Sys(SYS_DEV_BLOCK_DIR),
             SysBlock(_, b"") => Sys(SYS_BLOCK_DIR),
             SysBlock(n, path) => {
                 tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
             }
-            Cgroup(id, _) => Cgroup(*id, b""),
-            NetConf(v6, _, b"") => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
-            NetSysctl(path) => {
+            Cgroup(id, _, _) => Cgroup(*id, b"", 0),
+            NetConf(v6, _, b"", _) => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
+            NetSysctl(path, _) => {
                 let dir = &path[..=path.find('/').unwrap_or(0)];
                 tree_lookup(&STATIC, b"sys/net/", dir.trim_end_matches('/').as_bytes())
                     .map_or(ProcRoot, Static)
             }
-            NetConf(v6, dir, _) => NetConf(*v6, *dir, b""),
-            Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
-            Entry(pid, tid, _) => Pid(*pid, *tid),
-            Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
-            Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
-            OpenExe(pid) => Pid(*pid, None),
-            FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
-            Ns(pid, tid, _) => Entry(*pid, *tid, self::Entry::Ns),
+            NetConf(v6, dir, _, net) => NetConf(*v6, *dir, b"", net.clone()),
+            Pid(proc, Some(_)) => Entry(*proc, None, self::Entry::Task),
+            Entry(proc, tid, _) => Pid(*proc, *tid),
+            Net(proc, tid, _) => Entry(*proc, *tid, self::Entry::Net),
+            Fd(proc, tid, _) | OpenFd(proc, tid, _) => Entry(*proc, *tid, self::Entry::Fd),
+            OpenExe(proc) => Pid(*proc, None),
+            FdInfo(proc, tid, _) => Entry(*proc, *tid, self::Entry::FdInfo),
+            Ns(proc, tid, _) => Entry(*proc, *tid, self::Entry::Ns),
             NsFile(..) => return None,
         })
     }
@@ -1164,7 +1334,12 @@ impl Pseudo for View<'_> {
             Global(g) => GLOBALS.iter().find(|(_, x)| x == g).unwrap().0.to_vec(),
             SelfLink => b"self".to_vec(),
             ThreadSelf => b"thread-self".to_vec(),
-            Static(path) | Sys(path) => tree_name(path).to_vec(),
+            Static(path)
+            | NetStatic(path, _)
+            | IpcSysctl(path, _)
+            | UtsSysctl(path, _)
+            | PidSysctl(path, _)
+            | Sys(path) => tree_name(path).to_vec(),
             SysRoot => b"sys".to_vec(),
             MqRoot(_) => b"mqueue".to_vec(),
             Mq(ns, ino) => self
@@ -1176,31 +1351,32 @@ impl Pseudo for View<'_> {
             SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
             SysCpu(_, path) => tree_name(path).to_vec(),
             SysNet(n, b"") => self
-                .interface(*n)
+                .interface(mnt, *n)
                 .map_or_else(|| n.to_string(), |i| i.name)
                 .into_bytes(),
-            NetConf(_, dir, b"") => {
-                crate::netdev::conf_dir_name(&self.ns().net, *dir).unwrap_or_else(|| b"?".to_vec())
+            NetConf(_, dir, b"", net) => {
+                crate::netdev::conf_dir_name(&net.0, *dir).unwrap_or_else(|| b"?".to_vec())
             }
-            NetConf(_, _, name) => name.to_vec(),
-            NetSysctl(path) => tree_name(path.as_bytes()).to_vec(),
+            NetConf(_, _, name, _) => name.to_vec(),
+            NetSysctl(path, _) => tree_name(path.as_bytes()).to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
             SysBlock(n, b"") => format!("loop{n}").into_bytes(),
+            SysDevBlock(n) => format!("{LOOP_MAJOR}:{n}").into_bytes(),
             SysBlock(_, path) => tree_name(path).to_vec(),
             SysBrif(_, p) => self
-                .interface(*p)
+                .interface(mnt, *p)
                 .map_or_else(|| p.to_string(), |i| i.name)
                 .into_bytes(),
-            Cgroup(crate::cgroup::ROOT, b"") => b"cgroup".to_vec(),
-            Cgroup(id, b"") => self
+            Cgroup(crate::cgroup::ROOT, b"", 0) => b"cgroup".to_vec(),
+            Cgroup(id, b"", 0) => self
                 .k
                 .cgroups
                 .get(*id)
                 .map_or_else(|| id.to_string().into_bytes(), |g| g.name.clone()),
-            Cgroup(_, name) => name.to_vec(),
-            Pid(pid, None) => self
+            Cgroup(_, name, _) => name.to_vec(),
+            Pid(proc, None) => self
                 .pid_ns(mnt)
-                .vnr(*pid)
+                .vnr(proc.pid)
                 .unwrap_or(0)
                 .to_string()
                 .into_bytes(),
@@ -1212,7 +1388,7 @@ impl Pseudo for View<'_> {
                 .into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
             Net(_, _, name) => name.to_vec(),
-            Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
+            Fd(_, _, fd) | OpenFd(_, _, fd) | FdInfo(_, _, fd) => fd.to_string().into_bytes(),
             OpenExe(_) => b"exe".to_vec(),
             Ns(_, _, k) => k.name().as_bytes().to_vec(),
             NsFile(k, id) => format!("{}:[{id}]", k.type_name()).into_bytes(),
@@ -1222,9 +1398,11 @@ impl Pseudo for View<'_> {
     fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
         use PseudoNode::*;
         // fd and fdinfo of another process are open only to readers that pass the ptrace-read
-        // check (Linux's 0500 directories with proc_fd_permission, and proc_fd_access_allowed)
-        if let Entry(pid, _, self::Entry::Fd | self::Entry::FdInfo) = dir
-            && !self.may_read(*pid)
+        // check (Linux's 0500 directories with proc_fd_permission, and proc_fd_access_allowed);
+        // a reaped process's directory falls through to ENOENT rather than EACCES
+        if let Entry(proc, tid, self::Entry::Fd | self::Entry::FdInfo) = dir
+            && self.pid_exists(*proc, *tid)
+            && !self.may_read(*proc, *tid)
         {
             return Err(Errno::EACCES);
         }
@@ -1262,26 +1440,31 @@ impl Pseudo for View<'_> {
                     .map(|(_, g)| Global(*g))
                     .or_else(|| {
                         let pid = global(name)?;
-                        self.pid_exists(pid, None).then_some(Pid(pid, None))
+                        let g = group_of(self.k, pid)?;
+                        Some(Pid(ProcId::of(pid, &g.borrow()), None))
                     }),
             },
             Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
-                crate::netdev::conf_dirs(&self.ns().net)
+                let net = self.ns().net;
+                crate::netdev::conf_dirs(&net)
                     .into_iter()
                     .find(|(n, _)| n == name)
-                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b""))
+                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b"", PinnedNet(net)))
             }
-            Static(path) => tree_lookup(&STATIC, path, name).map(Static).or_else(|| {
-                let rest = path.strip_prefix(b"sys/net/")?;
-                let full = [rest, name].concat();
-                let init = self.ns().net.host_net.is_none();
-                crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0))
-            }),
-            NetConf(v6, dir, b"") => crate::netconf::table(*v6)
+            Static(path) => tree_lookup(&STATIC, path, name)
+                .map(|p| self.static_node(p))
+                .or_else(|| {
+                    let rest = path.strip_prefix(b"sys/net/")?;
+                    let full = [rest, name].concat();
+                    let net = self.ns().net;
+                    let init = net.host_net.is_none();
+                    crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0, PinnedNet(net)))
+                }),
+            NetConf(v6, dir, b"", net) => crate::netconf::table(*v6)
                 .iter()
                 .find(|(n, ..)| n.as_bytes() == name)
-                .filter(|_| self.conf_dir_exists(*dir))
-                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
+                .filter(|_| Self::conf_dir_exists_in(&net.0, *dir))
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes(), net.clone())),
             SysRoot => tree_lookup(&SYS_STATIC, b"", name)
                 .or_else(|| {
                     self.k
@@ -1300,7 +1483,7 @@ impl Pseudo for View<'_> {
                 .map(Sys)
                 .or_else(|| {
                     if *path == SYS_NET_DIR {
-                        return crate::netdev::interfaces(&self.ns().net)
+                        return crate::netdev::interfaces(&self.sys_net_ns(mnt))
                             .into_iter()
                             .find(|i| i.name.as_bytes() == name)
                             .map(|i| SysNet(i.index, b""));
@@ -1314,26 +1497,38 @@ impl Pseudo for View<'_> {
                             .sysfs_exists(n, b"")
                             .then_some(SysBlock(n, b""));
                     }
+                    if *path == SYS_DEV_BLOCK_DIR {
+                        let colon = name.iter().position(|&b| b == b':')?;
+                        let major = parse_num(&name[..colon])?;
+                        let minor = u32::try_from(parse_num(&name[colon + 1..])?).ok()?;
+                        return (major == i64::from(LOOP_MAJOR)
+                            && self.k.loops.sysfs_exists(minor, b""))
+                        .then_some(SysDevBlock(minor));
+                    }
                     let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
                     let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                     (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
                 }),
             // A child cgroup, or a file this cgroup has
-            Cgroup(id, b"") => self.k.cgroups.get(*id).and_then(|g| {
-                g.children.get(name).map(|&c| Cgroup(c, b"")).or_else(|| {
-                    self.k
-                        .cgroups
-                        .files(*id)
-                        .find(|f| *f == name)
-                        .map(|f| Cgroup(*id, f))
-                })
+            Cgroup(id, b"", 0) => self.k.cgroups.get(*id).and_then(|g| {
+                g.children
+                    .get(name)
+                    .map(|&c| Cgroup(c, b"", 0))
+                    .or_else(|| {
+                        self.k.cgroups.files(*id).find(|(f, _)| *f == name).map(
+                            |(f, generation)| {
+                                self.k.cgroups.file_looked_up(*id, f);
+                                Cgroup(*id, f, generation)
+                            },
+                        )
+                    })
             }),
             SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
                 .or_else(|| {
                     tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
                 })
                 .map(|p| SysCpu(*n, p)),
-            SysNet(n, b"brif/") => crate::netdev::views(&self.ns().net)
+            SysNet(n, b"brif/") => crate::netdev::views(&self.sys_net_ns(mnt))
                 .into_iter()
                 .find(|v| v.master == Some(*n) && v.name == name)
                 .map(|v| SysBrif(*n, v.index)),
@@ -1341,44 +1536,44 @@ impl Pseudo for View<'_> {
                 .filter(|p| self.k.loops.sysfs_exists(*n, p))
                 .map(|p| SysBlock(*n, p)),
             SysNet(n, path) => tree_lookup(&NET_FILES, path, name)
-                .filter(|_| self.interface(*n).is_some())
+                .filter(|_| self.interface(mnt, *n).is_some())
                 .or_else(|| {
-                    let (bridge, port) = self.bridge_roles(*n);
+                    let (bridge, port) = self.bridge_roles(mnt, *n);
                     tree_lookup(&BRIDGE_FILES, path, name)
                         .filter(|_| bridge)
                         .or_else(|| tree_lookup(&PORT_FILES, path, name).filter(|_| port))
                 })
                 .map(|p| SysNet(*n, p)),
-            Pid(pid, tid) => {
+            Pid(proc, tid) => {
                 let allowed = |e: &self::Entry| in_pid_dir(*tid, e);
                 ENTRIES
                     .iter()
                     .find(|(n, e)| *n == name && allowed(e))
-                    .map(|(_, e)| Entry(*pid, *tid, *e))
-                    .filter(|_| self.pid_exists(*pid, *tid))
+                    .map(|(_, e)| Entry(*proc, *tid, *e))
+                    .filter(|_| self.pid_exists(*proc, *tid))
             }
-            // fd and fdinfo in a thread directory are the process's open files too (the fd table
-            // is kept per process)
-            Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
+            // fd and fdinfo follow the thread's own fd table (which may differ from the group
+            // leader's after clone without CLONE_FILES or unshare(CLONE_FILES))
+            Entry(proc, tid, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
                 .map(|fd| fd as i32)
-                .filter(|&fd| self.open_file(*pid, fd).is_some())
+                .filter(|&fd| self.open_file(*proc, *tid, fd).is_some())
                 .map(|fd| match e {
-                    self::Entry::Fd => Fd(*pid, fd),
-                    _ => FdInfo(*pid, fd),
+                    self::Entry::Fd => Fd(*proc, *tid, fd),
+                    _ => FdInfo(*proc, *tid, fd),
                 }),
-            Entry(pid, None, self::Entry::Task) => global(name)
-                .filter(|&t| self.pid_exists(*pid, Some(t)))
-                .map(|t| Pid(*pid, Some(t))),
-            Entry(pid, tid, self::Entry::Net) => PROC_NET
+            Entry(proc, None, self::Entry::Task) => global(name)
+                .filter(|&t| self.pid_exists(*proc, Some(t)))
+                .map(|t| Pid(*proc, Some(t))),
+            Entry(proc, tid, self::Entry::Net) => PROC_NET
                 .iter()
                 .find(|n| **n == name)
-                .filter(|_| self.pid_exists(*pid, *tid))
-                .map(|n| Net(*pid, *tid, n)),
-            Entry(pid, tid, self::Entry::Ns) => NsKind::ALL
+                .filter(|_| self.pid_exists(*proc, *tid))
+                .map(|n| Net(*proc, *tid, n)),
+            Entry(proc, tid, self::Entry::Ns) => NsKind::ALL
                 .into_iter()
                 .find(|k| k.name().as_bytes() == name)
-                .filter(|_| self.pid_exists(*pid, *tid))
-                .map(|k| Ns(*pid, *tid, k)),
+                .filter(|_| self.pid_exists(*proc, *tid))
+                .map(|k| Ns(*proc, *tid, k)),
             _ => return Err(Errno::ENOTDIR),
         };
         found.ok_or(Errno::ENOENT)
@@ -1401,10 +1596,12 @@ impl Pseudo for View<'_> {
             SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
                 mode::S_IFDIR
             }
-            Cgroup(_, b"") => mode::S_IFDIR,
-            NetSysctl(_) => mode::S_IFREG,
-            NetConf(_, dir, name) => {
-                if !self.conf_dir_exists(*dir) {
+            Cgroup(_, b"", 0) => mode::S_IFDIR,
+            NetStatic(..) | NetSysctl(..) | IpcSysctl(..) | UtsSysctl(..) | PidSysctl(..) => {
+                mode::S_IFREG
+            }
+            NetConf(_, dir, name, net) => {
+                if !Self::conf_dir_exists_in(&net.0, *dir) {
                     return Err(Errno::ENOENT);
                 }
                 if name.is_empty() {
@@ -1423,11 +1620,11 @@ impl Pseudo for View<'_> {
                 | self::Entry::Ns,
             ) => mode::S_IFDIR,
             Pts(..) | PtsPtmx(_) => mode::S_IFCHR,
-            SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) => mode::S_IFLNK,
+            SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) | SysDevBlock(_) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
-            OpenFd(pid, fd) => {
-                let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+            OpenFd(proc, tid, fd) => {
+                let file = self.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
                 let f = file.borrow();
                 match &f.kind {
                     FileKind::Pipe(_) => mode::S_IFIFO,
@@ -1463,9 +1660,9 @@ impl Pseudo for View<'_> {
             }
             Global(self::Global::Mounts) => Ok(b"self/mounts".to_vec()),
             Global(self::Global::Net) => Ok(b"self/net".to_vec()),
-            Entry(pid, tid, self::Entry::Root) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Root) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let root = task.res.borrow().fs.borrow().root.clone();
@@ -1474,14 +1671,14 @@ impl Pseudo for View<'_> {
             // As with root and cwd, the reader must be able to see that process (Linux's
             // proc_pid_readlink and proc_pid_get_link both check proc_fd_access_allowed first).
             // After the program file is deleted it gets ` (deleted)`, as with fds
-            Entry(pid, tid, self::Entry::Exe) => {
-                let g = self.group(*pid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Exe) => {
+                let g = self.group(*proc).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 // The program is the thread's address space's: an exited thread (the main thread
                 // of a process living on, a zombie) has none
-                if self.task(*pid, *tid).is_none() {
+                if self.task(*proc, *tid).is_none() {
                     return Err(Errno::ENOENT);
                 }
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
@@ -1493,50 +1690,62 @@ impl Pseudo for View<'_> {
                     _ => path,
                 })
             }
-            Entry(pid, tid, self::Entry::Cwd) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Entry(proc, tid, self::Entry::Cwd) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let cwd = task.res.borrow().fs.borrow().cwd.clone();
                 self.vfs.path_of(self, &self.root(), &cwd)
             }
-            Fd(pid, fd) => {
-                let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Fd(proc, tid, fd) => {
+                let file = self.open_file(*proc, *tid, *fd).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let f = file.borrow();
-                let name = describe(&f);
+                let name = self.fd_path(&f).unwrap_or_else(|| describe(&f));
+                if f.dentry_unlinked() {
+                    return Ok(with_deleted(name));
+                }
                 Ok(match &f.kind {
                     FileKind::Regular { ino, .. } => mark_deleted(self.vfs.store(), *ino, name),
                     _ => name,
                 })
             }
-            Ns(pid, tid, k) => {
-                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                if !self.may_read(*pid) {
+            Ns(proc, tid, k) => {
+                let task = self.task(*proc, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*proc, *tid) {
                     return Err(Errno::EACCES);
                 }
                 let id = k.id_of(self.k, &task).ok_or(Errno::ENOENT)?;
                 Ok(self.name(mnt, &NsFile(*k, id)))
             }
             SysBrif(_, p) => {
-                let i = self.interface(*p).ok_or(Errno::ENOENT)?;
+                let i = self.interface(mnt, *p).ok_or(Errno::ENOENT)?;
                 Ok(format!("../../{}/brport", i.name).into_bytes())
+            }
+            SysDevBlock(n) => {
+                if !self.k.loops.sysfs_exists(*n, b"") {
+                    return Err(Errno::ENOENT);
+                }
+                Ok(format!("../../block/loop{n}").into_bytes())
             }
             _ => Err(Errno::EINVAL),
         }
     }
 
-    fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::Dentry> {
-        if let PseudoNode::Entry(pid, _, Entry::Exe) = node {
-            return self.group(*pid)?.borrow().exe.as_ref()?.dentry.clone();
+    fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::WalkDentry> {
+        if let PseudoNode::Entry(proc, _, Entry::Exe) = node {
+            return Some(crate::vfs::WalkDentry {
+                entry: self.group(*proc)?.borrow().exe.as_ref()?.dentry.clone()?,
+                unlinked: false,
+            });
         }
-        let PseudoNode::Fd(pid, fd) = node else {
+        let PseudoNode::Fd(proc, tid, fd) = node else {
             return None;
         };
-        let file = self.open_file(*pid, *fd)?;
+        let file = self.open_file(*proc, *tid, *fd)?;
         let f = file.borrow();
         // Only files that are not directories want it (a directory's path is derived from its
         // parent)
@@ -1545,7 +1754,10 @@ impl Pseudo for View<'_> {
             FileKind::Directory { .. } => true,
             _ => false,
         };
-        f.dentry.clone().filter(|_| !dir)
+        Some(crate::vfs::WalkDentry {
+            entry: f.current_dentry().filter(|_| !dir)?,
+            unlinked: f.dentry_unlinked(),
+        })
     }
 
     /// `/proc/<pid>/fd/<n>`, `ns/*`, `root`, `cwd`, `exe` (Linux's proc_pid_get_link and
@@ -1566,14 +1778,14 @@ impl Pseudo for View<'_> {
 
     /// A cgroup directory is searched by its mode, as kernfs checks it (mkdir gives it one).
     fn searched(&self, node: &PseudoNode) -> Option<Stat> {
-        matches!(node, PseudoNode::Cgroup(_, b"")).then(|| stat(self, node).ok())?
+        matches!(node, PseudoNode::Cgroup(_, b"", 0)).then(|| stat(self, node).ok())?
     }
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
-            PseudoNode::Ns(pid, tid, k) => {
-                let task = self.task(*pid, *tid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Ns(proc, tid, k) => {
+                let task = self.task(*proc, *tid)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let Some(id) = k.id_of(self.k, &task) else {
@@ -1584,9 +1796,9 @@ impl Pseudo for View<'_> {
             // The root and current directories point straight at that process's nodes (Linux's
             // proc_root_link, proc_cwd_link): through them one can get into other mount
             // namespaces and outside a chroot
-            PseudoNode::Entry(pid, tid, e @ (Entry::Root | Entry::Cwd)) => {
-                let task = self.task(*pid, *tid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Entry(proc, tid, e @ (Entry::Root | Entry::Cwd)) => {
+                let task = self.task(*proc, *tid)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let res = task.res.borrow();
@@ -1600,24 +1812,21 @@ impl Pseudo for View<'_> {
             // renamed, deleted or replaced. A deleted one's object in the store is deleted too,
             // so it is opened through the recorded host file (OpenExe). Without a store (host
             // files for development) it is followed by the path read back
-            PseudoNode::Entry(pid, tid, Entry::Exe) => {
-                let g = self.group(*pid)?;
-                if !self.may_read(*pid) {
+            PseudoNode::Entry(proc, tid, Entry::Exe) => {
+                let g = self.group(*proc)?;
+                if !self.may_read(*proc, *tid) {
                     return Some(Err(Errno::EACCES));
                 }
                 let exe = g.borrow().exe.clone();
-                let Some(exe) = exe.filter(|_| self.task(*pid, *tid).is_some()) else {
+                let Some(exe) = exe.filter(|_| self.task(*proc, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
-                // A program found through an overlay: its node while its name lasts. Once removed
-                // it can still be run through the recorded host file (OpenExe), but not opened
-                // (reopen_exe): a descriptor of the store inode behind it would change it behind
-                // the overlay's back
+                // A deleted overlay executable keeps both its overlay identity and its host file.
                 if let Some((m, o, _)) = &exe.ovl {
                     return Some(if self.vfs.overlay().linked(*o) {
                         Ok(Node::Overlay(*m, *o))
                     } else if exe.host.is_some() {
-                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*pid)))
+                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*proc)))
                     } else {
                         Err(Errno::ENOENT)
                     });
@@ -1625,12 +1834,16 @@ impl Pseudo for View<'_> {
                 let (m, ino) = exe.node?;
                 let deleted = self.vfs.store().attrs(ino).map_or(true, |st| st.nlink == 0);
                 return Some(Ok(if deleted && exe.host.is_some() {
-                    Node::Pseudo(mnt, PseudoNode::OpenExe(*pid))
+                    Node::Pseudo(mnt, PseudoNode::OpenExe(*proc))
                 } else {
                     Node::Store(m, ino)
                 }));
             }
-            PseudoNode::Fd(pid, _) if !self.may_read(*pid) => return Some(Err(Errno::EACCES)),
+            PseudoNode::Fd(proc, tid, _)
+                if self.pid_exists(*proc, *tid) && !self.may_read(*proc, *tid) =>
+            {
+                return Some(Err(Errno::EACCES));
+            }
             _ => {}
         }
         self.follow_fd(mnt, node).map(Ok)
@@ -1671,9 +1884,11 @@ impl View<'_> {
             ProcRoot if numbered(b"") => return None,
             ProcRoot => format!("/proc/{name_text}"),
             // Interfaces
-            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => return None,
+            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
+                return None;
+            }
             Static(path) => format!("/proc/{}{name_text}", text(path)),
-            NetConf(v6, _, b"") => {
+            NetConf(v6, _, b"", _) => {
                 let v = if *v6 { 6 } else { 4 };
                 format!("/proc/sys/net/ipv{v}/conf/<interface>/{name_text}")
             }
@@ -1688,7 +1903,7 @@ impl View<'_> {
             }
             SysRoot => format!("/sys/{name_text}"),
             // Interfaces, loop devices, CPUs
-            Sys(path) if *path == SYS_NET_DIR || *path == SYS_BLOCK_DIR => return None,
+            Sys(SYS_NET_DIR | SYS_BLOCK_DIR | SYS_DEV_BLOCK_DIR) => return None,
             Sys(path) if *path == SYS_CPU_DIR && numbered(b"cpu") => return None,
             Sys(path) => format!("/sys/{}{name_text}", text(path)),
             SysCpu(_, path) => {
@@ -1702,61 +1917,95 @@ impl View<'_> {
         })
     }
 
-    /// Whether the reader may look at the root directory, current directory, program file and
-    /// namespaces of thread or process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
-    /// on the thread, or the main thread).
-    fn may_read(&self, pid: Tid) -> bool {
-        self.may_read_as(pid, &self.reader())
+    /// Whether the reader may look at the root directory, current directory, program file, fds and
+    /// namespaces of thread `tid` (or `proc.pid`) (Linux's
+    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
+    fn may_read(&self, proc: ProcId, tid: Option<Tid>) -> bool {
+        self.may_read_as(proc, tid, &self.reader())
     }
 
     /// [`View::may_read`] with the credentials `reader`.
-    fn may_read_as(&self, pid: Tid, reader: &Cred) -> bool {
-        self.group(pid).is_some_and(|g| {
+    fn may_read_as(&self, proc: ProcId, tid: Option<Tid>, reader: &Cred) -> bool {
+        let target = tid.unwrap_or(proc.pid);
+        self.group(proc).is_some_and(|g| {
             let g = g.borrow();
             g.tgid == self.tgid
                 || self
                     .k
-                    .cred_of(pid)
+                    .cred_of(target)
                     .is_some_and(|c| reader.may_ptrace(&c, g.dump_scope(), true))
         })
     }
 
+    /// Current path of a named fd relative to the reader's root.
+    fn fd_path(&self, f: &OpenFile) -> Option<Vec<u8>> {
+        f.path.as_ref()?;
+        let node = f.node()?;
+        if matches!(node, Node::Pseudo(..)) {
+            return None;
+        }
+        let root = self.root();
+        let entry = f.current_dentry();
+        match entry.as_ref() {
+            // A mount root takes its name from the mount point.
+            Some((dir, _)) if dir.mnt() != node.mnt() => self.vfs.path_of(self, &root, &node),
+            found => self.vfs.found_path(self, &root, &node, found),
+        }
+        .ok()
+    }
+
     /// The node reached by following `/proc/<pid>/fd/<n>` ([`Pseudo::follow`]).
     fn follow_fd(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
-        let PseudoNode::Fd(pid, fd) = node else {
+        let PseudoNode::Fd(proc, tid, fd) = node else {
             return None;
         };
-        let file = self.open_file(*pid, *fd)?;
+        let file = self.open_file(*proc, *tid, *fd)?;
         let f = file.borrow();
         // A file opened through an overlay leads back to its overlay node, never to the store
         // inode behind it (which may be in a lower layer)
         if let Some(o) = f.ovl {
+            let ovl = self.vfs.overlay();
+            // If the last upper link is gone, only the retained fd can supply its bytes.
+            if self.opening
+                && !ovl.linked(o)
+                && ovl.node(o).upper.is_some()
+                && f.regular_backing().is_some_and(|(ino, ..)| {
+                    self.vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+                })
+            {
+                return Some(Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)));
+            }
             return Some(Node::Overlay(f.mnt, o));
         }
+        // A deleted object can only be reopened through the handle this description holds.
+        if let Some((ino, ..)) = f.regular_backing()
+            && self.vfs.store().attrs(ino).is_ok_and(|st| st.nlink == 0)
+        {
+            return Some(Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)));
+        }
         Some(match &f.kind {
-            // A deleted file cannot be reopened by inode (its object in the store is already
-            // deleted): point at the open file itself, and copy the host file on reopen
-            FileKind::Regular { ino, file, .. }
-                if self
-                    .vfs
-                    .store()
-                    .stat_open(*ino, file)
-                    .is_ok_and(|st| st.nlink == 0) =>
-            {
-                Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd))
-            }
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
                 Node::Store(f.mnt, *ino)
             }
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
             FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
-            // A slave device: its path in the devpts mount it was opened through
-            FileKind::Pty(end) if !end.master => {
+            // A slave device: its path in the devpts mount it was opened through (or the opened
+            // `/dev/tty` / `/dev/console` node when the open file carries one)
+            FileKind::Pty(end) if !end.master => f.node().unwrap_or_else(|| {
                 let t = end.tty.borrow();
                 Node::Pseudo(end.mnt, PseudoNode::Pts(t.fs, t.index))
-            }
-            _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd)),
+            }),
+            _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*proc, *tid, *fd)),
         })
+    }
+}
+
+/// The last pid allocated in `ns` (the root namespace lives on `Kernel`).
+fn last_pid_in(k: &Kernel, ns: &PidNs) -> Tid {
+    if ns.level == 0 {
+        k.last_pid()
+    } else {
+        ns.last_pid()
     }
 }
 
@@ -1809,6 +2058,14 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     // mqueue filesystem: owners, permissions and times are kept on the queues and the namespace
     match node {
+        PseudoNode::Cgroup(id, name, _) => {
+            if gone(ps.k, node) {
+                return Err(Errno::ENODEV);
+            }
+            let mut st = ps.k.cgroups.get(*id).ok_or(Errno::ENOENT)?.attrs(name)?;
+            st.ino = node_ino(node);
+            return Ok(st);
+        }
         PseudoNode::MqRoot(ns) => {
             let (_, ipc) = ps.k.ipcs.get(ns).ok_or(Errno::ENOENT)?;
             let mut st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
@@ -1825,18 +2082,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
-        // A cgroup directory has the mode mkdir gave it
-        (mode::S_IFDIR, PseudoNode::Cgroup(id, b"")) => {
-            ps.k.cgroups.get(*id).ok_or(Errno::ENOENT)?.mode
-        }
         (mode::S_IFDIR, _) if sysfs => 0o755,
-        (_, PseudoNode::Cgroup(_, name)) if !name.is_empty() => {
-            crate::cgroup::file_mode(name).unwrap_or(0o444)
-        }
+        (mode::S_IFDIR, PseudoNode::PtsRoot(_)) => 0o755,
+        (mode::S_IFDIR, PseudoNode::Entry(_, _, Entry::Fd | Entry::FdInfo | Entry::Ns)) => 0o500,
         (mode::S_IFDIR, _) => 0o555,
         // proc_fd_instantiate: read and search bits for a readable file, write and search for a
         // writable one (none for O_PATH)
-        (_, PseudoNode::Fd(pid, fd)) => ps.open_file(*pid, *fd).map_or(0, |f| {
+        (_, PseudoNode::Fd(proc, tid, fd)) => ps.open_file(*proc, *tid, *fd).map_or(0, |f| {
             let f = f.borrow();
             (if f.readable() { 0o500 } else { 0 }) | if f.writable() { 0o300 } else { 0 }
         }),
@@ -1849,12 +2101,15 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
                 .map_or(0o666, |v| v.devpts_options(*fs).ptmxmode)
         }
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
-        (_, PseudoNode::NetSysctl(path)) => {
+        (_, PseudoNode::NetSysctl(path, _)) => {
             u32::from(crate::netconf::sysctl(path.as_bytes(), true).map_or(0o444, |e| e.2))
         }
         (_, PseudoNode::Static(p)) if recorded(p).is_some() => recorded(p).map_or(0o444, |e| e.1),
         (_, n) if writable(n) => 0o644,
-        (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv | Entry::Syscall)) => 0o400,
+        (
+            _,
+            PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv | Entry::Environ | Entry::Syscall),
+        ) => 0o400,
         (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
         _ => 0o444,
     };
@@ -1872,13 +2127,16 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => None,
     };
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
-    // net.* sysctls belong to root of the user namespace owning the network namespace, when it
-    // maps one (net_ctl_set_ownership)
-    let (uid, gid) = if is_net_sysctl(node) {
-        let owner = ps.ns().net.owner.clone();
-        let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
-        let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
-        (uid, gid)
+    // net.* sysctls belong to root of the user namespace owning the pinned network namespace,
+    // when it maps one (net_ctl_set_ownership)
+    let (uid, gid) = if let Some(owner) = pinned_net(node)
+        .map(|n| n.0.owner.clone())
+        .or_else(|| is_net_sysctl(node).then(|| ps.ns().net.owner.clone()))
+    {
+        (
+            owner.uid_map.borrow().down(0).unwrap_or(0),
+            owner.gid_map.borrow().down(0).unwrap_or(0),
+        )
     } else {
         owner_of(ps.k, node)
     };
@@ -1895,13 +2153,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => 1,
     };
     Ok(Stat {
-        ino: node_ino(ps.k, node),
+        ino: node_ino(node),
         mode: kind | perm,
         nlink,
         uid,
         gid,
         rdev: rdev_value,
-        // sysfs files report one page, as on Linux
+        // sysfs files report one page of size but take no blocks, as on Linux
         size: if sysfs && kind == mode::S_IFREG {
             4096
         } else {
@@ -1910,7 +2168,8 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         atime_ns,
         mtime_ns,
         ctime_ns,
-        blocks: None,
+        blocks: sysfs.then_some(0),
+        ..Stat::default()
     })
 }
 
@@ -1923,6 +2182,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::SysCpu(..)
         | PseudoNode::SysNet(..)
         | PseudoNode::SysBrif(..)
+        | PseudoNode::SysDevBlock(_)
         | PseudoNode::SysBlock(..) => Fs::Sys,
         PseudoNode::Cgroup(..) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
@@ -1931,21 +2191,36 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     }
 }
 
-/// For a node under `/proc/sys`, whether it is a `net.*` one of the reader's network namespace;
-/// `None` for the rest of procfs. Opening one follows `proc_sys_permission`'s rules.
+/// For a node under `/proc/sys`, whether it is a `net.*` one; `None` for the rest of procfs.
+/// Opening one follows `proc_sys_permission`'s rules.
 pub(crate) fn sysctl_kind(node: &PseudoNode) -> Option<bool> {
     match node {
         PseudoNode::Static(p) if p.starts_with(b"sys/") => Some(is_net_sysctl(node)),
-        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => Some(true),
+        PseudoNode::IpcSysctl(..) | PseudoNode::UtsSysctl(..) | PseudoNode::PidSysctl(..) => {
+            Some(false)
+        }
+        PseudoNode::NetStatic(..) | PseudoNode::NetSysctl(..) | PseudoNode::NetConf(..) => {
+            Some(true)
+        }
         _ => None,
     }
 }
 
-/// A `net.*` sysctl (or directory) of the reader's network namespace.
+/// The pinned network namespace of a `net.*` sysctl node, if any.
+fn pinned_net(node: &PseudoNode) -> Option<&PinnedNet> {
+    match node {
+        PseudoNode::NetStatic(_, net)
+        | PseudoNode::NetSysctl(_, net)
+        | PseudoNode::NetConf(_, _, _, net) => Some(net),
+        _ => None,
+    }
+}
+
+/// A `net.*` sysctl (or directory) of a network namespace.
 fn is_net_sysctl(node: &PseudoNode) -> bool {
     match node {
         PseudoNode::Static(p) => p.starts_with(b"sys/net/"),
-        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => true,
+        PseudoNode::NetStatic(..) | PseudoNode::NetSysctl(..) | PseudoNode::NetConf(..) => true,
         _ => false,
     }
 }
@@ -1957,20 +2232,21 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
         // Files of a non-dumpable process belong to root in its user namespace (Linux's
         // task_dump_owner)
-        PseudoNode::Pid(pid, tid) | PseudoNode::Entry(pid, tid, _) => {
-            dump_owner(k, tid.unwrap_or(*pid))
-        }
-        PseudoNode::Fd(pid, _) => dump_owner(k, *pid),
+        PseudoNode::Pid(proc, tid)
+        | PseudoNode::Entry(proc, tid, _)
+        | PseudoNode::Fd(proc, tid, _)
+        | PseudoNode::FdInfo(proc, tid, _)
+        | PseudoNode::Ns(proc, tid, _) => dump_owner(k, *proc, *tid),
         PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
-        PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
         _ => (0, 0),
     }
 }
 
-/// The owner of thread `tid`'s procfs files (Linux's `task_dump_owner`): its effective user and
-/// group IDs, root in its user namespace when the process is not dumpable.
-fn dump_owner(k: &Kernel, tid: Tid) -> (u32, u32) {
-    match (group_of(k, tid), k.cred_of(tid)) {
+/// The owner of thread `tid` (or `proc.pid`)'s procfs files (Linux's `task_dump_owner`): its
+/// effective user and group IDs, root in its user namespace when the process is not dumpable.
+fn dump_owner(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> (u32, u32) {
+    let target = tid.unwrap_or(proc.pid);
+    match (group_of_id(k, proc), k.cred_of(target)) {
         (Some(g), Some(c)) if g.borrow().dumpable => (c.euid, c.egid),
         (Some(_), Some(c)) => (c.uid_in(0).unwrap_or(0), c.gid_in(0).unwrap_or(0)),
         _ => (0, 0),
@@ -2016,27 +2292,29 @@ pub(crate) fn readdir(
             nodes.extend(tree_children(&STATIC, b"").map(Static));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
             // Processes visible in the mount's pid namespace, sorted by their numbers there
-            let mut pids: Vec<(Tid, Tid)> =
+            let mut pids: Vec<(Tid, ProcId)> =
                 ps.k.groups
-                    .keys()
-                    .filter_map(|&pid| Some((ns.vnr(pid)?, pid)))
+                    .iter()
+                    .filter_map(|(&pid, g)| Some((ns.vnr(pid)?, ProcId::of(pid, &g.borrow()))))
                     .collect();
-            pids.sort_unstable();
-            nodes.extend(pids.into_iter().map(|(_, pid)| Pid(pid, None)));
+            pids.sort_unstable_by_key(|&(vnr, _)| vnr);
+            nodes.extend(pids.into_iter().map(|(_, proc)| Pid(proc, None)));
         }
         Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
             let v6 = *path == NET_CONF6;
+            let net = ps.ns().net;
             nodes.extend(
-                crate::netdev::conf_dirs(&ps.ns().net)
+                crate::netdev::conf_dirs(&net)
                     .into_iter()
-                    .map(|(_, d)| NetConf(v6, d, b"")),
+                    .map(|(_, d)| NetConf(v6, d, b"", PinnedNet(net.clone()))),
             );
         }
         Static(path) => {
-            nodes.extend(tree_children(&STATIC, path).map(Static));
+            nodes.extend(tree_children(&STATIC, path).map(|p| ps.static_node(p)));
             // The sysctls under /proc/sys/net/core, ipv4, ipv6 and unix
             if let Some(dir) = path.strip_prefix(b"sys/net/") {
-                let init = ps.ns().net.host_net.is_none();
+                let net = ps.ns().net;
+                let init = net.host_net.is_none();
                 nodes.extend(
                     crate::netconf::SYSCTLS
                         .iter()
@@ -2045,14 +2323,14 @@ pub(crate) fn readdir(
                                 && p.as_bytes().starts_with(dir)
                                 && !p.as_bytes()[dir.len()..].contains(&b'/')
                         })
-                        .map(|e| NetSysctl(e.0)),
+                        .map(|e| NetSysctl(e.0, PinnedNet(net.clone()))),
                 );
             }
         }
-        NetConf(v6, dir, b"") => nodes.extend(
+        NetConf(v6, dir, b"", net) => nodes.extend(
             crate::netconf::table(*v6)
                 .iter()
-                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes(), net.clone())),
         ),
         SysRoot => {
             nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys));
@@ -2070,13 +2348,16 @@ pub(crate) fn readdir(
             }
             if *path == SYS_NET_DIR {
                 nodes.extend(
-                    crate::netdev::interfaces(&ps.ns().net)
+                    crate::netdev::interfaces(&ps.sys_net_ns(mnt))
                         .iter()
                         .map(|i| SysNet(i.index, b"")),
                 );
             }
             if *path == SYS_BLOCK_DIR {
                 nodes.extend(ps.k.loops.numbers().into_iter().map(|n| SysBlock(n, b"")));
+            }
+            if *path == SYS_DEV_BLOCK_DIR {
+                nodes.extend(ps.k.loops.numbers().into_iter().map(SysDevBlock));
             }
         }
         SysBlock(n, path) => nodes.extend(
@@ -2085,14 +2366,14 @@ pub(crate) fn readdir(
                 .map(|p| SysBlock(*n, p)),
         ),
         SysNet(n, b"brif/") => nodes.extend(
-            crate::netdev::views(&ps.ns().net)
+            crate::netdev::views(&ps.sys_net_ns(mnt))
                 .into_iter()
                 .filter(|v| v.master == Some(*n))
                 .map(|v| SysBrif(*n, v.index)),
         ),
         SysNet(n, path) => {
             nodes.extend(tree_children(&NET_FILES, path).map(|p| SysNet(*n, p)));
-            let (bridge, port) = ps.bridge_roles(*n);
+            let (bridge, port) = ps.bridge_roles(mnt, *n);
             if bridge {
                 nodes.extend(tree_children(&BRIDGE_FILES, path).map(|p| SysNet(*n, p)));
             }
@@ -2100,10 +2381,14 @@ pub(crate) fn readdir(
                 nodes.extend(tree_children(&PORT_FILES, path).map(|p| SysNet(*n, p)));
             }
         }
-        Cgroup(id, b"") => {
-            nodes.extend(ps.k.cgroups.files(*id).map(|f| Cgroup(*id, f)));
+        Cgroup(id, b"", 0) => {
+            nodes.extend(
+                ps.k.cgroups
+                    .files(*id)
+                    .map(|(f, generation)| Cgroup(*id, f, generation)),
+            );
             if let Some(g) = ps.k.cgroups.get(*id) {
-                nodes.extend(g.children.values().map(|&c| Cgroup(c, b"")));
+                nodes.extend(g.children.values().map(|&c| Cgroup(c, b"", 0)));
             }
         }
         SysCpu(n, path) => {
@@ -2114,41 +2399,54 @@ pub(crate) fn readdir(
                     .map(|p| SysCpu(*n, p)),
             );
         }
-        Entry(pid, tid, self::Entry::Net) => {
-            nodes.extend(PROC_NET.iter().map(|n| Net(*pid, *tid, n)));
+        Entry(proc, tid, self::Entry::Net) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(PROC_NET.iter().map(|n| Net(*proc, *tid, n)));
         }
-        Entry(pid, tid, self::Entry::Ns) => {
-            nodes.extend(NsKind::ALL.iter().map(|k| Ns(*pid, *tid, *k)));
+        Entry(proc, tid, self::Entry::Ns) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(NsKind::ALL.iter().map(|k| Ns(*proc, *tid, *k)));
         }
-        Pid(pid, tid) => nodes.extend(
-            ENTRIES
-                .iter()
-                .filter(|(_, e)| in_pid_dir(*tid, e))
-                .map(|(_, e)| Entry(*pid, *tid, *e)),
-        ),
-        Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
-            if ps.group(*pid).is_some() && !ps.may_read(*pid) {
+        Pid(proc, tid) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            nodes.extend(
+                ENTRIES
+                    .iter()
+                    .filter(|(_, e)| in_pid_dir(*tid, e))
+                    .map(|(_, e)| Entry(*proc, *tid, *e)),
+            );
+        }
+        Entry(proc, tid, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ENOENT);
+            }
+            if !ps.may_read(*proc, *tid) {
                 return Err(Errno::EACCES);
             }
-            if let Some(task) = ps.leader(*pid) {
+            if let Some(task) = ps.task(*proc, *tid) {
                 let fds = task.res.borrow().fds.borrow().open_fds();
                 nodes.extend(fds.into_iter().map(|fd| match e {
-                    self::Entry::Fd => Fd(*pid, fd),
-                    _ => FdInfo(*pid, fd),
+                    self::Entry::Fd => Fd(*proc, *tid, fd),
+                    _ => FdInfo(*proc, *tid, fd),
                 }));
             }
         }
-        Entry(pid, None, self::Entry::Task) => {
-            if let Some(g) = ps.group(*pid) {
-                let g = g.borrow();
-                let zombie = g.leader_exit.is_some().then_some(g.tgid);
-                nodes.extend(
-                    zombie
-                        .into_iter()
-                        .chain(g.threads.iter().copied())
-                        .map(|t| Pid(*pid, Some(t))),
-                );
-            }
+        Entry(proc, None, self::Entry::Task) => {
+            let g = ps.group(*proc).ok_or(Errno::ENOENT)?;
+            let g = g.borrow();
+            let zombie = g.leader_exit.is_some().then_some(g.tgid);
+            nodes.extend(
+                zombie
+                    .into_iter()
+                    .chain(g.threads.iter().copied())
+                    .map(|t| Pid(*proc, Some(t))),
+            );
         }
         _ => return Err(Errno::ENOTDIR),
     }
@@ -2157,7 +2455,7 @@ pub(crate) fn readdir(
         .map(|n| {
             Ok(DirEntry {
                 name: ps.name(mnt, &n),
-                ino: node_ino(ps.k, &n),
+                ino: node_ino(&n),
                 mode: ps.kind(&n).unwrap_or(mode::S_IFREG),
             })
         })
@@ -2173,29 +2471,15 @@ fn in_pid_dir(tid: Option<Tid>, e: &Entry) -> bool {
     }
 }
 
-/// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it it also
-/// depends on which process it is, so as on Linux the inode differs after a new process reuses
-/// the pid.
-pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
-    let pid = match node {
+/// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it, [`ProcId`]
+/// already carries the thread group's serial, so as on Linux the inode differs after a new
+/// process reuses the pid and stays stable for a held fd after reap.
+pub(crate) fn node_ino(node: &PseudoNode) -> u64 {
+    match node {
         // A namespace's inode number is its id
-        PseudoNode::NsFile(_, id) => return *id,
-        PseudoNode::Pid(pid, _)
-        | PseudoNode::Entry(pid, ..)
-        | PseudoNode::Net(pid, ..)
-        | PseudoNode::Fd(pid, _)
-        | PseudoNode::OpenFd(pid, _)
-        | PseudoNode::OpenExe(pid)
-        | PseudoNode::FdInfo(pid, _) => *pid,
-        _ => return ino_of(node),
-    };
-    let Some(g) = group_of(k, pid) else {
-        return ino_of(node);
-    };
-    let mut h = std::hash::DefaultHasher::new();
-    node.hash(&mut h);
-    g.borrow().serial.hash(&mut h);
-    h.finish() | 1
+        PseudoNode::NsFile(_, id) => *id,
+        _ => ino_of(node),
+    }
 }
 
 /// The inode number of a synthetic node: a hash of the node (stable within one run), avoiding 0.
@@ -2209,7 +2493,7 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
         PseudoNode::ProcRoot
             | PseudoNode::SysRoot
             | PseudoNode::PtsRoot(_)
-            | PseudoNode::Cgroup(crate::cgroup::ROOT, b"")
+            | PseudoNode::Cgroup(crate::cgroup::ROOT, b"", 0)
     ) {
         return 1;
     }
@@ -2221,6 +2505,10 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     // A queue uses its own number (it is also what fstat on an fd from mq_open shows)
     if let PseudoNode::Mq(_, ino) = node {
         return *ino;
+    }
+    // A namespace file's inode number is its namespace id (consistent with stat and node_ino).
+    if let PseudoNode::NsFile(_, id) = node {
+        return *id;
     }
     let mut h = std::hash::DefaultHasher::new();
     node.hash(&mut h);
@@ -2234,27 +2522,41 @@ const HZ: u64 = crate::loader::CLOCK_TICKS;
 
 /// The procfs files that can be written.
 pub(crate) fn writable(node: &PseudoNode) -> bool {
-    if let PseudoNode::Cgroup(_, name) = node {
+    if let PseudoNode::Cgroup(_, name, _) = node {
         return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
     }
-    if let PseudoNode::NetConf(_, _, name) = node {
+    if let PseudoNode::NetConf(_, _, name, _) = node {
         return !name.is_empty() && !crate::netconf::read_only(name);
     }
-    if let PseudoNode::NetSysctl(path) = node {
+    if let PseudoNode::NetSysctl(path, _) = node {
         return crate::netconf::sysctl(path.as_bytes(), true).is_some_and(|e| e.2 & 0o200 != 0);
+    }
+    if let PseudoNode::NetStatic(p, _) = node {
+        return matches!(
+            *p,
+            b"sys/net/bridge/bridge-nf-call-iptables"
+                | b"sys/net/core/somaxconn"
+                | b"sys/net/ipv4/ip_forward"
+                | b"sys/net/ipv4/ip_local_port_range"
+                | b"sys/net/ipv4/ip_unprivileged_port_start"
+                | b"sys/net/ipv4/ping_group_range"
+        );
+    }
+    if matches!(
+        node,
+        PseudoNode::IpcSysctl(..) | PseudoNode::UtsSysctl(..) | PseudoNode::PidSysctl(..)
+    ) {
+        return true;
     }
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::CoredumpFilter | Entry::TimensOffsets)
-            | PseudoNode::Entry(_, _, Entry::OomScoreAdj)
+            | PseudoNode::Entry(_, _, Entry::Comm | Entry::OomScoreAdj)
             | PseudoNode::Entry(_, _, Entry::Mem)
             | PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
             | PseudoNode::Static(
-                b"sys/kernel/hostname"
-                    | b"sys/kernel/domainname"
-                    | b"sys/kernel/pid_max"
+                b"sys/kernel/pid_max"
                     | b"sys/kernel/threads-max"
-                    | b"sys/kernel/ns_last_pid"
                     | b"sys/kernel/core_pattern"
                     | b"sys/kernel/seccomp/actions_logged"
                     | b"sys/kernel/core_uses_pid"
@@ -2265,20 +2567,8 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/protected_symlinks"
                     | b"sys/kernel/printk"
                     | b"sys/kernel/printk_devkmsg"
-                    | b"sys/kernel/msgmax"
-                    | b"sys/kernel/msgmnb"
-                    | b"sys/kernel/msgmni"
-                    | b"sys/kernel/sem"
-                    | b"sys/kernel/shmall"
-                    | b"sys/kernel/shmmax"
-                    | b"sys/kernel/shmmni"
                     | b"sys/fs/lease-break-time"
                     | b"sys/fs/aio-max-nr"
-                    | b"sys/fs/mqueue/msg_default"
-                    | b"sys/fs/mqueue/msg_max"
-                    | b"sys/fs/mqueue/msgsize_default"
-                    | b"sys/fs/mqueue/msgsize_max"
-                    | b"sys/fs/mqueue/queues_max"
                     | b"sys/fs/mount-max"
                     | b"sys/fs/nr_open"
                     | b"sys/fs/pipe-max-size"
@@ -2287,11 +2577,6 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
                     | b"sys/vm/mmap_min_addr"
-                    | b"sys/net/core/somaxconn"
-                    | b"sys/net/ipv4/ip_forward"
-                    | b"sys/net/ipv4/ip_local_port_range"
-                    | b"sys/net/ipv4/ip_unprivileged_port_start"
-                    | b"sys/net/ipv4/ping_group_range"
                     | b"sys/kernel/tainted"
                     | b"sys/kernel/modprobe"
                     | b"sys/vm/overcommit_memory"
@@ -2329,7 +2614,12 @@ pub(crate) fn unwritable_error(node: &PseudoNode) -> Option<Errno> {
 pub(crate) fn open_unwritable(node: &PseudoNode, for_write: bool) -> Result<(), Errno> {
     match node {
         PseudoNode::Static(p) if p.starts_with(b"sys/") => Err(Errno::EACCES),
-        PseudoNode::NetConf(..) | PseudoNode::NetSysctl(_) => Err(Errno::EACCES),
+        PseudoNode::NetStatic(..)
+        | PseudoNode::IpcSysctl(..)
+        | PseudoNode::UtsSysctl(..)
+        | PseudoNode::PidSysctl(..)
+        | PseudoNode::NetConf(..)
+        | PseudoNode::NetSysctl(..) => Err(Errno::EACCES),
         _ if unwritable_error(node).is_some() || !for_write => Ok(()),
         _ => Err(Errno::EACCES),
     }
@@ -2345,9 +2635,13 @@ pub(crate) fn pollable(node: &PseudoNode) -> bool {
         node,
         Global(_)
             | Static(_)
+            | NetStatic(..)
+            | IpcSysctl(..)
+            | UtsSysctl(..)
+            | PidSysctl(..)
             | Net(..)
             | NetConf(..)
-            | NetSysctl(_)
+            | NetSysctl(..)
             | Entry(_, _, self::Entry::Mounts | self::Entry::MountInfo)
             | Sys(_)
             | SysCpu(..)
@@ -2357,10 +2651,88 @@ pub(crate) fn pollable(node: &PseudoNode) -> bool {
     )
 }
 
+/// Change-notification state attached to an open synthetic file (`open_pseudo`):
+/// - `/proc/<pid>/mounts` and `mountinfo`: the target thread's mount namespace's event counter
+///   (Linux's `mounts_open_common` -> `mnt_ns->event`),
+/// - `/proc/sys/kernel/{hostname,domainname}`: the pinned UTS namespace's per-name counter
+///   (Linux's `proc_uts_poll`),
+/// - cgroup2 files: the cgroup file's observation counter (kernfs first-read rule),
+/// - sysfs files: a constant kernfs counter (kernfs first-read rule).
+pub(crate) fn poll_event(
+    k: &mut Kernel,
+    vfs: &Vfs,
+    node: &PseudoNode,
+) -> Option<crate::fd::ProcEvent> {
+    match node {
+        PseudoNode::Entry(proc, entry_tid, Entry::Mounts | Entry::MountInfo) => {
+            let ns_id = group_of_id(k, *proc)
+                .and_then(|g| {
+                    let tgid = g.borrow().tgid;
+                    let tid = entry_tid.unwrap_or(proc.pid);
+                    k.tasks.get(&tid).filter(|t| t.tgid == tgid)
+                })
+                .map_or(crate::vfs::INIT_MNT_NS, |t| {
+                    t.res.borrow().fs.borrow().mnt_ns.id
+                });
+            Some(crate::fd::ProcEvent::mounts(vfs.mount_events_of(ns_id)))
+        }
+        PseudoNode::UtsSysctl(path, uts) => {
+            let counter = if *path == b"sys/kernel/hostname" {
+                uts.0.hostname_event.clone()
+            } else {
+                uts.0.domainname_event.clone()
+            };
+            Some(crate::fd::ProcEvent::mounts(counter))
+        }
+        PseudoNode::Cgroup(id, name, _) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
+            crate::cgroup::observe(k, *id, name)
+                .unwrap_or_else(|| Rc::new(std::cell::Cell::new(1))),
+        )),
+        PseudoNode::Sys(_)
+        | PseudoNode::SysCpu(..)
+        | PseudoNode::SysNet(..)
+        | PseudoNode::SysBlock(..) => Some(crate::fd::ProcEvent::kernfs(Rc::new(
+            std::cell::Cell::new(1),
+        ))),
+        _ => None,
+    }
+}
+
+/// Whether Linux 6.1 gives synthetic file `node` a `read_iter` (or, with `write`, a `write_iter`)
+/// operation, required by native AIO (`io_submit` returns `EINVAL` without). Sysfs, cgroup2 and
+/// `/proc/sys` (`kernfs_file_fops`, `proc_sys_file_operations`) implement both; procfs `seq_file`
+/// views implement `read_iter` (`seq_read_iter`) only; `/proc/kmsg`, nsfs and custom procfs files
+/// (`/proc/<pid>/mem`, `pagemap`, `cmdline`, `environ`, `auxv`, `oom_score_adj`,
+/// `coredump_filter`) implement neither.
+pub(crate) fn has_iter(node: &PseudoNode, write: bool) -> bool {
+    use PseudoNode::*;
+    match node {
+        Sys(_) | SysCpu(..) | SysNet(..) | SysBlock(..) | Cgroup(..) | NetStatic(..)
+        | IpcSysctl(..) | UtsSysctl(..) | PidSysctl(..) | NetConf(..) | NetSysctl(..) => true,
+        Static(p) if p.starts_with(b"sys/") => true,
+        Static(p) if p.starts_with(b"sysvipc/") => !write,
+        Global(self::Global::Kmsg | self::Global::Mounts | self::Global::Net) => false,
+        Global(_) | Net(..) | FdInfo(..) => !write,
+        Entry(
+            _,
+            _,
+            self::Entry::Mem
+            | self::Entry::Pagemap
+            | self::Entry::Cmdline
+            | self::Entry::Environ
+            | self::Entry::Auxv
+            | self::Entry::OomScoreAdj
+            | self::Entry::CoredumpFilter,
+        ) => false,
+        Entry(..) => !write,
+        _ => false,
+    }
+}
+
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
 /// checked at open, and reading is EINVAL (`cgroup_seqfile_show` has no read callback).
 pub(crate) fn unreadable(node: &PseudoNode) -> bool {
-    matches!(node, PseudoNode::Cgroup(_, name)
+    matches!(node, PseudoNode::Cgroup(_, name, _)
         if crate::cgroup::file_mode(name).is_some_and(|m| m & 0o444 == 0))
         || matches!(node, PseudoNode::Static(b"sys/vm/drop_caches"))
 }
@@ -2409,10 +2781,30 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         // Those of the network namespace that process is in: the interfaces are the host's (lo in
         // a new one) plus virtual devices (crate::netdev), and only sockets created in it are
         // listed; in a new one the traffic and protocol counters are all 0 (crate::netns)
-        Net(pid, tid, name) => {
+        Net(proc, tid, name) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ESRCH);
+            }
             let full = ps
-                .task(*pid, *tid)
-                .map_or_else(|| ps.k.init_ns.net.clone(), |t| t.ns.borrow().net.clone());
+                .task(*proc, *tid)
+                .map(|t| t.ns.borrow().net.clone())
+                .or_else(|| {
+                    let g = ps.group(*proc)?;
+                    let g = g.borrow();
+                    // Zombie leader: keep using the process's netns (prefer the leader's netns
+                    // if still alive, else any live thread in the thread group) rather than
+                    // falling back to the initial namespace.
+                    g.leader_net
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                        .or_else(|| {
+                            g.threads
+                                .iter()
+                                .find_map(|t| ps.k.tasks.get(t))
+                                .map(|t| t.ns.borrow().net.clone())
+                        })
+                })
+                .unwrap_or_else(|| ps.k.init_ns.net.clone());
             let net = Some(full.clone()).filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
             // The uid column is translated through the reader's user namespace (Linux's
@@ -2420,8 +2812,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             let reader = ps.reader();
             let socks: Vec<(SocketRef, u32)> = sockets(ps.k)
                 .into_iter()
-                .filter(|(s, _)| socket_net(&s.borrow()) == id)
-                .map(|(s, uid)| (s, reader.uid_out(uid)))
+                .filter_map(|s| {
+                    let uid = {
+                        let b = s.borrow();
+                        if socket_net(&b) != id {
+                            return None;
+                        }
+                        reader.uid_out(b.uid())
+                    };
+                    Some((s, uid))
+                })
                 .collect();
             let ifaces = crate::netdev::interfaces(&full);
             let world = ps.k.world();
@@ -2439,7 +2839,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 b"arp" => crate::net::PROC_ARP.to_owned(),
                 b"dev" => net_dev(ps.k, &ifaces, net.is_none()),
                 b"netstat" => crate::net::proc_netstat(protocols),
-                b"snmp" => crate::net::proc_snmp(&socks, protocols),
+                b"snmp" => {
+                    let mut s = crate::net::proc_snmp(&socks, protocols);
+                    // RFC 1213 ipForwarding: 1 when ip_forward is enabled in this netns, 2 when off
+                    if crate::netdev::ip_forward(&full) != 0
+                        && let Some(pos) = s.find("\nIp: 2 ")
+                    {
+                        s.replace_range(pos + 5..pos + 6, "1");
+                    }
+                    s
+                }
                 b"if_inet6" => net_if_inet6(&ifaces),
                 b"route" => crate::route::proc_route(&tables()),
                 b"ipv6_route" => crate::route::proc_ipv6_route(&tables()),
@@ -2457,15 +2866,56 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 _ => return Err(Errno::ENOENT),
             }
         }
+        NetStatic(path, net) => match &path[..] {
+            b"sys/net/bridge/bridge-nf-call-iptables" => {
+                format!("{}\n", u8::from(net.0.devs.borrow().conf.bridge_call_iptables))
+            }
+            b"sys/net/core/somaxconn" => format!("{}\n", net.0.devs.borrow().conf.somaxconn),
+            b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&net.0)),
+            b"sys/net/ipv4/ip_local_port_range" => {
+                let (lo, hi) = net.0.devs.borrow().conf.port_range;
+                format!("{lo}\t{hi}\n")
+            }
+            b"sys/net/ipv4/ip_unprivileged_port_start" => {
+                format!("{}\n", net.0.devs.borrow().conf.prot_sock)
+            }
+            b"sys/net/ipv4/ping_group_range" => {
+                // Kernel IDs, shown in the reader's namespace (65534 when unmapped)
+                let (lo, hi) = net.0.devs.borrow().conf.ping_group;
+                let r = ps.reader();
+                format!("{}\t{}\n", r.gid_out(lo as u32), r.gid_out(hi as u32))
+            }
+            _ => return Err(Errno::EISDIR),
+        },
+        IpcSysctl(path, ipc) => {
+            if let Some(name) = path.strip_prefix(b"sys/fs/mqueue/") {
+                format!("{}\n", ps.k.ipc(ipc.0.id).mq_limits.get(name).unwrap_or(0))
+            } else if let Some(name) = path.strip_prefix(b"sys/kernel/")
+                && let Some(val) = ps.k.ipc(ipc.0.id).tunables.read(name)
+            {
+                val
+            } else {
+                return Err(Errno::EISDIR);
+            }
+        }
+        UtsSysctl(path, uts) => match &path[..] {
+            b"sys/kernel/domainname" => {
+                format!("{}\n", String::from_utf8_lossy(&uts.0.domainname.borrow()))
+            }
+            b"sys/kernel/hostname" => {
+                format!("{}\n", String::from_utf8_lossy(&uts.0.hostname.borrow()))
+            }
+            _ => return Err(Errno::EISDIR),
+        },
+        PidSysctl(b"sys/kernel/ns_last_pid", pid_ns) => {
+            format!("{}\n", last_pid_in(ps.k, &pid_ns.0))
+        }
+        PidSysctl(..) => return Err(Errno::EISDIR),
         Static(path) => match &path[..] {
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
             b"sys/fs/aio-max-nr" => format!("{}\n", ps.k.aio_max_nr),
             b"sys/fs/aio-nr" => format!("{}\n", ps.k.aio_nr),
-            p if p.starts_with(b"sys/fs/mqueue/") => {
-                let ns = ps.ns().ipc.id;
-                format!("{}\n", ps.k.ipc(ns).mq_limits.get(&p[14..]).unwrap_or(0))
-            }
             b"sys/fs/inotify/max_queued_events" => {
                 format!("{}\n", ps.k.inotify.borrow().max_queued)
             }
@@ -2481,49 +2931,18 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
-            b"sys/net/core/somaxconn" => {
-                format!("{}\n", ps.ns().net.devs.borrow().conf.somaxconn)
-            }
-            b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&ps.ns().net)),
-            b"sys/net/ipv4/ip_local_port_range" => {
-                let (lo, hi) = ps.ns().net.devs.borrow().conf.port_range;
-                format!("{lo}\t{hi}\n")
-            }
-            b"sys/net/ipv4/ip_unprivileged_port_start" => {
-                format!("{}\n", ps.ns().net.devs.borrow().conf.prot_sock)
-            }
-            b"sys/net/ipv4/ping_group_range" => {
-                // Kernel IDs, shown in the reader's namespace (65534 when unmapped)
-                let (lo, hi) = ps.ns().net.devs.borrow().conf.ping_group;
-                let r = ps.reader();
-                format!("{}\t{}\n", r.gid_out(lo as u32), r.gid_out(hi as u32))
-            }
             b"sys/kernel/core_pattern" => {
                 format!("{}\n", String::from_utf8_lossy(&ps.k.core_pattern))
             }
             b"sys/kernel/core_uses_pid" => format!("{}\n", ps.k.core_uses_pid as u8),
-            b"sys/kernel/domainname" => {
-                format!(
-                    "{}\n",
-                    String::from_utf8_lossy(&ps.ns().uts.domainname.borrow())
-                )
-            }
-            b"sys/kernel/hostname" => {
-                format!(
-                    "{}\n",
-                    String::from_utf8_lossy(&ps.ns().uts.hostname.borrow())
-                )
-            }
             b"sys/kernel/sched_rr_timeslice_ms" => "100\n".to_owned(),
-            b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
-            | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
-            | b"sys/kernel/shmmni" => {
-                let ns = ps.ns().ipc.id;
-                ps.k.ipc(ns).tunables.read(&path[11..]).unwrap()
-            }
-            b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg", &ps.reader()),
-            b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem", &ps.reader()),
-            b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm", &ps.reader()),
+            b"sysvipc/msg" | b"sysvipc/sem" | b"sysvipc/shm" => ipc::proc_listing(
+                ps.k,
+                ps.ns().ipc.id,
+                &path[8..],
+                &ps.reader(),
+                &ps.k.pid_ns_of(ps.tgid),
+            ),
             b"sys/kernel/tainted" => format!("{}\n", ps.k.tainted),
             b"sys/kernel/modprobe" => format!("{}\n", String::from_utf8_lossy(&ps.k.modprobe)),
             // Write-only (reading is EINVAL, `unreadable`)
@@ -2542,12 +2961,11 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 )
             }
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
-            b"sys/kernel/ns_last_pid" => format!("{}\n", ps.last_pid()),
             b"sys/kernel/seccomp/actions_avail" => crate::seccomp::actions_avail(),
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
-            b"sys/kernel/pid_max" => "4194304\n".to_owned(),
+            b"sys/kernel/pid_max" => format!("{}\n", ps.k.pid_max),
             b"sys/kernel/dmesg_restrict" => format!("{}\n", ps.k.dmesg_restrict as u8),
             b"sys/kernel/panic" => format!("{}\n", ps.k.panic),
             b"sys/kernel/unprivileged_bpf_disabled" => {
@@ -2587,27 +3005,44 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             p if recorded(p).is_some() => format!("{}\n", recorded_value(ps.k, p)),
             _ => return Err(Errno::EISDIR),
         },
-        Entry(pid, tid, e) => {
-            let task = ps.task(*pid, *tid);
+        Entry(proc, tid, e) => {
+            if !ps.pid_exists(*proc, *tid) {
+                return Err(Errno::ESRCH);
+            }
+            let task = ps.task(*proc, *tid);
             match e {
                 // These carry the thread's name as its bytes, which need not be UTF-8
-                self::Entry::Stat => return pid_stat(ps, &ns, *pid, *tid),
-                self::Entry::Status => return pid_status(ps, &ns, *pid, *tid),
+                self::Entry::Stat => return pid_stat(ps, &ns, *proc, *tid),
+                self::Entry::Status => return pid_status(ps, &ns, *proc, *tid),
                 self::Entry::Statm => {
-                    let (vsize, rss) = mem_of(task.as_deref());
-                    format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
+                    if let Some(t) = task.as_deref() {
+                        let res = t.res.borrow();
+                        let mm = res.mm.borrow();
+                        let (anon, file, shmem) = mm.resident_split();
+                        let shared = file + shmem;
+                        let rss = anon + shared;
+                        let layout = vm_layout(&mm);
+                        let data_pages = (layout.data + layout.stack) / 4096;
+                        format!(
+                            "{} {rss} {shared} {} 0 {data_pages} 0\n",
+                            layout.size / 4096,
+                            layout.code_span / 4096,
+                        )
+                    } else {
+                        "0 0 0 0 0 0 0\n".to_owned()
+                    }
                 }
                 self::Entry::Comm => {
-                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
-                    let mut name = comm_of(&g.borrow(), task.as_deref(), *pid, *tid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
+                    let mut name = comm_of(&g.borrow(), task.as_deref(), proc.pid, *tid);
                     name.push(b'\n');
                     return Ok(name);
                 }
                 // The thread's child processes not yet reaped, each followed by a space, with no
                 // newline (Linux's children_seq_show)
                 self::Entry::Children => {
-                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
-                    let me = tid.unwrap_or(*pid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
+                    let me = tid.unwrap_or(proc.pid);
                     let mut s = String::new();
                     for c in &g.borrow().children {
                         if ps
@@ -2623,7 +3058,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 }
                 // Relative to the root of the reader's cgroup namespace
                 self::Entry::Cgroup => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let cgroup = g.borrow().cgroup;
                     crate::cgroup::proc_cgroup(ps.k, cgroup, ps.cgroup_root())
                 }
@@ -2631,21 +3066,23 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.args)));
                 }
                 self::Entry::Environ => {
+                    if !ps.may_read(*proc, *tid) {
+                        return Err(Errno::EACCES);
+                    }
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.env)));
                 }
                 self::Entry::Limits => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     limits(&g.borrow().rlimits)
                 }
-                self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs.store(), &t)),
+                self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs, &t)),
                 self::Entry::Smaps => {
-                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, false))
+                    task.map_or(String::new(), |t| smaps(ps.vfs, &t, false))
                 }
                 self::Entry::SmapsRollup => {
-                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, true))
+                    task.map_or(String::new(), |t| smaps(ps.vfs, &t, true))
                 }
-                // Binary, computed from the read or write position (`read_pagemap`, `read_mem`,
-                // `write_mem`)
+                // Binary, computed from the read or write position (`read_pagemap`, `access_mem`).
                 self::Entry::Pagemap | self::Entry::Mem => String::new(),
                 self::Entry::Auxv => {
                     let auxv =
@@ -2672,18 +3109,18 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 // generates nothing) with the reader's own credentials rather than the opener's
                 self::Entry::Syscall => {
                     let me = ps.k.cred_of(ps.tid).unwrap_or_else(Cred::root);
-                    let thread = tid.unwrap_or(*pid);
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let thread = tid.unwrap_or(proc.pid);
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     if task.is_none() && thread != g.borrow().tgid {
                         return Err(Errno::ESRCH);
                     }
-                    if !ps.may_read_as(thread, &me) {
+                    if !ps.may_read_as(*proc, *tid, &me) {
                         return Err(Errno::EPERM);
                     }
                     let own = thread == ps.tid;
                     let running = task.is_some()
                         && !own
-                        && state_of(ps, &g.borrow(), *pid, *tid).0 == 'R';
+                        && state_of(ps, &g.borrow(), *proc, *tid).0 == 'R';
                     match task.as_deref().and_then(|t| t.sync.entry.get()) {
                         _ if running => "running\n".to_owned(),
                         Some([nr, a0, a1, a2, a3, a4, a5, sp, pc]) => {
@@ -2702,16 +3139,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     }
                 }
                 self::Entry::OomScore => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{}\n", crate::oom::proc_score(ps.k, &g.borrow()))
                 }
                 self::Entry::OomScoreAdj => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
                 // Linux's proc_timens_show_offsets: the one for children
                 self::Entry::TimensOffsets => {
-                    let t = ps.k.tasks.get(pid).ok_or(Errno::ESRCH)?;
+                    let t = task.ok_or(Errno::ESRCH)?;
                     let [mono, boot] = t.ns.borrow().time_for_children.offsets.get();
                     format!(
                         "{:<10} {:>10} {:>9}\n{:<10} {:>10} {:>9}\n",
@@ -2719,51 +3156,56 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     )
                 }
                 e @ (self::Entry::UidMap | self::Entry::GidMap | self::Entry::ProjidMap) => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let ns = g.borrow().cred.user_ns.clone();
                     id_map(&ps.reader(), &ns, *e)
                 }
                 self::Entry::Setgroups => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     let allow = g.borrow().cred.user_ns.setgroups.get();
                     format!("{}\n", if allow { "allow" } else { "deny" })
                 }
                 self::Entry::CoredumpFilter => {
-                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let g = ps.group(*proc).ok_or(Errno::ESRCH)?;
                     format!("{:08x}\n", g.borrow().coredump_filter)
                 }
                 _ => return Err(Errno::EINVAL),
             }
         }
-        FdInfo(pid, fd) => fdinfo(ps, &ns, *pid, *fd)?,
+        FdInfo(proc, tid, fd) => fdinfo(ps, &ns, *proc, *tid, *fd)?,
         Sys(path) => match &path[..] {
             b"dev/char/226:128/device/uevent" => "OF_FULLNAME=/appine-gpu\nOF_COMPATIBLE_N=1\nOF_COMPATIBLE_0=virtio,mmio\n".to_owned(),
             b"devices/system/cpu/online"
             | b"devices/system/cpu/possible"
             | b"devices/system/cpu/present" => cpu_list(0..cpus()),
             b"devices/system/cpu/offline" => "\n".to_owned(),
-            // The defaults of 6.1's Kconfig, which are what the overlay does: no index, redirects,
-            // metacopy, NFS export or xino
-            b"module/overlay/parameters/redirect_always_follow" => "Y\n".to_owned(),
+            // The defaults of 6.1's Kconfig, except redirect_always_follow which is N because
+            // Appine does not follow trusted.overlay.redirect (no index, redirects, metacopy,
+            // NFS export or xino)
             b"module/overlay/parameters/redirect_max" => "256\n".to_owned(),
             p if p.starts_with(b"module/overlay/parameters/") => "N\n".to_owned(),
             _ => return Err(Errno::EISDIR),
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
-        SysNet(n, path) => net_file(ps.k, &ps.ns().net, *n, path)?,
-        SysBlock(n, path) => ps.k.loops.sysfs_read(*n, path).ok_or(Errno::EISDIR)?,
-        NetConf(v6, dir, name) => {
-            crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
+        SysNet(n, path) => net_file(ps.k, &ps.sys_net_ns(mnt), *n, path)?,
+        SysBlock(n, b"uevent") => {
+            if !ps.k.loops.sysfs_exists(*n, b"uevent") {
+                return Err(Errno::ENOENT);
+            }
+            format!("MAJOR={LOOP_MAJOR}\nMINOR={n}\nDEVNAME=loop{n}\nDEVTYPE=disk\n")
         }
-        NetSysctl(path) => crate::netconf::sysctl_read(&ps.ns().net.devs.borrow().conf, path),
-        // Write-only ones (cgroup.kill) are EINVAL to read
-        Cgroup(_, b"") => return Err(Errno::EISDIR),
-        Cgroup(id, name) => {
+        SysBlock(n, path) => ps.k.loops.sysfs_read(*n, path).ok_or(Errno::EISDIR)?,
+        NetConf(v6, dir, name, net) => crate::netdev::conf_read(&net.0, *v6, *dir, name)?,
+        NetSysctl(path, net) => crate::netconf::sysctl_read(&net.0.devs.borrow().conf, path),
+        // Removed cgroups / disabled controllers are ENODEV; write-only files are EINVAL
+        Cgroup(_, b"", 0) => return Err(Errno::EISDIR),
+        Cgroup(id, name, _) => {
+            if gone(ps.k, node) { return Err(Errno::ENODEV); }
             // Ids as the reader's pid namespace sees them (task_pid_vnr: current's, not the
             // mount's)
             let ns = ps.k.pid_ns_of(ps.tgid);
             let vnr = |t| ns.vnr(t).unwrap_or(0);
-            crate::cgroup::file(ps.k, *id, name, &vnr).ok_or(Errno::EINVAL)?
+            crate::cgroup::file(ps.k, *id, name, &vnr)?
         }
         // A namespace is opened only for setns; nothing can be read
         NsFile(..) => String::new(),
@@ -2774,12 +3216,17 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
 
 // ---- Per-process files ----
 
-fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
-    let g = ps.group(pid).ok_or(Errno::ENOENT)?;
+fn pid_stat(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
+    let g = ps.group(proc).ok_or(Errno::ESRCH)?;
     let g = g.borrow();
-    let task = ps.task(pid, tid);
+    let task = ps.task(proc, tid);
+    let start_ticks = if tid.unwrap_or(proc.pid) == g.tgid {
+        g.start_ticks
+    } else {
+        task.as_ref().map_or(g.start_ticks, |t| t.start_ticks)
+    };
     let nice = task.as_ref().map_or(0, |t| t.nice.get());
-    let (state, _) = state_of(ps, &g, pid, tid);
+    let (state, _) = state_of(ps, &g, proc, tid);
     let (tty_nr, tpgid) = ctty_info(ns, &g);
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
     let cpu = match (tid, &task, g.leader_exit) {
@@ -2795,7 +3242,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
     });
     // The layout goes only to readers passing the ptrace read check (6.1's do_task_stat):
     // others see 1 for the code's bounds and 0 for the rest
-    let permitted = ps.may_read(pid);
+    let permitted = ps.may_read(proc, tid);
     let layout = task.as_ref().map(|t| {
         let res = t.res.borrow();
         let mm = res.mm.borrow();
@@ -2812,8 +3259,8 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
         None => ((0, 0), 0, [0; 7]),
     };
     // The name as raw bytes, as Linux's proc_task_name without escaping
-    let mut out = format!("{} (", v(tid.unwrap_or(pid))).into_bytes();
-    out.extend(comm_of(&g, task.as_deref(), pid, tid));
+    let mut out = format!("{} (", v(tid.unwrap_or(proc.pid))).into_bytes();
+    out.extend(comm_of(&g, task.as_deref(), proc.pid, tid));
     let mut s = String::new();
     write!(
         s,
@@ -2831,7 +3278,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
         20 + nice,
         nice,
         thread_count(&g).max(1),
-        ps.with_boot_offset(g.start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
+        ps.with_boot_offset(start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
         vsize,
         rss,
     )
@@ -2860,15 +3307,11 @@ fn ctty_info(ns: &PidNs, g: &ThreadGroup) -> (u64, i64) {
     }
 }
 
-fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
-    let g = ps.group(pid).ok_or(Errno::ENOENT)?;
+fn pid_status(ps: &View<'_>, ns: &PidNs, proc: ProcId, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
+    let g = ps.group(proc).ok_or(Errno::ESRCH)?;
     let g = g.borrow();
-    let task = ps.task(pid, tid);
-    let (state, state_name) = state_of(ps, &g, pid, tid);
-    // The size only: the resident pages are measured below, split by kind
-    let vsize = task
-        .as_ref()
-        .map_or(0, |t| t.res.borrow().mm.borrow().size());
+    let task = ps.task(proc, tid);
+    let (state, state_name) = state_of(ps, &g, proc, tid);
     let (sigign, sigcgt) = sig_dispositions(&g);
     let (umask, fdsize) = task.as_ref().map_or((0o022, 0), |t| {
         let res = t.res.borrow();
@@ -2881,7 +3324,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     // The name as its bytes with only a newline and a backslash escaped (Linux's
     // proc_task_name with seq_escape_str(.., "\n\\"))
     let mut out = b"Name:\t".to_vec();
-    for b in comm_of(&g, task.as_deref(), pid, tid) {
+    for b in comm_of(&g, task.as_deref(), proc.pid, tid) {
         match b {
             b'\n' => out.extend(b"\\n"),
             b'\\' => out.extend(b"\\\\"),
@@ -2893,7 +3336,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
-    let tid = tid.unwrap_or(pid);
+    let tid = tid.unwrap_or(proc.pid);
     writeln!(s, "Tgid:\t{}\nNgid:\t0\nPid:\t{}", v(g.tgid), v(tid)).unwrap();
     let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
     writeln!(
@@ -2946,17 +3389,21 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
         col(g.sid)
     )
     .unwrap();
-    if task.is_some() {
-        let kb = vsize / 1024;
+    if let Some(t) = task.as_deref() {
+        let res = t.res.borrow();
+        let mm = res.mm.borrow();
+        let layout = vm_layout(&mm);
+        let kb = layout.size / 1024;
         writeln!(s, "VmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB").unwrap();
-        let locked = task
-            .as_ref()
-            .map_or(0, |t| t.res.borrow().mm.borrow().locked_bytes());
-        writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
+        writeln!(
+            s,
+            "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB",
+            mm.locked_bytes() / 1024,
+            0
+        )
+        .unwrap();
         // VmRSS is the sum of the three kinds, as on Linux
-        let (anon, file, shmem) = task
-            .as_ref()
-            .map_or((0, 0, 0), |t| t.res.borrow().mm.borrow().resident_split());
+        let (anon, file, shmem) = mm.resident_split();
         let rss = anon + file + shmem;
         let hwm = g.maxrss_kb.max(rss * 4);
         writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
@@ -2968,14 +3415,24 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
             shmem * 4
         )
         .unwrap();
-        // Grows-down mappings are the stack (Linux's stack_vm); data and code are not told
-        // apart; no swap
-        let stack = task
-            .as_ref()
-            .map_or(0, |t| t.res.borrow().mm.borrow().stack_bytes());
-        writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", stack / 1024).unwrap();
-        writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
-        writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
+        // Linux 6.1's task_mem: VmData (private writable non-stack), VmStk (grows-down),
+        // VmExe (code span capped by exec_vm), VmLib (remaining exec_vm), VmPTE (allocated
+        // soft-MMU page tables) and VmSwap (exact pagemap swap when readable, else 0).
+        let exe = layout.code_span.min(layout.exec);
+        let lib = layout.exec.saturating_sub(exe);
+        let pte_kb = mm.pgtables_bytes() / 1024;
+        let swap_kb = mm.exact_swap_pages().unwrap_or(0) * 4;
+        writeln!(
+            s,
+            "VmData:\t{:>8} kB\nVmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB\nVmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB",
+            layout.data / 1024,
+            layout.stack / 1024,
+            exe / 1024,
+            lib / 1024,
+            pte_kb,
+            swap_kb,
+        )
+        .unwrap();
     }
     writeln!(s, "Threads:\t{}", thread_count(&g).max(1)).unwrap();
     let limit = g.rlimits[crate::process::RLIMIT_SIGPENDING as usize].0;
@@ -3003,13 +3460,18 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     writeln!(
         s,
         "NoNewPrivs:\t{}\nSeccomp:\t{seccomp}\nSeccomp_filters:\t{filters}",
-        g.no_new_privs as u8
+        task.as_ref()
+            .map_or(g.leader_no_new_privs, |t| t.no_new_privs.get()) as u8
     )
     .unwrap();
-    // The thread's affinity (the main thread's for the process), within the online CPUs
-    let online = u64::MAX >> (64 - cpus().clamp(1, 64));
-    let allowed = task.as_ref().map_or(u64::MAX, |t| t.affinity.get()) & online;
+    // The thread's affinity (the main thread's for the process), clamped to its cgroup's effective
+    // cpuset (within the online CPUs)
+    let allowed = match task.as_ref() {
+        Some(t) => crate::cgroup::clamp_affinity(ps.k, g.cgroup, t.affinity.get()),
+        None => crate::cgroup::effective_cpus(ps.k, g.cgroup),
+    };
     let allowed: Vec<usize> = (0..64).filter(|b| allowed >> b & 1 != 0).collect();
+    write!(s, "Cpus_allowed:\t{}", cpu_mask_of(&allowed)).unwrap();
     write!(s, "Cpus_allowed_list:\t{}", cpu_list_of(&allowed)).unwrap();
     // Each time a host thread goes to sleep (waits) is one voluntary switch: a thread that has
     // not been woken does not change
@@ -3029,14 +3491,19 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
 
 /// The process state letter and name: Z zombie, t in a ptrace-stop, T stopped, S waiting in the
 /// kernel, and R otherwise (running guest code or handling a syscall).
-fn state_of(ps: &View<'_>, g: &ThreadGroup, pid: Tid, tid: Option<Tid>) -> (char, &'static str) {
+fn state_of(
+    ps: &View<'_>,
+    g: &ThreadGroup,
+    proc: ProcId,
+    tid: Option<Tid>,
+) -> (char, &'static str) {
     // The whole process, or its main thread once that has exited (Linux keeps it as a zombie
     // task, and the process directory shows it)
-    if g.zombie.is_some() || (tid.unwrap_or(pid) == g.tgid && g.leader_exit.is_some()) {
+    if g.zombie.is_some() || (tid.unwrap_or(proc.pid) == g.tgid && g.leader_exit.is_some()) {
         return ('Z', "zombie");
     }
     // Stopped in a ptrace-stop (also under PTRACE_LISTEN, as on Linux)
-    if let Some(t) = ps.task(pid, tid)
+    if let Some(t) = ps.task(proc, tid)
         && t.trace.borrow().stop.is_some()
     {
         return ('t', "tracing stop");
@@ -3047,7 +3514,7 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, pid: Tid, tid: Option<Tid>) -> (char
     // As on Linux, the state is the thread's (the main thread's for the process directory):
     // waiting in the kernel is S, and everything else (running guest code, handling a syscall,
     // just created and not yet run, woken but not yet running) is R
-    if ps.task(pid, tid).is_some_and(|t| t.asleep()) {
+    if ps.task(proc, tid).is_some_and(|t| t.asleep()) {
         ('S', "sleeping")
     } else {
         ('R', "running")
@@ -3070,6 +3537,52 @@ fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> 
     };
     let n = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     comm[..n].to_vec()
+}
+
+/// Virtual-memory breakdown matching Linux 6.1's `vm_stat_account` / `task_mem` / `task_statm`
+/// (in bytes): total size, `data_vm` (private writable non-stack), `stack_vm` (grows-down),
+/// `exec_vm` (executable non-writable non-stack), and the page-aligned code span (`[start_code,
+/// end_code)`).
+struct VmLayout {
+    size: u64,
+    data: u64,
+    stack: u64,
+    exec: u64,
+    code_span: u64,
+}
+
+fn vm_layout(mm: &crate::mm::Mm) -> VmLayout {
+    let size = mm.size();
+    let stack = mm.stack_bytes();
+    let mut main_stack = 0u64;
+    let mut raw_data = 0u64;
+    let mut exec = 0u64;
+    for r in mm.regions() {
+        let len = r.end.saturating_sub(r.start);
+        if r.name.as_deref() == Some(b"[stack]") {
+            main_stack = main_stack.saturating_add(len);
+        } else if r.prot & 4 != 0 && r.prot & 2 == 0 {
+            exec = exec.saturating_add(len);
+        } else if r.prot & 2 != 0 && !r.shared {
+            raw_data = raw_data.saturating_add(len);
+        }
+    }
+    // Exclude any additional MAP_GROWSDOWN mappings already counted in `stack_bytes`.
+    let extra_stack = stack.saturating_sub(main_stack);
+    let data = raw_data.saturating_sub(extra_stack);
+    let (code_start, code_end) = mm.code;
+    let code_span = if code_end > code_start {
+        (code_end.saturating_add(4095) & !4095u64).saturating_sub(code_start & !4095u64)
+    } else {
+        0
+    };
+    VmLayout {
+        size,
+        data,
+        stack,
+        exec,
+        code_span,
+    }
 }
 
 /// An address space's (total size, resident pages).
@@ -3109,11 +3622,20 @@ pub(crate) fn comm_str(task: Option<&Task>, pid: Tid) -> String {
     }
 }
 
+/// Reads `/proc/<pid>/environ` from the address space pinned at open (`proc_environ_operations`):
+/// returns empty/EOF once the process has exited or replaced its address space via `execve`.
+pub(crate) fn read_environ(mm: Option<&Rc<RefCell<crate::mm::Mm>>>) -> Vec<u8> {
+    mm.map_or_else(Vec::new, |mm| mm_bytes(&mm.borrow(), |m| m.env))
+}
+
 /// A range of guest memory (cmdline, environ); empty when it cannot be read.
 fn guest_bytes(task: &Task, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> {
     let res = task.res.borrow();
-    let mm = res.mm.borrow();
-    let (start, end) = range(&mm);
+    mm_bytes(&res.mm.borrow(), range)
+}
+
+fn mm_bytes(mm: &crate::mm::Mm, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> {
+    let (start, end) = range(mm);
     if end <= start || end - start > 1 << 20 {
         return Vec::new();
     }
@@ -3166,10 +3688,14 @@ fn limits(rlimits: &[(u64, u64); crate::process::RLIM_NLIMITS]) -> String {
     s
 }
 
-fn maps(store: &Store, task: &Task) -> String {
+fn maps(vfs: &Vfs, task: &Task) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
-    mm.regions().iter().map(|r| map_line(store, r)).collect()
+    let fuse_paths = crate::vfs::fuse::mapped_paths(&mm);
+    mm.regions()
+        .iter()
+        .map(|r| map_line(vfs, r, &fuse_paths))
+        .collect()
 }
 
 /// smaps counts, in kB. The host cannot tell which pages have been written: resident pages of
@@ -3246,12 +3772,17 @@ impl Usage {
 
 /// `/proc/<pid>/smaps`, or `smaps_rollup` with `rollup` (the total over all mappings). Resident
 /// pages are counted in host memory (mincore).
-fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
+fn smaps(vfs: &Vfs, task: &Task, rollup: bool) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
     let regions = mm.regions();
     let mut s = String::new();
     let mut total = Usage::default();
+    let fuse_paths = if rollup {
+        HashSet::new()
+    } else {
+        crate::vfs::fuse::mapped_paths(&mm)
+    };
     for r in &regions {
         let rss = mm.resident_in(r.start, r.end - r.start) * 4;
         let mut u = Usage {
@@ -3275,7 +3806,7 @@ fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
         if rollup {
             continue;
         }
-        s += &map_line(store, r);
+        s += &map_line(vfs, r, &fuse_paths);
         let kb = (r.end - r.start) / 1024;
         writeln!(s, "{:<16}{kb:>8} kB", "Size:").unwrap();
         writeln!(s, "{:<16}{:>8} kB", "KernelPageSize:", 4).unwrap();
@@ -3327,7 +3858,7 @@ fn vm_flags(r: &Region) -> String {
 
 /// One line of maps. As on Linux, lines without a name also end in a space, the name starts at
 /// column 74, and a newline in a file's path is escaped as `\012` (seq_file_path).
-fn map_line(store: &Store, r: &Region) -> String {
+fn map_line(vfs: &Vfs, r: &Region, fuse_paths: &HashSet<*const u8>) -> String {
     let perms = format!(
         "{}{}{}{}",
         if r.prot & 1 != 0 { 'r' } else { '-' },
@@ -3335,12 +3866,18 @@ fn map_line(store: &Store, r: &Region) -> String {
         if r.prot & 4 != 0 { 'x' } else { '-' },
         if r.shared { 's' } else { 'p' },
     );
-    // The device number of file mappings is the root filesystem's 8:1 (the same as stat's
-    // st_dev)
-    let (offset, dev, ino) = match r.file {
+    let fuse_mmap = r
+        .name
+        .as_ref()
+        .is_some_and(|name| fuse_paths.contains(&name.as_ptr()));
+    let (offset, dev, raw_ino) = match r.file {
         Some((offset, ino)) => (offset, "08:01", ino),
         None => (0, "00:00", 0),
     };
+    // Exec labels carry keys for cache pinning and ETXTBSY. Ordinary FUSE mmap labels
+    // already carry the daemon inode, which can have any of its high bits set.
+    let image = crate::vfs::fuse::id_of(raw_ino).filter(|_| r.name.is_some() && !fuse_mmap);
+    let ino = image.map_or(raw_ino, |id| vfs.fuse().get(id).map_or(0, |n| n.attr.ino));
     let line = format!(
         "{:08x}-{:08x} {perms} {offset:08x} {dev} {ino} ",
         r.start, r.end
@@ -3349,7 +3886,11 @@ fn map_line(store: &Store, r: &Region) -> String {
         Some(name) => {
             let name = match r.file {
                 Some((_, ino)) => {
-                    let path = mark_deleted(store, ino, name.to_vec());
+                    let path = if fuse_mmap || image.is_some() {
+                        name.to_vec()
+                    } else {
+                        mark_deleted(vfs.store(), ino, name.to_vec())
+                    };
                     let mut escaped = Vec::with_capacity(path.len());
                     for b in path {
                         match b {
@@ -3370,10 +3911,9 @@ fn map_line(store: &Store, r: &Region) -> String {
 /// As with Linux's `d_path`, deleted files (still open or mapped) get ` (deleted)` appended to
 /// their path: `/proc/<pid>/fd/<n>`, maps, smaps. After the last name is removed in the store,
 /// the inode's row stays with nlink = 0 until the store is next opened exclusively, so the check
-/// uses nlink. Linux looks at the name used at open and also appends it when only that name was
-/// removed while other hard links remain; here it does not. When apt upgrades, dpkg replaces old
-/// libraries with rename, and needrestart finds the processes to restart by the ` (deleted)` in
-/// maps.
+/// uses nlink. An fd link also checks its open dentry when other hard links remain.
+/// When dpkg replaces old libraries with rename, needrestart uses the suffix in maps to find
+/// processes still using them.
 pub(crate) fn mark_deleted(store: &Store, ino: Ino, name: Vec<u8>) -> Vec<u8> {
     if store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
         with_deleted(name)
@@ -3391,98 +3931,69 @@ fn with_deleted(mut name: Vec<u8>) -> Vec<u8> {
     name
 }
 
-/// Reads `/proc/<pid>/pagemap`: 8 bytes per page; the position and length must both be
-/// multiples of 8.
-pub(crate) fn read_pagemap(k: &Kernel, tid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
+/// Reads `/proc/<pid>/pagemap` (`mm` is the address space pinned at open; once it is released
+/// reads get EOF): 8 bytes per page; the position and length must both be multiples of 8.
+pub(crate) fn read_pagemap(
+    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
+    buf: &mut [u8],
+    pos: u64,
+) -> Result<usize, Errno> {
     if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
         return Err(Errno::EINVAL);
     }
-    // The thread exited after the open (which refuses one already gone, ESRCH): its address space
-    // is gone, end of file, rather than another thread's (a reader going to the end would walk
-    // all 48 bits)
-    let Some(task) = k.tasks.get(&tid).cloned() else {
+    // The address space was released (process execed or exited after open): return EOF rather
+    // than looking up a new image or a reused pid
+    let Some(mm) = mm else {
         return Ok(0);
     };
     // The user address space is 48 bits
     let pages_total = 1u64 << (48 - 12);
     let first = pos / 8;
     let n = (buf.len() as u64 / 8).min(pages_total.saturating_sub(first)) as usize;
-    let entries = task.res.borrow().mm.borrow().pagemap(first * 4096, n);
+    let entries = mm.borrow().pagemap(first * 4096, n);
     for (i, e) in entries.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&e.to_le_bytes());
     }
     Ok(n * 8)
 }
 
-/// Reads `/proc/<pid>/mem` (`mm` is the address space at open; once it is released reads get
-/// EOF): the position is the address. Reads page by page and stops at a page that cannot be read;
-/// when not a single byte was read, it is EIO (Linux's `mem_rw`). As Linux's access_remote_vm,
-/// a page below a grows-down mapping grows it first, within the reader's `RLIMIT_STACK`
-/// (`limit`).
-pub(crate) fn read_mem(
+/// Transfers bytes through an open /proc/<pid>/mem, holding the address space at open for
+/// this operation. Fill a cold FUSE page without holding an Mm borrow and retry that page.
+/// An expired address space gives EOF. An inaccessible page gives EIO or the preceding count.
+pub(crate) fn access_mem(
+    cx: &mut crate::kernel::Cx<'_>,
     mm: Option<Rc<RefCell<crate::mm::Mm>>>,
-    buf: &mut [u8],
     pos: u64,
-    limit: u64,
+    len: usize,
+    mut transfer: impl FnMut(&mut crate::mm::Mm, u64, Range<usize>) -> Result<(), Errno>,
 ) -> Result<usize, Errno> {
-    let Some(mm) = mm else {
-        return Ok(0);
-    };
+    let Some(mm) = mm else { return Ok(0) };
+    let limit = cx.stack_limit();
     let mut done = 0;
-    while done < buf.len() {
+    while done < len {
         let Some(addr) = pos.checked_add(done as u64) else {
             break;
         };
-        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(buf.len() - done);
-        let mut read =
-            |mm: &crate::mm::Mm| mm.read(UserSlice::new(addr, n), &mut buf[done..done + n]);
-        if read(&mm.borrow()).is_err()
-            && !(mm.borrow_mut().grow_for(addr, n, limit) && read(&mm.borrow()).is_ok())
-        {
+        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(len - done);
+        let result = crate::syscall::retry_user_pages(cx, Errno::EIO, |_| {
+            let mut mm = mm.borrow_mut();
+            match transfer(&mut mm, addr, done..done + n) {
+                Err(Errno::EFAULT) if mm.grow_for(addr, n, limit) => {
+                    transfer(&mut mm, addr, done..done + n)
+                }
+                result => result,
+            }
+        });
+        if result.is_err() {
             break;
         }
         done += n;
     }
-    if done == 0 && !buf.is_empty() {
-        return Err(Errno::EIO);
+    if done == 0 && len != 0 {
+        Err(Errno::EIO)
+    } else {
+        Ok(done)
     }
-    Ok(done)
-}
-
-/// Writes `/proc/<pid>/mem`: a forced write like PTRACE_POKETEXT ([`Mm::write_force`]), page by
-/// page, stopping at a page that cannot be written; grows grows-down mappings as [`read_mem`]
-/// does. `current` is the writing thread.
-///
-/// [`Mm::write_force`]: crate::mm::Mm::write_force
-pub(crate) fn write_mem(
-    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
-    data: &[u8],
-    pos: u64,
-    current: &Arc<crate::task::TaskSync>,
-    limit: u64,
-) -> Result<usize, Errno> {
-    let Some(mm) = mm else {
-        return Ok(0);
-    };
-    let mut mm = mm.borrow_mut();
-    let mut done = 0;
-    while done < data.len() {
-        let Some(addr) = pos.checked_add(done as u64) else {
-            break;
-        };
-        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(data.len() - done);
-        let page = &data[done..done + n];
-        if mm.write_force(addr, page, current).is_err()
-            && !(mm.grow_for(addr, n, limit) && mm.write_force(addr, page, current).is_ok())
-        {
-            break;
-        }
-        done += n;
-    }
-    if done == 0 && !data.is_empty() {
-        return Err(Errno::EIO);
-    }
-    Ok(done)
 }
 
 /// `/proc/<pid>/mounts` (`info` false) or `mountinfo`: as with Linux's `show_vfsmnt` and
@@ -3663,8 +4174,17 @@ fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
 /// `/proc/<pid>/fdinfo/<n>`: position, flags (plus close-on-exec; files opened with open carry
 /// `O_LARGEFILE`), mount id, inode, the locks held through it, and the extra lines of eventfd,
 /// inotify, pidfd, epoll, timerfd and signalfd.
-fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
-    let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
+fn fdinfo(
+    ps: &View<'_>,
+    ns: &PidNs,
+    proc: ProcId,
+    tid: Option<Tid>,
+    fd: i32,
+) -> Result<String, Errno> {
+    if !ps.pid_exists(proc, tid) {
+        return Err(Errno::ESRCH);
+    }
+    let task = ps.task(proc, tid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
     let fds = res.fds.borrow();
     let file = fds.get(fd).map_err(|_| Errno::ENOENT)?;
@@ -3674,12 +4194,22 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
         0
     };
     let f = file.borrow();
-    let mnt_id = f.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt());
+    let mnt_id = f.mnt_id();
+    let ino = match &f.kind {
+        FileKind::Host(hfd) => appine_hal::fstat(*hfd).map_or(0, |st| st.st_ino),
+        FileKind::MessageQueue(q) => q.borrow().stat().ino,
+        _ => match f.node() {
+            Some(Node::Store(_, ino)) => ino,
+            Some(Node::Overlay(_, o)) => ps.vfs.overlay().shown_ino(o),
+            Some(Node::Fuse(_, id)) => ps.vfs.fuse().get(id).map_or(0, |n| n.attr.ino),
+            Some(Node::Pseudo(_, p)) => node_ino(&p),
+            None => crate::syscall::dev_ino(&f).1,
+        },
+    };
     let mut s = format!(
-        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",
+        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{ino}\n",
         f.pos,
         f.flags | cloexec,
-        f.ino().unwrap_or(0)
     );
     // Only files and tables that have taken locks can hold any (most fds have none)
     if f.holds_locks || fds.holds_locks {
@@ -3911,10 +4441,12 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
 
 // ---- /proc/<pid>/net ----
 
-/// All open sockets (each counted once), sorted by inode, with the fsuid of the first thread
-/// found holding each in its fd table (Linux shows the creator's), or 0 for sockets that are only
-/// in SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
-pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
+/// All open sockets (each counted once), sorted by inode, including sockets that are only in
+/// SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
+///
+/// Does not borrow any socket `RefCell`, so callers such as netlink/nftables updates may walk the
+/// list while holding a mutable borrow on a socket.
+pub(crate) fn sockets(k: &Kernel) -> Vec<SocketRef> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -3923,23 +4455,22 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
         if !tables.insert(Rc::as_ptr(&fds)) {
             continue;
         }
-        let uid = task.cred.borrow().fsuid;
         let fds = fds.borrow();
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
             if let FileKind::Socket(s) = &file.borrow().kind
                 && seen.insert(Rc::as_ptr(s))
             {
-                out.push((s.clone(), uid));
+                out.push(s.clone());
             }
         }
     }
     // Those only in SCM_RIGHTS messages
     for s in crate::unix::inflight_sockets(k) {
         if seen.insert(Rc::as_ptr(&s)) {
-            out.push((s, 0));
+            out.push(s);
         }
     }
-    out.sort_by_key(|(s, _)| socket_ino(s));
+    out.sort_by_key(socket_ino);
     out
 }
 
@@ -4030,11 +4561,11 @@ fn net_if_inet6(ifaces: &[appine_hal::net::Interface]) -> String {
 
 // ---- sysfs ----
 
-/// The files under `/sys/class/net/<interface>`, with interfaces numbered as in the reader's
-/// network namespace (unlike Linux, which looks at the namespace of the process that mounted
-/// sysfs). As in the netlink replies, interface types are only loopback and Ethernet; `flags` is
-/// `dev->flags` as on Linux, without state-derived bits such as `IFF_RUNNING`. For virtual devices
-/// ([`crate::netdev`]) `iflink` is the veth peer, and `operstate` can be lowerlayerdown.
+/// The files under `/sys/class/net/<interface>`, with interfaces numbered as in the sysfs mount's
+/// network namespace (the mounter's, as on Linux). As in the netlink replies, interface types are
+/// only loopback and Ethernet; `flags` is `dev->flags` as on Linux, without state-derived bits
+/// such as `IFF_RUNNING`. For virtual devices ([`crate::netdev`]) `iflink` is the veth peer, and
+/// `operstate` can be lowerlayerdown.
 fn net_file(
     k: &Kernel,
     ns: &crate::nsproxy::NetNs,
@@ -4102,7 +4633,15 @@ fn net_file(
         let hex: Vec<String> = m.iter().map(|b| format!("{b:02x}")).collect();
         format!("{}\n", hex.join(":"))
     };
-    let st = k.traffic.get(&i.name);
+    // Host traffic counters and host tx_queue_len belong only to the initial network namespace;
+    // a new network namespace's `lo` starts with zero counters and Linux's default txqlen 1000
+    // (matching `/proc/net/dev` and rtnetlink)
+    let init_ns = ns.host_net.is_none();
+    let st = if init_ns {
+        k.traffic.get(&i.name)
+    } else {
+        crate::traffic::IfStats::default()
+    };
     Ok(match path {
         b"addr_len" => "6\n".to_owned(),
         b"address" => mac(i.mac.unwrap_or([0; 6])),
@@ -4121,7 +4660,11 @@ fn net_file(
         .to_owned(),
         b"tx_queue_len" => format!(
             "{}\n",
-            appine_hal::net::tx_queue_len(&i.name).unwrap_or(1000)
+            if init_ns {
+                appine_hal::net::tx_queue_len(&i.name).unwrap_or(1000)
+            } else {
+                1000
+            }
         ),
         b"type" => format!("{}\n", if loopback { 772 } else { 1 }),
         b"statistics/rx_bytes" => format!("{}\n", st.rx_bytes),
@@ -4244,7 +4787,12 @@ fn cpu_list_of(cpus: &[usize]) -> String {
 
 /// Writes a set of CPUs in CPU mask form ([`cpu_mask`]).
 fn cpu_mask_of(cpus: &[usize]) -> String {
-    let bits = self::cpus();
+    cpu_mask_for(self::cpus(), cpus)
+}
+
+/// Writes a set of CPUs in CPU mask form for a system with `bits` CPUs (`%*pb`).
+fn cpu_mask_for(bits: usize, cpus: &[usize]) -> String {
+    let bits = bits.max(1);
     let groups = bits.div_ceil(32);
     let mut s = String::new();
     for g in (0..groups).rev() {
@@ -4280,25 +4828,190 @@ fn host_cpu(n: u32) -> Option<usize> {
 
 // ---- Writing ----
 
+#[derive(Clone, Copy)]
+enum SysctlWrite {
+    // Signed ints, unsigned longs and strings (proc_dostring): update at 0, advance pos.
+    Advance,
+    // Linux 6.1's proc_douintvec and proc_dou8vec leave a successful initial write at zero.
+    Unsigned,
+    // addrconf returns one byte for a forwarding or linkdown fixup and restores the position.
+    Ipv6Fixup,
+    // Linux 6.1's proc_do_large_bitmap replaces at 0, ORs at nonzero offsets, and advances pos.
+    Bitmap,
+}
+
+/// Position rule of a writable `/proc/sys` sysctl. Ordinary procfs and cgroup files return None.
+fn sysctl_write(node: &PseudoNode) -> Option<SysctlWrite> {
+    use SysctlWrite::*;
+    if !writable(node) {
+        return None;
+    }
+    let rule = match node {
+        PseudoNode::Static(b"sys/fs/pipe-max-size") => Unsigned,
+        PseudoNode::Static(p) if p.starts_with(b"sys/") => Advance,
+        PseudoNode::UtsSysctl(..)
+        | PseudoNode::IpcSysctl(..)
+        | PseudoNode::PidSysctl(..)
+        | PseudoNode::NetStatic(..) => Advance,
+        PseudoNode::NetConf(true, dir, b"forwarding" | b"ignore_routes_with_linkdown", _)
+            if *dir != crate::netdev::ConfDir::Default =>
+        {
+            Ipv6Fixup
+        }
+        PseudoNode::NetConf(
+            true,
+            _,
+            b"addr_gen_mode"
+            | b"ra_defrtr_metric"
+            | b"ioam6_enabled"
+            | b"ioam6_id"
+            | b"ioam6_id_wide"
+            | b"ndisc_evict_nocarrier",
+            _,
+        ) => Unsigned,
+        PseudoNode::NetConf(..) => Advance,
+        PseudoNode::NetSysctl(path, _) => match path.split_once('/')? {
+            ("ipv4", "ip_local_reserved_ports") => Bitmap,
+            (
+                "ipv4",
+                "tcp_congestion_control"
+                | "tcp_fastopen_key"
+                | "icmp_ratelimit"
+                | "icmp_ratemask"
+                | "igmp_max_memberships"
+                | "igmp_max_msf"
+                | "igmp_qrv"
+                | "ipfrag_high_thresh"
+                | "ipfrag_low_thresh"
+                | "ipfrag_max_dist"
+                | "ipfrag_time"
+                | "tcp_adv_win_scale"
+                | "tcp_base_mss"
+                | "tcp_challenge_ack_limit"
+                | "tcp_comp_sack_delay_ns"
+                | "tcp_comp_sack_slack_ns"
+                | "tcp_fastopen"
+                | "tcp_fastopen_blackhole_timeout_sec"
+                | "tcp_fin_timeout"
+                | "tcp_invalid_ratelimit"
+                | "tcp_keepalive_intvl"
+                | "tcp_keepalive_time"
+                | "tcp_limit_output_bytes"
+                | "tcp_max_reordering"
+                | "tcp_max_syn_backlog"
+                | "tcp_max_tw_buckets"
+                | "tcp_min_rtt_wlen"
+                | "tcp_min_snd_mss"
+                | "tcp_mtu_probe_floor"
+                | "tcp_pacing_ca_ratio"
+                | "tcp_pacing_ss_ratio"
+                | "tcp_probe_threshold"
+                | "tcp_reordering"
+                | "tcp_rmem"
+                | "tcp_wmem"
+                | "udp_rmem_min"
+                | "udp_wmem_min"
+                | "xfrm4_gc_thresh",
+            ) => Advance,
+            ("ipv4", _) => Unsigned,
+            (
+                "ipv6",
+                "anycast_src_echo_reply"
+                | "auto_flowlabels"
+                | "bindv6only"
+                | "fib_multipath_hash_fields"
+                | "fib_multipath_hash_policy"
+                | "fib_notify_on_flag_change"
+                | "flowlabel_consistency"
+                | "flowlabel_state_ranges"
+                | "fwmark_reflect"
+                | "ioam6_id"
+                | "ip_nonlocal_bind",
+            ) => Unsigned,
+            ("core", "txrehash" | "xfrm_aevent_etime" | "xfrm_aevent_rseqth") => Unsigned,
+            _ => Advance,
+        },
+        _ => return None,
+    };
+    Some(rule)
+}
+
+pub(crate) fn is_sysctl_write(node: &PseudoNode) -> bool {
+    sysctl_write(node).is_some()
+}
+
 /// Writes a synthetic file: cgroup files go to [`crate::cgroup::write`], the id maps,
 /// `setgroups` and `timens_offsets` to their own writers, and the other writable files check the
-/// value and record it (namespaced sysctls in the writer's namespaces); some recorded values have
-/// no effect, and `kernel/pid_max` accepts writes and ignores them. `cred`, `ns` and `pid_ns` are
-/// the writer's, `opener` the credentials the file was opened with.
+/// value and record it (namespaced sysctls in the pinned lookup namespace); some recorded values
+/// have no effect. `cred`, `ns` and `pid_ns` are the writer's, `opener` the credentials the file
+/// was opened with. Returns the bytes consumed and the resulting position.
 pub(crate) fn write(
     k: &mut Kernel,
     (tid, cred, opener): (Tid, &Cred, &Cred),
     (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
-) -> Result<(), Errno> {
+    (pos, count): (u64, usize),
+) -> Result<(usize, u64), Errno> {
     // Opened for writing by root although not writable ([`unwritable_error`])
     if !writable(node) && !matches!(node, PseudoNode::Cgroup(..)) {
         return Err(unwritable_error(node).unwrap_or(Errno::EINVAL));
     }
+    let required = match node {
+        PseudoNode::Static(b"sys/vm/mmap_min_addr") => Some(cap::SYS_RAWIO),
+        PseudoNode::Static(
+            b"sys/kernel/dmesg_restrict"
+            | b"sys/kernel/kptr_restrict"
+            | b"sys/kernel/tainted"
+            | b"sys/kernel/unprivileged_bpf_disabled",
+        ) => Some(cap::SYS_ADMIN),
+        _ => None,
+    };
+    if required.is_some_and(|cap| !cred.capable(cap)) {
+        return Err(Errno::EPERM);
+    }
+    let sysctl = sysctl_write(node);
+    let apply = match sysctl {
+        None => true,
+        Some(SysctlWrite::Bitmap) => !data.is_empty(),
+        Some(_) => pos == 0 && !data.is_empty(),
+    };
+    if apply {
+        write_value(k, (tid, cred, opener), (ns, pid_ns), node, data, pos)?;
+    }
+    // Linux 6.1 position/count rules: sysctls advance (except Unsigned at 0 and Ipv6Fixup);
+    // uid_map/gid_map/setgroups and cgroup2 (kernfs) advance; oom_score_adj clamps to 12 and
+    // preserves pos; comm, coredump_filter and timens_offsets return count and preserve pos.
+    let result = match (sysctl, node) {
+        (Some(SysctlWrite::Ipv6Fixup), _) => (count.min(1), pos),
+        (Some(SysctlWrite::Unsigned), _) if pos == 0 => (count, pos),
+        (Some(_), _)
+        | (
+            None,
+            PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
+            | PseudoNode::Cgroup(..),
+        ) => (count, pos + count as u64),
+        (None, PseudoNode::Entry(_, _, Entry::OomScoreAdj)) => (count.min(12), pos),
+        (None, _) => (count, pos),
+    };
+    Ok(result)
+}
+
+fn write_value(
+    k: &mut Kernel,
+    (tid, cred, opener): (Tid, &Cred, &Cred),
+    (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
+    node: &PseudoNode,
+    data: &[u8],
+    pos: u64,
+) -> Result<(), Errno> {
     match node {
-        PseudoNode::Cgroup(id, name) => {
+        PseudoNode::Cgroup(id, name, _) => {
+            if gone(k, node) {
+                return Err(Errno::ENODEV);
+            }
             let writer = crate::cgroup::Writer {
+                cred,
                 tid,
                 pid_ns,
                 ns_root: ns.cgroup.root,
@@ -4306,79 +5019,120 @@ pub(crate) fn write(
             };
             return crate::cgroup::write(k, &writer, (*id, name), data);
         }
-        PseudoNode::Entry(pid, _, e @ (Entry::UidMap | Entry::GidMap)) => {
-            return write_id_map(k, (cred, opener), *pid, *e == Entry::GidMap, data);
+        PseudoNode::Entry(proc, entry_tid, Entry::Comm) => {
+            return write_comm(k, tid, *proc, *entry_tid, data);
         }
-        PseudoNode::Entry(pid, _, Entry::Setgroups) => {
-            return write_setgroups(k, opener, *pid, data);
+        PseudoNode::Entry(proc, _, e @ (Entry::UidMap | Entry::GidMap)) => {
+            return write_id_map(k, (cred, opener), *proc, *e == Entry::GidMap, data, pos);
         }
-        PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
-            return write_timens_offsets(k, opener, *pid, data);
+        PseudoNode::Entry(proc, _, Entry::Setgroups) => {
+            return write_setgroups(k, opener, *proc, data, pos);
         }
-        // Network namespace sysctls: the writer's namespace (crate::netconf)
-        PseudoNode::NetConf(v6, dir, name) => {
-            return crate::netdev::conf_write(&ns.net, *v6, *dir, name, data);
+        PseudoNode::Entry(proc, None, Entry::TimensOffsets) => {
+            return write_timens_offsets(k, opener, *proc, data, pos);
         }
-        PseudoNode::NetSysctl(path) => {
-            return crate::netconf::sysctl_write(&mut ns.net.devs.borrow_mut().conf, path, data);
+        // Network namespace sysctls: the pinned lookup namespace (crate::netconf)
+        PseudoNode::NetConf(v6, dir, name, net) => {
+            return crate::netdev::conf_write(&net.0, *v6, *dir, name, data);
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_forward") => {
+        PseudoNode::NetSysctl(path, net) => {
+            if *path == "ipv4/ip_local_reserved_ports" && pos != 0 {
+                let mut devs = net.0.devs.borrow_mut();
+                let current = crate::netconf::sysctl_read(&devs.conf, path);
+                let merged = merge_port_bitmap(&current, data)?;
+                return crate::netconf::sysctl_write(&mut devs.conf, path, merged.as_bytes());
+            }
+            return crate::netconf::sysctl_write(&mut net.0.devs.borrow_mut().conf, path, data);
+        }
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_forward", net) => {
             return crate::netdev::conf_write(
-                &ns.net,
+                &net.0,
                 false,
                 crate::netdev::ConfDir::All,
                 b"forwarding",
                 data,
             );
         }
-        PseudoNode::Static(b"sys/net/core/somaxconn") => {
+        PseudoNode::NetStatic(b"sys/net/bridge/bridge-nf-call-iptables", net) => {
+            let value =
+                i32::try_from(crate::netconf::parse_int(data)?).map_err(|_| Errno::EINVAL)?;
+            net.0.devs.borrow_mut().conf.bridge_call_iptables = value != 0;
+            return Ok(());
+        }
+        PseudoNode::NetStatic(b"sys/net/core/somaxconn", net) => {
             let v = crate::netconf::parse_int(data)?;
             if !(0..=i32::MAX as i64).contains(&v) {
                 return Err(Errno::EINVAL);
             }
-            ns.net.devs.borrow_mut().conf.somaxconn = v;
+            net.0.devs.borrow_mut().conf.somaxconn = v;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_local_port_range") => {
-            let mut d = ns.net.devs.borrow_mut();
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_local_port_range", net) => {
+            let mut d = net.0.devs.borrow_mut();
             d.conf.port_range = crate::netconf::parse_port_range(data, d.conf.prot_sock)?;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ip_unprivileged_port_start") => {
-            let mut d = ns.net.devs.borrow_mut();
+        PseudoNode::NetStatic(b"sys/net/ipv4/ip_unprivileged_port_start", net) => {
+            let mut d = net.0.devs.borrow_mut();
             d.conf.prot_sock = crate::netconf::parse_prot_sock(data, d.conf.port_range.0)?;
             return Ok(());
         }
-        PseudoNode::Static(b"sys/net/ipv4/ping_group_range") => {
+        PseudoNode::NetStatic(b"sys/net/ipv4/ping_group_range", net) => {
             let r = crate::netconf::parse_ping_group(data, cred)?;
-            ns.net.devs.borrow_mut().conf.ping_group = r;
+            net.0.devs.borrow_mut().conf.ping_group = r;
+            return Ok(());
+        }
+        // IPC namespace sysctls: the pinned lookup namespace
+        PseudoNode::IpcSysctl(path, ipc) => {
+            if let Some(name) = path.strip_prefix(b"sys/kernel/")
+                && k.ipc(ipc.0.id).tunables.read(name).is_some()
+            {
+                return k.ipc_mut(ipc.0.id).tunables.write(name, data);
+            }
+            if let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
+                && let Some(slot) = k.ipc_mut(ipc.0.id).mq_limits.slot(name)
+            {
+                *slot = std::str::from_utf8(data)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .filter(|&v: &u64| v > 0)
+                    .ok_or(Errno::EINVAL)?;
+                return Ok(());
+            }
+            return Err(Errno::EINVAL);
+        }
+        // UTS namespace sysctls: the pinned lookup namespace; wakes pollers with POLLPRI
+        PseudoNode::UtsSysctl(path, uts) => {
+            let name = data.strip_suffix(b"\n").unwrap_or(data);
+            if name.len() > crate::kernel::UTS_LEN {
+                return Err(Errno::EINVAL);
+            }
+            if *path == b"sys/kernel/hostname" {
+                uts.0.set_hostname(name.to_vec());
+            } else {
+                uts.0.set_domainname(name.to_vec());
+            }
+            return Ok(());
+        }
+        // Between 0 and pid_max, as on Linux (checkpoint/restore uses it to give a new process a
+        // chosen pid); targets the pinned lookup pid namespace
+        PseudoNode::PidSysctl(b"sys/kernel/ns_last_pid", pid_ns) => {
+            let pid: i32 = std::str::from_utf8(data)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|&n| (0..=k.pid_max).contains(&n))
+                .ok_or(Errno::EINVAL)?;
+            if pid_ns.0.level == 0 {
+                k.set_last_pid(pid);
+            } else {
+                pid_ns.0.set_last_pid(pid);
+            }
             return Ok(());
         }
         _ => {}
     }
-    if let PseudoNode::Static(path) = node
-        && let Some(name) = path.strip_prefix(b"sys/kernel/")
-        && k.ipc(ns.ipc.id).tunables.read(name).is_some()
-    {
-        return k.ipc_mut(ns.ipc.id).tunables.write(name, data);
-    }
-    if let PseudoNode::Static(path @ (b"sys/kernel/hostname" | b"sys/kernel/domainname")) = node {
-        let name = data.strip_suffix(b"\n").unwrap_or(data);
-        if name.len() > crate::kernel::UTS_LEN {
-            return Err(Errno::EINVAL);
-        }
-        let mut slot = if *path == b"sys/kernel/hostname" {
-            ns.uts.hostname.borrow_mut()
-        } else {
-            ns.uts.domainname.borrow_mut()
-        };
-        *slot = name.to_vec();
-    }
     // mmap_min_addr_handler: writing needs CAP_SYS_RAWIO
     if let PseudoNode::Static(b"sys/vm/mmap_min_addr") = node {
-        if !cred.capable(cap::SYS_RAWIO) {
-            return Err(Errno::EPERM);
-        }
         let n: u64 = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -4403,17 +5157,8 @@ pub(crate) fn write(
             .ok_or(Errno::EINVAL)?;
         crate::mm::MAX_MAP_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
     }
-    if let PseudoNode::Static(path) = node
-        && let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
-        && let Some(slot) = k.ipc_mut(ns.ipc.id).mq_limits.slot(name)
-    {
-        *slot = std::str::from_utf8(data)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|&v: &u64| v > 0)
-            .ok_or(Errno::EINVAL)?;
-    }
-    // Between 0 and INT_MAX, as on Linux; the writer's user namespace's own limit
+    // Between 0 and INT_MAX, as on Linux; targets the opener's user namespace (matching reads,
+    // which use the opener's credentials)
     if let PseudoNode::Static(path) = node
         && let Some(kind) = path
             .strip_prefix(b"sys/user/")
@@ -4424,7 +5169,7 @@ pub(crate) fn write(
             .and_then(|s| s.trim().parse().ok())
             .filter(|&n| n <= i32::MAX as u32)
             .ok_or(Errno::EINVAL)?;
-        k.ucounts.set_limit(cred.user_ns.id, kind, n);
+        k.ucounts.set_limit(opener.user_ns.id, kind, n);
     }
     if let PseudoNode::Static(b"sys/fs/aio-max-nr") = node {
         k.aio_max_nr = std::str::from_utf8(data)
@@ -4446,20 +5191,6 @@ pub(crate) fn write(
             b"max_queued_events" => r.max_queued = n,
             b"max_user_instances" => r.max_instances = n,
             _ => r.max_watches = n,
-        }
-    }
-    // Between 0 and pid_max, as on Linux (checkpoint/restore uses it to give a new process a
-    // chosen pid); it changes the writer's pid namespace
-    if let PseudoNode::Static(b"sys/kernel/ns_last_pid") = node {
-        let pid: i32 = std::str::from_utf8(data)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|&n| (0..=crate::kernel::PID_MAX).contains(&n))
-            .ok_or(Errno::EINVAL)?;
-        if pid_ns.level == 0 {
-            k.set_last_pid(pid);
-        } else {
-            pid_ns.set_last_pid(pid);
         }
     }
     // Between MIN_THREADS and FUTEX_TID_MASK, as on Linux; RLIMIT_NPROC values already set are
@@ -4504,13 +5235,13 @@ pub(crate) fn write(
             .max(crate::pipe::PIPE_BUF)
             .next_power_of_two();
     }
-    if let PseudoNode::Entry(pid, _, Entry::OomScoreAdj) = node {
+    if let PseudoNode::Entry(proc, _, Entry::OomScoreAdj) = node {
         let value = kstrto(proc_number(data)?, true)?;
         if !(-1000..=1000).contains(&value) {
             return Err(Errno::EINVAL);
         }
         let value = value as i32;
-        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
+        let group = group_of_id(k, *proc).ok_or(Errno::ESRCH)?;
         let mut g = group.borrow_mut();
         // As on Linux: going below the minimum needs CAP_SYS_RESOURCE, and with it the value
         // written also becomes the new minimum
@@ -4536,9 +5267,6 @@ pub(crate) fn write(
     // proc_dointvec_minmax_sysadmin: writing needs CAP_SYS_ADMIN in the boot-time namespace, and
     // only 0 or 1
     if let PseudoNode::Static(b"sys/kernel/dmesg_restrict") = node {
-        if !cred.capable(cap::SYS_ADMIN) {
-            return Err(Errno::EPERM);
-        }
         k.dmesg_restrict = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
@@ -4554,6 +5282,10 @@ pub(crate) fn write(
             .ok_or(Errno::EINVAL)
     };
     match node {
+        PseudoNode::Static(b"sys/kernel/pid_max") => {
+            k.pid_max =
+                int_in(crate::kernel::pid_max_min() as i64..=crate::kernel::PID_MAX as i64)? as Tid;
+        }
         PseudoNode::Static(b"sys/kernel/panic") => {
             k.panic = int_in(i32::MIN as i64..=i32::MAX as i64)? as i32;
         }
@@ -4568,9 +5300,6 @@ pub(crate) fn write(
         // proc_taint: needs CAP_SYS_ADMIN, and the flags written (of the 19 defined) are added
         // to those already set, never cleared
         PseudoNode::Static(b"sys/kernel/tainted") => {
-            if !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v: u64 = std::str::from_utf8(data)
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
@@ -4587,9 +5316,6 @@ pub(crate) fn write(
         }
         PseudoNode::Static(p) if recorded(p).is_some() => {
             let (path, _, _, lo, hi) = *recorded(p).unwrap();
-            if path == b"sys/kernel/kptr_restrict" && !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v = int_in(lo..=hi)?;
             k.sysctls.insert(path, v);
         }
@@ -4599,9 +5325,6 @@ pub(crate) fn write(
         // bpf_unpriv_handler: needs CAP_SYS_ADMIN, 0 to 2, and once set to 1 it cannot be changed
         // back (EPERM)
         PseudoNode::Static(b"sys/kernel/unprivileged_bpf_disabled") => {
-            if !cred.capable(cap::SYS_ADMIN) {
-                return Err(Errno::EPERM);
-            }
             let v = int_in(0..=2)? as u8;
             if k.unprivileged_bpf_disabled == 1 && v != 1 {
                 return Err(Errno::EPERM);
@@ -4654,12 +5377,51 @@ pub(crate) fn write(
             .ok_or(Errno::EINVAL)?;
         k.core_uses_pid = v != 0;
     }
-    // Parsed the C way, as on Linux (0x prefix is hexadecimal, 0 prefix octal), keeping only 9
-    // bits
-    if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
-        let value = kstrto(proc_number(data)?, false)?;
-        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
+    // Parsed the C way, as on Linux (`kstrtouint_from_user` base 0), keeping only 9 bits
+    if let PseudoNode::Entry(proc, _, Entry::CoredumpFilter) = node {
+        let trimmed = data.split(|&b| b == 0).next().unwrap_or(data);
+        let text = std::str::from_utf8(trimmed)
+            .map_err(|_| Errno::EINVAL)?
+            .trim();
+        let value = kstrto(text, false)?;
+        let group = group_of_id(k, *proc).ok_or(Errno::ESRCH)?;
         group.borrow_mut().coredump_filter = value as u32 & 0x1ff;
+    }
+    Ok(())
+}
+
+/// Writes `/proc/<pid>/comm` or `/proc/<pid>/task/<tid>/comm` (Linux's `comm_write`): copies up to
+/// 15 bytes up to the first NUL byte verbatim (trailing newlines are not stripped, matching
+/// `set_task_comm` and `PR_SET_NAME`), and permits writes only to a task in the writer's own
+/// thread group (`EINVAL` otherwise, `ESRCH` if the target thread is gone).
+fn write_comm(
+    k: &Kernel,
+    writer_tid: Tid,
+    proc: ProcId,
+    entry_tid: Option<Tid>,
+    data: &[u8],
+) -> Result<(), Errno> {
+    let group = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
+    let tgid = group.borrow().tgid;
+    let target_tid = entry_tid.unwrap_or(proc.pid);
+    let task = k.tasks.get(&target_tid).filter(|t| t.tgid == tgid).cloned();
+    let zombie_leader =
+        task.is_none() && target_tid == tgid && group.borrow().leader_exit.is_some();
+    if task.is_none() && !zombie_leader {
+        return Err(Errno::ESRCH);
+    }
+    let writer_tgid = k.tasks.get(&writer_tid).map(|t| t.tgid);
+    if writer_tgid != Some(tgid) {
+        return Err(Errno::EINVAL);
+    }
+    let raw = &data[..data.len().min(15)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let mut comm = [0u8; 16];
+    comm[..end].copy_from_slice(&raw[..end]);
+    if let Some(t) = task {
+        t.comm.set(comm);
+    } else if let Some((ref mut c, _)) = group.borrow_mut().leader_exit {
+        *c = comm;
     }
     Ok(())
 }
@@ -4678,11 +5440,17 @@ pub(crate) fn write(
 fn write_id_map(
     k: &Kernel,
     (writer, opener): (&Cred, &Cred),
-    pid: Tid,
+    proc: ProcId,
     gid: bool,
     data: &[u8],
+    pos: u64,
 ) -> Result<(), Errno> {
-    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
+    // Linux's map_write: only allows < PAGE_SIZE writes starting at offset 0 (so a second write
+    // on the same fd without rewinding fails with EINVAL rather than EPERM).
+    if pos != 0 || data.len() >= 4096 {
+        return Err(Errno::EINVAL);
+    }
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
     if opener.user_ns.id != ns.id && opener.user_ns.id != parent.id {
@@ -4732,9 +5500,19 @@ fn write_id_map(
 /// only by whitespace (EINVAL); the opener needs `CAP_SYS_ADMIN` in that user namespace (checked
 /// at open as Linux's `proc_setgroups_open` does, `EACCES`, and again here in case the process has
 /// moved to another namespace since, EPERM). Once denied it cannot be allowed again, and it cannot
-/// be denied after gid_map has been written (EPERM).
-fn write_setgroups(k: &Kernel, opener: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
-    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
+/// be denied after gid_map has been written (EPERM). Only writes starting at offset 0 are
+/// accepted (EINVAL otherwise).
+fn write_setgroups(
+    k: &Kernel,
+    opener: &Cred,
+    proc: ProcId,
+    data: &[u8],
+    pos: u64,
+) -> Result<(), Errno> {
+    if pos != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     if !opener.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -4765,12 +5543,19 @@ fn write_setgroups(k: &Kernel, opener: &Cred, pid: Tid, data: &[u8]) -> Result<(
 /// Writes `/proc/<pid>/timens_offsets` (Linux 6.1's `timens_offsets_write`,
 /// `proc_timens_set_offset`): one or two lines of `<clock> <seconds> <nanoseconds>`, where the
 /// clock is `monotonic`, `boottime` or their numbers 1 and 7. Writes into the time namespace that
-/// process uses for children: the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's
-/// `file_ns_capable`), the clocks with the offsets added must be within [0, KTIME_SEC_MAX / 2]
-/// (ERANGE), and once a process has entered it is EACCES.
-fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
+/// process uses for children: only writes at offset 0 and `< PAGE_SIZE` are accepted (`EINVAL`),
+/// the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's `file_ns_capable`), the clocks
+/// with the offsets added must be within [0, KTIME_SEC_MAX / 2] (ERANGE), and once a process has
+/// entered it is EACCES.
+fn write_timens_offsets(
+    k: &Kernel,
+    cred: &Cred,
+    proc: ProcId,
+    data: &[u8],
+    pos: u64,
+) -> Result<(), Errno> {
     const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
-    if data.len() >= 4096 {
+    if pos != 0 || data.len() >= 4096 {
         return Err(Errno::EINVAL);
     }
     let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -4796,7 +5581,13 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Resul
             break;
         }
     }
-    let task = k.tasks.get(&pid).ok_or(Errno::ESRCH)?;
+    let g = group_of_id(k, proc).ok_or(Errno::ESRCH)?;
+    let tgid = g.borrow().tgid;
+    let task = k
+        .tasks
+        .get(&proc.pid)
+        .filter(|t| t.tgid == tgid)
+        .ok_or(Errno::ESRCH)?;
     let ns = task.ns.borrow().time_for_children.clone();
     if !cred.ns_capable(&ns.owner, cap::SYS_TIME) {
         return Err(Errno::EPERM);
@@ -4823,9 +5614,66 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Resul
     Ok(())
 }
 
-/// The buffer of the number-taking files in `/proc/<pid>` (oom_score_adj, coredump_filter): as
-/// with Linux's `PROC_NUMBUF`, only the first 12 bytes up to a NUL are looked at (values runc
-/// writes end in a NUL), with whitespace stripped from both ends (`strstrip`).
+/// Merges a nonzero-offset write to `net.ipv4.ip_local_reserved_ports` into the existing port
+/// bitmap (Linux 6.1's `proc_do_large_bitmap`: offset 0 replaces, nonzero offsets OR into the
+/// bitmap) and formats the sorted coalesced range list.
+fn merge_port_bitmap(current: &str, data: &[u8]) -> Result<String, Errno> {
+    let mut bits = vec![0u64; 1024]; // 65536 ports
+    let parse_into = |text: &str, bits: &mut [u64]| -> Result<(), Errno> {
+        let text = text.trim_end_matches(['\n', '\0']).trim();
+        for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (lo, hi) = match part.split_once('-') {
+                Some((a, b)) => {
+                    let lo: u16 = a.trim().parse().map_err(|_| Errno::EINVAL)?;
+                    let hi: u16 = b.trim().parse().map_err(|_| Errno::EINVAL)?;
+                    if lo > hi {
+                        return Err(Errno::EINVAL);
+                    }
+                    (lo, hi)
+                }
+                None => {
+                    let p: u16 = part.parse().map_err(|_| Errno::EINVAL)?;
+                    (p, p)
+                }
+            };
+            for p in usize::from(lo)..=usize::from(hi) {
+                bits[p / 64] |= 1u64 << (p % 64);
+            }
+        }
+        Ok(())
+    };
+    let incoming = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    parse_into(current, &mut bits)?;
+    parse_into(incoming, &mut bits)?;
+    let has = |p: usize| bits[p / 64] & (1u64 << (p % 64)) != 0;
+    let mut ranges = Vec::new();
+    let mut p = 0;
+    while p < 65536 {
+        if bits[p / 64] == 0 {
+            p += 64 - (p % 64);
+            continue;
+        }
+        if !has(p) {
+            p += 1;
+            continue;
+        }
+        let start = p;
+        while p + 1 < 65536 && has(p + 1) {
+            p += 1;
+        }
+        ranges.push(if start == p {
+            start.to_string()
+        } else {
+            format!("{start}-{p}")
+        });
+        p += 1;
+    }
+    Ok(ranges.join(","))
+}
+
+/// The buffer of `/proc/<pid>/oom_score_adj`: as with Linux's `PROC_NUMBUF`, only the first 12
+/// bytes up to a NUL are looked at (values runc writes end in a NUL), with whitespace stripped
+/// from both ends (`strstrip`).
 fn proc_number(data: &[u8]) -> Result<&str, Errno> {
     let data = &data[..data.len().min(12)];
     let data = data.split(|&b| b == 0).next().unwrap_or(data);
@@ -4857,16 +5705,6 @@ fn kstrto(s: &str, signed: bool) -> Result<i64, Errno> {
     }
 }
 
-/// The number of bytes a write to `node` consumes: `/proc/<pid>` files taking numbers accept only
-/// the 12 bytes [`proc_number`] looks at (Linux truncates count and returns it), everything else
-/// accepts all.
-pub(crate) fn written(node: &PseudoNode, len: usize) -> usize {
-    match node {
-        PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter) => len.min(12),
-        _ => len,
-    }
-}
-
 // ---- Shared helpers ----
 
 /// The thread group a pid directory names. `/proc/<pid>` resolves any thread id, not only
@@ -4877,6 +5715,46 @@ pub(crate) fn group_of(k: &Kernel, pid: Tid) -> Option<&Rc<RefCell<ThreadGroup>>
     k.groups
         .get(&pid)
         .or_else(|| k.groups.get(&k.tasks.get(&pid)?.tgid))
+}
+
+/// Like [`group_of`], additionally requiring the thread group's non-reusable serial to match
+/// `proc.serial` so a held `/proc/<pid>` node never resolves to a new process reusing the pid.
+pub(crate) fn group_of_id(k: &Kernel, proc: ProcId) -> Option<&Rc<RefCell<ThreadGroup>>> {
+    group_of(k, proc.pid).filter(|g| g.borrow().serial == proc.serial)
+}
+
+fn pid_exists_in(k: &Kernel, proc: ProcId, tid: Option<Tid>) -> bool {
+    match (group_of_id(k, proc), tid) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        // An exited main thread stays, as a zombie, until the process is reaped
+        (Some(g), Some(t)) => {
+            let g = g.borrow();
+            g.threads.contains(&t) || (t == g.tgid && g.leader_exit.is_some())
+        }
+    }
+}
+
+/// Whether `node` refers to a process or thread that has been reaped (or exited, for a non-leader
+/// thread), or to a cgroup file whose cgroup was removed or whose controller was disabled: reads
+/// at offset 0 of an already-open file must fail with `ESRCH`/`ENODEV` instead of returning a
+/// cached open-time snapshot.
+pub(crate) fn gone(k: &Kernel, node: &PseudoNode) -> bool {
+    match node {
+        PseudoNode::Pid(proc, tid)
+        | PseudoNode::Entry(proc, tid, _)
+        | PseudoNode::Net(proc, tid, _)
+        | PseudoNode::Fd(proc, tid, _)
+        | PseudoNode::OpenFd(proc, tid, _)
+        | PseudoNode::FdInfo(proc, tid, _)
+        | PseudoNode::Ns(proc, tid, _) => !pid_exists_in(k, *proc, *tid),
+        PseudoNode::OpenExe(proc) => group_of_id(k, *proc).is_none(),
+        PseudoNode::Cgroup(id, name, generation) if !name.is_empty() => !k
+            .cgroups
+            .files(*id)
+            .any(|entry| entry == (*name, *generation)),
+        _ => false,
+    }
 }
 
 fn cpus() -> usize {
@@ -4917,7 +5795,7 @@ fn tree_name(path: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Number-taking /proc files: up to a NUL, only the first 12 bytes, base 0, beyond 32 bits is
@@ -4975,5 +5853,701 @@ mod tests {
         assert_eq!(cpu_list_of(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8\n");
         assert_eq!(cpu_list_of(&[3]), "3\n");
         assert_eq!(cpu_list_of(&[]), "\n");
+        assert_eq!(cpu_mask_for(1, &[0]), "1\n");
+        assert_eq!(cpu_mask_for(4, &[0, 1, 2, 3]), "f\n");
+        assert_eq!(cpu_mask_for(8, &[0]), "01\n");
+        assert_eq!(cpu_mask_for(8, &[0, 1, 2, 3, 4, 5, 6, 7]), "ff\n");
+        assert_eq!(cpu_mask_for(36, &[0, 1, 2, 3, 32]), "1,0000000f\n");
+        assert_eq!(cpu_mask_for(64, &[0, 63]), "80000000,00000001\n");
+    }
+
+    #[test]
+    fn aio_has_iter_matches_linux_procfs_and_kernfs() {
+        // procfs non-seq_file entries refuse both read and write AIO.
+        for e in [
+            Entry::Mem,
+            Entry::Pagemap,
+            Entry::Cmdline,
+            Entry::Environ,
+            Entry::Auxv,
+            Entry::OomScoreAdj,
+            Entry::CoredumpFilter,
+        ] {
+            let node = PseudoNode::Entry(ProcId { pid: 1, serial: 1 }, None, e);
+            assert!(!has_iter(&node, false), "{e:?} read");
+            assert!(!has_iter(&node, true), "{e:?} write");
+        }
+        assert!(!has_iter(&PseudoNode::Global(Global::Kmsg), false));
+        assert!(!has_iter(&PseudoNode::Global(Global::Kmsg), true));
+
+        // procfs seq_file entries allow AIO read and refuse AIO write.
+        let cpuinfo = PseudoNode::Global(Global::Cpuinfo);
+        assert!(has_iter(&cpuinfo, false));
+        assert!(!has_iter(&cpuinfo, true));
+        let status = PseudoNode::Entry(ProcId { pid: 1, serial: 1 }, None, Entry::Status);
+        assert!(has_iter(&status, false));
+        assert!(!has_iter(&status, true));
+
+        // sysctl, sysfs, and cgroup2 (kernfs) allow both AIO read and write.
+        let sysctl = PseudoNode::Static(b"sys/kernel/ostype");
+        assert!(has_iter(&sysctl, false));
+        assert!(has_iter(&sysctl, true));
+        let cg = PseudoNode::Cgroup(1, b"memory.max", 0);
+        assert!(has_iter(&cg, false));
+        assert!(has_iter(&cg, true));
+    }
+
+    #[test]
+    fn ipc_and_net_sysctl_paths_exclude_directories() {
+        assert!(!is_ipc_sysctl_path(b"sys/fs/mqueue/"));
+        assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/queues_max"));
+        assert!(is_ipc_sysctl_path(b"sys/fs/mqueue/msg_max"));
+        assert!(is_ipc_sysctl_path(b"sys/kernel/shmmax"));
+        assert!(!is_ipc_sysctl_path(b"sys/kernel/"));
+
+        assert!(!is_net_sysctl_path(b"sys/net/"));
+        assert!(!is_net_sysctl_path(b"sys/net/core/"));
+        assert!(!is_net_sysctl_path(b"sys/net/ipv4/"));
+        assert!(!is_net_sysctl_path(b"sys/net/ipv4/conf/"));
+        assert!(!is_net_sysctl_path(b"sys/net/unix/"));
+        assert!(is_net_sysctl_path(b"sys/net/core/somaxconn"));
+        assert!(is_net_sysctl_path(b"sys/net/ipv4/ip_forward"));
+
+        assert!(is_uts_sysctl_path(b"sys/kernel/hostname"));
+        assert!(is_uts_sysctl_path(b"sys/kernel/domainname"));
+        assert!(!is_uts_sysctl_path(b"sys/kernel/"));
+        assert!(is_pid_sysctl_path(b"sys/kernel/ns_last_pid"));
+        assert!(!is_pid_sysctl_path(b"sys/kernel/pid_max"));
+
+        let proc = ProcId { pid: 1, serial: 1 };
+        assert!(writable(&PseudoNode::Entry(proc, None, Entry::Comm)));
+        assert!(writable(&PseudoNode::Entry(proc, Some(2), Entry::Comm)));
+        assert!(STATIC.contains(&PROTECTED_FIFOS));
+        assert!(STATIC.contains(&PROTECTED_REGULAR));
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        assert_eq!(recorded_value(&k, PROTECTED_FIFOS), 1);
+        assert_eq!(recorded_value(&k, PROTECTED_REGULAR), 2);
+    }
+
+    #[test]
+    fn overlay_redirect_always_follow_reports_n() {
+        let dir = std::env::temp_dir().join(format!("appine-pseudo-ovl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = crate::vfs::Vfs::open(&dir).unwrap();
+        let k = Kernel::new(crate::process::Tier::Interpreter);
+        let view = View {
+            k: &k,
+            vfs: &vfs,
+            tid: 1,
+            tgid: 1,
+            cred: None,
+            opening: false,
+        };
+        assert_eq!(
+            content(
+                &view,
+                crate::vfs::SYS_MOUNT,
+                &PseudoNode::Sys(b"module/overlay/parameters/redirect_always_follow"),
+            )
+            .unwrap(),
+            b"N\n"
+        );
+        assert_eq!(
+            content(
+                &view,
+                crate::vfs::SYS_MOUNT,
+                &PseudoNode::Sys(b"module/overlay/parameters/redirect_max"),
+            )
+            .unwrap(),
+            b"256\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn string_bitmap_sysctl_and_synthetic_write_positions() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let cred = Cred::root();
+        let ns = k.init_ns.clone();
+        let pid_ns = PidNs::init();
+        let uts = PinnedUts(ns.uts.clone());
+        let net = PinnedNet(ns.net.clone());
+        let hostname = PseudoNode::UtsSysctl(b"sys/kernel/hostname", uts.clone());
+        let reserved = PseudoNode::NetSysctl("ipv4/ip_local_reserved_ports", net.clone());
+
+        // String and bitmap sysctls are classified as sysctl writes (gathered writev + pos rules).
+        for node in [
+            hostname.clone(),
+            reserved.clone(),
+            PseudoNode::NetSysctl("ipv4/tcp_congestion_control", net.clone()),
+            PseudoNode::Static(b"sys/kernel/core_pattern"),
+            PseudoNode::Static(b"sys/kernel/modprobe"),
+            PseudoNode::Static(b"sys/kernel/printk_devkmsg"),
+            PseudoNode::Static(b"sys/kernel/seccomp/actions_logged"),
+        ] {
+            assert!(is_sysctl_write(&node));
+        }
+
+        // Bitmap merging helper for nonzero-offset writes to ip_local_reserved_ports.
+        assert_eq!(merge_port_bitmap("1000\n", b"2000\n").unwrap(), "1000,2000");
+        assert_eq!(
+            merge_port_bitmap("1000-1005\n", b"1003-1010,500\n").unwrap(),
+            "500,1000-1010"
+        );
+        assert_eq!(merge_port_bitmap("1000\n", b"\n").unwrap(), "1000");
+        assert_eq!(merge_port_bitmap("1000\n", b"bad\n"), Err(Errno::EINVAL));
+        assert_eq!(
+            merge_port_bitmap("1000\n", b"2000-1000\n"),
+            Err(Errno::EINVAL)
+        );
+
+        let sub = k
+            .cgroups
+            .mkdir(crate::cgroup::ROOT, b"sub", &cred, 0o755)
+            .unwrap();
+        let cg = PseudoNode::Cgroup(sub, b"cgroup.max.depth", 0);
+        let mut do_write = |node: &PseudoNode, data: &[u8], pos: u64| {
+            write(
+                &mut k,
+                (1, &cred, &cred),
+                (&ns, &pid_ns),
+                node,
+                data,
+                (pos, data.len()),
+            )
+        };
+        let read_reserved = || {
+            crate::netconf::sysctl_read(&net.0.devs.borrow().conf, "ipv4/ip_local_reserved_ports")
+        };
+
+        // String sysctl: offset 0 updates and advances pos; nonzero offset ignores and advances.
+        let (n, pos) = do_write(&hostname, b"hostA\n", 0).unwrap();
+        assert_eq!((n, pos), (6, 6));
+        assert_eq!(uts.0.hostname.borrow().as_slice(), b"hostA");
+        let (n, pos) = do_write(&hostname, b"hostB\n", pos).unwrap();
+        assert_eq!((n, pos), (6, 12));
+        assert_eq!(uts.0.hostname.borrow().as_slice(), b"hostA");
+
+        // Bitmap sysctl: offset 0 replaces and advances pos; nonzero offset ORs into bitmap.
+        let (n, pos) = do_write(&reserved, b"1000\n", 0).unwrap();
+        assert_eq!((n, pos), (5, 5));
+        assert_eq!(read_reserved(), "1000\n");
+        let (n, pos) = do_write(&reserved, b"2000,1001\n", pos).unwrap();
+        assert_eq!((n, pos), (10, 15));
+        assert_eq!(read_reserved(), "1000-1001,2000\n");
+        // Invalid write at nonzero offset fails with EINVAL and leaves value intact.
+        assert_eq!(do_write(&reserved, b"oops\n", pos), Err(Errno::EINVAL));
+        assert_eq!(read_reserved(), "1000-1001,2000\n");
+        // Offset 0 replaces again.
+        let (n, pos) = do_write(&reserved, b"3000\n", 0).unwrap();
+        assert_eq!((n, pos), (5, 5));
+        assert_eq!(read_reserved(), "3000\n");
+
+        // Cgroup2 file write advances position (kernfs_fop_write_iter) and accepts subsequent writes.
+        let (n, pos) = do_write(&cg, b"10\n", 0).unwrap();
+        assert_eq!((n, pos), (3, 3));
+        let (n, pos) = do_write(&cg, b"20\n", pos).unwrap();
+        assert_eq!((n, pos), (3, 6));
+    }
+
+    #[test]
+    fn nsfs_ino_of_and_dev_ino_match_stat() {
+        let ns_node = PseudoNode::NsFile(NsKind::Net, 4_026_531_992);
+        assert_eq!(node_ino(&ns_node), 4_026_531_992);
+        assert_eq!(ino_of(&ns_node), 4_026_531_992);
+        let file = OpenFile::new(
+            FileKind::Proc {
+                mnt: crate::vfs::PROC_MOUNT,
+                node: ns_node,
+                data: Vec::new(),
+                fresh: false,
+                mm: None,
+                ns: None,
+                klog: None,
+                opener: Rc::new(Cred::root()),
+                event: None,
+            },
+            oflags::O_RDONLY,
+        );
+        assert_eq!(
+            crate::syscall::dev_ino(&file.borrow()),
+            (Fs::Nsfs.dev(), 4_026_531_992)
+        );
+    }
+
+    #[test]
+    fn sockets_report_creator_uid_even_when_inflight() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        let (_a, b) =
+            crate::unix::UnixSocket::pair(crate::net::SOCK_DGRAM, crate::unix::Ucred::of(1, 0, 0));
+
+        // Send a socket created by UID 2000 over SCM_RIGHTS so it is only in-flight (not in any
+        // task's fd table).
+        let mut payload = crate::unix::UnixSocket::new(crate::net::SOCK_STREAM);
+        payload.uid = 2000;
+        let payload_sock = Rc::new(RefCell::new(crate::net::Socket::Unix(payload)));
+        let payload_file = OpenFile::new(FileKind::Socket(payload_sock.clone()), oflags::O_RDWR);
+
+        b.rx.borrow_mut().push(crate::unix::Packet {
+            data: b"hi".to_vec(),
+            off: 0,
+            fds: vec![payload_file],
+            cred: crate::unix::Ucred::of(1, 0, 0),
+            from: Vec::new(),
+            outq: None,
+        });
+        k.unix_inflight.push(Rc::downgrade(&b.rx));
+
+        // `sockets(&k)` must not borrow any socket RefCell (e.g. while a netlink socket is
+        // mutably borrowed during `forward_all`).
+        let listed = {
+            let _held = payload_sock.borrow_mut();
+            sockets(&k)
+        };
+        assert_eq!(listed.len(), 1);
+        assert!(Rc::ptr_eq(&listed[0], &payload_sock));
+        assert_eq!(listed[0].borrow().uid(), 2000);
+    }
+
+    #[test]
+    fn vm_layout_matches_linux_status_and_statm_semantics() {
+        use crate::mm::{Mm, flags};
+        use appine_engine::prot;
+
+        let mut mm = Mm::new();
+        let mut map = |pages, p, f| {
+            mm.mmap(0, pages * PAGE_SIZE, p, f | flags::MAP_ANONYMOUS, None)
+                .unwrap()
+        };
+        // Private writable data (16 KiB), executable non-writable code (8 KiB),
+        // shared writable (12 KiB, excluded from VmData), grows-down stack (8 KiB, in VmStk).
+        let data = map(4, prot::READ | prot::WRITE, flags::MAP_PRIVATE);
+        let code = map(2, prot::READ | prot::EXEC, flags::MAP_PRIVATE);
+        map(3, prot::READ | prot::WRITE, flags::MAP_SHARED);
+        let stack = map(2, prot::READ | prot::WRITE, flags::MAP_PRIVATE);
+        mm.code = (code, code + PAGE_SIZE);
+        mm.set_growsdown(stack);
+        assert_ne!(data, 0);
+        assert_ne!(stack, 0);
+
+        let layout = vm_layout(&mm);
+        assert_eq!(layout.size, 11 * PAGE_SIZE);
+        assert_eq!(layout.data, 4 * PAGE_SIZE);
+        assert_eq!(layout.stack, 2 * PAGE_SIZE);
+        assert_eq!(layout.exec, 2 * PAGE_SIZE);
+        assert_eq!(layout.code_span, PAGE_SIZE);
+        // status VmExe = min(code_span, exec) = 4 KiB, VmLib = exec - VmExe = 4 KiB
+        let exe = layout.code_span.min(layout.exec);
+        let lib = layout.exec.saturating_sub(exe);
+        assert_eq!(exe, PAGE_SIZE);
+        assert_eq!(lib, PAGE_SIZE);
+        // statm data field = (VmData + VmStk) in pages = 6
+        assert_eq!((layout.data + layout.stack) / PAGE_SIZE, 6);
+    }
+
+    pub(crate) fn mm_with_env(env: &[u8]) -> (crate::mm::Mm, u64) {
+        use crate::mm::{Mm, flags};
+        use appine_engine::prot;
+        let mut mm = Mm::new();
+        let addr = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                prot::READ | prot::WRITE,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.write(
+            crate::uaccess::UserSlice::new(addr + PAGE_SIZE, env.len()),
+            env,
+        )
+        .unwrap();
+        mm.env = (addr + PAGE_SIZE, addr + PAGE_SIZE + env.len() as u64);
+        (mm, addr)
+    }
+
+    pub(crate) fn add_task(
+        k: &mut Kernel,
+        tid: Tid,
+        uid: u32,
+        dumpable: bool,
+        env: &[u8],
+    ) -> (ProcId, u64, appine_engine::Cpu) {
+        use crate::process::ThreadGroup;
+        use crate::signal::SigHandlers;
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            tid,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        group.borrow_mut().dumpable = dumpable;
+        let mut cred = Cred::root();
+        cred.user_ns = k.init_ns.ipc.owner.clone();
+        if uid != 0 {
+            cred.setgid(uid).unwrap();
+            cred.setuid(uid).unwrap();
+        }
+        group.borrow_mut().cred = cred;
+        let proc = ProcId::of(tid, &group.borrow());
+        let (addr, cpu) = add_thread(k, tid, &group, env);
+        k.groups.insert(tid, group);
+        (proc, addr, cpu)
+    }
+
+    fn add_thread(
+        k: &mut Kernel,
+        tid: Tid,
+        group: &Rc<RefCell<ThreadGroup>>,
+        env: &[u8],
+    ) -> (u64, appine_engine::Cpu) {
+        use crate::task::{FsContext, Task, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let (mm, addr) = mm_with_env(env);
+        let mm = mm.into_shared();
+        let fds = Rc::new(RefCell::new(crate::fd::FdTable::new()));
+        let fs = Rc::new(RefCell::new(FsContext {
+            root: Node::ROOT,
+            cwd: Node::ROOT,
+            umask: 0o022,
+            mnt_ns: Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: k.init_ns.ipc.owner.clone(),
+                anon: false,
+            }),
+        }));
+        let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+        let state = TaskState {
+            mm,
+            fds,
+            fs,
+            group: group.clone(),
+            vfs: k.vfs.clone(),
+            altstack: Default::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        };
+        let task = Task::new(
+            tid,
+            group.borrow().tgid,
+            &cpu,
+            state,
+            k.init_ns.clone(),
+            0,
+            [0; 16],
+        )
+        .unwrap();
+        group.borrow_mut().threads.push(tid);
+        k.tasks.insert(tid, task);
+        (addr, cpu)
+    }
+
+    #[test]
+    fn environ_fd_and_ns_modes_and_ptrace_access_match_linux() {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-pseudo-environ-{}-{}",
+            std::process::id(),
+            crate::tty::wall_ns()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::vfs::store::Store::create(&dir).unwrap());
+        let vfs = Rc::new(Vfs::open(&dir).unwrap());
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        k.vfs = Some(vfs.clone());
+
+        let (root_proc, _, _c1) = add_task(&mut k, 10, 0, true, b"SECRET=root\0");
+        let (alice_proc, _, _c2) = add_task(&mut k, 20, 1000, true, b"USER=alice\0");
+        let (nondump_proc, _, _c3) = add_task(&mut k, 21, 1000, false, b"SECRET=nondump\0");
+
+        let view_as = |tid: Tid| View {
+            k: &k,
+            vfs: &vfs,
+            tid,
+            tgid: tid,
+            cred: None,
+            opening: false,
+        };
+
+        // Modes: environ is 0o400, fd/ and ns/ are 0o500.
+        let v_root = view_as(10);
+        for (entry, mode) in [
+            (Entry::Environ, mode::S_IFREG | 0o400),
+            (Entry::Fd, mode::S_IFDIR | 0o500),
+            (Entry::Ns, mode::S_IFDIR | 0o500),
+        ] {
+            assert_eq!(
+                stat(&v_root, &PseudoNode::Entry(root_proc, None, entry))
+                    .unwrap()
+                    .mode,
+                mode
+            );
+        }
+        let environ = |reader: &View<'_>, target| {
+            content(
+                reader,
+                crate::vfs::PROC_MOUNT,
+                &PseudoNode::Entry(target, None, Entry::Environ),
+            )
+        };
+        let v_alice = view_as(20);
+        assert_eq!(environ(&v_alice, root_proc), Err(Errno::EACCES));
+        assert_eq!(environ(&v_alice, nondump_proc), Err(Errno::EACCES));
+        assert_eq!(environ(&v_alice, alice_proc).unwrap(), b"USER=alice\0");
+        assert_eq!(environ(&v_root, alice_proc).unwrap(), b"USER=alice\0");
+
+        // read_environ uses the pinned mm and yields EOF once the mm is gone.
+        assert_eq!(
+            read_environ(Some(&k.tasks[&20].res.borrow().mm)),
+            b"USER=alice\0"
+        );
+        assert_eq!(read_environ(None), Vec::<u8>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn with_test_mount(name: &[u8], test: impl FnOnce(&Vfs)) {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-pseudo-mount-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::create(&dir).unwrap();
+        store
+            .mkdir(crate::vfs::store::ROOT, name, 0o755, 0, 0)
+            .unwrap();
+        drop(store);
+        test(&Vfs::open(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_view<'a>(k: &'a Kernel, vfs: &'a Vfs) -> View<'a> {
+        View {
+            k,
+            vfs,
+            tid: INIT,
+            tgid: INIT,
+            cred: None,
+            opening: false,
+        }
+    }
+
+    #[test]
+    fn fdinfo_and_namespace_link_owners_follow_target_credentials() {
+        use crate::cred::{IdMap, UserNs};
+        with_test_mount(b"proc", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            let (proc, _, _leader_cpu) = add_task(&mut k, 10, 1000, true, b"");
+            let group = k.groups[&10].clone();
+            let (_, _worker_cpu) = add_thread(&mut k, 11, &group, b"");
+            let user_ns = UserNs::child(&k.init_ns.ipc.owner, 1000, false);
+            *user_ns.uid_map.borrow_mut() = IdMap::parse(b"0 2000 10").unwrap();
+            *user_ns.gid_map.borrow_mut() = IdMap::parse(b"0 3000 10").unwrap();
+            let mut worker = k.tasks[&11].cred.borrow_mut();
+            worker.user_ns = user_ns;
+            worker.euid = 2001;
+            worker.egid = 3002;
+            drop(worker);
+
+            let view = test_view(&k, vfs);
+            for (dumpable, leader_owner, worker_owner) in [
+                (true, (1000, 1000), (2001, 3002)),
+                (false, (0, 0), (2000, 3000)),
+            ] {
+                group.borrow_mut().dumpable = dumpable;
+                for (tid, owner) in [(None, leader_owner), (Some(11), worker_owner)] {
+                    let dir = PseudoNode::Entry(proc, tid, Entry::FdInfo);
+                    assert_eq!(stat(&view, &dir).unwrap().mode, mode::S_IFDIR | 0o500);
+                    for node in [
+                        PseudoNode::FdInfo(proc, tid, 0),
+                        PseudoNode::Ns(proc, tid, NsKind::Net),
+                    ] {
+                        let st = stat(&view, &node).unwrap();
+                        assert_eq!((st.uid, st.gid), owner);
+                    }
+                }
+                let nsfs = stat(&view, &PseudoNode::NsFile(NsKind::Net, k.init_ns.net.id)).unwrap();
+                assert_eq!((nsfs.uid, nsfs.gid), (0, 0));
+            }
+            assert_eq!(
+                stat(&view, &PseudoNode::PtsRoot(Fs::Pts.dev()))
+                    .unwrap()
+                    .mode,
+                mode::S_IFDIR | 0o755
+            );
+        });
+    }
+
+    #[test]
+    fn stat_start_time_follows_the_named_thread() {
+        with_test_mount(b"proc", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            let (_, _, _leader_cpu) = add_task(&mut k, 10, 0, true, b"");
+            let group = k.groups[&10].clone();
+            let (_, _worker_cpu) = add_thread(&mut k, 11, &group, b"");
+            // Distinguish all three creation ticks even when the tasks were created in one tick.
+            group.borrow_mut().start_ticks = 10;
+            for (tid, ticks) in [(10, 11), (11, 20)] {
+                Rc::get_mut(k.tasks.get_mut(&tid).unwrap())
+                    .unwrap()
+                    .start_ticks = ticks;
+            }
+            let view = test_view(&k, vfs);
+            for (path, expected) in [
+                (b"/proc/10/stat".as_slice(), 10),
+                (b"/proc/10/task/10/stat", 10),
+                (b"/proc/11/stat", 20),
+                (b"/proc/10/task/11/stat", 20),
+            ] {
+                let Node::Pseudo(mnt, node) = vfs
+                    .resolve(&view, &Cred::root(), &Node::ROOT, &Node::ROOT, path, true)
+                    .unwrap()
+                else {
+                    panic!("expected a procfs stat file");
+                };
+                let line = String::from_utf8(content(&view, mnt, &node).unwrap()).unwrap();
+                // Field 3 (state) follows the parenthesized comm. Field 22 is starttime.
+                let (_, fields) = line.rsplit_once(')').unwrap();
+                let start = fields.split_whitespace().nth(19).unwrap();
+                assert_eq!(start.parse::<u64>().unwrap(), expected, "{path:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn loop_device_numbers_resolve_to_block_attributes() {
+        use crate::vfs::SYS_MOUNT;
+        with_test_mount(b"sys", |vfs| {
+            let k = Kernel::new(crate::process::Tier::Interpreter);
+            let view = test_view(&k, vfs);
+            let resolve = |path: &[u8], follow| {
+                vfs.resolve(&view, &Cred::root(), &Node::ROOT, &Node::ROOT, path, follow)
+            };
+            let dir = resolve(b"/sys/dev/block", true).unwrap();
+            let Node::Pseudo(_, ref block) = dir else {
+                panic!("expected sysfs");
+            };
+            let entries = readdir(&view, SYS_MOUNT, block).unwrap();
+            let numbers = k.loops.numbers();
+            assert_eq!(entries.len(), numbers.len());
+            for (entry, n) in entries.iter().zip(numbers) {
+                assert_eq!(entry.name, format!("7:{n}").as_bytes());
+                assert_eq!(entry.mode, mode::S_IFLNK);
+            }
+            for name in [
+                b"7".as_slice(),
+                b"7:",
+                b":0",
+                b"07:0",
+                b"7:00",
+                b"7:+0",
+                b"7:0:1",
+                b"7:4294967296",
+                b"8:1",
+                b"7:99999",
+            ] {
+                assert_eq!(
+                    view.lookup(SYS_MOUNT, block, name),
+                    Err(Errno::ENOENT),
+                    "{name:?}"
+                );
+            }
+            assert_eq!(view.missing_path(&dir, b"8:1"), None);
+            let Node::Pseudo(_, link) = resolve(b"/sys/dev/block/7:0", false).unwrap() else {
+                panic!("expected sysfs");
+            };
+            assert_eq!(view.parent(&link).as_ref(), Some(block));
+            assert_eq!(stat(&view, &link).unwrap().mode, mode::S_IFLNK | 0o777);
+            assert_eq!(
+                view.readlink(SYS_MOUNT, &link).unwrap(),
+                b"../../block/loop0"
+            );
+            let direct = resolve(b"/sys/block/loop0/uevent", true).unwrap();
+            assert_eq!(
+                resolve(b"/sys/dev/block/7:0/uevent", true),
+                Ok(direct.clone())
+            );
+            let Node::Pseudo(mnt, file) = direct else {
+                panic!("expected sysfs");
+            };
+            assert_eq!(
+                content(&view, mnt, &file).unwrap(),
+                b"MAJOR=7\nMINOR=0\nDEVNAME=loop0\nDEVTYPE=disk\n"
+            );
+            let st = stat(&view, &file).unwrap();
+            assert_eq!(
+                (st.mode, st.size, st.blocks),
+                (mode::S_IFREG | 0o444, 4096, Some(0))
+            );
+            assert!(pollable(&file) && has_iter(&file, false) && has_iter(&file, true));
+            let queue_file = resolve(b"/sys/block/loop1/queue/rotational", true).unwrap();
+            assert_eq!(
+                resolve(b"/sys/dev/block/7:1/queue/rotational", true),
+                Ok(queue_file)
+            );
+            let absent = 99999;
+            assert_eq!(
+                view.readlink(mnt, &PseudoNode::SysDevBlock(absent)),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                content(&view, mnt, &PseudoNode::SysBlock(absent, b"uevent")),
+                Err(Errno::ENOENT)
+            );
+        });
+    }
+
+    #[test]
+    fn sys_dev_lists_each_available_directory_once() {
+        use crate::gpu::{Context, Renderer};
+        use crate::vfs::SYS_MOUNT;
+        use std::sync::Arc;
+
+        struct TestRenderer;
+        impl Renderer for TestRenderer {
+            fn capset(&self) -> &[u8] {
+                &[]
+            }
+            fn open(&self) -> Result<Arc<dyn Context>, Errno> {
+                unreachable!()
+            }
+        }
+        with_test_mount(b"sys", |vfs| {
+            let mut k = Kernel::new(crate::process::Tier::Interpreter);
+            for gpu in [false, true] {
+                k.gpu = gpu.then(|| Arc::new(TestRenderer) as Arc<dyn Renderer>);
+                let view = test_view(&k, vfs);
+                let root = PseudoNode::SysRoot;
+                let dev = view.lookup(SYS_MOUNT, &root, b"dev").unwrap();
+                assert_eq!(
+                    readdir(&view, SYS_MOUNT, &root)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.name == b"dev")
+                        .count(),
+                    1
+                );
+                let names: Vec<_> = readdir(&view, SYS_MOUNT, &dev)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.name)
+                    .collect();
+                let mut expected = vec![b"block".to_vec()];
+                let block = view.lookup(SYS_MOUNT, &dev, b"block").unwrap();
+                assert_eq!(view.parent(&block).as_ref(), Some(&dev));
+                let char_dir = view.lookup(SYS_MOUNT, &dev, b"char");
+                if gpu {
+                    expected.push(b"char".to_vec());
+                    assert_eq!(view.parent(&char_dir.unwrap()).as_ref(), Some(&dev));
+                } else {
+                    assert_eq!(char_dir, Err(Errno::ENOENT));
+                }
+                assert_eq!(names, expected);
+            }
+        });
     }
 }

@@ -13,11 +13,6 @@ SKIP="$SKIP:$P.PrctlSetPtracerDoesNotPersistPastTracerThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNotAffectCurrentTracer"
 SKIP="$SKIP:$P.PrctlNotInherited:$P.TraceParentNotAllowed:$P.TraceNonDescendantNotAllowed"
 SKIP="$SKIP:$P.ExecvePtraceLockStress"
-# kernel/ptrace: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; detaching
-# at an attach-time group stop reports the stop again (the second fails only when the whole case
-# runs, not on its own)
-SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
-SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
 # kernel/cred D2: no ACLs
 SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
 # Cannot be compared: PIDFD_THREAD came in 6.9, so these skip themselves on 6.8 and Appine and run
@@ -27,8 +22,7 @@ SKIP="$SKIP:PidfdTest.PidfdThread*:ExecTest.SUIDExecGainsUID:ExecTest.SGIDExecGa
 SKIP="$SKIP:WaitTest.NonConsumingWaitPrefersGroupExitStatus"
 # Hang on both sides until the 60 s timeout (only the timeout would be compared)
 SKIP="$SKIP:SigtimedwaitTest.NullTimeoutReturnsEINTR:PidfdTest.SendSignalToStoppedChildSucceeds"
-# Slow by design (they sleep 10 to 30 s each to show that nothing happens), left out for the time
-# they would add to every run
+# These cases wait 10 to 30 s each and run in gvisor-slow-process.
 SKIP="$SKIP:SigstopTest.Correctness:SigstopTest.RestartSyscall:SigtimedwaitTest.AlarmReturnsAlarm"
 SKIP="$SKIP:AlarmTest.Restart:AlarmTest.UserModeSpinning:AlarmTest.SaSiginfo:AlarmTest.SaInterrupt"
 SKIP="$SKIP:AlarmTest.Interrupt:VforkTest.ParentStopsUntilChildExecves"

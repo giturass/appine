@@ -67,6 +67,125 @@ internal class GuestActivity {
 }
 
 /**
+ * Serializes console opens and closes with [Native.takeKills] using a monotonic epoch so each
+ * console lifetime owns a disjoint `[openedEpoch, closedEpoch]` interval and a kill report from
+ * an ended tab cannot be delivered to a newer tab that reused its console number.
+ */
+internal class ConsoleTracker(
+    private val takeKills: () -> Array<String>?,
+    private val onDrainedKills: (Array<String>, Long) -> Unit,
+) {
+    private var epoch = 0L
+
+    /** Opens a console and returns `(console, openedEpoch)`. */
+    fun open(open: () -> Int): Pair<Int, Long> = synchronized(this) {
+        val opened = ++epoch
+        val console = open()
+        console to opened
+    }
+
+    /**
+     * Closes a console, drains any kills recorded before the close, records the closing epoch via
+     * [onClosed], and advances the epoch past it before another console can reuse the number.
+     */
+    fun close(close: () -> Unit, onClosed: (Long) -> Unit) {
+        val (drained, closed) = synchronized(this) {
+            close()
+            val kills = takeKills()
+            val closed = epoch
+            onClosed(closed)
+            epoch++
+            kills to closed
+        }
+        if (drained != null && drained.isNotEmpty()) onDrainedKills(drained, closed)
+    }
+
+    /** Takes pending kills together with the epoch at which they were observed. */
+    fun take(): Pair<Array<String>?, Long> = synchronized(this) {
+        takeKills() to epoch
+    }
+}
+
+/**
+ * Tracks inactive tabs' Kitty image caches ([VtNative.dropImages]) on Android 14+, where foreground
+ * services no longer receive `onTrimMemory`'s `RUNNING_*` or cached-background callbacks. Keeps up
+ * to [maxRetained] most recently left tabs untrimmed for [delayMs], evicts older ones immediately,
+ * and remembers trimmed tabs so periodic saves re-trim unseen tabs that keep emitting images.
+ */
+internal class BackgroundImageTrim(
+    private val delayMs: Long = DELAY_MS,
+    private val maxRetained: Int = MAX_RETAINED,
+) {
+    /** Started background tab IDs in LRU order (oldest first) to when they left the foreground. */
+    private val pending = LinkedHashMap<Int, Long>()
+
+    /** Already-trimmed background tab IDs still unseen (eligible for periodic re-trim). */
+    private val trimmed = LinkedHashSet<Int>()
+
+    /**
+     * Records a foreground change from [previousId] (when still open and started) to [currentId]
+     * at monotonic [now], returning background tab IDs evicted past [maxRetained].
+     */
+    fun onCurrentChanged(previousId: Int?, currentId: Int?, now: Long): List<Int> {
+        if (currentId != null) remove(currentId)
+        if (previousId != null && previousId != currentId) {
+            remove(previousId)
+            pending[previousId] = now
+        }
+        if (pending.size <= maxRetained) return emptyList()
+        val evicted = ArrayList<Int>(pending.size - maxRetained)
+        while (pending.size > maxRetained && pending.isNotEmpty()) {
+            val id = pending.keys.first()
+            pending.remove(id)
+            trimmed.add(id)
+            evicted.add(id)
+        }
+        return evicted
+    }
+
+    /** Returns background tab IDs unseen for at least [delayMs] as of [now] and marks them trimmed. */
+    fun takeDue(now: Long): List<Int> {
+        val due = pending.entries.mapNotNull { (id, leftAt) -> id.takeIf { now - leftAt >= delayMs } }
+        for (id in due) {
+            pending.remove(id)
+            trimmed.add(id)
+        }
+        return due
+    }
+
+    /** Milliseconds until the next pending tab becomes due, or null when none wait. */
+    fun nextDelayMs(now: Long): Long? {
+        val earliest = pending.values.minOrNull() ?: return null
+        return (delayMs - (now - earliest)).coerceAtLeast(0L)
+    }
+
+    /** Records that every started tab in [openIds] except [currentId] was just trimmed. */
+    fun markAllTrimmed(currentId: Int?, openIds: Iterable<Int>) {
+        clear()
+        for (id in openIds) {
+            if (id != currentId) trimmed.add(id)
+        }
+    }
+
+    fun trimmedIds(): Set<Int> = trimmed.toSet()
+
+    fun remove(id: Int) {
+        pending.remove(id)
+        trimmed.remove(id)
+    }
+
+    fun clear() {
+        pending.clear()
+        trimmed.clear()
+    }
+
+    companion object {
+        const val DELAY_MS = 60_000L
+        const val MAX_RETAINED = 2
+    }
+}
+
+/**
  * The foreground service that holds the guest kernel and all terminal sessions (the android/service
  * map). The sessions' lifecycle hangs on the service, not on an Activity: shells keep running after
  * the Activity is closed. The notification shows the number of sessions and offers "Exit all".
@@ -101,10 +220,9 @@ class TerminalService : Service() {
 
         /**
          * A program in the tab in front ([inFront], so the current one) asks to read the clipboard
-         * (OSC 52): the listener asks the user and answers through
-         * [VtSession.answerClipboardRead].
+         * (OSC 52). Return true if handling the request for [sessionId], including an empty answer.
          */
-        fun onClipboardRead() {}
+        fun onClipboardRead(sessionId: Int): Boolean = false
 
         /** A guest requests a browser; true means Android accepted the launch. */
         fun onOpenUrl(url: String): Boolean = false
@@ -160,10 +278,11 @@ class TerminalService : Service() {
     /**
      * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
      * when all have stopped (switched to another app, screen off) and none has come back after
-     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released and the tabs' scrollback is
-     * compressed ([trimMemory]): since Android 14 a process with a foreground service no longer
-     * gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch whether the UI is there itself; when
-     * the user switches back quickly, nothing has to be translated again either.
+     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released, background tabs' Kitty image
+     * caches are trimmed, and the tabs' scrollback is compressed ([trimMemory]): since Android 14
+     * a process with a foreground service no longer gets `onTrimMemory`'s `RUNNING_*` or cached
+     * background callbacks, so it has to watch whether the UI is there itself; when the user
+     * switches back quickly, nothing has to be translated or discarded either.
      */
     private val listeners = mutableListOf<Listener>()
 
@@ -173,6 +292,15 @@ class TerminalService : Service() {
      */
     private val trimWhenHidden = Runnable { trimMemory() }
 
+    /** Tracks inactive background tabs so their Kitty images are trimmed even while the UI stays visible. */
+    private val backgroundImages = BackgroundImageTrim()
+
+    /** Trims background tabs whose grace window in [backgroundImages] has expired. */
+    private val trimBackgroundImages = Runnable {
+        dropImagesForIds(backgroundImages.takeDue(SystemClock.elapsedRealtime()))
+        scheduleBackgroundImageTrim()
+    }
+
     /**
      * Every [POLL_MS], asks the kernel on [worker] (this takes the BKL):
      * - when the guest first listens on a port on a non-loopback address, posts a notification
@@ -180,7 +308,7 @@ class TerminalService : Service() {
      *   refuses was moved, so the user must be told which one to connect to;
      * - the guest's power requests (busybox's reboot, halt, poweroff);
      * - directories the guest changed: the Files app is told to refresh them (the android/documents
-     *   map), and a change in `/etc` rewrites the login's NOPASSWD rules (the android/setup map);
+     *   map). The login rule inputs are sampled separately (the android/setup map);
      * - whether guest processes remain when there are no sessions and no UI: if none, exit (the
      *   android/service map).
      *
@@ -191,17 +319,22 @@ class TerminalService : Service() {
         override fun run() {
             val m = machine
             if (m == 0L) return
+            val tracker = consoleTracker
+            val rules = loginRules
+            val roots = autoRoots
             Native.bklStall(m)?.let { notifications.stall(m, it) }
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
-                    val kills = Native.takeKills(m)
+                    val (kills, killsEpoch) = tracker?.take() ?: (Native.takeKills(m) to 0L)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
-                    Native.takeChangedDirs(m)?.let {
+                    val changedDirs = Native.takeChangedDirs(m)
+                    changedDirs?.let {
                         Documents.dirsChanged(this@TerminalService, it)
-                        runCatching { Rootfs.dirsChanged(this@TerminalService, m, it) }
                     }
+                    roots?.poll(this@TerminalService, changedDirs)
+                    rules?.poll(this@TerminalService)
                     val cpu = Native.guestCpuTime(m)
                     val sampledAt = SystemClock.elapsedRealtime()
                     main.post {
@@ -209,7 +342,7 @@ class TerminalService : Service() {
                         guestActivity.sample(cpu, sampledAt, SystemClock.elapsedRealtime())
                         updateWakeLock()
                         lines?.forEach(notifications::listen)
-                        kills?.forEach(::reportKill)
+                        kills?.forEach { reportKill(it, killsEpoch) }
                         when (power) {
                             Native.POWER_REBOOT -> restart()
                             Native.POWER_HALT, Native.POWER_OFF -> exitAll()
@@ -229,6 +362,11 @@ class TerminalService : Service() {
 
     /** The browser endpoint for the current kernel, independent of terminal sessions. */
     private var browserBridge: BrowserBridge? = null
+
+    /** Console-lifetime epoch tracker for the current kernel's kill reports. */
+    private var consoleTracker: ConsoleTracker? = null
+    private var loginRules: Rootfs.LoginRules? = null
+    private var autoRoots: Documents.AutoRootsWatcher? = null
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -291,13 +429,6 @@ class TerminalService : Service() {
      */
     private var nextSessionId = (System.currentTimeMillis() % Notifications.TAB_NOTIFICATION_COUNT).toInt()
 
-    /**
-     * The thread that probes mirror speeds after an import: replacing the store must wait until
-     * it has written the sources.
-     */
-    @Volatile
-    private var mirrorThread: Thread? = null
-
     /** [network] is registered. */
     private var watchingNetwork = false
 
@@ -330,14 +461,20 @@ class TerminalService : Service() {
 
     /**
      * The tab the Activity is showing (saving tabs records which one it is); showing a tab takes
-     * away its notification ([Notifications.cancelTab]), and the done and error statuses it was
-     * showing have been seen.
+     * away its notification ([Notifications.cancelTab]), marks its done and error statuses seen,
+     * and protects its Kitty image cache while scheduling the previous tab for background trimming.
      */
     internal var current: VtSession? = null
         set(value) {
+            val previous = field
             field = value
             value?.let(notifications::cancelTab)
             value?.takeIf(::inFront)?.statusSeen()
+            if (previous !== value) {
+                val previousId = previous?.takeIf { it in sessions && it.tab != 0L }?.id
+                dropImagesForIds(backgroundImages.onCurrentChanged(previousId, value?.id, SystemClock.elapsedRealtime()))
+                scheduleBackgroundImageTrim()
+            }
         }
 
     /**
@@ -374,14 +511,12 @@ class TerminalService : Service() {
             if (inFront(session)) each { it.onBell() } else notifications.program(session, title, body)
         }
 
-        /**
-         * Programs read the clipboard as Ghostty lets them by default (clipboard-read = ask): the
-         * user is asked, in the tab in front only. A tab elsewhere gets an empty clipboard at once:
-         * Android lets an app read the clipboard only while it has the focus, and the program
-         * would otherwise wait for a timeout.
-         */
+        /** The session keeps an unclaimed read until its waiting deadline. */
         override fun onClipboardRead(session: VtSession) {
-            if (inFront(session)) each { it.onClipboardRead() } else session.answerClipboardRead(null)
+            if (!inFront(session)) return
+            for (listener in listeners.toList()) {
+                if (listener.onClipboardRead(session.id)) return
+            }
         }
 
         override fun onStatusChanged(session: VtSession) {
@@ -406,10 +541,12 @@ class TerminalService : Service() {
 
     /**
      * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
-     * memory is short.
+     * memory is short. Already-trimmed background tabs are also re-trimmed here so unseen tabs
+     * emitting new Kitty images stay capped.
      */
     private val periodicSave = object : Runnable {
         override fun run() {
+            dropImagesForIds(backgroundImages.trimmedIds())
             saveTabs()
             main.postDelayed(this, SAVE_MS)
         }
@@ -586,11 +723,10 @@ class TerminalService : Service() {
         thread(name = "appine-start") {
             val result = runCatching {
                 if (distro != null) {
-                    Rootfs.prepare(this, distro, progress = { done, total ->
+                    Rootfs.prepare(this, distro, startMirrorProbes = Rootfs::probeMirrors, progress = { done, total ->
                         val text = getString(R.string.downloading, distro.label, done shr 20, total shr 20)
                         main.post { preparing(text) }
                     })
-                    mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
                 }
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
@@ -628,6 +764,17 @@ class TerminalService : Service() {
     private fun started(kernel: StartedKernel) {
         val m = kernel.handle
         browserBridge = kernel.browser
+        consoleTracker = ConsoleTracker(
+            takeKills = { Native.takeKills(m) },
+            onDrainedKills = { kills, epoch ->
+                main.post {
+                    if (machine != m) return@post
+                    kills.forEach { reportKill(it, epoch) }
+                }
+            },
+        )
+        loginRules = Rootfs.LoginRules(m)
+        autoRoots = Documents.AutoRootsWatcher(m)
         machine = m
         gpuAvailable = kernel.gpuAvailable
         booting = true
@@ -683,8 +830,9 @@ class TerminalService : Service() {
             // The import failed while switching to another distro (the download was already
             // verified, so most likely space ran out) or while resuming one the app was killed
             // in (its download may have been needed again): the old store is already deleted,
-            // so fall back to the Alpine in the APK rather than leave the user facing an app
-            // that does not work
+            // so drop the abandoned tarball and fall back to the Alpine in the APK rather than
+            // leave the user facing an app that does not work
+            Rootfs.deleteTarball(this, distro)
             tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
             start(Rootfs.Distro.ALPINE)
         } else {
@@ -816,7 +964,7 @@ class TerminalService : Service() {
      * (null is the home directory). The shell starts when the window size is first known.
      */
     internal fun createSession(account: String = login, cwd: String? = null): VtSession {
-        val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
+        val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd, consoleTracker)
         val session = VtSession(nextSessionId++, pty, machine, sessionEvents)
         session.setCursor(cursorStyle, cursorBlink)
         sessions.add(session)
@@ -829,6 +977,8 @@ class TerminalService : Service() {
         session.release()
         sessions.remove(session)
         unshown.remove(session)
+        backgroundImages.remove(session.id)
+        if (current === session) current = null else scheduleBackgroundImageTrim()
         notifications.cancelTab(session)
         sessionsChanged()
     }
@@ -931,7 +1081,7 @@ class TerminalService : Service() {
      * posted. Appine's own bugs always get a notification, with "Copy report" on it
      * ([Notifications.kill]).
      */
-    private fun reportKill(line: String) {
+    private fun reportKill(line: String, epoch: Long) {
         val f = line.split('\t')
         if (f.size != 7) return
         val console = f[0].toIntOrNull() ?: return
@@ -953,10 +1103,7 @@ class TerminalService : Service() {
             }
             else -> getString(R.string.killed_bug, comm, pid)
         }
-        // An ended tab keeps its console's number, which the kernel may have given to a newer tab's
-        // console since: the tab whose console is open has it, else the newest one that had it
-        val session = sessions.firstOrNull { it.console == console && it.consoleOpen }
-            ?: sessions.lastOrNull { it.console == console && console >= 0 }
+        val session = sessionForKill(sessions, console, epoch)
         val shown = session?.showMessage("[appine] $text") == true
         // Enough only when that tab is the one in front of the user
         if (shown && inFront(session) && !bug) return
@@ -972,40 +1119,60 @@ class TerminalService : Service() {
 
     /**
      * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
-     * translations kept in the pool take up to 70–80 MB), compresses the tabs' scrollback and
-     * cuts the images of the tabs other than [current] down ([trimMemory]). Since Android 14 the
-     * `RUNNING_*` levels are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by
-     * [removeListener].
+     * translations kept in the pool take up to 70–80 MB), cuts the images of the tabs other than
+     * [current] down, and compresses the tabs' scrollback ([trimMemory]). Since Android 14 the
+     * `RUNNING_*` levels are no longer sent and a foreground service never receives cached
+     * background trims; UI hiding is handled by [removeListener] and inactive background tabs by
+     * [backgroundImages].
      */
     @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
-            trimMemory(pressure = true)
+            trimMemory()
             saveTabs()
         }
     }
 
     /**
-     * Drops the kernel's rebuildable caches and compresses every tab's cold scrollback, including
-     * that of tabs whose output never paused long enough for the idle compression (`vt.rs`). Under
-     * [pressure], also deletes the oldest Kitty images of every tab but [current] (the one shown,
-     * or to be shown when the app comes back) down to a few MiB per screen: they are gone, not
-     * kept elsewhere ([VtNative.dropImages]).
+     * Drops the kernel's rebuildable caches, deletes the oldest Kitty images of every started tab
+     * other than [current] (the one shown, or to be shown when the app comes back) down to a few
+     * MiB per screen ([VtNative.dropImages]), and compresses every tab's cold scrollback,
+     * including that of tabs whose output never paused long enough for the idle compression
+     * (`vt.rs`).
      */
-    private fun trimMemory(pressure: Boolean = false) {
+    private fun trimMemory() {
         val m = machine
-        if (m != 0L) {
-            val others = if (pressure) {
-                sessions.filter { it !== current && it.tab != 0L }.map { it.tab }
-            } else {
-                emptyList()
-            }
+        if (m == 0L) return
+        val active = current?.takeIf { it in sessions }
+        val started = sessions.filter { it.tab != 0L }
+        val others = started.filter { it !== active }.map { it.tab }
+        backgroundImages.markAllTrimmed(active?.id, started.map { it.id })
+        main.removeCallbacks(trimBackgroundImages)
+        runCatching {
             worker.execute {
                 Native.trimMemory(m)
                 others.forEach(VtNative::dropImages)
                 VtNative.compressAll()
             }
+        }
+    }
+
+    /** Schedules [trimBackgroundImages] for the next pending background tab, or cancels it. */
+    private fun scheduleBackgroundImageTrim() {
+        main.removeCallbacks(trimBackgroundImages)
+        val delay = backgroundImages.nextDelayMs(SystemClock.elapsedRealtime()) ?: return
+        main.postDelayed(trimBackgroundImages, delay)
+    }
+
+    /** Trims Kitty images on [worker] for every started non-current session whose id is in [ids]. */
+    private fun dropImagesForIds(ids: Collection<Int>) {
+        if (machine == 0L || ids.isEmpty()) return
+        val active = current
+        val tabs = sessions.filter { it !== active && it.tab != 0L && it.id in ids }.map { it.tab }
+        if (tabs.isEmpty()) return
+        runCatching {
+            worker.execute { tabs.forEach(VtNative::dropImages) }
         }
     }
 
@@ -1182,16 +1349,20 @@ class TerminalService : Service() {
      * are done on [worker].
      */
     private fun replace(distro: Rootfs.Distro) {
-        // The old accounts were all deleted with the store
+        // The old accounts and path-based document grants belong to the store being removed.
         Settings.clearLogin(this)
+        Documents.revokeAccess(this)
+        Documents.rootsChanged(this)
         transitioning = true
         val m = detach()
         startError = null
         preparing(getString(R.string.preparing, distro.label))
         worker.execute {
             if (m != 0L) Native.stop(m)
-            mirrorThread?.join()
             Rootfs.reset(this)
+            // Revoke again after deletion in case a grant was issued while stopping the old kernel.
+            Documents.revokeAccess(this)
+            Documents.rootsChanged(this)
             main.post {
                 transitioning = false
                 // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro
@@ -1289,6 +1460,9 @@ class TerminalService : Service() {
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         releaseSessions()
+        consoleTracker = null
+        loginRules = null
+        autoRoots = null
         sessionsChanged()
         return m
     }
@@ -1301,6 +1475,9 @@ class TerminalService : Service() {
         }
         sessions.clear()
         unshown.clear()
+        backgroundImages.clear()
+        main.removeCallbacks(trimBackgroundImages)
+        current = null
     }
 
     override fun onDestroy() {
@@ -1312,6 +1489,7 @@ class TerminalService : Service() {
         switching?.cancelled = true
         switching = null
         main.removeCallbacks(trimWhenHidden)
+        main.removeCallbacks(trimBackgroundImages)
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         main.removeCallbacks(saveSoon)
@@ -1320,10 +1498,13 @@ class TerminalService : Service() {
         // here
         if (restore == null) Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        releaseSessions()
         val m = machine
         machine = 0
         gpuAvailable = false
+        releaseSessions()
+        consoleTracker = null
+        loginRules = null
+        autoRoots = null
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
         // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }
@@ -1335,6 +1516,16 @@ class TerminalService : Service() {
 
     companion object {
         private const val TAG = "TerminalService"
+
+        /**
+         * Finds the tab that owned [console] when kill reports were taken at [epoch]; disjoint
+         * `[openedEpoch, closedEpoch]` intervals prevent misdelivery when a new tab reuses a freed
+         * console number.
+         */
+        internal fun sessionForKill(sessions: List<VtSession>, console: Int, epoch: Long): VtSession? {
+            if (console < 0) return null
+            return sessions.firstOrNull { it.ownedConsoleAt(console, epoch) }
+        }
 
         /**
          * The format of [Native.setRoutes]. Before Android 13 the route type cannot be told, so all
@@ -1359,7 +1550,7 @@ class TerminalService : Service() {
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"
         private const val WAKE_LOCK_TAG = "appine:keep-awake"
-        private const val TRIM_DELAY_MS = 60_000L
+        private const val TRIM_DELAY_MS = BackgroundImageTrim.DELAY_MS
         private const val SAVE_MS = 60_000L
         private const val SAVE_SOON_MS = 2_000L
     }

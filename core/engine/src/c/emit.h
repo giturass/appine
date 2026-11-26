@@ -301,6 +301,12 @@ static inline uint32_t enc_mul(unsigned rd, unsigned rn, unsigned rm)
     return 0x9b007c00u | rm << 16 | rn << 5 | rd;
 }
 
+/* UDIV Xd, Xn, Xm */
+static inline uint32_t enc_udiv(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x9ac00800u | rm << 16 | rn << 5 | rd;
+}
+
 /* AND Xd, Xn, Xm */
 static inline uint32_t enc_and_reg(unsigned rd, unsigned rn, unsigned rm)
 {

@@ -26,13 +26,12 @@
 //! attributes, links) go this way; operations that change something are made directly by the
 //! syscall that has `&mut Cx`, after which it must not need a retry.
 //!
-//! Nodes are kept by node id per instance until the instance goes; the kernel never sends
-//! `FUSE_FORGET`, so the daemon keeps every node it has looked up while mounted. There is no page
-//! cache: reads and writes go to the daemon as they come (as with `FOPEN_DIRECT_IO`), and
-//! mappings copy the file ([`snapshot`]).
+//! Nodes are cached by node id per instance. Descriptor I/O goes through the daemon and
+//! live mappings share demand-filled file pages. Inode notifications revoke affected
+//! translations before the pages can be filled from a new daemon reply.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -42,6 +41,7 @@ use crate::cell::RefCell;
 use crate::cred::{Cred, UserNs};
 use crate::errno::Errno;
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
+use crate::mm::FillPages;
 
 mod host;
 
@@ -134,12 +134,13 @@ mod init {
     pub const EXPORT_SUPPORT: u32 = 1 << 4;
     pub const BIG_WRITES: u32 = 1 << 5;
     pub const DONT_MASK: u32 = 1 << 6;
+    pub const AUTO_INVAL_DATA: u32 = 1 << 12;
     pub const NO_OPEN_SUPPORT: u32 = 1 << 17;
     pub const PARALLEL_DIROPS: u32 = 1 << 18;
     pub const HANDLE_KILLPRIV: u32 = 1 << 19;
     pub const MAX_PAGES: u32 = 1 << 22;
     pub const NO_OPENDIR_SUPPORT: u32 = 1 << 24;
-    /// What the kernel offers: no page cache, so no writeback cache, splice, readdirplus or
+    /// Descriptor writes go to the daemon, so no writeback cache is negotiated. No splice, readdirplus or
     /// cache invalidation flags, and no `ASYNC_READ` (the kernel reads ahead in parallel with it,
     /// which this one does not: sshfs leaves reading ahead to a kernel that offers it, and does it
     /// itself otherwise); locks are kept in the kernel (no `POSIX_LOCKS`, `FLOCK_LOCKS`).
@@ -150,6 +151,7 @@ mod init {
         | EXPORT_SUPPORT
         | BIG_WRITES
         | DONT_MASK
+        | AUTO_INVAL_DATA
         | NO_OPEN_SUPPORT
         | PARALLEL_DIROPS
         | HANDLE_KILLPRIV
@@ -160,6 +162,7 @@ mod init {
 /// `FOPEN_*` flags of an open reply.
 pub(crate) mod fopen {
     pub const DIRECT_IO: u32 = 1 << 0;
+    pub const KEEP_CACHE: u32 = 1 << 1;
     pub const NONSEEKABLE: u32 = 1 << 2;
     pub const STREAM: u32 = 1 << 4;
     pub const NOFLUSH: u32 = 1 << 5;
@@ -324,6 +327,7 @@ impl Attr {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             blocks: Some(self.blocks),
+            ..Stat::default()
         }
     }
 }
@@ -485,10 +489,14 @@ pub(crate) struct Conn {
     forget_batch: i32,
     /// Open handles of each node id ([`Handle`]): such nodes are never forgotten.
     opens: HashMap<u64, u32>,
-    /// Node ids `drop_caches` kept only for a release in flight: each is forgotten once the
-    /// daemon has answered it ([`Fuses::evict`]), as Linux evicts the inode then (the release
-    /// holds the last reference to it, its dentry gone, and FUSE keeps no unused inode).
+    /// Node ids marked for prompt forgetting: either kept at `drop_caches` only for a release in
+    /// flight, or whose last link was removed through the mount (`unlink`, `rmdir`, overwriting
+    /// `rename`). Each is forgotten in the first sweep once nothing keeps it ([`Fuses::evict`]),
+    /// without waiting for [`NODES_MAX`].
     doomed: HashSet<u64>,
+    /// Serializes cross-directory directory renames on this instance (Linux's
+    /// `s_vfs_rename_mutex`), preventing concurrent moves from forming a directory cycle.
+    pub rename_busy: bool,
     /// The in-process shared-storage server, when no guest daemon serves this connection.
     host: Option<Arc<host::Host>>,
 }
@@ -519,18 +527,36 @@ pub(crate) mod no {
     pub const RENAME2: u64 = 1 << 14;
 }
 
+/// In-flight periodic background writeback state: clears `FillPages::bg_busy` and wakes
+/// foreground I/O waiters on completion, error, oversized-request drop, or connection abort.
+struct BgWriteback {
+    id: FuseId,
+    pages: Rc<FillPages>,
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl Drop for BgWriteback {
+    fn drop(&mut self) {
+        self.pages.bg_busy.set(false);
+        crate::kernel::request_wake_locks();
+    }
+}
+
 /// One request (Linux's `struct fuse_req`).
 struct Req {
     /// The whole message, header included.
     message: Vec<u8>,
     state: ReqState,
-    /// Nobody waits for the reply (RELEASE, INIT): it is dropped, or for INIT handled by the
-    /// connection.
+    /// Nobody waits for the reply (RELEASE, INIT, periodic writeback): it is dropped, or handled
+    /// in `dev_write` when the reply arrives.
     background: bool,
     /// Waited for even by a killed caller (6.1's `FR_FORCE`: FLUSH).
     force: bool,
     /// An interrupt was queued for it.
     interrupted: bool,
+    /// Present for periodic background `FUSE_WRITE` requests.
+    writeback: Option<BgWriteback>,
 }
 
 enum ReqState {
@@ -543,14 +569,21 @@ enum ReqState {
 }
 
 /// The wake object of a connection's readers (daemon threads reading the device, poll on it).
-fn readers(conn: &Rc<RefCell<Conn>>) -> wake::Object {
-    wake::of(&**conn)
+fn readers(conn: &RefCell<Conn>) -> wake::Object {
+    wake::of(conn)
 }
+
+const ANSWER_OFFSET: usize = 1;
 
 /// The wake object of the threads waiting for answers (and for INIT): an address inside the
 /// connection, different from [`readers`].
-fn answers(conn: &Rc<RefCell<Conn>>) -> wake::Object {
-    wake::of(&**conn) + 1
+fn answers(conn: &RefCell<Conn>) -> wake::Object {
+    readers(conn) + ANSWER_OFFSET
+}
+
+fn wake_connection(readers: wake::Object) {
+    request_wake_object(readers);
+    request_wake_object(readers + ANSWER_OFFSET);
 }
 
 impl Conn {
@@ -579,6 +612,7 @@ impl Conn {
             forget_batch: 16,
             opens: HashMap::new(),
             doomed: HashSet::new(),
+            rename_busy: false,
             host: None,
         }
     }
@@ -686,9 +720,28 @@ impl Conn {
                 background,
                 force,
                 interrupted: false,
+                writeback: None,
             },
         );
         self.pending.push_back(unique);
+        unique
+    }
+
+    /// Queues a periodic background `FUSE_WRITE` with `FUSE_WRITE_CACHE` for a dirty mapped range.
+    fn queue_writeback(&mut self, nodeid: u64, fh: u64, flags: u32, wb: BgWriteback) -> u64 {
+        let args = Args::default()
+            .u64(fh)
+            .u64(wb.offset)
+            .u32(wb.data.len() as u32)
+            .u32(1) // FUSE_WRITE_CACHE
+            .u64(0)
+            .u32(flags)
+            .u32(0)
+            .bytes(&wb.data);
+        let unique = self.queue(op::WRITE, nodeid, None, &args.0, (true, false));
+        if let Some(r) = self.requests.get_mut(&unique) {
+            r.writeback = Some(wb);
+        }
         unique
     }
 
@@ -711,6 +764,8 @@ impl Conn {
             }
             true
         });
+        wake_connection(wake::of_value(self));
+        crate::kernel::request_wake_locks();
     }
 
     /// The next forget message for a read of `len` bytes (6.1's `fuse_read_forget`): one
@@ -750,19 +805,31 @@ impl Conn {
     /// The node ids requests still unanswered are about: the node of each, and the other
     /// directory of a rename or the file of a link (their callers hold those nodes until the
     /// reply comes).
-    fn busy_nodeids(&self) -> Vec<u64> {
-        let mut ids = Vec::new();
+    fn busy_nodeids(&self) -> HashSet<u64> {
+        let mut ids = HashSet::new();
         for r in self.requests.values() {
-            let m = &r.message;
-            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
-            ids.push(u64::from_le_bytes(m[16..24].try_into().unwrap()));
-            if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8 {
-                ids.push(u64::from_le_bytes(
-                    m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
-                ));
-            }
+            let (nodeid, other) = req_nodeids(&r.message);
+            ids.insert(nodeid);
+            ids.extend(other);
         }
         ids
+    }
+
+    /// Schedules a sweep when a finished request referenced a doomed node that has no open
+    /// handles left, so an unlinked or `drop_caches`-doomed node kept only by that request is
+    /// forgotten promptly without triggering sweeps on I/O of an open unlinked file.
+    fn note_request_done(&self, message: &[u8]) {
+        if self.doomed.is_empty() {
+            return;
+        }
+        let (nodeid, other) = req_nodeids(message);
+        if [Some(nodeid), other]
+            .into_iter()
+            .flatten()
+            .any(|id| self.doomed.contains(&id) && !self.opens.contains_key(&id))
+        {
+            SWEEP.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The node ids of the releases still unanswered that no other request is about.
@@ -770,19 +837,13 @@ impl Conn {
         let mut releasing = HashSet::new();
         let mut others = HashSet::new();
         for r in self.requests.values() {
-            let m = &r.message;
-            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
-            let nodeid = u64::from_le_bytes(m[16..24].try_into().unwrap());
+            let opcode = u32::from_le_bytes(r.message[4..8].try_into().unwrap());
+            let (nodeid, other) = req_nodeids(&r.message);
             if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
                 releasing.insert(nodeid);
             } else {
                 others.insert(nodeid);
-                if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8
-                {
-                    others.insert(u64::from_le_bytes(
-                        m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
-                    ));
-                }
+                others.extend(other);
             }
         }
         &releasing - &others
@@ -801,15 +862,19 @@ impl Conn {
     }
 
     /// Completes a sent request; an abort that won the race keeps its error. Returns whether
-    /// callers waiting for answers need waking.
-    fn answer(&mut self, unique: u64, reply: Result<Vec<u8>, Errno>) -> bool {
-        let (opcode, background, nodeid) = match self.requests.get(&unique) {
+    /// callers waiting for answers need waking, and the periodic writeback the reply ends, for
+    /// [`finish_bg_writeback`] once the connection is no longer borrowed.
+    fn answer(
+        &mut self,
+        unique: u64,
+        reply: Result<Vec<u8>, Errno>,
+    ) -> (bool, Option<(BgWriteback, Result<Vec<u8>, Errno>)>) {
+        let (opcode, background) = match self.requests.get(&unique) {
             Some(r) if matches!(r.state, ReqState::Sent) => (
                 u32::from_le_bytes(r.message[4..8].try_into().unwrap()),
                 r.background,
-                u64::from_le_bytes(r.message[16..24].try_into().unwrap()),
             ),
-            _ => return false,
+            _ => return (false, None),
         };
         if reply == Err(Errno::ENOSYS) {
             self.no |= match opcode {
@@ -831,19 +896,35 @@ impl Conn {
             };
         }
         if background {
-            self.requests.remove(&unique);
-            if matches!(opcode, op::RELEASE | op::RELEASEDIR) && self.doomed.contains(&nodeid) {
-                SWEEP.store(true, Ordering::Relaxed);
+            // A release for a doomed node (from drop_caches or unlink): once no open handle remains,
+            // forget it at the end of this syscall.
+            let removed = self.requests.remove(&unique);
+            if let Some(r) = &removed
+                && matches!(opcode, op::RELEASE | op::RELEASEDIR)
+            {
+                self.note_request_done(&r.message);
             }
             if opcode == op::INIT {
                 init_reply(self, reply);
-                return true;
+                return (true, None);
             }
-            return false;
+            let writeback = removed.and_then(|r| r.writeback).map(|wb| (wb, reply));
+            return (false, writeback);
         }
         self.requests.get_mut(&unique).unwrap().state = ReqState::Done(reply);
-        true
+        (true, None)
     }
+}
+
+/// Decodes the primary node id from a FUSE request header and, for `RENAME`/`RENAME2`/`LINK`,
+/// the secondary node id from the start of the request body.
+fn req_nodeids(message: &[u8]) -> (u64, Option<u64>) {
+    let opcode = u32::from_le_bytes(message[4..8].try_into().unwrap());
+    let nodeid = u64::from_le_bytes(message[16..24].try_into().unwrap());
+    let other = (matches!(opcode, op::RENAME | op::RENAME2 | op::LINK)
+        && message.len() >= IN_HEADER + 8)
+        .then(|| u64::from_le_bytes(message[IN_HEADER..IN_HEADER + 8].try_into().unwrap()));
+    (nodeid, other)
 }
 
 /// Queues `FUSE_INIT` on a new connection (6.1's `fuse_send_init`); nobody waits for it, and its
@@ -981,14 +1062,24 @@ fn request(
         // Sent requests remain in Conn: cache eviction must keep their nodes while unlocked.
         let replies = cx.unlocked(move || host.dispatch(messages, forgets));
         let mut wake = false;
+        let mut writebacks = Vec::new();
         {
             let mut c = conn.borrow_mut();
             for (u, reply) in replies {
-                wake |= c.answer(u, reply);
+                let (w, writeback) = c.answer(u, reply);
+                wake |= w;
+                writebacks.extend(writeback);
             }
         }
         if wake {
             request_wake_object(answers(conn));
+        }
+        if !writebacks.is_empty()
+            && let Ok(vfs) = cx.vfs()
+        {
+            for (wb, reply) in writebacks {
+                finish_bg_writeback(&vfs, wb, reply);
+            }
         }
     } else {
         request_wake_object(readers(conn));
@@ -1045,19 +1136,25 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
             let Some(r) = c.requests.get_mut(&unique) else {
                 return Err(Errno::ECONNABORTED);
             };
+            // The exit path sets killed before issuing forced I/O and still needs its reply.
+            let interruptible = !(r.interrupted || killed && r.force);
             match r.state {
                 ReqState::Done(_) => {
                     let Some(Req {
+                        message,
                         state: ReqState::Done(reply),
                         ..
                     }) = c.requests.remove(&unique)
                     else {
                         unreachable!()
                     };
+                    c.note_request_done(&message);
                     return reply;
                 }
                 ReqState::Pending if killed && !r.force => {
-                    c.requests.remove(&unique);
+                    if let Some(r) = c.requests.remove(&unique) {
+                        c.note_request_done(&r.message);
+                    }
                     c.pending.retain(|&u| u != unique);
                     return Err(Errno::EINTR);
                 }
@@ -1066,7 +1163,7 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
                     return Err(Errno::EINTR);
                 }
                 ReqState::Sent
-                    if !r.interrupted && c.no & no::INTERRUPT == 0 && cx.interrupted() =>
+                    if interruptible && c.no & no::INTERRUPT == 0 && cx.interrupted() =>
                 {
                     r.interrupted = true;
                     c.interrupts.push_back(unique);
@@ -1074,7 +1171,7 @@ fn wait_answer(cx: &mut Cx<'_>, conn: &Rc<RefCell<Conn>>, unique: u64) -> Result
                     request_wake_object(readers(conn));
                 }
                 // Not read yet: the interrupt is sent when it is (FR_INTERRUPTED)
-                ReqState::Pending if !r.interrupted && cx.interrupted() => r.interrupted = true,
+                ReqState::Pending if interruptible && cx.interrupted() => r.interrupted = true,
                 _ => {}
             }
         }
@@ -1133,7 +1230,7 @@ impl DevFile {
             .interrupts
             .iter()
             .any(|u| matches!(c.requests.get(u).map(|r| &r.state), Some(ReqState::Sent)));
-        if !c.pending.is_empty() || interrupt {
+        if !c.pending.is_empty() || !c.forgets.is_empty() || interrupt {
             ev |= POLLIN | POLLRDNORM;
         }
         ev
@@ -1141,7 +1238,7 @@ impl DevFile {
 
     /// The object poll and epoll wait on.
     pub fn object(&self) -> Option<wake::Object> {
-        self.conn.as_ref().map(readers)
+        self.conn.as_deref().map(readers)
     }
 }
 
@@ -1158,9 +1255,6 @@ impl Drop for DevFile {
         c.devs = c.devs.saturating_sub(1);
         if c.devs == 0 {
             c.abort();
-            drop(c);
-            request_wake_object(readers(&conn));
-            request_wake_object(answers(&conn));
         }
     }
 }
@@ -1237,6 +1331,12 @@ pub(crate) fn dev_read(
                 // A request the buffer cannot hold ends with EIO (E2BIG for a SETXATTR, whose
                 // value may be too large), and the read goes on with the next one
                 if r.message.len() > len {
+                    if r.background {
+                        if let Some(r) = c.requests.remove(&unique) {
+                            c.note_request_done(&r.message);
+                        }
+                        continue;
+                    }
                     let opcode = u32::from_le_bytes(r.message[4..8].try_into().unwrap());
                     let e = if opcode == op::SETXATTR {
                         Errno::E2BIG
@@ -1280,7 +1380,7 @@ pub(crate) fn dev_read(
 /// (EINVAL); a reply to no request the daemon holds is ENOENT. ENOSYS replies mark the operation
 /// as not implemented ([`no`]); an interrupt answered with EAGAIN is queued again.
 pub(crate) fn dev_write(
-    _cx: &mut Cx<'_>,
+    cx: &mut Cx<'_>,
     vfs: &super::Vfs,
     file: &crate::fd::FileRef,
     data: &[u8],
@@ -1299,7 +1399,7 @@ pub(crate) fn dev_write(
         return Err(Errno::ENOENT);
     }
     if unique == 0 {
-        notification(vfs, &conn, error, body)?;
+        notification(cx, vfs, &conn, error, body)?;
         return Ok(len);
     }
     if error > 0 || error <= -512 || (error != 0 && !body.is_empty()) {
@@ -1338,19 +1438,244 @@ pub(crate) fn dev_write(
     } else {
         Err(Errno(-error))
     };
-    let wake = c.answer(unique, reply);
+    let (wake, writeback) = c.answer(unique, reply);
     drop(c);
     if wake {
         request_wake_object(answers(&conn));
     }
+    if let Some((wb, reply)) = writeback {
+        finish_bg_writeback(vfs, wb, reply);
+    }
     Ok(len)
 }
 
-/// A notification from the daemon (6.1's `fuse_notify`). Without a page cache, invalidating an
-/// inode drops its cached attributes, and invalidating or deleting an entry drops the name from
-/// its directory's cache; storing data and polls have nothing to act on and are accepted, and
-/// retrieving cached data is refused (ENOSYS: there is none).
+/// Ordinary FUSE mmap labels share their path allocation with the pinned open file. ELF
+/// snapshots have separately allocated labels. This distinguishes a daemon's full-width inode
+/// from an internal program key even when both numbers occur in the same address space.
+pub(crate) fn mapped_paths(mm: &crate::mm::Mm) -> HashSet<*const u8> {
+    let mut paths = HashSet::new();
+    if mm.has_fills() {
+        let mut files = Vec::new();
+        mm.mapped_file_inos(&mut Vec::new(), &mut files);
+        for file in files {
+            if let Some(path) = &file.borrow().path {
+                paths.insert(path.as_ptr());
+            }
+        }
+    }
+    paths
+}
+
+pub(crate) fn mapped_pages(vfs: &super::Vfs, id: FuseId) -> Option<Rc<FillPages>> {
+    vfs.fuse().get(id)?.pages.upgrade()
+}
+
+fn for_each_mm(cx: &Cx<'_>, mut f: impl FnMut(&mut crate::mm::Mm) -> bool) {
+    let mut seen = HashSet::new();
+    for task in cx.kr().tasks.values() {
+        let mm = task.res.borrow().mm.clone();
+        if seen.insert(Rc::as_ptr(&mm)) {
+            let mut mm = mm.borrow_mut();
+            if f(&mut mm) {
+                mm.sync(&cx.task.sync);
+            }
+        }
+    }
+}
+
+/// Revoke all translations before marking the file pages stale. The daemon may still owe a
+/// READ reply, so this runs under the BKL without acquiring the inode I/O lock.
+fn invalidate_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+    for_each_mm(cx, |mm| mm.invalidate_fill(pages, lo, hi));
+    pages.invalidate(lo, hi);
+}
+
+/// Queue Tier 1 code-cache invalidation for executable mappings of `pages` overlapping `[lo, hi)`.
+fn invalidate_code_pages(cx: &Cx<'_>, pages: &Rc<FillPages>, lo: u64, hi: u64) {
+    for_each_mm(cx, |mm| mm.invalidate_fill_code(pages, lo, hi));
+}
+
+/// Processes the daemon's reply to a periodic background `FUSE_WRITE`, advancing the clean
+/// baseline for acknowledged bytes and chaining the next dirty chunk if the node is still idle.
+fn finish_bg_writeback(vfs: &super::Vfs, wb: BgWriteback, reply: Result<Vec<u8>, Errno>) {
+    let id = wb.id;
+    let acked = match reply {
+        Ok(r) => Fields::new(&r)
+            .u32()
+            .ok()
+            .map(|n| n as usize)
+            .filter(|&n| n <= wb.data.len()),
+        Err(_) => None,
+    };
+    let mut chain = false;
+    if let Some(n) = acked {
+        wb.pages.acknowledge(wb.offset, &wb.data[..n]);
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut() {
+            f.stale(id);
+        }
+        chain = n == wb.data.len();
+    }
+    // Drops `wb`, clearing `FillPages::bg_busy` and waking any foreground `with_io` waiter.
+    drop(wb);
+    if chain {
+        let _ = queue_next_bg_writeback(vfs, id);
+    }
+}
+
+/// Queues the next dirty byte run for node `id` as a background `FUSE_WRITE` when no foreground
+/// I/O or background writeback is in progress. Returns whether a request was queued.
+fn queue_next_bg_writeback(vfs: &super::Vfs, id: FuseId) -> bool {
+    let (conn, nodeid, pages, fh, flags) = {
+        let Ok(mut f) = vfs.fuse.try_borrow_mut() else {
+            return false;
+        };
+        let Some(n) = f.nodes.get_mut(&id) else {
+            return false;
+        };
+        if n.io_busy {
+            return false;
+        }
+        let Some(pages) = n.pages.upgrade() else {
+            n.retry_writeback = None;
+            return false;
+        };
+        if pages.bg_busy.get() || pages.size_stale.get() || !pages.has_tracked() {
+            return false;
+        }
+        let Some(writer) = pages.writer() else {
+            return false;
+        };
+        let (conn, nodeid, fh, flags) = {
+            let Ok(file) = writer.source.try_borrow() else {
+                return false;
+            };
+            match &file.kind {
+                crate::fd::FileKind::Fuse(h) => (h.conn.clone(), h.nodeid, h.fh, h.flags),
+                _ => return false,
+            }
+        };
+        (conn, nodeid, pages, fh, flags)
+    };
+    let max_write = {
+        let Ok(c) = conn.try_borrow() else {
+            return false;
+        };
+        if c.aborted || c.state != InitState::Ready {
+            return false;
+        }
+        c.max_write as usize
+    };
+    let mut next_run = None;
+    for page in pages.tracked(0, u64::MAX) {
+        let Ok(runs) = pages.dirty_runs(page) else {
+            return false;
+        };
+        if let Some((at, mut data)) = runs.into_iter().next() {
+            let len = (data.len() as u64)
+                .min(pages.size().saturating_sub(at))
+                .min(max_write as u64) as usize;
+            if len != 0 {
+                data.truncate(len);
+                next_run = Some((at, data));
+                break;
+            }
+        }
+    }
+    let Some((offset, data)) = next_run else {
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut()
+            && let Some(n) = f.nodes.get_mut(&id)
+        {
+            n.retry_writeback = None;
+        }
+        return false;
+    };
+    let Ok(mut c) = conn.try_borrow_mut() else {
+        return false;
+    };
+    if c.aborted || c.state != InitState::Ready {
+        return false;
+    }
+    pages.bg_busy.set(true);
+    let wb = BgWriteback {
+        id,
+        pages,
+        offset,
+        data,
+    };
+    c.queue_writeback(nodeid, fh, flags, wb);
+    drop(c);
+    request_wake_object(readers(&conn));
+    true
+}
+
+/// Periodic dirty-page writeback for shared writable FUSE mappings (called from the timer thread
+/// under the BKL; never blocks). Honours `/proc/sys/vm/dirty_writeback_centisecs` (default 500 =
+/// 5 s; `<= 0` disables periodic writeback) and returns `None` when no writable shared FUSE
+/// mapping exists so the timer thread stays idle.
+pub(crate) fn flush_dirty(k: &crate::kernel::Kernel) -> Option<Instant> {
+    let vfs = k.vfs.as_ref()?;
+    let centisecs = k
+        .sysctls
+        .get(b"sys/vm/dirty_writeback_centisecs".as_slice())
+        .copied()
+        .unwrap_or(500);
+    if centisecs <= 0 {
+        if let Ok(mut f) = vfs.fuse.try_borrow_mut() {
+            f.next_writeback = None;
+        }
+        return None;
+    }
+    let interval = Duration::from_millis((centisecs as u64).saturating_mul(10).max(10));
+    let now = Instant::now();
+    let (ids, due) = {
+        let Ok(mut f) = vfs.fuse.try_borrow_mut() else {
+            return Some(now + interval);
+        };
+        let Fuses {
+            mapped,
+            nodes,
+            next_writeback,
+            ..
+        } = &mut *f;
+        let mut active = Vec::new();
+        mapped.retain(|&id| {
+            let Some(n) = nodes.get(&id) else {
+                return false;
+            };
+            let Some(p) = n.pages.upgrade() else {
+                return false;
+            };
+            if n.retry_writeback.is_some() || (p.writer().is_some() && p.has_tracked()) {
+                active.push(id);
+            }
+            true
+        });
+        if active.is_empty() {
+            *next_writeback = None;
+            return None;
+        }
+        let Some(target) = next_writeback.map(|due| due.min(now + interval)) else {
+            let first = now + interval;
+            *next_writeback = Some(first);
+            return Some(first);
+        };
+        if now < target {
+            *next_writeback = Some(target);
+            return Some(target);
+        }
+        let next = now + interval;
+        *next_writeback = Some(next);
+        (active, next)
+    };
+    for id in ids {
+        let _ = queue_next_bg_writeback(vfs, id);
+    }
+    Some(due)
+}
+
+/// Daemon notifications for cached attributes, directory entries and mapped file ranges.
 fn notification(
+    cx: &Cx<'_>,
     vfs: &super::Vfs,
     conn: &Rc<RefCell<Conn>>,
     code: i32,
@@ -1361,7 +1686,29 @@ fn notification(
     match code {
         notify::INVAL_INODE => {
             let nodeid = f.u64()?;
-            vfs.fuse_mut().invalidate_attr(dev, nodeid);
+            let offset = f.u64()? as i64;
+            let len = f.u64()? as i64;
+            if !f.rest().is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            let pages = {
+                let mut nodes = vfs.fuse_mut();
+                let id = *nodes.by_nodeid.get(&(dev, nodeid)).ok_or(Errno::ENOENT)?;
+                nodes.stale(id);
+                nodes.node(id).pages.upgrade()
+            };
+            if let Some(pages) = pages
+                && offset >= 0
+            {
+                use appine_engine::PAGE_SIZE;
+                let lo = offset as u64 / PAGE_SIZE;
+                let hi = if len <= 0 {
+                    u64::MAX
+                } else {
+                    (offset as u64 + len as u64).div_ceil(PAGE_SIZE)
+                };
+                invalidate_pages(cx, &pages, lo, hi);
+            }
             Ok(())
         }
         notify::INVAL_ENTRY | notify::DELETE => {
@@ -1378,7 +1725,37 @@ fn notification(
             vfs.fuse_mut().invalidate_entry(dev, parent, name);
             Ok(())
         }
-        notify::POLL | notify::STORE => Ok(()),
+        notify::STORE => {
+            let nodeid = f.u64()?;
+            let offset = f.u64()?;
+            let size = f.u32()?;
+            let _padding = f.u32()?;
+            let data = f.rest();
+            if data.len() != size as usize {
+                return Err(Errno::EINVAL);
+            }
+            let end = offset.checked_add(u64::from(size)).ok_or(Errno::EINVAL)?;
+            let pages = {
+                let mut nodes = vfs.fuse_mut();
+                let id = *nodes.by_nodeid.get(&(dev, nodeid)).ok_or(Errno::ENOENT)?;
+                let n = nodes.nodes.get_mut(&id).ok_or(Errno::ENOENT)?;
+                if end > n.attr.size {
+                    n.attr.size = end;
+                }
+                n.pages.upgrade()
+            };
+            if let Some(pages) = pages
+                && size > 0
+                && pages.notify_store(offset, data)?
+            {
+                use appine_engine::PAGE_SIZE;
+                let lo = offset / PAGE_SIZE;
+                let hi = end.div_ceil(PAGE_SIZE);
+                invalidate_code_pages(cx, &pages, lo, hi);
+            }
+            Ok(())
+        }
+        notify::POLL => Ok(()),
         notify::RETRIEVE => Err(Errno::ENOSYS),
         _ => Err(Errno::EINVAL),
     }
@@ -1387,7 +1764,6 @@ fn notification(
 // ---- Nodes and their caches ----
 
 /// Every FUSE connection and the nodes looked up in its instance.
-#[derive(Default)]
 pub(crate) struct Fuses {
     /// Connections by their instance's device number (bind mounts share their source's).
     conns: HashMap<u64, Rc<RefCell<Conn>>>,
@@ -1397,13 +1773,41 @@ pub(crate) struct Fuses {
     next: FuseId,
     /// Counts entries made ([`Node::seen`]).
     clock: u64,
+    /// Node count above which [`Fuses::enter`] asks for a sweep. Starts at [`NODES_MAX`],
+    /// backs off above remaining live nodes after a sweep so working sets above [`NODES_MAX`] do
+    /// not scan on every entry, and resets as nodes drop or `drop_caches` runs.
+    sweep_at: usize,
+    /// Nodes that currently have a live [`FillPages`] (tracked for periodic writeback).
+    mapped: HashSet<FuseId>,
+    /// Next periodic dirty-page writeback tick, or `None` when idle.
+    next_writeback: Option<Instant>,
+}
+
+impl Default for Fuses {
+    fn default() -> Fuses {
+        Fuses {
+            conns: HashMap::new(),
+            nodes: HashMap::new(),
+            by_nodeid: HashMap::new(),
+            next: 0,
+            clock: 0,
+            sweep_at: NODES_MAX,
+            mapped: HashSet::new(),
+            next_writeback: None,
+        }
+    }
 }
 
 /// Nodes the cache keeps before it forgets the ones least recently looked up ([`Fuses::evict`]).
 const NODES_MAX: usize = 1 << 14;
+/// Target node count after a normal size-triggered eviction (3/4 of [`NODES_MAX`]).
+const NODES_TARGET: usize = NODES_MAX / 4 * 3;
+/// Minimum headroom above live pinned nodes before triggering another sweep (1/4 of [`NODES_MAX`]).
+const NODES_HEADROOM: usize = NODES_MAX / 4;
 
 /// The cache should be swept at the end of the syscall ([`Fuses::evict`]): it outgrew
-/// [`NODES_MAX`], or `drop_caches` asked ([`DROP`]).
+/// [`Fuses::sweep_at`], an unlinked/doomed node may be ready to forget, or `drop_caches` asked
+/// ([`DROP`]).
 pub(crate) static SWEEP: AtomicBool = AtomicBool::new(false);
 
 /// `drop_caches` asked to drop dentries and inodes: every node nothing uses goes.
@@ -1431,23 +1835,47 @@ pub(crate) struct Node {
     /// Until when they are valid (None: no longer), or the syscall that fetched them ([`token`]).
     attr_until: Option<Instant>,
     attr_token: u64,
+    /// Whether `attr` has been populated by a daemon reply (`LOOKUP`, `GETATTR`, `SETATTR`).
+    attr_seen: bool,
     /// What lookups said about names in this directory: the node (None: no such name), until
     /// when, and the syscall that asked.
     children: HashMap<Vec<u8>, (Option<FuseId>, Option<Instant>, u64)>,
     /// A symlink's target and the syscall that read it (Linux caches it only with
     /// `FUSE_CACHE_SYMLINKS`, which is not offered).
     link: Option<(Vec<u8>, u64)>,
-    /// An `O_APPEND` write is between asking for the size and writing there: others wait (6.1
-    /// holds the inode lock across both).
-    pub appending: bool,
+    /// Serializes page fills, writeback and mutations, including append offset selection.
+    pub io_busy: bool,
+    /// Serializes directory-modifying operations (Linux's directory `i_rwsem`).
+    pub dir_busy: bool,
+    /// Threads waiting to acquire [`Node::dir_busy`]; keeps the node alive in [`Fuses::evict`].
+    pub dir_waiters: u32,
+    pub pages: Weak<FillPages>,
+    /// A last unmap or exit could not write back. Keep dirty data for a later sync on
+    /// this inode, or until the connection is torn down.
+    pub retry_writeback: Option<Rc<crate::mm::Fill>>,
     /// Entries the daemon returned for it, given back with `FUSE_FORGET` when it is forgotten
     /// (Linux's `nlookup`).
     nlookup: u64,
+    /// Shared by O_PATH descriptions, which have no daemon file handle.
+    path_pin: Weak<()>,
+    /// Live AF_UNIX socket bound to this node, pinning it against cache eviction while bound.
+    sock_pin: Weak<RefCell<crate::net::Socket>>,
+    /// True once `unlink`, `rmdir`, or an overwriting `rename` removed the node's last link.
+    pub unlinked: bool,
     /// When it was last entered ([`Fuses::clock`]): the oldest go first.
     seen: u64,
 }
 
 impl Node {
+    pub(crate) fn pin_path(&mut self) -> Rc<()> {
+        if let Some(pin) = self.path_pin.upgrade() {
+            return pin;
+        }
+        let pin = Rc::new(());
+        self.path_pin = Rc::downgrade(&pin);
+        pin
+    }
+
     /// The file type bits.
     pub fn kind(&self) -> u32 {
         self.attr.mode & mode::S_IFMT
@@ -1456,6 +1884,11 @@ impl Node {
     /// The attributes when still valid, or fetched by this syscall.
     pub fn fresh_attr(&self) -> Option<&Attr> {
         fresh(self.attr_until, self.attr_token).then_some(&self.attr)
+    }
+
+    /// Whether any I/O or directory lock (or waiter) pins this node.
+    fn is_locked(&self) -> bool {
+        self.io_busy || self.dir_busy || self.dir_waiters != 0
     }
 }
 
@@ -1493,15 +1926,31 @@ impl Fuses {
                 },
                 attr_until: None,
                 attr_token: 0,
+                attr_seen: false,
                 children: HashMap::new(),
                 link: None,
-                appending: false,
+                io_busy: false,
+                dir_busy: false,
+                dir_waiters: 0,
+                pages: Weak::new(),
+                retry_writeback: None,
                 nlookup: 0,
+                path_pin: Weak::new(),
+                sock_pin: Weak::new(),
+                unlinked: false,
                 seen: 0,
             },
         );
         self.by_nodeid.insert((dev, ROOT_ID), id);
         id
+    }
+
+    /// Next node count at which [`Fuses::enter`] should trigger a sweep, given `live` nodes
+    /// remaining in the cache: at least [`NODES_MAX`], and at least 25% (or [`NODES_HEADROOM`])
+    /// above `live` so working sets larger than [`NODES_MAX`] do not rescan on every new entry.
+    fn next_sweep_at(live: usize) -> usize {
+        let headroom = (live / 4).max(NODES_HEADROOM);
+        NODES_MAX.max(live.saturating_add(headroom))
     }
 
     /// Forgets instance `dev`: its connection is aborted and its nodes go (the instance's last
@@ -1510,12 +1959,30 @@ impl Fuses {
         if let Some(conn) = self.conns.remove(&dev) {
             if let Ok(mut c) = conn.try_borrow_mut() {
                 c.abort();
+            } else {
+                wake_connection(readers(&conn));
             }
-            request_wake_object(readers(&conn));
-            request_wake_object(answers(&conn));
         }
+        let wake_locks = self.nodes.values().any(|n| n.dev == dev && n.is_locked());
         self.nodes.retain(|_, n| n.dev != dev);
         self.by_nodeid.retain(|&(d, _), _| d != dev);
+        self.mapped.retain(|id| self.nodes.contains_key(id));
+        self.sweep_at = self.sweep_at.min(Self::next_sweep_at(self.nodes.len()));
+        if wake_locks {
+            crate::kernel::request_wake_locks();
+        }
+    }
+
+    /// Pins node `id` against cache eviction while AF_UNIX socket `sock` stays bound to it.
+    pub fn pin_socket(&mut self, id: FuseId, sock: &Rc<RefCell<crate::net::Socket>>) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.sock_pin = Rc::downgrade(sock);
+        }
+    }
+
+    /// Records node `id` as having a live [`FillPages`] so periodic writeback can find it.
+    pub fn track_mapped(&mut self, id: FuseId) {
+        self.mapped.insert(id);
     }
 
     /// The device numbers of every instance.
@@ -1553,11 +2020,16 @@ impl Fuses {
         self.conn(n.dev).ok_or(Errno::ENOTCONN)
     }
 
-    /// What the cache knows of `name` in directory `dir`: Some(Some(node)), Some(None) for no such
-    /// name, None when it must be looked up.
-    pub fn cached_child(&self, dir: FuseId, name: &[u8]) -> Option<Option<FuseId>> {
-        let (node, until, t) = self.nodes.get(&dir)?.children.get(name)?;
-        fresh(*until, *t).then_some(*node)
+    /// What the cache knows of `name` in directory `dir`: `Some(Ok(node))`, `Some(Err(ENOENT))`
+    /// for a cached negative entry, `Some(Err(e))` for a non-`ENOENT` lookup error recorded for
+    /// this syscall, or `None` when it must be looked up.
+    pub fn cached_child(&self, dir: FuseId, name: &[u8]) -> Option<Result<FuseId, Errno>> {
+        if let Some((node, until, t)) = self.nodes.get(&dir)?.children.get(name)
+            && fresh(*until, *t)
+        {
+            return Some(node.ok_or(Errno::ENOENT));
+        }
+        lookup_error(dir, name).map(Err)
     }
 
     /// The node of an entry the daemon returned for `name` in directory `dir` (a lookup, or a
@@ -1609,14 +2081,28 @@ impl Fuses {
                         attr: e.attr,
                         attr_until: None,
                         attr_token: 0,
+                        attr_seen: false,
                         children: HashMap::new(),
                         link: None,
-                        appending: false,
+                        io_busy: false,
+                        dir_busy: false,
+                        dir_waiters: 0,
+                        pages: Weak::new(),
+                        retry_writeback: None,
                         nlookup: 1,
+                        path_pin: Weak::new(),
+                        sock_pin: Weak::new(),
+                        unlinked: false,
                         seen: 0,
                     },
                 );
-                if self.nodes.len() > NODES_MAX {
+                // A daemon reusing a doomed node id for a different type must not inherit doom
+                if let Some(c) = self.conns.get(&dev)
+                    && let Ok(mut c) = c.try_borrow_mut()
+                {
+                    c.doomed.remove(&e.nodeid);
+                }
+                if self.nodes.len() > self.sweep_at {
                     SWEEP.store(true, Ordering::Relaxed);
                 }
                 id
@@ -1624,6 +2110,7 @@ impl Fuses {
         };
         let n = self.nodes.get_mut(&id).unwrap();
         n.seen = self.clock;
+        n.unlinked = false;
         // The root keeps itself as its parent
         if n.nodeid != ROOT_ID {
             n.parent = dir;
@@ -1632,7 +2119,9 @@ impl Fuses {
         n.attr = e.attr;
         n.attr_until = e.attr_until;
         n.attr_token = t;
+        n.attr_seen = true;
         n.link = None;
+        clear_lookup_error(dir, name);
         self.nodes
             .get_mut(&dir)
             .unwrap()
@@ -1644,14 +2133,17 @@ impl Fuses {
     /// Forgets the nodes nothing uses (Linux evicting unused inodes), giving their lookups back to
     /// their daemons (`FUSE_FORGET`, [`Conn::read_forget`]); returns how many went. Kept are
     /// those in `keep` (what processes' roots, cwds and open files, mounts, inotify watches and
-    /// running programs are), roots, nodes with an open handle or a request in flight, and the
-    /// directories any of these or any remaining node lies in. With `all` (`drop_caches`) every
-    /// other node goes; otherwise only when the cache holds more than [`NODES_MAX`], the least
-    /// recently entered first, down to 3/4 of it. Entries naming forgotten nodes go too, and so do
-    /// negative entries no longer valid. A node `all` keeps only for a release in flight loses its
-    /// names and is doomed ([`Conn::doomed`]): it goes in the first sweep after nothing keeps it.
+    /// running programs are), roots, nodes with an O_PATH pin, an open handle or a request in
+    /// flight, and the directories any of these or any remaining node lies in. Doomed nodes
+    /// ([`Conn::doomed`]: unlinked/rmdir'd/overwritten nodes or nodes `drop_caches` kept only for
+    /// a release in flight) go in the first sweep once nothing keeps them, without waiting for
+    /// [`NODES_MAX`]. With `all` (`drop_caches`) every other unused node goes; otherwise bulk
+    /// eviction runs only when the cache holds more than [`NODES_MAX`], the least recently entered
+    /// first, down to [`NODES_TARGET`], raising [`Fuses::sweep_at`] above remaining live nodes so
+    /// working sets above [`NODES_MAX`] do not rescan on every new entry. Entries naming forgotten
+    /// nodes go too, and so do negative entries no longer valid.
     pub fn evict(&mut self, keep: &HashSet<FuseId>, all: bool) -> usize {
-        let target = if all { 0 } else { NODES_MAX / 4 * 3 };
+        let target = if all { 0 } else { NODES_TARGET };
         let mut doomed = HashSet::new();
         for c in self.conns.values() {
             let Ok(mut c) = c.try_borrow_mut() else {
@@ -1667,7 +2159,8 @@ impl Fuses {
                 id.is_some()
             });
         }
-        if self.nodes.len() <= target && doomed.is_empty() {
+        if !all && self.nodes.len() <= NODES_MAX && doomed.is_empty() {
+            self.sweep_at = self.sweep_at.min(Self::next_sweep_at(self.nodes.len()));
             return 0;
         }
         let mut kept = keep.clone();
@@ -1677,16 +2170,25 @@ impl Fuses {
         for c in self.conns.values() {
             let c = c.borrow();
             let busy = c.busy_nodeids();
-            let only = c.releasing_only();
+            let only = if all {
+                c.releasing_only()
+            } else {
+                HashSet::new()
+            };
             for (&id, n) in &self.nodes {
                 if n.dev != c.dev {
                     continue;
                 }
-                let open = c.opens.get(&n.nodeid).is_some_and(|&k| k > 0);
-                if n.nodeid == ROOT_ID || open || busy.contains(&n.nodeid) {
+                let open = n.path_pin.strong_count() != 0
+                    || n.sock_pin.strong_count() != 0
+                    || c.opens.contains_key(&n.nodeid);
+                let locked = n.is_locked();
+                if n.nodeid == ROOT_ID || open || locked || busy.contains(&n.nodeid) {
                     kept.insert(id);
-                    if n.nodeid != ROOT_ID
+                    if all
+                        && n.nodeid != ROOT_ID
                         && !open
+                        && !locked
                         && only.contains(&n.nodeid)
                         && !keep.contains(&id)
                     {
@@ -1706,32 +2208,81 @@ impl Fuses {
             }
         }
         let mut gone: HashSet<FuseId> = HashSet::new();
-        // Doomed nodes nothing keeps any more go now; one that other nodes lie in waits for them
-        let parents = self.parents();
-        for id in doomed {
-            if !kept.contains(&id) && !parents.contains(&id) {
-                self.forget_node(id);
-                gone.insert(id);
+        // Doomed nodes nothing keeps any more go now, along with any unused cached descendants
+        // under a doomed directory (e.g. a directory rmdir'd after the daemon removed its entries).
+        let mut doomed_unused: HashSet<FuseId> =
+            doomed.into_iter().filter(|id| !kept.contains(id)).collect();
+        if !doomed_unused.is_empty() {
+            let mut parents = self.parents();
+            if doomed_unused.iter().any(|id| parents.contains(id)) {
+                let extra: Vec<FuseId> = self
+                    .nodes
+                    .keys()
+                    .copied()
+                    .filter(|id| !kept.contains(id) && !doomed_unused.contains(id))
+                    .filter(|&id| {
+                        let mut x = id;
+                        while let Some(n) = self.nodes.get(&x) {
+                            if n.parent == x {
+                                return false;
+                            }
+                            x = n.parent;
+                            if doomed_unused.contains(&x) {
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .collect();
+                doomed_unused.extend(extra);
+            }
+            loop {
+                let leaves: Vec<FuseId> = doomed_unused
+                    .iter()
+                    .copied()
+                    .filter(|id| !parents.contains(id))
+                    .collect();
+                if leaves.is_empty() {
+                    break;
+                }
+                for id in leaves {
+                    doomed_unused.remove(&id);
+                    self.forget_node(id);
+                    gone.insert(id);
+                }
+                if doomed_unused.is_empty() {
+                    break;
+                }
+                parents = self.parents();
             }
         }
-        // Leaves first, oldest first; a directory whose last node went is a leaf the next round
-        while self.nodes.len() > target {
-            let parents = self.parents();
-            let mut leaves: Vec<(u64, FuseId)> = self
-                .nodes
-                .iter()
-                .filter(|(id, _)| !kept.contains(id) && !parents.contains(id))
-                .map(|(&id, n)| (n.seen, id))
-                .collect();
-            if leaves.is_empty() {
-                break;
+        // Bulk LRU trim runs only on drop_caches or when the cache is above NODES_MAX.
+        let trim = all || self.nodes.len() > NODES_MAX;
+        if trim {
+            // Leaves first, oldest first; a directory whose last node went is a leaf the next round
+            while self.nodes.len() > target {
+                let parents = self.parents();
+                let mut leaves: Vec<(u64, FuseId)> = self
+                    .nodes
+                    .iter()
+                    .filter(|(id, _)| !kept.contains(id) && !parents.contains(id))
+                    .map(|(&id, n)| (n.seen, id))
+                    .collect();
+                if leaves.is_empty() {
+                    break;
+                }
+                leaves.sort_unstable();
+                leaves.truncate(self.nodes.len() - target);
+                for (_, id) in leaves {
+                    self.forget_node(id);
+                    gone.insert(id);
+                }
             }
-            leaves.sort_unstable();
-            leaves.truncate(self.nodes.len() - target);
-            for (_, id) in leaves {
-                self.forget_node(id);
-                gone.insert(id);
-            }
+            // Raise the next sweep trigger above remaining live nodes (with headroom), or reset
+            // to NODES_MAX once nodes dropped back down.
+            self.sweep_at = Self::next_sweep_at(self.nodes.len());
+        } else {
+            self.sweep_at = self.sweep_at.min(Self::next_sweep_at(self.nodes.len()));
         }
         // Linux has dropped the dentries of what only a release keeps, and evicts the inode when
         // the release ends (FUSE keeps no unused inode, generic_delete_inode): such a node loses
@@ -1750,11 +2301,13 @@ impl Fuses {
                 }
             }
         }
-        for n in self.nodes.values_mut() {
-            n.children.retain(|_, (child, until, t)| match child {
-                Some(c) => !gone.contains(c),
-                None => fresh(*until, *t),
-            });
+        if !gone.is_empty() || trim {
+            for n in self.nodes.values_mut() {
+                n.children.retain(|_, (child, until, t)| match child {
+                    Some(c) => !gone.contains(c),
+                    None => fresh(*until, *t),
+                });
+            }
         }
         for c in self.conns.values() {
             if !c.borrow().forgets.is_empty() {
@@ -1762,6 +2315,33 @@ impl Fuses {
             }
         }
         gone.len()
+    }
+
+    /// Updates the cache after `FUSE_UNLINK`, `FUSE_RMDIR`, or an overwriting `FUSE_RENAME`
+    /// removed a link to node `id`: decrements its cached link count, returns whether this was its
+    /// last link (always true for a directory or a vanished cache entry), and when it was, dooms
+    /// the node and schedules a sweep so it is forgotten once nothing keeps it.
+    pub fn unlinked(&mut self, id: FuseId, rmdir: bool) -> bool {
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return true;
+        };
+        let last = rmdir || n.attr.nlink <= 1;
+        n.attr.nlink = if rmdir {
+            0
+        } else {
+            n.attr.nlink.saturating_sub(1)
+        };
+        if last && n.nodeid != ROOT_ID {
+            n.unlinked = true;
+            let (dev, nodeid) = (n.dev, n.nodeid);
+            if let Some(c) = self.conns.get(&dev)
+                && let Ok(mut c) = c.try_borrow_mut()
+            {
+                c.doomed.insert(nodeid);
+                SWEEP.store(true, Ordering::Relaxed);
+            }
+        }
+        last
     }
 
     /// The nodes other nodes lie in.
@@ -1777,6 +2357,7 @@ impl Fuses {
     /// and its lookups are queued as a forget.
     fn forget_node(&mut self, id: FuseId) {
         let n = self.nodes.remove(&id).unwrap();
+        self.mapped.remove(&id);
         if self.by_nodeid.get(&(n.dev, n.nodeid)) == Some(&id) {
             self.by_nodeid.remove(&(n.dev, n.nodeid));
         }
@@ -1805,6 +2386,7 @@ impl Fuses {
 
     /// Records that directory `dir` has no `name`, for `until` and this syscall.
     pub fn enter_negative(&mut self, dir: FuseId, name: &[u8], until: Option<Instant>) {
+        clear_lookup_error(dir, name);
         if let Some(n) = self.nodes.get_mut(&dir) {
             n.children.insert(name.to_vec(), (None, until, token()));
         }
@@ -1813,6 +2395,7 @@ impl Fuses {
     /// Drops what the cache knows of `name` in directory `dir` (removed or renamed through the
     /// mount, or invalidated by the daemon).
     pub fn forget_child(&mut self, dir: FuseId, name: &[u8]) {
+        clear_lookup_error(dir, name);
         if let Some(n) = self.nodes.get_mut(&dir) {
             n.children.remove(name);
         }
@@ -1843,6 +2426,7 @@ impl Fuses {
             };
             n.attr_until = until;
             n.attr_token = token();
+            n.attr_seen = true;
         }
     }
 
@@ -1865,13 +2449,6 @@ impl Fuses {
     pub fn set_link(&mut self, id: FuseId, target: Vec<u8>) {
         if let Some(n) = self.nodes.get_mut(&id) {
             n.link = Some((target, token()));
-        }
-    }
-
-    /// The daemon invalidated node id `nodeid`'s attributes (`FUSE_NOTIFY_INVAL_INODE`).
-    fn invalidate_attr(&mut self, dev: u64, nodeid: u64) {
-        if let Some(&id) = self.by_nodeid.get(&(dev, nodeid)) {
-            self.stale(id);
         }
     }
 
@@ -1928,7 +2505,15 @@ pub(crate) fn attr_out(reply: &[u8], ns: &UserNs) -> Result<(Attr, Option<Instan
 #[derive(Debug, Clone)]
 pub(crate) enum Query {
     Lookup(FuseId, Vec<u8>),
-    Getattr(FuseId),
+    /// A batch of consecutive plain components from a path walk inside mount `mnt`, resolved in
+    /// one retry while checking directory type, mount crossings, and search permission at each
+    /// step.
+    LookupWalk {
+        mnt: super::MountId,
+        dir: FuseId,
+        names: Vec<Vec<u8>>,
+    },
+    Getattr(FuseId, Option<u64>),
     Readlink(FuseId),
     /// A program to execute, read whole ([`program`]).
     Program(FuseId),
@@ -1941,6 +2526,12 @@ thread_local! {
     /// The query the last [`Errno::FUSE_RETRY`] stands for.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static QUERY: std::cell::RefCell<Option<Query>> = const { std::cell::RefCell::new(None) };
+    /// Non-`ENOENT` lookup errors seen in this syscall, keyed by `(dir, name)`, so walks and
+    /// syscall handlers receive the error directly on retry (and can tolerate it when appropriate)
+    /// instead of `serve()` aborting the syscall prematurely.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static LOOKUP_ERRORS: std::cell::RefCell<Vec<(FuseId, Vec<u8>, Errno)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The programs execve read from FUSE nodes in this syscall (the program, its interpreters):
     /// dropped when the next syscall starts.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
@@ -1948,8 +2539,34 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+fn lookup_error(dir: FuseId, name: &[u8]) -> Option<Errno> {
+    LOOKUP_ERRORS.with_borrow(|errs| {
+        errs.iter()
+            .find(|(d, n, _)| *d == dir && n.as_slice() == name)
+            .map(|(_, _, e)| *e)
+    })
+}
+
+fn record_lookup_error(dir: FuseId, name: Vec<u8>, err: Errno) {
+    LOOKUP_ERRORS.with_borrow_mut(|errs| {
+        if let Some(slot) = errs.iter_mut().find(|(d, n, _)| *d == dir && *n == name) {
+            slot.2 = err;
+        } else {
+            errs.push((dir, name, err));
+        }
+    });
+}
+
+fn clear_lookup_error(dir: FuseId, name: &[u8]) {
+    LOOKUP_ERRORS.with_borrow_mut(|errs| {
+        if !errs.is_empty() {
+            errs.retain(|(d, n, _)| !(*d == dir && n.as_slice() == name));
+        }
+    });
+}
+
 /// A copy of FUSE node `id`'s data for execve, when this syscall has read it ([`Query::Program`]):
-/// the loader needs a host file, and there is no page cache to map.
+/// the loader needs a fully populated host file.
 pub(crate) fn program(id: FuseId) -> Option<std::fs::File> {
     PROGRAMS.with_borrow(|p| {
         p.iter()
@@ -1969,6 +2586,9 @@ pub(crate) fn token() -> u64 {
 pub(crate) fn new_syscall() {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     TOKEN.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    if LOOKUP_ERRORS.with_borrow(|e| !e.is_empty()) {
+        LOOKUP_ERRORS.with_borrow_mut(Vec::clear);
+    }
     if PROGRAMS.with_borrow(|p| !p.is_empty()) {
         PROGRAMS.with_borrow_mut(Vec::clear);
     }
@@ -1981,11 +2601,57 @@ pub(crate) fn need(q: Query) -> Errno {
     Errno::FUSE_RETRY
 }
 
+/// Checks whether the caller may search directory `dir` before continuing a batched
+/// [`Query::LookupWalk`], matching [`super::Vfs::fuse_permission`] without issuing a nested retry.
+fn may_search_in_walk(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    cred: &Cred,
+    dir: FuseId,
+) -> Result<bool, Errno> {
+    let (allowed, default_permissions, cached) = {
+        let f = vfs.fuse();
+        let Some(n) = f.get(dir) else {
+            return Ok(false);
+        };
+        if n.kind() != mode::S_IFDIR {
+            return Ok(false);
+        }
+        let Ok(conn) = f.conn_of(dir) else {
+            return Ok(false);
+        };
+        let c = conn.borrow();
+        (
+            c.allows(cred),
+            c.opts.default_permissions,
+            n.fresh_attr().copied(),
+        )
+    };
+    if !allowed {
+        return Ok(false);
+    }
+    if !default_permissions || cred.searches_all() {
+        return Ok(true);
+    }
+    let attr = match cached {
+        Some(a) => a,
+        None => match getattr(cx, vfs, dir, None, false) {
+            Ok(a) => a,
+            Err(Errno::EINTR) => return Err(Errno::EINTR),
+            Err(_) => return Ok(false),
+        },
+    };
+    Ok(cred.permission(&attr.stat(), crate::cred::MAY_EXEC).is_ok())
+}
+
 /// Asks the daemon what the last [`need`] recorded and caches the answer for this syscall, with
-/// the BKL released; the dispatcher then runs the syscall again. A lookup of a missing name is
-/// cached as such; any other error ends the syscall with it, as a failed lookup ends Linux's
-/// walk.
-pub(crate) fn serve(cx: &mut Cx<'_>) -> Result<(), Errno> {
+/// the BKL released; the dispatcher then runs the syscall again. Lookup errors (other than
+/// `EINTR`) are cached for this syscall so walks and handlers receive them directly and can
+/// tolerate them when Linux VFS rules allow.
+pub(crate) fn serve(
+    cx: &mut Cx<'_>,
+    program_opened: impl FnOnce(&crate::kernel::Kernel, FuseId),
+) -> Result<(), Errno> {
     let Some(q) = QUERY.with_borrow_mut(Option::take) else {
         return Err(Errno::EIO);
     };
@@ -1993,13 +2659,52 @@ pub(crate) fn serve(cx: &mut Cx<'_>) -> Result<(), Errno> {
     match q {
         Query::Lookup(dir, name) => match lookup(cx, &vfs, dir, &name) {
             Ok(_) | Err(Errno::ENOENT) => Ok(()),
-            Err(e) => Err(e),
+            Err(Errno::EINTR) => Err(Errno::EINTR),
+            Err(e) => {
+                record_lookup_error(dir, name, e);
+                Ok(())
+            }
         },
-        Query::Getattr(id) => getattr(cx, &vfs, id, None).map(|_| ()),
+        Query::LookupWalk { mnt, dir, names } => {
+            let cred = cx.cred();
+            let mut cur = dir;
+            for (i, name) in names.into_iter().enumerate() {
+                if i > 0 {
+                    if cx.task.killed.get() {
+                        return Err(Errno::EINTR);
+                    }
+                    // Never cross a mount point inside the batched FUSE walk.
+                    let node = super::Node::Fuse(mnt, cur);
+                    if vfs.mounted(node.clone()) != node {
+                        break;
+                    }
+                    if !may_search_in_walk(cx, &vfs, &cred, cur)? {
+                        break;
+                    }
+                }
+                let cached = vfs.fuse().cached_child(cur, &name);
+                match cached {
+                    Some(Ok(next)) => cur = next,
+                    Some(Err(_)) => break,
+                    None => match lookup(cx, &vfs, cur, &name) {
+                        Ok(next) => cur = next,
+                        Err(Errno::ENOENT) => break,
+                        Err(Errno::EINTR) => return Err(Errno::EINTR),
+                        Err(e) => {
+                            record_lookup_error(cur, name, e);
+                            break;
+                        }
+                    },
+                }
+            }
+            Ok(())
+        }
+        Query::Getattr(id, fh) => getattr(cx, &vfs, id, fh, false).map(|_| ()),
         Query::Program(id) => {
             use crate::fd::oflags;
             let h = open(cx, &vfs, id, oflags::O_RDONLY | oflags::O_LARGEFILE, false)?;
-            let size = getattr(cx, &vfs, id, Some(h.fh))?.size;
+            program_opened(cx.kr(), id);
+            let size = getattr(cx, &vfs, id, h.fh(), false)?.size;
             let copy = snapshot(cx, (&h.conn, h.nodeid, h.fh, h.flags), 0, size)?;
             drop(h);
             PROGRAMS.with_borrow_mut(|p| p.push((id, copy)));
@@ -2043,9 +2748,34 @@ pub(crate) fn lookup(
         }
         r => r?,
     };
-    let ns = conn.borrow().user_ns.clone();
+    let (ns, dev, auto_inval) = {
+        let c = conn.borrow();
+        (
+            c.user_ns.clone(),
+            c.dev,
+            c.flags & init::AUTO_INVAL_DATA != 0,
+        )
+    };
     match Entry::parse(&reply, &ns)? {
-        Ok(e) => vfs.fuse_mut().enter(dir, name, &e),
+        Ok(e) => {
+            let inval = auto_inval
+                .then(|| {
+                    let f = vfs.fuse();
+                    let id = *f.by_nodeid.get(&(dev, e.nodeid))?;
+                    let n = f.get(id)?;
+                    ((n.attr.mode ^ e.attr.mode) & mode::S_IFMT == 0
+                        && n.attr_seen
+                        && (e.attr.size != n.attr.size || e.attr.mtime_ns != n.attr.mtime_ns))
+                        .then(|| n.pages.upgrade())
+                        .flatten()
+                })
+                .flatten();
+            let id = vfs.fuse_mut().enter(dir, name, &e)?;
+            if let Some(pages) = inval {
+                invalidate_pages(cx, &pages, 0, u64::MAX);
+            }
+            Ok(id)
+        }
         Err(until) => {
             vfs.fuse_mut().enter_negative(dir, name, until);
             Err(Errno::ENOENT)
@@ -2054,12 +2784,37 @@ pub(crate) fn lookup(
 }
 
 /// `FUSE_GETATTR` of node `id` (through open file handle `fh` when given, `FUSE_GETATTR_FH`),
-/// cached.
+/// cached. Under `FUSE_AUTO_INVAL_DATA`, invalidates resident mapped pages if size or mtime
+/// changed on the daemon.
 pub(crate) fn getattr(
     cx: &mut Cx<'_>,
     vfs: &super::Vfs,
     id: FuseId,
     fh: Option<u64>,
+    forced: bool,
+) -> Result<Attr, Errno> {
+    getattr_inner(cx, vfs, id, fh, forced, true)
+}
+
+/// [`getattr`] without `FUSE_AUTO_INVAL_DATA` page invalidation (used by `refresh_mapping_size`
+/// while servicing an invalidation so it cannot trigger a second invalidation loop).
+pub(crate) fn getattr_no_inval(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    id: FuseId,
+    fh: Option<u64>,
+    forced: bool,
+) -> Result<Attr, Errno> {
+    getattr_inner(cx, vfs, id, fh, forced, false)
+}
+
+fn getattr_inner(
+    cx: &mut Cx<'_>,
+    vfs: &super::Vfs,
+    id: FuseId,
+    fh: Option<u64>,
+    forced: bool,
+    auto_inval_check: bool,
 ) -> Result<Attr, Errno> {
     const GETATTR_FH: u32 = 1;
     let (conn, nodeid) = target(vfs, id)?;
@@ -2067,25 +2822,52 @@ pub(crate) fn getattr(
         .u32(if fh.is_some() { GETATTR_FH } else { 0 })
         .u32(0)
         .u64(fh.unwrap_or(0));
-    let reply = call(cx, &conn, op::GETATTR, nodeid, &args.0)?;
-    let ns = conn.borrow().user_ns.clone();
+    let reply = request(
+        cx,
+        &cx.cred(),
+        &conn,
+        (op::GETATTR, nodeid),
+        &args.0,
+        forced,
+    )?;
+    let (ns, auto_inval) = {
+        let c = conn.borrow();
+        (c.user_ns.clone(), c.flags & init::AUTO_INVAL_DATA != 0)
+    };
     let (attr, until) = attr_out(&reply, &ns)?;
-    let mut f = vfs.fuse_mut();
-    let old = f.get(id).ok_or(Errno::ENOTCONN)?.attr.mode;
-    if (attr.mode ^ old) & mode::S_IFMT != 0 {
-        return Err(Errno::EIO);
+    let (res, inval_pages) = {
+        let mut f = vfs.fuse_mut();
+        let n = f.get(id).ok_or(Errno::ENOTCONN)?;
+        if (attr.mode ^ n.attr.mode) & mode::S_IFMT != 0 {
+            return Err(Errno::EIO);
+        }
+        let inval = (auto_inval_check
+            && auto_inval
+            && n.attr_seen
+            && (attr.size != n.attr.size || attr.mtime_ns != n.attr.mtime_ns))
+            .then(|| n.pages.upgrade())
+            .flatten();
+        f.set_attr(id, attr, until);
+        (f.node(id).attr, inval)
+    };
+    if let Some(pages) = inval_pages {
+        invalidate_pages(cx, &pages, 0, u64::MAX);
     }
-    f.set_attr(id, attr, until);
-    Ok(f.node(id).attr)
+    Ok(res)
 }
 
 /// Node `id`'s attributes from the cache, or a retry to fetch them ([`need`]).
 pub(crate) fn cached_attr(vfs: &super::Vfs, id: FuseId) -> Result<Attr, Errno> {
+    cached_attr_fh(vfs, id, None)
+}
+
+/// [`cached_attr`], passing open file handle `fh` (`FUSE_GETATTR_FH`) if a retry fetches them.
+pub(crate) fn cached_attr_fh(vfs: &super::Vfs, id: FuseId, fh: Option<u64>) -> Result<Attr, Errno> {
     let f = vfs.fuse();
     let n = f.get(id).ok_or(Errno::ENOTCONN)?;
     match n.fresh_attr() {
         Some(a) => Ok(*a),
-        None => Err(need(Query::Getattr(id))),
+        None => Err(need(Query::Getattr(id, fh))),
     }
 }
 
@@ -2109,9 +2891,27 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// The daemon file handle when an open request actually succeeded (`!no_release`).
+    pub(crate) fn fh(&self) -> Option<u64> {
+        (!self.no_release).then_some(self.fh)
+    }
+
+    /// OPEN and CREATE use the same cache policy. An atomic truncate resizes the backing
+    /// in the caller, even for a handle that otherwise keeps the cache.
+    pub(crate) fn finish_open(self, cx: &Cx<'_>, vfs: &super::Vfs) -> Self {
+        if !self.dir
+            && self.flags & crate::fd::oflags::O_TRUNC == 0
+            && self.open_flags & fopen::KEEP_CACHE == 0
+            && let Some(pages) = mapped_pages(vfs, self.id)
+        {
+            invalidate_pages(cx, &pages, 0, u64::MAX);
+        }
+        self.counted()
+    }
+
     /// Counts it among the node's open handles ([`Conn::opens`]), which keep the node from being
     /// forgotten until it goes.
-    pub(crate) fn counted(self) -> Handle {
+    fn counted(self) -> Handle {
         *self.conn.borrow_mut().opens.entry(self.nodeid).or_insert(0) += 1;
         self
     }
@@ -2159,6 +2959,11 @@ impl Released {
             *k -= 1;
             if *k == 0 {
                 c.opens.remove(&self.nodeid);
+                if (self.release.is_none() || c.refusal().is_some())
+                    && c.doomed.contains(&self.nodeid)
+                {
+                    SWEEP.store(true, Ordering::Relaxed);
+                }
             }
         }
         drop(c);
@@ -2197,6 +3002,16 @@ pub(crate) fn flush_released() {
     }
 }
 
+/// File status flags kept on a FUSE handle and sent in a standalone OPEN request.
+pub(crate) fn handle_flags(conn: &Conn, flags: u32) -> u32 {
+    use crate::fd::oflags;
+    let mut kept = flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOCTTY);
+    if !atomic_o_trunc(conn) {
+        kept &= !oflags::O_TRUNC;
+    }
+    kept
+}
+
 /// Opens node `id` (6.1's `fuse_do_open`): `FUSE_OPEN` or `FUSE_OPENDIR` with the open flags
 /// less `O_CREAT`, `O_EXCL` and `O_NOCTTY` (and `O_TRUNC` unless the daemon takes it). A daemon
 /// answering ENOSYS needs no open: no handle, no release, and none is asked again.
@@ -2207,50 +3022,37 @@ pub(crate) fn open(
     flags: u32,
     dir: bool,
 ) -> Result<Handle, Errno> {
-    use crate::fd::oflags;
     let (conn, nodeid) = target(vfs, id)?;
-    let (skip, keep_trunc) = {
-        let c = conn.borrow();
-        let bit = if dir { no::OPENDIR } else { no::OPEN };
-        (c.no & bit != 0, atomic_o_trunc(&c))
+    let sent = handle_flags(&conn.borrow(), flags);
+    let (opcode, unsupported) = if dir {
+        (op::OPENDIR, no::OPENDIR)
+    } else {
+        (op::OPEN, no::OPEN)
     };
-    let mut sent = flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOCTTY);
-    if !keep_trunc {
-        sent &= !oflags::O_TRUNC;
-    }
-    let handle = |fh, open_flags, no_release| {
-        Handle {
-            conn: conn.clone(),
-            id,
-            nodeid,
-            fh,
-            open_flags,
-            flags: sent,
-            dir,
-            no_release,
+    let (fh, open_flags, no_release) = if conn.borrow().no & unsupported != 0 {
+        (0, fopen::KEEP_CACHE, true)
+    } else {
+        let args = Args::default().u32(sent).u32(0);
+        match call(cx, &conn, opcode, nodeid, &args.0) {
+            Ok(reply) => {
+                let mut f = Fields::new(&reply);
+                (f.u64()?, f.u32()?, false)
+            }
+            Err(Errno::ENOSYS) => (0, fopen::KEEP_CACHE, true),
+            Err(e) => return Err(e),
         }
-        .counted()
     };
-    if skip {
-        return Ok(handle(0, 0, true));
-    }
-    let opcode = if dir { op::OPENDIR } else { op::OPEN };
-    match call(
-        cx,
-        &conn,
-        opcode,
+    Ok(Handle {
+        conn,
+        id,
         nodeid,
-        &Args::default().u32(sent).u32(0).0,
-    ) {
-        Ok(reply) => {
-            let mut f = Fields::new(&reply);
-            let (fh, open_flags) = (f.u64()?, f.u32()?);
-            Ok(handle(fh, open_flags, false))
-        }
-        // A daemon without them needs no open, whatever INIT said (6.1's fuse_file_open)
-        Err(Errno::ENOSYS) => Ok(handle(0, 0, true)),
-        Err(e) => Err(e),
+        fh,
+        flags: sent,
+        open_flags,
+        dir,
+        no_release,
     }
+    .finish_open(cx, vfs))
 }
 
 /// Reads up to `len` bytes at `offset` through open handle `h` (`FUSE_READ`), in requests of at
@@ -2260,6 +3062,7 @@ pub(crate) fn read(
     h: (&Rc<RefCell<Conn>>, u64, u64, u32),
     offset: u64,
     len: usize,
+    forced: bool,
 ) -> Result<Vec<u8>, Errno> {
     let (conn, nodeid, fh, flags) = h;
     let chunk = conn.borrow().max_read as usize;
@@ -2274,7 +3077,7 @@ pub(crate) fn read(
             .u64(0)
             .u32(flags)
             .u32(0);
-        let data = match call(cx, conn, op::READ, nodeid, &args.0) {
+        let data = match request(cx, &cx.cred(), conn, (op::READ, nodeid), &args.0, forced) {
             Ok(d) => d,
             Err(e) if out.is_empty() => return Err(e),
             Err(_) => break,
@@ -2296,6 +3099,7 @@ pub(crate) fn write(
     h: (&Rc<RefCell<Conn>>, u64, u64, u32),
     offset: u64,
     data: &[u8],
+    cached: bool,
 ) -> Result<usize, Errno> {
     let (conn, nodeid, fh, flags) = h;
     let chunk = conn.borrow().max_write as usize;
@@ -2306,12 +3110,17 @@ pub(crate) fn write(
             .u64(fh)
             .u64(offset + done as u64)
             .u32(piece.len() as u32)
-            .u32(0)
+            .u32(u32::from(cached)) // FUSE_WRITE_CACHE
             .u64(0)
             .u32(flags)
             .u32(0)
             .bytes(piece);
-        let n = match call(cx, conn, op::WRITE, nodeid, &args.0) {
+        let reply = if cached {
+            call_forced(cx, conn, op::WRITE, nodeid, &args.0)
+        } else {
+            call(cx, conn, op::WRITE, nodeid, &args.0)
+        };
+        let n = match reply {
             Ok(r) => Fields::new(&r).u32()? as usize,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
@@ -2476,7 +3285,7 @@ pub(crate) fn snapshot(
     len: u64,
 ) -> Result<std::fs::File, Errno> {
     use std::os::unix::fs::FileExt;
-    let data = read(cx, h, offset, len as usize)?;
+    let data = read(cx, h, offset, len as usize, false)?;
     let file = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
     file.set_len(offset + data.len() as u64)
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
@@ -2486,7 +3295,7 @@ pub(crate) fn snapshot(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2512,10 +3321,10 @@ mod tests {
         f.enter_negative(root, b"absent", None);
         // The newer lookup happened after the older syscall started: both may use it.
         TOKEN.set(older);
-        assert_eq!(f.cached_child(root, b"link"), Some(Some(child)));
+        assert_eq!(f.cached_child(root, b"link"), Some(Ok(child)));
         assert!(f.node(child).fresh_attr().is_some());
         assert_eq!(f.link(child), Some(b"target".as_slice()));
-        assert_eq!(f.cached_child(root, b"absent"), Some(None));
+        assert_eq!(f.cached_child(root, b"absent"), Some(Err(Errno::ENOENT)));
         TOKEN.set(0);
         assert_eq!(f.cached_child(root, b"link"), None);
         assert!(f.node(child).fresh_attr().is_none());
@@ -2736,10 +3545,10 @@ mod tests {
             attr_until: None,
         };
         let a = f.enter(root, b"a", &e).unwrap();
-        assert_eq!(f.cached_child(root, b"a"), Some(Some(a)));
+        assert_eq!(f.cached_child(root, b"a"), Some(Ok(a)));
         assert!(f.node(a).fresh_attr().is_some());
         f.enter_negative(root, b"gone", None);
-        assert_eq!(f.cached_child(root, b"gone"), Some(None));
+        assert_eq!(f.cached_child(root, b"gone"), Some(Err(Errno::ENOENT)));
         // The same node id gives the same node, which a directory takes to its new place
         // A directory moving below itself is a loop
         assert_eq!(f.enter(a, b"b", &e), Err(Errno::ELOOP));
@@ -2883,5 +3692,362 @@ mod tests {
         c.borrow_mut().requests.clear();
         assert_eq!(f.evict(&HashSet::new(), false), 0);
         assert!(f.get(b).is_some());
+    }
+
+    pub(crate) static SWEEP_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn live_working_set_above_nodes_max_backs_off_and_recovers() {
+        let _guard = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        SWEEP.store(false, Ordering::Relaxed);
+        DROP.store(false, Ordering::Relaxed);
+        new_syscall();
+        let mut f = Fuses::default();
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        c.borrow_mut().minor = 37;
+        let root = f.add(c.clone());
+        let entry = |nodeid| Entry {
+            nodeid,
+            attr: Attr {
+                ino: nodeid,
+                mode: mode::S_IFREG | 0o644,
+                nlink: 1,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+        let mut keep = HashSet::new();
+        // Enter NODES_MAX - 1 children (total NODES_MAX with root): no sweep yet.
+        let mut next_nodeid = 2u64;
+        for _ in 0..NODES_MAX - 1 {
+            let name = next_nodeid.to_le_bytes();
+            let id = f.enter(root, &name, &entry(next_nodeid)).unwrap();
+            keep.insert(id);
+            next_nodeid += 1;
+        }
+        assert_eq!(f.nodes.len(), NODES_MAX);
+        assert!(!SWEEP.load(Ordering::Relaxed));
+
+        // Crossing NODES_MAX requests a sweep once.
+        let id = f
+            .enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+            .unwrap();
+        keep.insert(id);
+        next_nodeid += 1;
+        assert_eq!(f.nodes.len(), NODES_MAX + 1);
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+
+        // Nothing can be evicted because all nodes are live: sweep_at backs off with headroom.
+        assert_eq!(f.evict(&keep, false), 0);
+        let first_backoff = f.sweep_at;
+        assert_eq!(first_backoff, Fuses::next_sweep_at(NODES_MAX + 1));
+        assert!(first_backoff >= NODES_MAX + 1 + NODES_HEADROOM);
+
+        // Entering additional live nodes up to sweep_at must NOT trigger redundant sweeps.
+        while f.nodes.len() < first_backoff {
+            let id = f
+                .enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+                .unwrap();
+            keep.insert(id);
+            next_nodeid += 1;
+            assert!(!SWEEP.load(Ordering::Relaxed));
+        }
+
+        // Crossing the backed-off threshold requests a sweep once, then backs off again.
+        let id = f
+            .enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+            .unwrap();
+        keep.insert(id);
+        next_nodeid += 1;
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&keep, false), 0);
+        let second_backoff = f.sweep_at;
+        assert!(second_backoff > first_backoff);
+
+        // Once live nodes become unused, entering past the backed-off threshold triggers eviction
+        // down to NODES_TARGET and resets sweep_at back to NODES_MAX.
+        keep.clear();
+        while f.nodes.len() < second_backoff {
+            f.enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+                .unwrap();
+            next_nodeid += 1;
+            assert!(!SWEEP.load(Ordering::Relaxed));
+        }
+        f.enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+            .unwrap();
+        next_nodeid += 1;
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        let before = f.nodes.len();
+        let evicted = f.evict(&keep, false);
+        assert_eq!(evicted, before - NODES_TARGET);
+        assert_eq!(f.nodes.len(), NODES_TARGET);
+        assert_eq!(f.sweep_at, NODES_MAX);
+        assert_eq!(c.borrow().forgets.len(), evicted);
+        c.borrow_mut().forgets.clear();
+
+        // drop_caches also resets a backed-off threshold when pinned nodes are released.
+        for _ in 0..NODES_MAX {
+            let id = f
+                .enter(root, &next_nodeid.to_le_bytes(), &entry(next_nodeid))
+                .unwrap();
+            keep.insert(id);
+            next_nodeid += 1;
+        }
+        SWEEP.store(false, Ordering::Relaxed);
+        f.evict(&keep, false);
+        assert!(f.sweep_at > NODES_MAX);
+        drop_caches(2);
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert!(DROP.swap(false, Ordering::Relaxed));
+        let dropped = f.evict(&HashSet::new(), true);
+        assert_eq!(dropped, NODES_MAX);
+        assert_eq!(f.nodes.len(), 1);
+        assert_eq!(f.sweep_at, NODES_MAX);
+    }
+
+    #[test]
+    fn unlinked_unused_nodes_are_forgotten_promptly() {
+        let _guard = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        SWEEP.store(false, Ordering::Relaxed);
+        new_syscall();
+        let mut f = Fuses::default();
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        c.borrow_mut().minor = 37;
+        let root = f.add(c.clone());
+        let mut dev = DevFile::new(&Cred::root(), 1);
+        dev.attach(&c);
+        let entry = |nodeid, m, nlink| Entry {
+            nodeid,
+            attr: Attr {
+                ino: nodeid,
+                mode: m,
+                nlink,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+
+        // Regular file with nlink == 1: unlinking forgets it at the next sweep well below NODES_MAX.
+        let a = f
+            .enter(root, b"a", &entry(2, mode::S_IFREG | 0o644, 1))
+            .unwrap();
+        f.forget_child(root, b"a");
+        f.stale(a);
+        assert!(f.unlinked(a, false));
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(a).is_none());
+        assert!(c.borrow().doomed.is_empty());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(2, 1)]
+        );
+        // Queued forgets make /dev/fuse readable for poll/epoll-based daemons.
+        assert_ne!(dev.readiness() & 1, 0);
+        let _ = c.borrow_mut().read_forget(8192);
+        assert_eq!(dev.readiness() & 1, 0);
+
+        // Hard-linked file (nlink == 2): unlinking the first link decrements nlink and keeps it,
+        // and unlinking the second link dooms and forgets it with both lookups returned.
+        let b = f
+            .enter(root, b"b1", &entry(3, mode::S_IFREG | 0o644, 2))
+            .unwrap();
+        assert_eq!(
+            f.enter(root, b"b2", &entry(3, mode::S_IFREG | 0o644, 2)),
+            Ok(b)
+        );
+        f.forget_child(root, b"b1");
+        f.stale(b);
+        assert!(!f.unlinked(b, false));
+        assert!(!SWEEP.load(Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        assert!(f.get(b).is_some());
+
+        f.forget_child(root, b"b2");
+        f.stale(b);
+        assert!(f.unlinked(b, false));
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(b).is_none());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(3, 2)]
+        );
+        c.borrow_mut().forgets.clear();
+
+        // rmdir forgets the directory even when nlink >= 2, along with any stale unused child.
+        let d = f
+            .enter(root, b"d", &entry(4, mode::S_IFDIR | 0o755, 2))
+            .unwrap();
+        let stale_child = f
+            .enter(d, b"ghost", &entry(5, mode::S_IFREG | 0o644, 1))
+            .unwrap();
+        f.forget_child(root, b"d");
+        f.stale(d);
+        assert!(f.unlinked(d, true));
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 2);
+        assert!(f.get(d).is_none() && f.get(stale_child).is_none());
+        let mut forgets: Vec<_> = c.borrow().forgets.iter().copied().collect();
+        forgets.sort_unstable();
+        assert_eq!(forgets, [(4, 1), (5, 1)]);
+    }
+
+    #[test]
+    fn unlinked_open_and_pinned_nodes_stay_alive_until_released() {
+        let _guard = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        SWEEP.store(false, Ordering::Relaxed);
+        new_syscall();
+        let mut f = Fuses::default();
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        c.borrow_mut().minor = 37;
+        let root = f.add(c.clone());
+        let entry = |nodeid, m| Entry {
+            nodeid,
+            attr: Attr {
+                ino: nodeid,
+                mode: m,
+                nlink: 1,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+
+        // Open file (normal FUSE_RELEASE): stays alive while open and while RELEASE is in flight,
+        // does not trigger sweeps on I/O while open, and is forgotten once RELEASE is answered.
+        let f1 = f.enter(root, b"f1", &entry(10, mode::S_IFREG)).unwrap();
+        let h1 = Handle {
+            conn: c.clone(),
+            id: f1,
+            nodeid: 10,
+            fh: 1,
+            open_flags: 0,
+            flags: 0,
+            dir: false,
+            no_release: false,
+        }
+        .counted();
+        f.forget_child(root, b"f1");
+        assert!(f.unlinked(f1, false));
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::from([f1]), false), 0);
+        assert!(f.get(f1).is_some() && c.borrow().forgets.is_empty());
+        assert!(c.borrow().doomed.contains(&10));
+
+        // Finishing an I/O request while still open does not trigger a redundant sweep.
+        let read_u = c
+            .borrow_mut()
+            .queue(op::READ, 10, None, &[], (false, false));
+        {
+            let mut c = c.borrow_mut();
+            let req = c.requests.remove(&read_u).unwrap();
+            c.note_request_done(&req.message);
+            c.pending.retain(|&u| u != read_u);
+        }
+        assert!(!SWEEP.load(Ordering::Relaxed));
+
+        // Closing queues FUSE_RELEASE; node stays alive until the daemon answers RELEASE.
+        drop(h1);
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        assert!(f.get(f1).is_some() && c.borrow().forgets.is_empty());
+        {
+            let mut c = c.borrow_mut();
+            let rel_u = c.pending.pop_front().unwrap();
+            let req = c.requests.remove(&rel_u).unwrap();
+            assert_eq!(req.message[4..8], op::RELEASE.to_le_bytes());
+            c.note_request_done(&req.message);
+        }
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(f1).is_none());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(10, 1)]
+        );
+        c.borrow_mut().forgets.clear();
+
+        // Open file with no_release (FUSE_NO_OPEN_SUPPORT): closing schedules a sweep immediately.
+        let f2 = f.enter(root, b"f2", &entry(11, mode::S_IFREG)).unwrap();
+        let h2 = Handle {
+            conn: c.clone(),
+            id: f2,
+            nodeid: 11,
+            fh: 0,
+            open_flags: fopen::KEEP_CACHE,
+            flags: 0,
+            dir: false,
+            no_release: true,
+        }
+        .counted();
+        f.forget_child(root, b"f2");
+        assert!(f.unlinked(f2, false));
+        SWEEP.store(false, Ordering::Relaxed);
+        assert_eq!(f.evict(&HashSet::from([f2]), false), 0);
+        assert!(f.get(f2).is_some());
+        drop(h2);
+        assert!(SWEEP.swap(false, Ordering::Relaxed));
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(f2).is_none());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(11, 1)]
+        );
+        c.borrow_mut().forgets.clear();
+
+        // O_PATH pin keeps an unlinked node alive until dropped.
+        let f3 = f.enter(root, b"f3", &entry(12, mode::S_IFREG)).unwrap();
+        let pin = f.get_mut(f3).unwrap().pin_path();
+        f.forget_child(root, b"f3");
+        assert!(f.unlinked(f3, false));
+        SWEEP.store(false, Ordering::Relaxed);
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        assert!(f.get(f3).is_some());
+        drop(pin);
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(f3).is_none());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(12, 1)]
+        );
+        c.borrow_mut().forgets.clear();
+
+        // cwd / mount / watch in `keep` keeps an unlinked node alive until released.
+        let f4 = f.enter(root, b"f4", &entry(13, mode::S_IFDIR)).unwrap();
+        f.forget_child(root, b"f4");
+        assert!(f.unlinked(f4, true));
+        SWEEP.store(false, Ordering::Relaxed);
+        assert_eq!(f.evict(&HashSet::from([f4]), false), 0);
+        assert!(f.get(f4).is_some());
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(f4).is_none());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(13, 1)]
+        );
+        c.borrow_mut().forgets.clear();
+
+        // Daemon reusing a doomed node id for a different file type does not doom the new node.
+        let f5 = f.enter(root, b"f5", &entry(14, mode::S_IFREG)).unwrap();
+        let _h5 = Handle {
+            conn: c.clone(),
+            id: f5,
+            nodeid: 14,
+            fh: 2,
+            open_flags: 0,
+            flags: 0,
+            dir: false,
+            no_release: true,
+        }
+        .counted();
+        assert!(f.unlinked(f5, false));
+        assert!(c.borrow().doomed.contains(&14));
+        let f6 = f.enter(root, b"f6", &entry(14, mode::S_IFDIR)).unwrap();
+        assert_ne!(f6, f5);
+        assert!(!c.borrow().doomed.contains(&14));
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        assert!(f.get(f6).is_some());
     }
 }

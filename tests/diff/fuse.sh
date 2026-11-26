@@ -256,6 +256,112 @@ if pid == 0:
 _, status = os.waitpid(pid, 0)
 print("past the end:", signal.Signals(os.WTERMSIG(status)).name)
 '
+# Independent mappings and descriptor I/O share the inode, including across processes.
+python3 - <<'PYTEST' || exit 1
+import mmap, os, signal, sqlite3, subprocess, sys
+
+p = mmap.PAGESIZE
+path = "m/mapped"
+fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+os.ftruncate(fd, 2 * p)
+ro = os.open(path, os.O_RDONLY)
+reader = mmap.mmap(ro, p, access=mmap.ACCESS_READ, offset=p)
+assert reader[0] == 0
+writer = mmap.mmap(fd, 2 * p)
+writer[p] = 41
+assert reader[0] == 41 and os.pread(ro, 1, p) == b")"
+os.pwrite(fd, b"B", p + 1)
+assert reader[:2] == writer[p:p+2] == b")B"
+writer.flush()
+with open("u/mapped", "rb") as upper:
+    upper.seek(p)
+    assert upper.read(2) == b")B"
+# A private store stays private, including across later descriptor writes to the same page.
+private = mmap.mmap(fd, p, access=mmap.ACCESS_COPY, offset=p)
+private[0] = 90
+os.pwrite(fd, b"x", p + 1)
+assert private[:2] == b"ZB" and reader[:2] == b")x"
+private.close()
+os.pwrite(fd, b"B", p + 1)
+# Removing a populated page must invalidate the child's translations as well as the parent's.
+ready, notify = os.pipe()
+resume, go = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(ready)
+    os.close(go)
+    assert writer[p] == 41
+    os.write(notify, b"r")
+    os.read(resume, 1)
+    writer[p]
+    os._exit(1)
+os.close(notify)
+os.close(resume)
+assert os.read(ready, 1) == b"r"
+os.ftruncate(fd, p)
+os.write(go, b"g")
+assert os.waitpid(pid, 0)[1] & 127 == signal.SIGBUS
+for pipe in (ready, go):
+    os.close(pipe)
+os.ftruncate(fd, 2 * p)
+assert reader[:3] == bytes(3)
+writer[p:p+3] = b"old"
+writer.madvise(mmap.MADV_REMOVE, p, p)
+assert reader[:3] == bytes(3) and os.pread(fd, 3, p) == bytes(3)
+writer[p:p+2] = b")B"
+os.fsync(fd)
+with open("u/mapped", "rb") as upper:
+    upper.seek(p)
+    assert upper.read(2) == b")B"
+os.close(fd)
+writer[p+2] = 67
+writer.close()
+reader.close()
+os.close(ro)
+with open(path, "rb") as f:
+    f.seek(p)
+    assert f.read(3) == b")BC"
+# Exit and exec must persist the final store even after the original descriptor is closed.
+for finish in ('os._exit(0)', 'os.execl("/bin/true", "true")'):
+    pid = os.fork()
+    if pid == 0:
+        child_fd = os.open(path, os.O_RDWR)
+        last = mmap.mmap(child_fd, p, trackfd=False)
+        os.close(child_fd)
+        last[:4] = b"exit"
+        exec(finish)
+    assert os.waitpid(pid, 0)[1] == 0
+    with open("u/mapped", "r+b") as upper:
+        assert upper.read(4) == b"exit"
+        upper.seek(0)
+        upper.write(bytes(4))
+os.unlink(path)
+print("shared mmap and descriptor I/O: ok", flush=True)
+
+db = "m/mapped.db"
+def connect():
+    return sqlite3.connect(db, isolation_level=None)
+parent = connect()
+assert parent.execute("pragma journal_mode=wal").fetchone() == ("wal",)
+parent.execute("create table t (n integer)")
+parent.execute("insert into t values(1)")
+parent.execute("begin")
+def rows(conn):
+    return conn.execute("select n from t order by n").fetchall()
+assert rows(parent) == [(1,)]
+# Exec gives the writer a fresh SQLite process and a separate mapping of the WAL index.
+subprocess.run([sys.executable, "-c",
+    "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+    "c.execute('insert into t values(2)'); c.commit(); c.close()", db], check=True)
+assert rows(parent) == [(1,)]
+parent.execute("commit")
+assert rows(parent) == [(1,), (2,)]
+assert parent.execute("pragma wal_checkpoint(truncate)").fetchone() == (0, 0, 0)
+assert parent.execute("pragma integrity_check").fetchone() == ("ok",)
+parent.close()
+os.unlink(db)
+print("SQLite WAL snapshot, checkpoint and integrity: ok")
+PYTEST
 cp /usr/lib/libz.so.1 m/libz.so.1
 python3 -c '
 import ctypes, zlib
@@ -311,9 +417,14 @@ if libc.mount(b"fz", b"/tmp/fuse/z", b"fuse.fz", 0, opts) != 0:
 names = {1: {b"d": 2, b"f1": 3, b"f2": 4, b"f3": 5}, 2: {b"g": 6}}
 label = {2: "d", 3: "f1", 4: "f2", 5: "f3", 6: "g"}
 held = {n: 0 for n in label}
+backing = os.open("fz-data", os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600)
+os.ftruncate(backing, 8192)
 def attr(n):
     mode = 0o40755 if n in names else 0o100644
-    return struct.pack("<6Q4x4x4xIIIIIII", n, 0, 0, 0, 0, 0, mode, 1, 0, 0, 0, 4096, 0)
+    size = os.fstat(backing).st_size if n == 3 else 1 if n == 5 else 0
+    if n == 5:
+        mode = 0o100755
+    return struct.pack("<6Q4x4x4xIIIIIII", n, size, 0, 0, 0, 0, mode, 1, 0, 0, 0, 4096, 0)
 def state():
     with open("/tmp/fuse/zs.new", "w") as f:
         f.write("".join("%s %d\n" % (label[n], held[n]) for n in sorted(label)))
@@ -340,7 +451,24 @@ while True:
     elif op == 3:
         reply(unique, body=struct.pack("<QII", 3600, 0, 0) + attr(node))
     elif op in (14, 27):
-        reply(unique, body=struct.pack("<QII", 0, 0, 0))
+        # Read-only opens of f1 keep its cached pages. A read/write open drops them.
+        flags = struct.unpack_from("<I", body)[0]
+        keep = node == 3 and flags & os.O_ACCMODE == os.O_RDONLY
+        reply(unique, body=struct.pack("<QII", 0, 2 if keep else 0, 0))
+    elif op == 15 and node == 3:
+        _, offset, length = struct.unpack_from("<QQI", body)
+        reply(unique, body=os.pread(backing, length, offset))
+    elif op == 16 and node == 3:
+        _, offset, length = struct.unpack_from("<QQI", body)
+        n = os.pwrite(backing, body[40:40 + length], offset)
+        reply(unique, body=struct.pack("<II", n, 0))
+    elif op == 16 and node == 4:
+        # The control inode supplies offsets for a notification about the separate data inode.
+        offset, length = struct.unpack_from("<qq", body, 40)
+        reply(0, -2, struct.pack("<Qqq", 3, offset, length))
+        reply(unique, body=struct.pack("<II", 16, 0))
+    elif op == 15 and node == 5:
+        reply(unique, 5)  # EIO reading the executable
     elif op in (18, 29, 25):
         reply(unique)
     elif op == 2:
@@ -354,6 +482,7 @@ while True:
         state()
     elif op != 36:
         reply(unique, 38)
+open("/tmp/fuse/fz-exited", "w").close()
 EOF
 mkdir z
 python3 fz.py &
@@ -361,6 +490,84 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     grep -q ' /tmp/fuse/z ' /proc/self/mountinfo && break
     sleep 0.5
 done
+# Both processes have already installed translations when the daemon invalidates a single page.
+python3 - <<'PYINVAL' || exit 1
+import mmap, os, struct
+data = os.open("z/f1", os.O_RDONLY)
+view = mmap.mmap(data, 8192, access=mmap.ACCESS_READ)
+control = os.open("z/f2", os.O_WRONLY)
+backing = os.open("fz-data", os.O_RDWR)
+ready, signal_ready = os.pipe()
+go, signal_go = os.pipe()
+assert (view[0], view[4096]) == (0, 0)
+pid = os.fork()
+if pid == 0:
+    try:
+        assert (view[0], view[4096]) == (0, 0)
+        os.write(signal_ready, b"r")
+        os.close(signal_go)
+        assert os.read(go, 1) == b"g"
+        os._exit(0 if (view[0], view[4096]) == (0, 66) else 1)
+    except BaseException:
+        os._exit(2)
+os.close(signal_ready)
+os.close(go)
+assert os.read(ready, 1) == b"r"
+os.pwrite(backing, b"A", 0)
+os.pwrite(backing, b"B", 4096)
+def notify(offset, length):
+    assert os.pwrite(control, struct.pack("<qq", offset, length), 0) == 16
+notify(-1, 0)
+assert (view[0], view[4096]) == (0, 0)
+notify(4097, 1)
+os.write(signal_go, b"g")
+assert os.waitpid(pid, 0)[1] == 0
+assert (view[0], view[4096]) == (0, 66)
+notify(0, 0)
+assert (view[0], view[4096]) == (65, 66)
+view.close()
+print("FUSE inode invalidation refreshed both mappings in range")
+
+writer = os.open("z/f1", os.O_RDWR)
+with mmap.mmap(writer, 8192, access=mmap.ACCESS_WRITE) as shared:
+    assert shared[0:1] == b"A"
+    os.pwrite(backing, b"C", 0)
+    kept = os.open("z/f1", os.O_RDONLY)
+    assert shared[0:1] == b"A"
+    shared[4096:4097] = b"D"
+    reopened = os.open("z/f1", os.O_RDWR)
+    with mmap.mmap(reopened, 8192, access=mmap.ACCESS_READ) as second:
+        assert shared[0:1] == second[0:1] == b"C"
+        assert shared[4096:4097] == second[4096:4097] == b"D"
+    shared.flush()
+    assert os.pread(backing, 1, 4096) == b"D"
+    os.close(reopened)
+    os.close(kept)
+os.close(writer)
+print("FUSE reopen honored KEEP_CACHE and preserved dirty data")
+PYINVAL
+# A retry opens the shebang interpreter on FUSE, then the daemon fails its first read.
+# Both files have been opened, and only the outer script supplied any bytes.
+printf '#!/tmp/fuse/z/f3\n' > launch
+chmod 755 launch
+python3 - <<'PYEXEC'
+import ctypes, errno, os, struct
+libc = ctypes.CDLL(None, use_errno=True)
+fd = libc.inotify_init1(os.O_NONBLOCK)
+names = {}
+for target in (b"launch", b"z/f3"):
+    wd = libc.inotify_add_watch(fd, target, 0x31)
+    assert wd >= 0
+    names[wd] = target.decode()
+try:
+    os.execv("./launch", ["launch"])
+except OSError as exc:
+    print("FUSE exec error:", errno.errorcode[exc.errno])
+events = os.read(fd, 4096)
+for wd, mask, _, _ in struct.iter_unpack("iIII", events):
+    print("FUSE exec event:", names[wd], hex(mask))
+os.close(fd)
+PYEXEC
 stat -c %n z/f1 z/f2 z/f3 z/d/g
 exec 3< z/f2
 (cd z/d && sleep 3) &
@@ -384,9 +591,77 @@ exec 3<&-
 wait $sleeper
 echo 2 > /proc/sys/vm/drop_caches
 settle "$(printf 'd 0\nf1 0\nf2 0\nf3 0\ng 0')"
-umount z && echo unmounted
-sleep 0.5
-rm -f fz.py zs
+# Only the socket message holds the path when the node cache is reclaimed.
+python3 - <<'PYRIGHTS'
+import ctypes, os, socket
+libc = ctypes.CDLL(None, use_errno=True)
+sender, receiver = socket.socketpair()
+for fd in (os.open("z/f1", os.O_PATH), libc.syscall(428, -100, b"z/f2", 0)):  # open_tree
+    ino = os.fstat(fd).st_ino
+    socket.send_fds(sender, [b"x"], [fd])
+    os.close(fd)
+    with open("/proc/sys/vm/drop_caches", "w") as drop:
+        drop.write("2")
+    _, (fd,), _, _ = socket.recv_fds(receiver, 1, 1)
+    print("received O_PATH keeps inode", os.fstat(fd).st_ino == ino)
+    os.close(fd)
+sender.close()
+receiver.close()
+PYRIGHTS
+echo 2 > /proc/sys/vm/drop_caches
+settle "$(printf 'd 0\nf1 0\nf2 0\nf3 0\ng 0')"
+# Only sendmsg, then its queued message, holds this mount. After a lazy detach, its
+# daemon serves the received fd until the last unread copy is discarded.
+python3 - <<'PYMOUNT' || exit 1
+import ctypes, errno, os, socket, threading, time
+libc = ctypes.CDLL(None, use_errno=True)
+sender, receiver = socket.socketpair()
+receiver.settimeout(5)
+filled = 0
+while True:
+    try:
+        filled += sender.send(b"x" * 16384, socket.MSG_DONTWAIT)
+    except BlockingIOError:
+        break
+fd = os.open("z/f1", os.O_PATH)
+ino = os.fstat(fd).st_ino
+worker = threading.Thread(target=socket.send_fds, args=(sender, [b"r"], [fd]), daemon=True)
+worker.start()
+task = "/proc/self/task/%d/" % worker.native_id
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    with open(task + "stat") as st, open(task + "syscall") as call:
+        if st.read().rsplit(")", 1)[1].split()[0] == "S" and call.read().split()[0] == "211":
+            break
+    time.sleep(0.01)
+else:
+    raise RuntimeError("sender did not block in sendmsg")
+os.close(fd)
+def expect_busy(stage):
+    r = libc.umount2(b"z", 0)
+    assert r == -1 and ctypes.get_errno() == errno.EBUSY, (stage, r, ctypes.get_errno())
+    print("mount busy", stage)
+expect_busy("during send")
+while filled:
+    filled -= len(receiver.recv(min(filled, 65536)))
+worker.join(5)
+assert not worker.is_alive()
+expect_busy("while queued")
+assert libc.umount2(b"z", 2) == 0  # MNT_DETACH
+_, (fd,), _, _ = socket.recv_fds(receiver, 1, 1)
+assert os.fstat(fd).st_ino == ino
+socket.send_fds(sender, [b"d"], [fd])
+os.close(fd)
+receiver.close()
+sender.close()
+deadline = time.monotonic() + 5
+while not os.path.exists("fz-exited"):
+    if time.monotonic() >= deadline:
+        raise RuntimeError("FUSE daemon still serving after last queued fd was discarded")
+    time.sleep(0.01)
+print("detached mount released")
+PYMOUNT
+rm -f fz.py fz-data zs fz-exited
 echo "-- mount errors"
 python3 -c '
 import ctypes, errno, os

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint IPC and mqueue sysctl references to kernel/sysctl)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: reap dead IPC namespaces via Drop-flagged collect_ipc in post-syscall sweeps, task exit, and BKL release)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@ Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, a
 shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `detach_shm`,
 `shm_attachments`, `kernel/mm`); the mqueue filesystem's node views and `/proc/sysvipc` files
 (`kernel/procfs`), and IPC/mqueue sysctl plumbing (`kernel/sysctl`); mqueue mounts and the generic file syscalls that dispatch to queues
-(`kernel/vfs`, `kernel/files`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
+(`kernel/vfs`, `kernel/files`, `kernel/fileio`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
 (`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/netlink`); credentials
 (`kernel/cred`).
 
@@ -39,8 +39,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 ### SysV objects
 
 - `Ipc` — one IPC namespace's objects: the `msg`, `sem` and `shm` tables; `undo`, the `SEM_UNDO`
-  adjustments keyed by `(tgid, semid)`; `tunables`; and the POSIX side: `mqueues` (name to queue),
-  `mq_limits`, `mq_dir`. `Kernel::ipcs` keeps one per namespace id, next to a weak `IpcNs`.
+  adjustments keyed by `(undo_id, semid)` (where `SemUndo { id }` is shared across tasks via
+  `Rc<SemUndo>` on `TaskState::sem_undo`); `tunables`; and the POSIX side: `mqueues` (name to
+  queue), `mq_limits`, `mq_dir`. `Kernel::ipcs` keeps one per namespace id, next to a weak `IpcNs`.
 - `Table<T>` — slots of `(Perm, T)` with a sequence number per slot; an id is
   `seq * 32768 + index` (IPCMNI 32768).
 - `Perm` — `ipc_perm`: key, uid/gid, cuid/cgid, mode (permission bits plus `SHM_DEST` and
@@ -61,8 +62,10 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   times, `maxmsg`, `msgsize`, messages as `(priority, bytes)`, at most one `Notify` registration,
   the count of blocked receivers, and `sent`/`received` counters for edge-triggered polling. Its
   fd kind is `FileKind::MessageQueue`.
-- `Notify` — `Signal { tgid, sig, value }`, `None { tgid }` (`SIGEV_NONE`) or
-  `Socket { tgid, netlink socket, cookie }` (`SIGEV_THREAD` as musl and glibc implement it).
+- `Notify` — `Signal { owner, sig, value }`, `None { owner }` (`SIGEV_NONE`) or
+  `Socket { owner, netlink socket, cookie }` (`SIGEV_THREAD` as musl and glibc implement it),
+  where `owner` is a `Registrant { tgid, group: Weak<RefCell<ThreadGroup>> }` pinning the
+  registering process instance rather than a bare tgid.
 - `Limits` (`MqLimits`) — `queues_max`, `msg_max`, `msgsize_max`, `msg_default`,
   `msgsize_default` (defaults 256, 10, 8192, 10, 8192).
 - `MqDir` — a namespace's mqueue root: owner (the namespace's creator), mode 01777, times.
@@ -90,9 +93,13 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   one (default limits, empty tables, a root directory owned by the creator's fsuid and fsgid).
   clone with both `CLONE_NEWIPC` and `CLONE_SYSVSEM` is `EINVAL`.
 - Every syscall uses the calling task's namespace. An `Ipc` is dropped once its `IpcNs` has no
-  strong reference (tasks, mqueue mounts and nsfs files hold one), but `collect_ipc` runs only
-  after a thread exits, after setns and after unshare. Shm mappings keep their host memory, and
-  open queue fds their queue, after the namespace is gone.
+  strong reference (tasks, mqueue mounts, nsfs files and bind mounts, and pinned IPC sysctl nodes
+  hold one): `Drop for IpcNs` sets a per-kernel `ipc_dead` flag, and `Kernel::collect_ipc` (an O(1)
+  no-op unless a namespace dropped) runs in end-of-syscall sweeps (after AF_UNIX GC and mount
+  collection), `task::exit` (after mount collection), and `Bkl::drop` before deferred host unmaps
+  are released. Shm mappings keep their host memory, and open queue fds their queue, after the
+  namespace is gone; named queues without open fds drop with the namespace and release their
+  `RLIMIT_MSGQUEUE` (`Kernel::mq_usage`) charge immediately.
 
 ### Ids and permissions
 
@@ -112,7 +119,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 - The `*ctl` calls strip `IPC_64` from cmd. `IPC_STAT` and the `*_STAT`/`*_STAT_ANY` forms encode
   the 64-bit layouts with ids mapped into the caller's user namespace and pids into its pid
   namespace; the `*_STAT` forms take an index and return the full id, and `*_STAT_ANY` skips the
-  read check. `IPC_INFO` and `*_INFO` return the highest used index.
+  read check. `IPC_INFO` and `*_INFO` return the highest used index. `/proc/sysvipc/{msg,sem,shm}`
+  (`proc_listing`) likewise translates stored global pids into the reader's pid namespace (0 when
+  invisible) and preserves `SHM_DEST` and `SHM_LOCKED` in `shm` perms.
 
 ### SysV message queues
 
@@ -130,8 +139,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ### Semaphores
 
-- semget: nsems at most `semmsl` and nonzero for a new set (allocated fallibly, `ENOMEM`); an
-  existing set with fewer semaphores is `EINVAL`. `semmns` is only reported (IPC_INFO, SEM_INFO, the sysctl), never enforced.
+- semget: nsems at most `semmsl` and nonzero for a new set (allocated fallibly, `ENOMEM`), and
+  total semaphores in the namespace plus `nsems` must not exceed `semmns` (`ENOSPC`); an
+  existing set with fewer semaphores is `EINVAL`.
 - semtimedop: nsops (an unsigned int, as in Linux's prototype) 1 to `semopm` (`E2BIG` above),
   read into a fallibly allocated buffer; a semaphore number out of range is `EFBIG`;
   write permission if any op is nonzero, else read. `SemSet::apply` works on copies of the values
@@ -148,8 +158,9 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 ### Shared memory
 
 - shmget: destroyed segments are reaped first; a new segment needs a size from `SHMMIN` to
-  `shmmax` and no `SHM_HUGETLB`, and gets page-rounded host shared memory; an existing smaller
-  segment is `EINVAL`. `shmall` is only reported, never enforced.
+  `shmmax`, total namespace shm pages (guest 4 KiB pages) plus the new segment's pages within
+  `shmall` (`ENOSPC`), and no `SHM_HUGETLB`, and gets page-rounded host shared memory; an existing
+  smaller segment is `EINVAL`.
 - shmat: alignment (`SHM_RND` rounds down to 4096), `SHM_RDONLY`, `SHM_EXEC`, `SHM_REMAP`, then
   permission, then `Mm::attach_shm`, which tags the VMA with the `ShmKey` and its base. shmdt needs
   a shm VMA starting at the address, and updates the segment in the namespace recorded at attach
@@ -174,24 +185,33 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ### Process exit and namespace changes
 
-- At group exit, `ipc::exit` applies the process's undo adjustments in every namespace (values
-  clamped to 0 to `SEMVMX`) and removes them.
-- unshare with `CLONE_SYSVSEM` or `CLONE_NEWIPC`, and setns into an IPC namespace, first apply and
-  drop the whole process's undo records in the old namespace. clone otherwise ignores
-  `CLONE_SYSVSEM`: undo records are per process whatever the flag says.
+- Each task holds an `Rc<SemUndo>` (`TaskState::sem_undo`). `clone` shares it iff `CLONE_SYSVSEM`
+  is set, else allocates a fresh `SemUndo` (so forked children start with empty undo state).
+- `unshare` with `CLONE_SYSVSEM` or `CLONE_NEWIPC`, and `setns` into an IPC namespace, replace
+  the caller's `sem_undo` with a fresh one and apply `Ipc::exit` on the old list only when
+  `Rc::strong_count == 1` (last sharer leaving), leaving sibling threads' shared adjustments intact.
+- At thread exit, `ipc::exit` applies the task's `sem_undo` adjustments in every namespace (values
+  clamped to 0 to `SEMVMX`) and removes them only when that task was the last holder
+  (`Rc::strong_count == 1`, inside `finish_group` for the last thread or directly on non-last
+  thread exit).
 
 ### POSIX message queues
 
+- A new queue reserves its maximum payload plus arm64 message and priority-node overhead.
+  Both creation paths charge the real uid in its user namespace against the soft
+  `RLIMIT_MSGQUEUE`, and charge ancestor namespace owners against the limits saved at creation.
+  An over-limit creation returns `EMFILE`. The queue owns its charge until its name and final
+  reference (including an O_PATH descriptor) have gone.
 - mq_open: the name (one leading `/` stripped) must be 1 to 255 bytes without `/`, `.` or `..`;
-  access mode 3 is `EINVAL`. An existing queue is `EEXIST` with `O_CREAT|O_EXCL`, else permission
-  by access mode. A new one: attr's `mq_maxmsg` and `mq_msgsize` must be positive and within
+  access mode 3 is `EINVAL`; checks `MAY_EXEC` on `mq_dir` before lookup. An existing queue is
+  `EEXIST` with `O_CREAT|O_EXCL`, else permission by access mode. A new one: checks
+  `MAY_WRITE|MAY_EXEC` on `mq_dir`; attr's `mq_maxmsg` and `mq_msgsize` must be positive and within
   `msg_max` and `msgsize_max` (the hard limits 65536 and 16 MiB with `CAP_SYS_RESOURCE`), the
   defaults capped by `msg_max` and `msgsize_max` without attr (`mqueue_get_inode`); at most
   `queues_max` named queues (`ENOSPC`, unless `CAP_SYS_RESOURCE`); owner fsuid/fsgid and mode
   `perm & ~umask & 0o777`. The fd (always close-on-exec) is installed
   before the name is entered, so a failed install leaves nothing; opening an existing queue also
-  touches the root directory's times. Neither mq_open nor mq_unlink checks permission on the root
-  directory.
+  touches the root directory's times.
 - Through a mounted mqueue filesystem the same objects are created by open with `O_CREAT`, removed
   by unlink (both check write and search permission on the root directory), read as a status line
   (`QSIZE`, `NOTIFY`, `SIGNO`, `NOTIFY_PID`) and changed by chmod, chown and utimensat; write is
@@ -211,16 +231,20 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   wall clock.
 - Senders, receivers and poll/epoll wait on the queue object; both directions wake it.
 - mq_notify validates the sigevent before the fd; NULL cancels the caller's own registration;
-  `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. While the registrant's process is
-  alive, any new registration is `EBUSY`, the registrant's own included; a registration ends when
+  `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. Registrant identity and liveness
+  are checked through `Registrant`'s weak `ThreadGroup` reference, so while the registering process
+  instance is alive, any new registration is `EBUSY`, the registrant's own included, and an exited
+  registrant whose fd table survives via `CLONE_FILES` neither blocks new registrations nor delivers
+  notifications to a later process reusing its tgid. A registration ends when
   it fires, when its registrant cancels it, when the registrant's process closes any descriptor of
   the queue (close, dup3 over it, close_range, close-on-exec, seccomp addfd replacing it, or its fd
   table going with its last thread; Linux's `mqueue_flush_file`), or when another process registers
   after the registrant is gone or a zombie. A `SIGEV_THREAD` registration that ends without firing
   queues its cookie marked `NOTIFY_REMOVED`, which ends musl's helper thread. mq_getsetattr changes
   only the fd's `O_NONBLOCK`.
-- mq_unlink and filesystem unlink remove only the name (the queue's owner, the root directory's
-  owner, or `CAP_FOWNER`); open fds keep the queue.
+- mq_unlink and filesystem unlink check `MAY_EXEC`, `ENOENT`, and `MAY_WRITE|MAY_EXEC` on `mq_dir`,
+  enforce the sticky check (queue owner, root directory owner, or `CAP_FOWNER`) only when `mq_dir`
+  has `S_ISVTX` set, and remove only the name; open fds keep the queue.
 
 ## Dependencies (inbound / outbound)
 
@@ -230,7 +254,7 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 - `kernel/process`: group exit (`ipc::exit`).
 - `kernel/ns`: unshare and setns (`Ipc::exit`), namespace creation (`MqDir::new`, default
   `Tunables` and `Limits`).
-- `kernel/vfs` and `kernel/files`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
+- `kernel/vfs`, `kernel/files` and `kernel/fileio`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
   and utimensat on the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the
   `MessageQueue` accessors).
 - `kernel/procfs`: `/proc/sysvipc/*` (`proc_listing`), mqueue node views (`find`, `MqDir`,
@@ -258,8 +282,8 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
   because the calling task holds its `IpcNs`.
 - SysV waiters wake on any kernel change and redo the lookup and permission checks, so an IPC_SET
   during a semop wait can end it with `EACCES`, and waiters are served in no particular order.
-- msgrcv and mq_timedreceive dequeue before copying out, so a fault loses the message (as on
-  Linux).
+- After dequeue, `msgrcv` and `mq_timedreceive` retry each result copy locally across FUSE
+  page fills. A terminal copy fault loses the selected message. Later messages stay queued.
 - `shmmni` counts destroyed segments that are still attached.
 - An unlinked queue that is still open no longer counts toward `queues_max` and still reports
   nlink 1.
@@ -268,26 +292,11 @@ shared memory (`SharedMemory`, `kernel/hostmem`) and shm VMAs (`attach_shm`, `de
 
 ## Confirmed bugs / technical debt
 
-- **unshare and setns drop sibling threads' undo:** undo records are per process, so one thread's
-  `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
-  adjustments of every thread in the process (Linux applies a shared undo list only when its last
-  sharer leaves, and threads share one only with `CLONE_SYSVSEM`).
-- **`/proc/sysvipc` leaks global pids:** the listings print stored global pids without translating
-  them into the reader's pid namespace (the `*_STAT` syscalls do translate), and the shm listing
-  masks the mode with `0o1777`, hiding `SHM_LOCKED`.
-- **`semmns` and `shmall` are not enforced:** semget and shmget never fail with `ENOSPC` for the
-  total number of semaphores or shm pages; both values are only reported.
-- **mqueue registrations are keyed by tgid alone:** one whose process exited while its fd table
-  lives on in another process (`CLONE_FILES`) stays registered, and a reused tgid looks alive and
-  would get the signal (Linux holds the registrant's `struct pid`).
-- **mqueue limits and root permissions are partly missing:** `RLIMIT_MSGQUEUE` is not enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem
-  paths make (it matters once the 01777 root is chmod'ed), and unlink applies the sticky rule even
-  when the root has lost `S_ISVTX`.
+None recorded.
 
 ## Open questions
 
 - Is the `wake::ALL` broadcast for SysV waits meant to stay?
-- Should `collect_ipc` also run when the last nsfs file or mount holding an IPC namespace goes?
 
 ## To verify
 

@@ -123,13 +123,31 @@ void appine_unmap_code(uint32_t *code, size_t bytes, intptr_t rw_delta);
 /* soft-MMU page table (mmu.c): Tier 1's TLB refill routine also walks this structure */
 #define MMU_LEVELS 4
 #define MMU_LEVEL_BITS 9
+/* One L2 entry covers 2 MiB (512 * 4 KiB). Bit 3 marks a 2 MiB superpage leaf (host_2m_base |
+ * prot | PTE_SUPER); intermediate table pointers are >= 16-byte aligned so bits 3..0 are 0. */
+#define MMU_SUPER_SHIFT (APPINE_PAGE_SHIFT + MMU_LEVEL_BITS)
+#define MMU_SUPER_SIZE (UINT64_C(1) << MMU_SUPER_SHIFT)
+#define MMU_SUPER_MASK (MMU_SUPER_SIZE - 1)
+#define PTE_SUPER_BIT 3
+#define PTE_SUPER (UINT64_C(1) << PTE_SUPER_BIT)
 
 struct appine_mmu {
     uintptr_t *root;
+    /* Total allocated 4 KiB radix tables (root, intermediate, active and retired L3 tables). */
+    size_t tables;
+    /* Empty L3 tables replaced by L2 superpages; kept alive until appine_mmu_free so concurrent
+     * walkers that already loaded the pointer never read freed memory. */
+    uintptr_t **retired;
+    size_t nretired;
+    size_t cap_retired;
 };
 
 /* Return the leaf entry of gva's page, or 0 if it is not mapped */
 uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva);
+
+/* Return either the raw L2 superpage entry (*is_super = true, host_2m_base | prot | PTE_SUPER) or
+ * the L3 4 KiB leaf entry (*is_super = false, host_4k_page | prot), or 0 if unmapped */
+uintptr_t appine_mmu_lookup_super(const struct appine_mmu *mmu, uint64_t gva, bool *is_super);
 
 /* TLB miss: look up the page table and fill the TLB; returns NULL on failure */
 void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access);
@@ -171,8 +189,22 @@ static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t acc
     return appine_tlb_fill(cpu, va, access);
 }
 
+/* Model ERET on guest exception exits, before the kernel can retry the instruction. */
+static inline void clear_exclusive(struct appine_cpu *cpu)
+{
+    cpu->excl_size = 0;
+}
+
+static inline enum appine_exit undef(struct appine_cpu *cpu, uint32_t insn)
+{
+    cpu->exit_info = insn;
+    clear_exclusive(cpu);
+    return APPINE_EXIT_UNDEF;
+}
+
 static inline bool raise_fault(struct appine_cpu *cpu, uint64_t va, uint32_t access, uint32_t kind)
 {
+    clear_exclusive(cpu);
     cpu->fault_addr = va;
     cpu->fault_access = access;
     cpu->fault_kind = kind;
@@ -200,7 +232,7 @@ static inline bool watch_hit(const struct appine_cpu *cpu, uint64_t va, uint64_t
 /*
  * Read and write guest memory (n ≤ 16). A cross-page access first confirms that both pages are
  * accessible, then copies.
- * On failure, record the fault and return false, without any side effect.
+ * On failure, record the fault and return false before copying any bytes.
  */
 static inline bool mem_read(struct appine_cpu *cpu, uint64_t va, void *out, unsigned n)
 {

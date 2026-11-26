@@ -46,6 +46,33 @@ pub(crate) enum Socket {
     Unix(crate::unix::UnixSocket),
 }
 
+impl Socket {
+    /// Socket inode UID (`sock_i_uid`), reported in `/proc/net/*`.
+    pub(crate) fn uid(&self) -> u32 {
+        match self {
+            Socket::Inet(s) => s.uid,
+            Socket::Netlink(s) => s.uid,
+            Socket::Unix(s) => s.uid,
+        }
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        match self {
+            Socket::Inet(s) => s.gid,
+            Socket::Netlink(s) => s.gid,
+            Socket::Unix(s) => s.gid,
+        }
+    }
+
+    pub(crate) fn set_owner(&mut self, uid: u32, gid: u32) {
+        match self {
+            Socket::Inet(s) => (s.uid, s.gid) = (uid, gid),
+            Socket::Netlink(s) => (s.uid, s.gid) = (uid, gid),
+            Socket::Unix(s) => (s.uid, s.gid) = (uid, gid),
+        }
+    }
+}
+
 /// TCP, UDP and ping sockets implemented with host sockets.
 pub(crate) struct InetSocket {
     /// The host fd (nonblocking), closed together with this object.
@@ -116,9 +143,15 @@ pub(crate) struct InetSocket {
     /// the call fails with `ENOTCONN`, as Linux's `inet_shutdown` sets `sk_shutdown` then too): a
     /// blocking receive on a datagram socket with nothing queued returns 0.
     pub rd_shut: bool,
-    /// The number under which a listen in a new network namespace is registered in the namespace
-    /// ([`crate::nsproxy::Listener`]), removed on close.
+    /// The number under which a bound socket in a new network namespace is registered in the
+    /// namespace ([`crate::netns::Binding`]), removed on close.
     pub listener: Option<std::num::NonZeroU64>,
+    /// Effective UID of the socket owner at creation (`SO_REUSEPORT` matching).
+    pub euid: u32,
+    /// Creator's filesystem UID (`sock_i_uid`), reported in `/proc/net/*`.
+    pub uid: u32,
+    /// Socket inode group, initialized from the creator's filesystem GID.
+    pub gid: u32,
     /// UDP: bound on the host to 127.a.b.254 (for datagrams sent to its own virtual address), with
     /// the port registered in the namespace's [`crate::nsproxy::Loopback::self_udp`], removed on
     /// close.
@@ -139,17 +172,40 @@ pub(crate) struct InetSocket {
     /// Linux's rules say to report to the guest (an errno, 0 for none): the next send or receive,
     /// or `SO_ERROR`, takes it (Linux's `sk_err`).
     pub icmp_err: std::cell::Cell<i32>,
+    /// A host socket error consumed after a partial `MSG_WAITALL` receive (an errno, 0 for none):
+    /// preserved here so the next read, write or `SO_ERROR` reports it instead of EOF.
+    pub pending_err: std::cell::Cell<i32>,
     /// Bound to a mapped low port ([`crate::portmap`]): the lease, and (guest port, host port).
     /// Connections from accept have only the latter (the local end is the listening port).
     pub lease: Option<crate::portmap::Lease>,
     pub local_map: Option<(u16, u16)>,
     /// Connected to a mapped low port on the local machine: (guest port, host port).
     pub peer_map: Option<(u16, u16)>,
-    /// A classic BPF program attached with `SO_ATTACH_FILTER` that the host refused (a host with
-    /// Linux 5d39580f68e6 lets only `CAP_NET_ADMIN` attach one to a TCP socket, and the app never
-    /// has it), kept here as the guest gave it so that `SO_GET_FILTER`, `SO_DETACH_FILTER` and
-    /// accepted sockets see it as on Linux. It filters nothing.
+    /// A host-refused constant-verdict filter, retained for SO_GET_FILTER.
     pub filter: Option<Vec<u8>>,
+    /// Guest listen under a host-refused RET 0. The guest fd stays bound until detach.
+    pub deferred: Option<Box<DeferredListen>>,
+    /// Interface index bound via `SO_BINDTODEVICE` / `SO_BINDTOIFINDEX` (0 when unbound),
+    /// resolved against this socket's network namespace.
+    pub bound_dev_if: i32,
+}
+
+pub(crate) struct DeferredListen {
+    pub backlog: i32,
+    pub reuse_addr: i32,
+    /// Only the DNAT forwarder can accept from this separate queue.
+    pub forward: Option<ForwardListener>,
+}
+
+pub(crate) struct ForwardListener(pub std::os::fd::OwnedFd);
+
+impl Drop for ForwardListener {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // The forwarding thread can still be polling its dup. Stop the listener and discard
+        // its backlog synchronously when the rule goes away.
+        let _ = appine_hal::net::shutdown(self.0.as_raw_fd(), 2);
+    }
 }
 
 impl InetSocket {
@@ -184,6 +240,9 @@ impl InetSocket {
             listening: false,
             rd_shut: false,
             listener: None,
+            euid: 0,
+            uid: 0,
+            gid: 0,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -191,19 +250,120 @@ impl InetSocket {
             guest_recverr: false,
             udp_tap: None,
             icmp_err: std::cell::Cell::new(0),
+            pending_err: std::cell::Cell::new(0),
             lease: None,
             local_map: None,
             peer_map: None,
             filter: None,
+            deferred: None,
+            bound_dev_if: 0,
         }
     }
 }
 
 impl InetSocket {
+    /// Guest-visible state for the TCP tables in /proc/net.
+    fn tcp_state(&self) -> u8 {
+        if self.deferred.is_some() {
+            return TCP_LISTEN;
+        }
+        appine_hal::net::getsockopt(self.fd, IPPROTO_TCP, TCP_INFO, 8)
+            .ok()
+            .and_then(|info| info.first().copied())
+            .unwrap_or(TCP_CLOSE)
+    }
+
     /// An ICMPv6 socket (a ping socket, or the one emulating a raw socket): IPv4-mapped addresses
     /// cannot be used in a new network namespace ([`crate::netns::to_host`]).
     pub fn icmp6(&self) -> bool {
         self.family == AF_INET6 && self.proto == IPPROTO_ICMPV6
+    }
+}
+
+/// Translates a host peer address `host_addr` (with host port intact) into the guest peer address
+/// seen by socket `s`, combining host-port unmapping and namespace address translation in a single
+/// `owner_of_host` + `lookup_host` lookup without cloning `host_addr`.
+pub(crate) fn translate_peer(
+    portmap: &crate::cell::RefCell<crate::portmap::PortMap>,
+    w: &crate::netns::World,
+    s: &InetSocket,
+    host_addr: &[u8],
+    self_peer: bool,
+) -> Vec<u8> {
+    let me = s.net.as_deref().unwrap_or_else(|| w.init());
+    let proto = map_proto(s);
+    crate::netns::from_host_peer(
+        w,
+        me,
+        proto,
+        host_addr,
+        self_peer,
+        s.icmp6(),
+        |owner, ns_port, host_port| match s.peer_map {
+            Some((g, h)) if h == host_port => Some(g),
+            _ if !mappable(s) => None,
+            _ => match owner {
+                Some(o) if o.host_net.is_some() => ns_port,
+                None if s.net.is_some() => None,
+                _ => portmap
+                    .borrow()
+                    .guest_port(proto, host_port)
+                    .filter(|_| is_local(host_addr)),
+            },
+        },
+    )
+}
+
+/// Mapped low ports apply to this socket ([`crate::portmap`]): TCP, UDP, not raw sockets.
+pub(crate) fn mappable(s: &InetSocket) -> bool {
+    !s.raw && matches!(map_proto(s), IPPROTO_TCP | IPPROTO_UDP)
+}
+
+/// The protocol in the port-mapping and binding tables: MPTCP's ports are the same as TCP's (Go
+/// 1.24 and later listen with MPTCP by default).
+pub(crate) fn map_proto(s: &InetSocket) -> i32 {
+    if s.proto == IPPROTO_MPTCP {
+        IPPROTO_TCP
+    } else {
+        s.proto
+    }
+}
+
+/// The host address is local: loopback, the wildcard address, or one on a host interface
+/// (connecting to its own wlan0 address).
+pub(crate) fn is_local(addr: &[u8]) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let Some(ip) = ip_of(addr) else {
+        return false;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    appine_hal::net::interfaces().iter().any(|i| {
+        i.addrs.iter().any(|(_, a, _)| {
+            let own = match a.len() {
+                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&a[..]).unwrap())),
+                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&a[..]).unwrap())),
+                _ => return false,
+            };
+            own == ip
+        })
+    })
+}
+
+/// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
+pub(crate) fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
+    match family {
+        AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(addr.get(4..8)?).ok()?,
+        ))),
+        AF_INET6 => {
+            let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(addr.get(8..24)?).ok()?);
+            Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
+        }
+        _ => None,
     }
 }
 
@@ -221,6 +381,13 @@ pub(crate) struct Track {
     /// address are not sent: 0 means silently dropped, anything else is an error number (a drop
     /// on OUTPUT is EPERM).
     pub blocked: Option<i32>,
+    /// Connected UDP into a new network namespace: the target namespace and the destination
+    /// sockaddr as seen there (after DNAT), so address-less sends recheck the target's listeners.
+    pub udp_target: Option<(std::rc::Weak<crate::nsproxy::NetNs>, Vec<u8>)>,
+    /// An accepted TCP connection forwarded in from outside (127.254.x.y): the real outside client
+    /// sockaddr captured at accept, kept until the guest socket closes so `getpeername` and
+    /// `/proc/net` do not revert to 127.254.x.y in `CLOSE_WAIT` after the forwarder closes.
+    pub outside_peer: Option<Vec<u8>>,
     /// A TCP connection from accept: when nat rewrote the destination of the initiating end, the
     /// original destination seen in this namespace (a guest sockaddr, reported by
     /// `SO_ORIGINAL_DST`, [`crate::origdst`]).
@@ -251,10 +418,8 @@ impl Drop for InetSocket {
         {
             lo.self_udp.swap_remove(i);
         }
-        if let (Some(id), Some(n)) = (self.listener, &self.net)
-            && let Ok(mut l) = n.listeners.try_borrow_mut()
-        {
-            l.retain(|x| x.id != id.get());
+        if let (Some(id), Some(n)) = (self.listener, &self.net) {
+            crate::netns::remove_binding(n, id);
         }
     }
 }
@@ -309,10 +474,16 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
+const NLM_F_ECHO: u16 = 8;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_DUMP: u16 = 0x300;
+const NLM_F_CREATE: u16 = 0x400;
+const NLM_F_APPEND: u16 = 0x800;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
@@ -348,12 +519,18 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-/// The largest datagram of a dump (larger dumps are split): Linux's `NLMSG_GOODSIZE` on 4 KiB
-/// pages, `SKB_WITH_OVERHEAD(PAGE_SIZE)`, which bounds a dump's first datagram and every later one
-/// for a reader whose buffer is a page. Go's `syscall.NetlinkRIB` (`net.Interfaces`,
-/// `net.InterfaceAddrs`) reads into one page and fails on a truncated datagram without checking
-/// `MSG_TRUNC`, so a dump datagram must fit in 4 KiB.
-const DUMP_CHUNK: usize = 3776;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
+const IFLA_EXT_MASK: u16 = 29;
+const IFLA_TARGET_NETNSID: u16 = 46;
+const IFA_TARGET_NETNSID: u16 = 10;
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
+const NLM_F_ACK_TLVS: u16 = 0x200;
+const NLMSGERR_ATTR_MSG: u16 = 1;
+const NETLINK_GET_STRICT_CHK: u32 = 12;
+/// Upper bound on a single dynamically packed dump datagram (Linux's 32 KiB `max_recvmsg_len`
+/// ceiling in `netlink_dump`).
+const DUMP_MAX: usize = 32768;
 /// `IF_OPER_*` (RFC 2863 interface states).
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
@@ -392,6 +569,152 @@ pub const NETLINK_NETFILTER: i32 = 12;
 /// a kernel without its diag modules ([`sock_diag_request`]).
 pub const NETLINK_SOCK_DIAG: i32 = 4;
 
+/// One queued entry on a netlink socket: either an atomic datagram (single reply, ack/error,
+/// notification, peer unicast or `mq_notify` cookie) with its multicast group (0 for unicast), or
+/// a resumable multipart dump packed on demand into each receive buffer.
+pub(crate) enum NetlinkItem {
+    Datagram(Vec<u8>, u32),
+    Dump(NetlinkDump),
+}
+
+impl NetlinkItem {
+    /// A unicast reply or ack datagram (multicast group 0).
+    pub(crate) fn reply(msg: Vec<u8>) -> Self {
+        NetlinkItem::Datagram(msg, 0)
+    }
+
+    /// A resumable dump of pre-encoded netlink messages.
+    pub(crate) fn dump(msgs: DumpMessages) -> Self {
+        NetlinkItem::Dump(NetlinkDump::Messages(msgs))
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            NetlinkItem::Datagram(..) => false,
+            NetlinkItem::Dump(d) => d.is_empty(),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        match self {
+            NetlinkItem::Datagram(msg, _) => msg.len(),
+            NetlinkItem::Dump(d) => d.remaining_bytes(),
+        }
+    }
+}
+
+/// Resumable multipart dump state queued on a [`NetlinkSocket`], packed on demand to match each
+/// `recv`/`recvmsg` buffer size (Linux's `netlink_dump`).
+pub(crate) enum NetlinkDump {
+    Messages(DumpMessages),
+    SetElems(crate::nft::SetElemDump),
+}
+
+impl NetlinkDump {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            NetlinkDump::Messages(m) => m.is_empty(),
+            NetlinkDump::SetElems(s) => s.is_empty(),
+        }
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        match self {
+            NetlinkDump::Messages(m) => m.remaining_bytes(),
+            NetlinkDump::SetElems(s) => s.remaining_bytes(),
+        }
+    }
+
+    pub(crate) fn next_datagram(&mut self, max: usize, peek: bool) -> Option<Vec<u8>> {
+        match self {
+            NetlinkDump::Messages(m) => m.next_datagram(max, peek),
+            NetlinkDump::SetElems(s) => s.next_datagram(max, peek),
+        }
+    }
+}
+
+/// A resumable dump of pre-encoded individual netlink messages (carrying `NLM_F_MULTI` where
+/// appropriate, terminating with `NLMSG_DONE`), packed on demand into each caller's buffer.
+pub(crate) struct DumpMessages {
+    /// `(message, end_section)`: when `end_section` is true, packing stops after this message so
+    /// the next section (e.g. next address family or trailing `NLMSG_DONE`) starts in a fresh
+    /// datagram, matching Linux 6.1's `rtnl_dump_all` / `netlink_dump`.
+    msgs: VecDeque<(Vec<u8>, bool)>,
+    /// Sum of `m.len()` across `msgs`, for O(1) `SO_RCVBUF` accounting.
+    bytes: usize,
+}
+
+impl DumpMessages {
+    pub(crate) fn new() -> Self {
+        Self {
+            msgs: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Appends a section of messages; if non-empty, ends the section after the last message so
+    /// the following section starts in a fresh datagram.
+    pub(crate) fn push_section(&mut self, iter: impl IntoIterator<Item = Vec<u8>>) {
+        let start = self.msgs.len();
+        for m in iter {
+            self.bytes = self.bytes.saturating_add(m.len());
+            self.msgs.push_back((m, false));
+        }
+        if self.msgs.len() > start {
+            self.msgs.back_mut().unwrap().1 = true;
+        }
+    }
+
+    /// Appends one message, ending the current section only when `end_section` is true.
+    fn push(&mut self, msg: Vec<u8>, end_section: bool) {
+        self.bytes = self.bytes.saturating_add(msg.len());
+        self.msgs.push_back((msg, end_section));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Packs consecutive messages from the current section up to `max.min(DUMP_MAX)` bytes.
+    /// Always returns at least one atomic message (so an oversized message triggers `MSG_TRUNC`
+    /// with its true length without losing subsequent messages; `peek` leaves the queue intact).
+    fn next_datagram(&mut self, max: usize, peek: bool) -> Option<Vec<u8>> {
+        if self.msgs.is_empty() {
+            return None;
+        }
+        let budget = max.min(DUMP_MAX);
+        let mut count = 0;
+        let mut total = 0;
+        for (m, end_section) in &self.msgs {
+            if count > 0 && total + m.len() > budget {
+                break;
+            }
+            total += m.len();
+            count += 1;
+            if *end_section {
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(total);
+        if peek {
+            for (m, _) in self.msgs.iter().take(count) {
+                out.extend_from_slice(m);
+            }
+        } else {
+            for _ in 0..count {
+                let (m, _) = self.msgs.pop_front().unwrap();
+                self.bytes = self.bytes.saturating_sub(m.len());
+                out.extend_from_slice(&m);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// A netlink socket emulated in process. `NETLINK_ROUTE` answers queries, `NETLINK_GENERIC` only
 /// for nlctrl, `NETLINK_NETFILTER` for nftables and `NETLINK_SOCK_DIAG` only with errors; a
 /// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
@@ -403,10 +726,15 @@ pub(crate) struct NetlinkSocket {
     /// `nl_pid`: assigned on bind, or by the first connect or send (Linux's autobind); 0 until
     /// then.
     pub pid: u32,
-    /// Answers and notifications waiting for the guest to read them, one datagram per item,
-    /// with the multicast group a notification went to (0 for a unicast answer: the source
-    /// address's `nl_groups` and `NETLINK_PKTINFO` report it).
-    pub queue: VecDeque<(Vec<u8>, u32)>,
+    /// Connected destination port (`dst_portid`) and multicast group number (`dst_group`, 1-based;
+    /// 0 for none), reported by `getpeername` and used by address-less sends.
+    pub dst_pid: u32,
+    pub dst_group: u32,
+    /// Answers, resumable dumps and notifications waiting for the guest to read them.
+    pub queue: VecDeque<NetlinkItem>,
+    /// Bytes currently charged in `queue` (payload plus per-datagram overhead), capped against
+    /// `SO_RCVBUF` (`opts.rcvbuf()`).
+    pub queued_bytes: usize,
     /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
     pub arrivals: u64,
     /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
@@ -437,15 +765,25 @@ pub(crate) struct NetlinkSocket {
     pub sndtimeo: Option<Duration>,
     /// The generic `SOL_SOCKET` options it only records.
     pub opts: SockOpts,
+    /// Creator's filesystem UID (`sock_i_uid`).
+    pub uid: u32,
+    /// Socket inode group, initialized from the creator's filesystem GID.
+    pub gid: u32,
 }
 
 impl NetlinkSocket {
+    /// Per-datagram overhead charged against `SO_RCVBUF` (like Linux's `sk_buff` truesize).
+    pub(crate) const SKB_OVERHEAD: usize = 256;
+
     pub fn new(protocol: i32, ty: i32) -> NetlinkSocket {
         NetlinkSocket {
             protocol,
             ty,
             pid: 0,
+            dst_pid: 0,
+            dst_group: 0,
             queue: VecDeque::new(),
+            queued_bytes: 0,
             arrivals: 0,
             rcvtimeo: None,
             net: None,
@@ -456,7 +794,77 @@ impl NetlinkSocket {
             passcred: false,
             sndtimeo: None,
             opts: SockOpts::default(),
+            uid: 0,
+            gid: 0,
             overrun: Default::default(),
+        }
+    }
+
+    /// Queues a datagram (reply, nftables reply, `mq_notify` cookie or multicast notification)
+    /// bounded by `SO_RCVBUF`: an empty queue always admits one entry; otherwise exceeding
+    /// `SO_RCVBUF` drops it and sets `overrun` (`ENOBUFS`) unless `NETLINK_NO_ENOBUFS` is set.
+    /// Returns whether the datagram was queued.
+    pub(crate) fn enqueue(&mut self, msg: Vec<u8>, group: u32) -> bool {
+        self.enqueue_item(NetlinkItem::Datagram(msg, group))
+    }
+
+    /// Queues one datagram or resumable dump bounded by `SO_RCVBUF`.
+    pub(crate) fn enqueue_item(&mut self, item: NetlinkItem) -> bool {
+        const NETLINK_NO_ENOBUFS: u32 = 5;
+        if item.is_empty() {
+            return true;
+        }
+        let charge = item.byte_len().saturating_add(Self::SKB_OVERHEAD);
+        let limit = self.opts.rcvbuf();
+        if !self.queue.is_empty() && self.queued_bytes.saturating_add(charge) > limit {
+            if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
+                self.overrun.set(true);
+            }
+            return false;
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(charge);
+        self.queue.push_back(item);
+        self.arrivals += 1;
+        true
+    }
+
+    /// Takes (or peeks) the next datagram from `queue` sized for a `max`-byte receive buffer,
+    /// packing resumable dump messages on demand and updating `queued_bytes`.
+    pub(crate) fn dequeue(&mut self, max: usize, peek: bool) -> Option<(Vec<u8>, u32)> {
+        if peek {
+            return match self.queue.front_mut()? {
+                NetlinkItem::Datagram(msg, group) => Some((msg.clone(), *group)),
+                NetlinkItem::Dump(dump) => dump.next_datagram(max, true).map(|d| (d, 0)),
+            };
+        }
+        match self.queue.front_mut()? {
+            NetlinkItem::Datagram(..) => {
+                let Some(NetlinkItem::Datagram(msg, group)) = self.queue.pop_front() else {
+                    unreachable!();
+                };
+                let charge = msg.len().saturating_add(Self::SKB_OVERHEAD);
+                self.queued_bytes = self.queued_bytes.saturating_sub(charge);
+                Some((msg, group))
+            }
+            NetlinkItem::Dump(dump) => {
+                let before = dump.remaining_bytes();
+                let d = dump.next_datagram(max, false)?;
+                let after = dump.remaining_bytes();
+                if dump.is_empty() {
+                    self.queue.pop_front();
+                    self.queued_bytes = self
+                        .queued_bytes
+                        .saturating_sub(before.saturating_add(Self::SKB_OVERHEAD));
+                } else {
+                    self.queued_bytes = self
+                        .queued_bytes
+                        .saturating_sub(before.saturating_sub(after));
+                    // Mirror Linux's netlink_dump -> sk_data_ready so EPOLLET readers wake for
+                    // the next dump chunk.
+                    self.arrivals += 1;
+                }
+                Some((d, 0))
+            }
         }
     }
 
@@ -466,22 +874,14 @@ impl NetlinkSocket {
     }
 
     /// Queues notification `msg` of multicast group `group` when the socket joined it; when the
-    /// queue is full it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive reports the
-    /// overrun. Returns whether it concerned the socket.
+    /// queue is full (`SO_RCVBUF`) it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive
+    /// reports the overrun. Returns whether it concerned the socket.
     pub fn notify(&mut self, group: u32, msg: &[u8]) -> bool {
-        const NETLINK_NO_ENOBUFS: u32 = 5;
         if self.protocol != NETLINK_ROUTE || self.groups.is_none_or(|g| g & (1 << (group - 1)) == 0)
         {
             return false;
         }
-        if self.queue.len() >= NOTE_QUEUE {
-            if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
-                self.overrun.set(true);
-            }
-            return true;
-        }
-        self.queue.push_back((msg.to_vec(), group));
-        self.arrivals += 1;
+        self.enqueue(msg.to_vec(), group);
         true
     }
 
@@ -496,7 +896,7 @@ impl NetlinkSocket {
     }
 
     /// Handles one datagram from the guest (which may hold several requests) and queues the
-    /// answers.
+    /// answers (bounded by `SO_RCVBUF`).
     pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
         // An nftables batch spans several messages, so the whole datagram is handled together
         if self.protocol == NETLINK_NETFILTER {
@@ -507,9 +907,8 @@ impl NetlinkSocket {
                 proc_pid: 0,
                 comm: b"",
             };
-            for d in host.netfilter(data, &peer) {
-                self.queue.push_back((d, 0));
-                self.arrivals += 1;
+            for item in host.netfilter(data, &peer) {
+                self.enqueue_item(item);
             }
             return;
         }
@@ -527,68 +926,105 @@ impl NetlinkSocket {
                 break;
             }
             let answers = match self.protocol {
-                NETLINK_GENERIC => generic_request(&h[..len], self.pid),
+                NETLINK_GENERIC => generic_request(&h[..len], self.pid, self.cap_ack, self.ext_ack),
                 NETLINK_SOCK_DIAG => sock_diag_request(&h[..len], self.pid, self.cap_ack),
                 _ => self.route_request(&h[..len], host),
             };
-            for d in answers {
-                self.queue.push_back((d, 0));
-                self.arrivals += 1;
+            for item in answers {
+                self.enqueue_item(item);
             }
             off += len.next_multiple_of(4);
         }
     }
 
-    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning the datagrams.
-    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
+    /// Whether `NETLINK_GET_STRICT_CHK` is enabled on this socket.
+    fn strict(&self) -> bool {
+        self.flags & (1 << NETLINK_GET_STRICT_CHK) != 0
+    }
+
+    /// Builds an `NLMSG_ERROR` reply honouring `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK`.
+    fn err_ack(&self, req: &[u8], err: i32, msg: Option<&str>) -> NetlinkItem {
+        NetlinkItem::reply(ack_ext(
+            req,
+            err,
+            self.pid,
+            msg.filter(|_| self.ext_ack),
+            self.cap_ack,
+        ))
+    }
+
+    /// Builds a dump-terminating `NLMSG_DONE` message (with optional negative errno,
+    /// `NLM_F_DUMP_FILTERED`, and `NLMSGERR_ATTR_MSG` when `NETLINK_EXT_ACK` is enabled).
+    fn done_msg(&self, seq: u32, err: i32, filtered: bool, msg: Option<&str>) -> Vec<u8> {
+        let mut flags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
+        let mut p = (-err).to_le_bytes().to_vec();
+        extack_tlvs(&mut p, &mut flags, msg.filter(|_| self.ext_ack), None);
+        message(NLMSG_DONE, flags, seq, self.pid, &p)
+    }
+
+    /// Returns a dump that immediately terminates with an error `NLMSG_DONE`.
+    fn dump_err(&self, seq: u32, err: i32, filtered: bool, msg: Option<&str>) -> Vec<NetlinkItem> {
+        let mut out = DumpMessages::new();
+        out.push_section([self.done_msg(seq, err, filtered, msg)]);
+        vec![NetlinkItem::dump(out)]
+    }
+
+    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning single
+    /// datagrams or a resumable dump.
+    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<NetlinkItem> {
         let ty = u16::from_le_bytes([req[4], req[5]]);
         let flags = u16::from_le_bytes([req[6], req[7]]);
+        // Linux's netlink_rcv_skb: non-requests and control messages (< NLMSG_MIN_TYPE) are
+        // skipped and acked with 0 only when NLM_F_ACK is set.
+        if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+            return if flags & NLM_F_ACK != 0 {
+                vec![NetlinkItem::reply(ack(req, 0, self.pid))]
+            } else {
+                Vec::new()
+            };
+        }
         let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
         let family = req.get(16).copied().unwrap_or(0) as i32;
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
-        let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
+        let single = |ty, payload: &[u8]| {
+            let mut out = vec![NetlinkItem::reply(reply(ty, 0, payload))];
+            if flags & NLM_F_ACK != 0 {
+                out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
+            }
+            out
+        };
         let dump = flags & NLM_F_DUMP != 0;
-        if let Some(r) = host.configure(req) {
-            return match r {
-                Err(f) => vec![ack_ext(
-                    req,
-                    f.errno,
-                    self.pid,
-                    f.msg.filter(|_| self.ext_ack),
-                    self.cap_ack,
-                )],
-                Ok(()) if flags & NLM_F_ACK != 0 => vec![ack(req, 0, self.pid)],
-                Ok(()) => Vec::new(),
+        if let Some(ConfigureResult { result, echoed }) = host.configure(req, self.pid) {
+            return match result {
+                Err(f) => vec![self.err_ack(req, f.errno, f.msg)],
+                Ok(()) => {
+                    let mut out: Vec<NetlinkItem> = echoed
+                        .into_iter()
+                        .map(|(group, msg)| NetlinkItem::Datagram(msg, group))
+                        .collect();
+                    if flags & NLM_F_ACK != 0 {
+                        out.push(NetlinkItem::reply(ack(req, 0, self.pid)));
+                    }
+                    out
+                }
             };
         }
         let one = |l: &Link| match l {
             Link::Host(i) => link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name)),
             Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
         };
+        let strict = self.strict();
         match ty {
-            // As on Linux, the interfaces are one datagram (split into several when too large,
-            // `pack`); the addresses one per address family (IPv4 first for AF_UNSPEC, each split
-            // the same way), and NLMSG_DONE another one. When filtering by IFLA_MASTER or
-            // IFLA_LINKINFO's kind, the messages carry NLM_F_DUMP_FILTERED (Linux's
-            // rtnl_dump_ifinfo)
+            // As on Linux 6.1/6.8, links form one dump section, addresses one section per address
+            // family (IPv4 first for AF_UNSPEC), and NLMSG_DONE its own trailing section; each
+            // section is packed on demand to fit the reader's receive buffer. When filtering by
+            // IFLA_MASTER or IFLA_LINKINFO's kind, the messages carry NLM_F_DUMP_FILTERED
+            // (Linux's rtnl_dump_ifinfo).
             RTM_GETLINK if dump => {
-                const NLM_F_DUMP_FILTERED: u16 = 0x20;
-                let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
-                let master = attrs
-                    .iter()
-                    .find(|(t, d)| *t == IFLA_MASTER && d.len() >= 4)
-                    .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
-                    .filter(|&m| m != 0);
-                let kind = attrs
-                    .iter()
-                    .find(|(t, _)| *t == IFLA_LINKINFO)
-                    .and_then(|(_, d)| {
-                        crate::route::attrs(d)
-                            .into_iter()
-                            .find(|(t, _)| *t == 1)
-                            .map(|(_, k)| k.split(|&c| c == 0).next().unwrap_or_default().to_vec())
-                    })
-                    .filter(|k| matches!(&k[..], b"bridge" | b"veth" | b"dummy"));
+                let (master, kind) = match parse_link_dump(req, strict) {
+                    Ok(f) => f,
+                    Err((e, m)) => return self.dump_err(seq, e, false, m),
+                };
                 let filtered = master.is_some() || kind.is_some();
                 let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
                 let links = host.links();
@@ -601,42 +1037,121 @@ impl NetlinkSocket {
                                 .is_none_or(|k| k == v.kind.name().as_bytes())
                     }
                 });
-                let mut out = pack(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
-                out.push(done());
-                out
+                let mut out = DumpMessages::new();
+                out.push_section(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
+                out.push_section([self.done_msg(seq, 0, false, None)]);
+                vec![NetlinkItem::dump(out)]
             }
             RTM_GETADDR if dump => {
+                let filter_if = match parse_addr_dump(req, strict) {
+                    Ok(i) => i,
+                    Err((e, m)) => return self.dump_err(seq, e, false, m),
+                };
                 let links = host.links();
-                let mut out = Vec::new();
+                let filtered = filter_if != 0;
+                if filtered && !links.iter().any(|l| l.index() as i32 == filter_if) {
+                    return self.dump_err(seq, ENODEV, true, None);
+                }
+                let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
+                let mut out = DumpMessages::new();
                 for f in [AF_INET, AF_INET6] {
                     if family != 0 && family != f {
                         continue;
                     }
                     let messages = links
                         .iter()
+                        .filter(|l| !filtered || l.index() as i32 == filter_if)
                         .flat_map(|l| match l {
                             Link::Host(i) => addr_messages(i, f as u8),
                             Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
                         })
-                        .map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m));
-                    out.extend(pack(messages));
+                        .map(|m| reply(RTM_NEWADDR, mflags, &m));
+                    out.push_section(messages);
                 }
-                out.push(done());
-                out
+                out.push_section([self.done_msg(seq, 0, filtered, None)]);
+                vec![NetlinkItem::dump(out)]
+            }
+            // Single RTM_GETADDR: IPv6 only (Linux's inet6_rtm_getaddr); IPv4 and others are
+            // EOPNOTSUPP.
+            RTM_GETADDR => {
+                if family != AF_INET6 {
+                    return vec![self.err_ack(req, EOPNOTSUPP, None)];
+                }
+                if req.len() < 24 {
+                    return vec![self.err_ack(
+                        req,
+                        EINVAL,
+                        Some("ipv6: Invalid header for get address request"),
+                    )];
+                }
+                let ifindex = u32::from_le_bytes(req[20..24].try_into().unwrap());
+                let (mut local, mut address) = (None, None);
+                for (t, d) in crate::route::attrs(&req[24..]) {
+                    if t == IFA_ADDRESS || t == IFA_LOCAL {
+                        let Some(a) = d.get(..16) else {
+                            return vec![self.err_ack(req, ERANGE, Some(BAD_ATTR_MSG))];
+                        };
+                        if t == IFA_LOCAL {
+                            local = Some(a);
+                        } else {
+                            address = Some(a);
+                        }
+                    }
+                }
+                let Some(target) = local.or(address) else {
+                    return vec![self.err_ack(req, EINVAL, None)];
+                };
+                let link_local = target[0] == 0xfe && target[1] & 0xc0 == 0x80;
+                let found = host
+                    .links()
+                    .into_iter()
+                    .filter(|l| !link_local || ifindex == 0 || l.index() == ifindex)
+                    .flat_map(|l| match l {
+                        Link::Host(i) => addr_messages(&i, AF_INET6 as u8),
+                        Link::Virt(v, _) => crate::netdev::addr_messages(&v, AF_INET6),
+                    })
+                    .find(|m| {
+                        crate::route::attrs(m.get(8..).unwrap_or_default())
+                            .into_iter()
+                            .any(|(t, d)| t == IFA_ADDRESS && d == target)
+                    });
+                match found {
+                    Some(msg) => single(RTM_NEWADDR, &msg),
+                    None => vec![self.err_ack(req, EADDRNOTAVAIL, None)],
+                }
             }
             // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
             // rtnl_getlink)
             RTM_GETLINK => {
-                const ENODEV: i32 = 19;
-                let index = req
-                    .get(20..24)
-                    .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
-                let name = crate::route::attrs(req.get(32..).unwrap_or_default())
-                    .into_iter()
-                    .find(|(t, _)| *t == IFLA_IFNAME)
-                    .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
+                if req.len() < 32 {
+                    return vec![self.err_ack(req, EINVAL, Some("Invalid header for get link"))];
+                }
+                let index = i32::from_le_bytes(req[20..24].try_into().unwrap());
+                let mut name = None;
+                for (t, d) in crate::route::attrs(&req[32..]) {
+                    match t {
+                        IFLA_IFNAME => {
+                            if d.is_empty() || d.len() > 16 || (d.len() == 16 && d[15] != 0) {
+                                return vec![self.err_ack(req, ERANGE, Some(BAD_ATTR_MSG))];
+                            }
+                            name = Some(cstr(d).to_vec());
+                        }
+                        IFLA_MTU | IFLA_MASTER | IFLA_TXQLEN | IFLA_NET_NS_PID | IFLA_GROUP
+                        | IFLA_NET_NS_FD | IFLA_EXT_MASK | IFLA_TARGET_NETNSID
+                            if d.len() != 4 =>
+                        {
+                            return vec![self.err_ack(req, ERANGE, Some(BAD_ATTR_MSG))];
+                        }
+                        IFLA_OPERSTATE | IFLA_LINKMODE | IFLA_CARRIER | IFLA_PROTO_DOWN
+                            if d.len() != 1 =>
+                        {
+                            return vec![self.err_ack(req, ERANGE, Some(BAD_ATTR_MSG))];
+                        }
+                        _ => {}
+                    }
+                }
                 if index <= 0 && name.is_none() {
-                    return vec![ack(req, EINVAL, self.pid)];
+                    return vec![self.err_ack(req, EINVAL, None)];
                 }
                 let found = host.links().into_iter().find(|l| {
                     if index > 0 {
@@ -645,56 +1160,82 @@ impl NetlinkSocket {
                         name.as_deref() == Some(l.name())
                     }
                 });
-                let Some(l) = found else {
-                    return vec![ack(req, ENODEV, self.pid)];
-                };
-                let mut out = vec![reply(RTM_NEWLINK, 0, &one(&l))];
-                if flags & NLM_F_ACK != 0 {
-                    out.push(ack(req, 0, self.pid));
+                match found {
+                    Some(l) => single(RTM_NEWLINK, &one(&l)),
+                    None => vec![self.err_ack(req, ENODEV, None)],
                 }
-                out
             }
-            // As on Linux, the routes of each address family are one datagram (split when too
-            // large), and NLMSG_DONE another one
+            // As on Linux 6.1/6.8, each address family's routes form one dump section, followed by
+            // NLMSG_DONE, packed on demand to the caller's receive buffer.
             RTM_GETROUTE if dump => {
-                let entries = host.tables();
-                let mut out = Vec::new();
-                for f in [AF_INET, AF_INET6] {
-                    let messages = entries
-                        .iter()
-                        .filter(|e| e.family == f && (family == 0 || family == f))
-                        .map(|e| reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e)));
-                    out.extend(pack(messages));
+                let f = match parse_route_dump(req, strict) {
+                    Ok(f) => f,
+                    Err((e, m)) => return self.dump_err(seq, e, false, m),
+                };
+                if f.oif != 0 && !host.links().iter().any(|l| l.index() == f.oif) {
+                    return self.dump_err(seq, ENODEV, false, None);
                 }
-                out.push(done());
-                out
+                let entries = host.tables();
+                if strict && family != 0 && f.table != 0 {
+                    let exists = f.table == u32::from(crate::route::RT_TABLE_MAIN)
+                        || f.table == u32::from(crate::route::RT_TABLE_LOCAL)
+                        || entries
+                            .iter()
+                            .any(|e| e.family == family && u32::from(e.table) == f.table);
+                    if !exists {
+                        return self.dump_err(seq, ENOENT, true, Some("FIB table does not exist"));
+                    }
+                }
+                let mflags = NLM_F_MULTI | if strict { NLM_F_DUMP_FILTERED } else { 0 };
+                let mut out = DumpMessages::new();
+                if !f.cloned {
+                    for fam in [AF_INET, AF_INET6] {
+                        let messages = entries
+                            .iter()
+                            .filter(|e| {
+                                e.family == fam
+                                    && (family == 0 || family == fam)
+                                    && (f.table == 0 || u32::from(e.table) == f.table)
+                                    && (f.proto == 0 || e.proto == f.proto)
+                                    && (f.rty == 0 || e.ty == f.rty)
+                                    && (f.oif == 0 || e.index == f.oif)
+                            })
+                            .map(|e| reply(RTM_NEWROUTE, mflags, &crate::route::route_message(e)));
+                        out.push_section(messages);
+                    }
+                }
+                out.push_section([self.done_msg(seq, 0, strict && f.active(), None)]);
+                vec![NetlinkItem::dump(out)]
             }
             RTM_GETROUTE => {
                 let ifaces = host.all_interfaces();
                 let entries = host.tables();
-                match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
-                    Ok(p) => {
-                        let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
-                        if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
-                        }
-                        out
-                    }
-                    Err(e) => vec![ack(req, e, self.pid)],
+                match crate::route::get(
+                    req,
+                    &entries,
+                    &ifaces,
+                    host.uid(),
+                    host.init_net(),
+                    |iif| host.ip_forward(iif),
+                    |iif| host.route_localnet(iif),
+                ) {
+                    Ok(p) => single(RTM_NEWROUTE, &p),
+                    Err((e, msg)) => vec![self.err_ack(req, e, msg)],
                 }
             }
-            // The rules fit in one datagram, and NLMSG_DONE is another one
+            // Rules form one dump section, followed by NLMSG_DONE, packed on demand.
             RTM_GETRULE if dump => {
-                const EAFNOSUPPORT: i32 = 97;
+                if strict && let Err((e, m)) = check_rule_dump(req) {
+                    return self.dump_err(seq, e, false, m);
+                }
                 let rules = crate::route::rule_messages(family);
                 if rules.is_empty() {
-                    return vec![ack(req, EAFNOSUPPORT, self.pid)];
+                    return self.dump_err(seq, EAFNOSUPPORT, false, None);
                 }
-                let d = rules
-                    .iter()
-                    .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
-                    .collect();
-                vec![d, done()]
+                let mut out = DumpMessages::new();
+                out.push_section(rules.iter().map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m)));
+                out.push_section([self.done_msg(seq, 0, false, None)]);
+                vec![NetlinkItem::dump(out)]
             }
             // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
             // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
@@ -702,93 +1243,336 @@ impl NetlinkSocket {
             // answered, -1 when unassigned (NETNSA_NSID_NOT_ASSIGNED), and lookups by number never
             // find anything. The order is the same as Linux's rtnl_net_getid
             RTM_GETNSID => {
-                let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
-                let get = |t| {
-                    attrs
-                        .iter()
-                        .find(|(a, d)| *a == t && d.len() >= 4)
-                        .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
-                };
-                let peer = if let Some(pid) = get(NETNSA_PID) {
-                    host.peer_net(NETNSA_PID, pid)
-                } else if let Some(fd) = get(NETNSA_FD) {
-                    host.peer_net(NETNSA_FD, fd)
-                } else if get(NETNSA_NSID).is_some() {
-                    Err(ENOENT)
+                let (mut pid_v, mut fd_v, mut nsid_v, mut target_v) = (None, None, None, None);
+                for (a, d) in crate::route::attrs(req.get(20..).unwrap_or_default()) {
+                    let slot = match a {
+                        NETNSA_PID => &mut pid_v,
+                        NETNSA_FD => &mut fd_v,
+                        NETNSA_NSID => &mut nsid_v,
+                        NETNSA_TARGET_NSID => &mut target_v,
+                        _ => continue,
+                    };
+                    let Some(b) = d.get(..4) else {
+                        return vec![self.err_ack(req, ERANGE, Some(BAD_ATTR_MSG))];
+                    };
+                    *slot = Some(u32::from_le_bytes(b.try_into().unwrap()));
+                }
+                let peer = if let Some(pid) = pid_v {
+                    host.peer_net(NETNSA_PID, pid).map_err(|e| (e, None))
+                } else if let Some(fd) = fd_v {
+                    host.peer_net(NETNSA_FD, fd).map_err(|e| (e, None))
+                } else if nsid_v.is_some() {
+                    Err((ENOENT, None))
                 } else {
-                    Err(EINVAL)
+                    Err((EINVAL, Some("Peer netns reference is missing")))
                 };
-                let r = peer.and_then(|id| match get(NETNSA_TARGET_NSID) {
-                    Some(_) => Err(EINVAL),
-                    None => Ok(id),
-                });
-                match r {
+                match peer.and_then(|id| target_v.map_or(Ok(id), |_| Err((EINVAL, None)))) {
                     Ok(id) => {
                         let mut p = vec![0u8; 4];
                         attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
-                        let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
-                        if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
-                        }
-                        out
+                        single(RTM_NEWNSID, &p)
                     }
-                    Err(e) => vec![ack(req, e, self.pid)],
+                    Err((e, msg)) => vec![self.err_ack(req, e, msg)],
                 }
             }
             // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
-            // always empty
-            RTM_GETNEIGH if dump => vec![done()],
-            RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
+            // always empty; single gets still validate ndmsg, family, ifindex and NDA_DST as
+            // Linux's neigh_get does before answering ENOENT.
+            RTM_GETNEIGH if dump => {
+                if strict && let Err((e, m)) = check_neigh_dump(req) {
+                    return self.dump_err(seq, e, false, m);
+                }
+                let mut out = DumpMessages::new();
+                out.push_section([self.done_msg(seq, 0, false, None)]);
+                vec![NetlinkItem::dump(out)]
+            }
+            RTM_GETNEIGH => vec![self.err_ack(req, check_getneigh(req, host), None)],
             // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
-            // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM);
-            // control messages are acked only when an ack is asked for
-            _ if flags & NLM_F_REQUEST != 0 => {
-                if ty < NLMSG_MIN_TYPE {
-                    if flags & NLM_F_ACK != 0 {
-                        vec![ack(req, 0, self.pid)]
-                    } else {
-                        Vec::new()
-                    }
-                } else if (RTM_BASE..=RTM_MAX).contains(&ty)
+            // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM).
+            _ => {
+                if (RTM_BASE..=RTM_MAX).contains(&ty)
                     && (ty - RTM_BASE) & 3 != 2
                     && !host.net_admin()
                 {
-                    vec![ack(req, EPERM, self.pid)]
+                    vec![self.err_ack(req, EPERM, None)]
                 } else {
-                    vec![ack(req, EOPNOTSUPP, self.pid)]
+                    vec![self.err_ack(req, EOPNOTSUPP, None)]
                 }
             }
-            _ => Vec::new(),
         }
     }
 
     /// This socket's `sockaddr_nl`.
     pub fn sockaddr(&self) -> Vec<u8> {
-        let mut b = vec![0u8; 12];
-        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-        b[4..8].copy_from_slice(&self.pid.to_le_bytes());
         // nl_groups: the first 32 groups
-        b[8..12].copy_from_slice(&(self.groups.unwrap_or(0) as u32).to_le_bytes());
-        b
+        sockaddr_nl(self.pid, self.groups.unwrap_or(0) as u32)
+    }
+
+    /// The connected peer's `sockaddr_nl` (Linux's `netlink_getname` with `peer = 1`).
+    pub fn peer_sockaddr(&self) -> Vec<u8> {
+        let mask = if (1..=32).contains(&self.dst_group) {
+            1u32 << (self.dst_group - 1)
+        } else {
+            0
+        };
+        sockaddr_nl(self.dst_pid, mask)
     }
 }
 
-/// Packs a dump's messages into datagrams of at most `DUMP_CHUNK` bytes, as Linux's `netlink_dump`
-/// fills one buffer after another (a message larger than that goes alone); no messages give no
-/// datagram.
-fn pack(messages: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut cur = Vec::new();
-    for m in messages {
-        if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
-            out.push(std::mem::take(&mut cur));
+type NlErr = (i32, Option<&'static str>);
+
+const BAD_ATTR_MSG: &str = "Attribute failed policy validation";
+const BAD_ATTR: NlErr = (ERANGE, Some(BAD_ATTR_MSG));
+const UNSUP_ATTR: NlErr = (EINVAL, Some("Unsupported attribute in dump request"));
+
+fn cstr(b: &[u8]) -> &[u8] {
+    b.split(|&c| c == 0).next().unwrap_or_default()
+}
+
+fn attr_u32(d: &[u8]) -> Result<u32, NlErr> {
+    d.try_into().map(u32::from_le_bytes).map_err(|_| BAD_ATTR)
+}
+
+fn strict_attrs(b: &[u8]) -> Result<Vec<crate::route::Attr<'_>>, NlErr> {
+    crate::route::attrs_strict(b).map_err(|(e, m)| (e, Some(m)))
+}
+
+fn parse_link_dump(req: &[u8], strict: bool) -> Result<(Option<u32>, Option<Vec<u8>>), NlErr> {
+    if !strict {
+        let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
+        let master = attrs
+            .iter()
+            .find(|(t, d)| *t == IFLA_MASTER && d.len() >= 4)
+            .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
+            .filter(|&m| m != 0);
+        let kind = attrs
+            .iter()
+            .find(|(t, _)| *t == IFLA_LINKINFO)
+            .and_then(|(_, d)| {
+                crate::route::attrs(d)
+                    .into_iter()
+                    .find(|(t, _)| *t == 1)
+                    .map(|(_, k)| cstr(k).to_vec())
+            })
+            .filter(|k| !k.is_empty());
+        return Ok((master, kind));
+    }
+    if req.len() < 32 {
+        return Err((EINVAL, Some("Invalid header for link dump")));
+    }
+    // ifi_pad, ifi_type, ifi_index, ifi_flags, ifi_change must all be 0
+    if req[17..32].iter().any(|&b| b != 0) {
+        return Err((
+            EINVAL,
+            Some("Invalid values in header for link dump request"),
+        ));
+    }
+    let (mut master, mut kind) = (None, None);
+    for (t, d) in strict_attrs(&req[32..])? {
+        match t {
+            IFLA_MASTER => {
+                let m = attr_u32(d)?;
+                if m != 0 {
+                    master = Some(m);
+                }
+            }
+            IFLA_EXT_MASK | IFLA_TARGET_NETNSID => {
+                attr_u32(d)?;
+            }
+            IFLA_LINKINFO => {
+                for (nt, nd) in strict_attrs(d)? {
+                    if nt == 1 {
+                        if nd.is_empty() || nd.len() > 16 {
+                            return Err(BAD_ATTR);
+                        }
+                        let k = cstr(nd);
+                        if !k.is_empty() {
+                            kind = Some(k.to_vec());
+                        }
+                    }
+                }
+            }
+            _ => return Err(UNSUP_ATTR),
         }
-        cur.extend(m);
     }
-    if !cur.is_empty() {
-        out.push(cur);
+    Ok((master, kind))
+}
+
+fn parse_addr_dump(req: &[u8], strict: bool) -> Result<i32, NlErr> {
+    if !strict {
+        return Ok(0);
     }
-    out
+    if req.len() < 24 {
+        return Err((EINVAL, Some("Invalid header for address dump")));
+    }
+    // ifa_prefixlen, ifa_flags, ifa_scope must be 0
+    if req[17..20].iter().any(|&b| b != 0) {
+        return Err((
+            EINVAL,
+            Some("Invalid values in header for address dump request"),
+        ));
+    }
+    for (t, d) in strict_attrs(&req[24..])? {
+        match t {
+            IFA_TARGET_NETNSID => {
+                attr_u32(d)?;
+            }
+            _ => return Err(UNSUP_ATTR),
+        }
+    }
+    Ok(i32::from_le_bytes(req[20..24].try_into().unwrap()))
+}
+
+#[derive(Default)]
+struct RouteDumpFilter {
+    table: u32,
+    proto: u8,
+    rty: u8,
+    oif: u32,
+    cloned: bool,
+}
+
+impl RouteDumpFilter {
+    fn active(&self) -> bool {
+        self.table != 0 || self.proto != 0 || self.rty != 0 || self.oif != 0 || self.cloned
+    }
+}
+
+fn parse_route_dump(req: &[u8], strict: bool) -> Result<RouteDumpFilter, NlErr> {
+    const RTA_OIF: u16 = 4;
+    const RTA_TABLE: u16 = 15;
+    const RTM_F_CLONED: u32 = 0x200;
+    if !strict {
+        return Ok(RouteDumpFilter::default());
+    }
+    if req.len() < 28 {
+        return Err((EINVAL, Some("Invalid header for route dump")));
+    }
+    let rtm_flags = u32::from_le_bytes(req[24..28].try_into().unwrap());
+    if rtm_flags & !RTM_F_CLONED != 0 {
+        return Err((EINVAL, Some("Invalid flags for FIB dump request")));
+    }
+    // rtm_dst_len, rtm_src_len, rtm_tos, rtm_scope must be 0
+    if req[17] != 0 || req[18] != 0 || req[19] != 0 || req[22] != 0 {
+        return Err((
+            EINVAL,
+            Some("Invalid values in header for FIB dump request"),
+        ));
+    }
+    let mut f = RouteDumpFilter {
+        table: u32::from(req[20]),
+        proto: req[21],
+        rty: req[23],
+        oif: 0,
+        cloned: rtm_flags & RTM_F_CLONED != 0,
+    };
+    for (t, d) in strict_attrs(&req[28..])? {
+        match t {
+            RTA_TABLE => f.table = attr_u32(d)?,
+            RTA_OIF => f.oif = attr_u32(d)?,
+            _ => return Err(UNSUP_ATTR),
+        }
+    }
+    Ok(f)
+}
+
+fn check_rule_dump(req: &[u8]) -> Result<(), NlErr> {
+    if req.len() < 28 {
+        return Err((EINVAL, Some("Invalid header for fib rule dump")));
+    }
+    if req[17..28].iter().any(|&b| b != 0) {
+        return Err((
+            EINVAL,
+            Some("Invalid values in header for fib rule dump request"),
+        ));
+    }
+    if !req[28..].is_empty() {
+        return Err((EINVAL, Some("bytes leftover after parsing attributes")));
+    }
+    Ok(())
+}
+
+fn check_neigh_dump(req: &[u8]) -> Result<(), NlErr> {
+    const NDA_IFINDEX: u16 = 8;
+    const NDA_MASTER: u16 = 9;
+    const NDA_FLAGS_EXT: u16 = 16;
+    const NTF_PROXY: u8 = 0x08;
+    if req.len() < 28 {
+        return Err((EINVAL, Some("Invalid header for neighbor dump")));
+    }
+    // ndm_pad1, ndm_pad2, ndm_ifindex, ndm_state, ndm_type must be 0; only NTF_PROXY is valid in
+    // ndm_flags
+    if req[17..26].iter().any(|&b| b != 0) || (req[26] & !NTF_PROXY) != 0 || req[27] != 0 {
+        return Err((
+            EINVAL,
+            Some("Invalid values in header for neighbor dump request"),
+        ));
+    }
+    for (t, d) in strict_attrs(&req[28..])? {
+        match t {
+            NDA_IFINDEX | NDA_MASTER | NDA_FLAGS_EXT => {
+                attr_u32(d)?;
+            }
+            _ => return Err(UNSUP_ATTR),
+        }
+    }
+    Ok(())
+}
+
+/// Validates a single (non-dump) `RTM_GETNEIGH` request as Linux's `neigh_get` does and returns
+/// the errno to report (`ENOENT` when valid, since the neighbour table is always empty).
+fn check_getneigh(req: &[u8], host: &dyn Host) -> i32 {
+    const NDA_DST: u16 = 1;
+    const NTF_PROXY: u8 = 0x08;
+    let Some(ndm) = req.get(16..28) else {
+        return EINVAL;
+    };
+    let family = i32::from(ndm[0]);
+    let ifindex = i32::from_le_bytes(ndm[4..8].try_into().unwrap());
+    let state = u16::from_le_bytes([ndm[8], ndm[9]]);
+    let flags = ndm[10];
+    let ty = ndm[11];
+    if state != 0 || ty != 0 {
+        return EINVAL;
+    }
+    let attrs = crate::route::attrs(&req[28..]);
+    let Some(dst) = attrs.iter().find(|(t, _)| *t == NDA_DST).map(|(_, d)| *d) else {
+        return EINVAL;
+    };
+    let key_len = match family {
+        AF_INET => 4,
+        AF_INET6 => 16,
+        _ => return EAFNOSUPPORT,
+    };
+    if dst.len() != key_len {
+        return EINVAL;
+    }
+    if ifindex < 0 {
+        return ENODEV;
+    }
+    if ifindex == 0 {
+        if flags & NTF_PROXY == 0 {
+            return EINVAL;
+        }
+    } else if !host.links().iter().any(|l| l.index() as i32 == ifindex) {
+        return ENODEV;
+    }
+    ENOENT
+}
+
+fn sockaddr_nl(pid: u32, groups: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 12];
+    b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+    b[4..8].copy_from_slice(&pid.to_le_bytes());
+    b[8..12].copy_from_slice(&groups.to_le_bytes());
+    b
+}
+
+/// Result of an rtnetlink configuration request ([`Host::configure`]).
+pub(crate) struct ConfigureResult {
+    pub result: Result<(), crate::netdev::Fail>,
+    /// `NLM_F_ECHO` notifications `(group, msg)` to queue on the sender before its ack.
+    pub echoed: Vec<(u32, Vec<u8>)>,
 }
 
 /// Host information that netlink answers need (replaced with fixed values in tests).
@@ -805,9 +1589,18 @@ pub(crate) trait Host {
     /// The user ID of the requesting process (RTA_UID in the `ip route get` answer).
     fn uid(&self) -> u32;
     /// Requests that change interfaces, addresses or routes ([`crate::netdev::request`]): None
-    /// means not handled, Some holds the result.
-    fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+    /// means not handled; Some holds the result and any `NLM_F_ECHO` notifications to queue on
+    /// the requesting socket before its ack.
+    fn configure(&self, _req: &[u8], _port: u32) -> Option<ConfigureResult> {
         None
+    }
+    /// Whether IPv4 forwarding is enabled on input interface `iif` (`ip route get iif`).
+    fn ip_forward(&self, _iif: u32) -> bool {
+        false
+    }
+    /// Whether `route_localnet` is enabled on input interface `iif` (`ip route get iif`).
+    fn route_localnet(&self, _iif: u32) -> bool {
+        false
     }
     /// The network namespace RTM_GETNSID looks for: `attr` is [`NETNSA_PID`] (a process) or
     /// [`NETNSA_FD`] (a namespace file), and `value` its value. When found, the number this
@@ -836,9 +1629,9 @@ pub(crate) trait Host {
     fn net_admin(&self) -> bool {
         true
     }
-    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
-    /// datagrams.
-    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns single datagrams or
+    /// resumable dumps.
+    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<NetlinkItem> {
         Vec::new()
     }
 }
@@ -1104,9 +1897,68 @@ const RTNL_NOTIFIED: u64 = 1 << (RTNLGRP_LINK - 1)
     | 1 << (RTNLGRP_IPV4_ROUTE - 1)
     | 1 << (RTNLGRP_IPV6_IFADDR - 1)
     | 1 << (RTNLGRP_IPV6_ROUTE - 1);
-/// The most datagrams a socket holds before notifications are dropped (about its 212992-byte
-/// receive buffer at a typical notification's size).
-const NOTE_QUEUE: usize = 1024;
+
+/// Request metadata carried into rtnetlink notifications (`Snapshot::changes`).
+/// All zeros for non-netlink changes (socket ioctls).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NotifyCause {
+    pub ty: u16,
+    pub flags: u16,
+    pub seq: u32,
+    pub port: u32,
+}
+
+impl NotifyCause {
+    /// Extracts header metadata from an rtnetlink request message.
+    pub(crate) fn from_req(req: &[u8], port: u32) -> Self {
+        Self {
+            ty: req
+                .get(4..6)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+            flags: req
+                .get(6..8)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+            seq: req
+                .get(8..12)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())),
+            port,
+        }
+    }
+
+    /// Whether `ty` is an rtnetlink change request whose effects may emit notifications.
+    pub(crate) fn is_change(self) -> bool {
+        matches!(
+            self.ty,
+            RTM_NEWLINK
+                | RTM_DELLINK
+                | RTM_SETLINK
+                | RTM_NEWADDR
+                | RTM_DELADDR
+                | RTM_NEWROUTE
+                | RTM_DELROUTE
+        )
+    }
+
+    /// Whether this request can produce `NLM_F_ECHO` replies (address and route changes only;
+    /// Linux 6.1's `rtmsg_ifinfo` passes `nlh = NULL` and never echoes link notifications).
+    pub(crate) fn wants_echo(self) -> bool {
+        self.flags & NLM_F_ECHO != 0
+            && matches!(
+                self.ty,
+                RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
+            )
+    }
+}
+
+/// One rtnetlink notification produced by [`Snapshot::changes`].
+pub(crate) struct RtnlNote {
+    pub group: u32,
+    pub msg: Vec<u8>,
+    /// True when the triggering request asked for `NLM_F_ECHO` and this notification directly
+    /// corresponds to that request: it is queued unicast onto the sender before its ack, and the
+    /// multicast broadcast excludes the sender so a subscribed sender receives it only once.
+    pub echo: bool,
+}
 
 /// A namespace's links, addresses and routes as rtnetlink dumps encode them (message bodies, in
 /// dump order). Taken before and after a change request, the difference is what Linux notifies
@@ -1150,73 +2002,128 @@ impl Snapshot {
         }
     }
 
-    /// The notifications (group, message) for the change from `before` to this one, in the order
-    /// Linux makes them: links that appeared or changed (`RTM_NEWLINK`, statistics aside),
-    /// addresses that went and came, routes that went and came, links that went
-    /// (`RTM_DELLINK`). An address or route that changed in place ([`addr_identity`], [`route_identity`]) is only notified
-    /// as new. They carry no sequence number, port or flags.
-    pub(crate) fn changes(&self, before: &Snapshot) -> Vec<(u32, Vec<u8>)> {
-        let index = |m: &[u8]| {
+    /// The notifications for the change from `before` to this one, in the order Linux makes them:
+    /// links that appeared or changed (`RTM_NEWLINK`, statistics aside), addresses that went and
+    /// came, routes that went and came, links that went (`RTM_DELLINK`). An address or route that
+    /// changed in place ([`addr_identity`], [`route_identity`]) is only notified as new.
+    ///
+    /// Matches Linux 6.1 header fields:
+    /// - IPv4 `RTM_NEWADDR`/`RTM_DELADDR` and IPv4/IPv6 `RTM_NEWROUTE`/`RTM_DELROUTE` directly
+    ///   caused by the request copy `seq` and `port` and honour `NLM_F_ECHO`; link notifications
+    ///   (`RTM_NEWLINK`/`RTM_DELLINK`, emitted by Linux's `rtmsg_ifinfo` with `pid=0, seq=0` and
+    ///   no `nlh`), IPv6 address notifications, and kernel-induced side effects (e.g. routes
+    ///   added/removed by an address change) carry `seq = 0, port = 0` and are not echoed.
+    /// - `RTM_NEWROUTE` carries `NLM_F_REPLACE` when replacing an existing route via
+    ///   `NLM_F_REPLACE`, `NLM_F_CREATE | NLM_F_APPEND` when appending, and
+    ///   `NLM_F_CREATE | NLM_F_EXCL` otherwise (including kernel-added routes).
+    pub(crate) fn changes(&self, before: &Snapshot, cause: NotifyCause) -> Vec<RtnlNote> {
+        fn link_index(m: &[u8]) -> Option<i32> {
             m.get(4..8)
                 .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        }
+        fn find_link(set: &[Vec<u8>], i: Option<i32>) -> Option<&[u8]> {
+            set.iter().find(|m| link_index(m) == i).map(Vec::as_slice)
+        }
+        let is_v4 = |m: &[u8]| m.first().map(|&f| f as i32) == Some(AF_INET);
+        let echo_req = cause.wants_echo();
+        let note = |group, ty, flags, body: &[u8], direct: bool| {
+            let (seq, port) = if direct {
+                (cause.seq, cause.port)
+            } else {
+                (0, 0)
+            };
+            RtnlNote {
+                group,
+                msg: message(ty, flags, seq, port, body),
+                echo: direct && echo_req,
+            }
         };
-        let find = |set: &[Vec<u8>], i| set.iter().find(|m| index(m) == i).cloned();
-        let note = |group, ty, body: &[u8]| (group, message(ty, 0, 0, 0, body));
         let mut out = Vec::new();
         for m in &self.links {
-            if find(&before.links, index(m))
-                .is_none_or(|old| without_stats(&old) != without_stats(m))
+            if find_link(&before.links, link_index(m))
+                .is_none_or(|old| without_stats(old) != without_stats(m))
             {
-                out.push(note(RTNLGRP_LINK, RTM_NEWLINK, m));
+                out.push(note(RTNLGRP_LINK, RTM_NEWLINK, 0, m, false));
             }
         }
-        let groups = [
-            (
-                &before.addrs,
-                &self.addrs,
-                addr_identity as Identity,
-                RTM_DELADDR,
-                RTM_NEWADDR,
-                RTNLGRP_IPV4_IFADDR,
-                RTNLGRP_IPV6_IFADDR,
-            ),
-            (
-                &before.routes,
-                &self.routes,
-                route_identity,
-                RTM_DELROUTE,
-                RTM_NEWROUTE,
-                RTNLGRP_IPV4_ROUTE,
-                RTNLGRP_IPV6_ROUTE,
-            ),
-        ];
-        for (old, new, identity, del, add, v4, v6) in groups {
-            let group = |m: &[u8]| match m.first().map(|&f| f as i32) {
-                Some(AF_INET) => v4,
-                _ => v6,
+        // Addresses (hashed: a namespace can hold thousands of addresses and routes)
+        {
+            let group = |m: &[u8]| {
+                if is_v4(m) {
+                    RTNLGRP_IPV4_IFADDR
+                } else {
+                    RTNLGRP_IPV6_IFADDR
+                }
             };
-            // Hashed: a namespace can hold thousands of addresses and routes
-            let kept: HashSet<_> = new.iter().map(|m| identity(m)).collect();
-            let was: HashSet<&Vec<u8>> = old.iter().collect();
-            let gone = |m: &&Vec<u8>| !kept.contains(&identity(m));
-            out.extend(old.iter().filter(gone).map(|m| note(group(m), del, m)));
-            out.extend(
-                new.iter()
-                    .filter(|m| !was.contains(m))
-                    .map(|m| note(group(m), add, m)),
-            );
+            let kept: HashSet<_> = self.addrs.iter().map(|m| addr_identity(m)).collect();
+            let was: HashSet<&Vec<u8>> = before.addrs.iter().collect();
+            for m in before
+                .addrs
+                .iter()
+                .filter(|m| !kept.contains(&addr_identity(m)))
+            {
+                out.push(note(
+                    group(m),
+                    RTM_DELADDR,
+                    0,
+                    m,
+                    is_v4(m) && cause.ty == RTM_DELADDR,
+                ));
+            }
+            for m in self.addrs.iter().filter(|m| !was.contains(m)) {
+                out.push(note(
+                    group(m),
+                    RTM_NEWADDR,
+                    0,
+                    m,
+                    is_v4(m) && cause.ty == RTM_NEWADDR,
+                ));
+            }
+        }
+        // Routes
+        {
+            let group = |m: &[u8]| {
+                if is_v4(m) {
+                    RTNLGRP_IPV4_ROUTE
+                } else {
+                    RTNLGRP_IPV6_ROUTE
+                }
+            };
+            let kept: HashSet<_> = self.routes.iter().map(|m| route_identity(m)).collect();
+            let was: HashSet<&Vec<u8>> = before.routes.iter().collect();
+            for m in before
+                .routes
+                .iter()
+                .filter(|m| !kept.contains(&route_identity(m)))
+            {
+                out.push(note(group(m), RTM_DELROUTE, 0, m, cause.ty == RTM_DELROUTE));
+            }
+            let direct_new = cause.ty == RTM_NEWROUTE;
+            let replace_req = direct_new && cause.flags & NLM_F_REPLACE != 0;
+            let old_ids: HashSet<_> = if replace_req {
+                before.routes.iter().map(|m| route_identity(m)).collect()
+            } else {
+                HashSet::new()
+            };
+            for m in self.routes.iter().filter(|m| !was.contains(m)) {
+                let rt_flags = if replace_req && old_ids.contains(&route_identity(m)) {
+                    NLM_F_REPLACE
+                } else if direct_new && cause.flags & NLM_F_APPEND != 0 {
+                    NLM_F_CREATE | NLM_F_APPEND
+                } else {
+                    NLM_F_CREATE | NLM_F_EXCL
+                };
+                out.push(note(group(m), RTM_NEWROUTE, rt_flags, m, direct_new));
+            }
         }
         for m in &before.links {
-            if find(&self.links, index(m)).is_none() {
-                out.push(note(RTNLGRP_LINK, RTM_DELLINK, m));
+            if find_link(&self.links, link_index(m)).is_none() {
+                out.push(note(RTNLGRP_LINK, RTM_DELLINK, 0, m, false));
             }
         }
         out
     }
 }
-
-/// The identity of an address or route message (header bytes, attributes).
-type Identity = for<'a> fn(&'a [u8]) -> (Vec<u8>, Vec<(u16, &'a [u8])>);
 
 /// What identifies an address: family, prefix length, interface (`struct ifaddrmsg` without
 /// flags and scope), address and local address.
@@ -1287,10 +2194,23 @@ const CTRL_ATTR_HDRSIZE: u16 = 4;
 const CTRL_ATTR_MAXATTR: u16 = 5;
 const CTRL_ATTR_OPS: u16 = 6;
 const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_POLICY: u16 = 8;
+const CTRL_ATTR_OP_POLICY: u16 = 9;
+const CTRL_ATTR_OP: u16 = 10;
 const CTRL_ATTR_OP_ID: u16 = 1;
 const CTRL_ATTR_OP_FLAGS: u16 = 2;
 const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
 const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+const CTRL_ATTR_POLICY_DO: u16 = 1;
+const CTRL_ATTR_POLICY_DUMP: u16 = 2;
+const NL_POLICY_TYPE_ATTR_TYPE: u16 = 1;
+const NL_POLICY_TYPE_ATTR_MIN_VALUE_U: u16 = 4;
+const NL_POLICY_TYPE_ATTR_MAX_VALUE_U: u16 = 5;
+const NL_POLICY_TYPE_ATTR_MAX_LENGTH: u16 = 7;
+const NL_ATTR_TYPE_U16: u32 = 3;
+const NL_ATTR_TYPE_U32: u32 = 4;
+const NL_ATTR_TYPE_NUL_STRING: u32 = 12;
+const NLA_F_NESTED: u16 = 0x8000;
 const GENL_CMD_CAP_DO: u32 = 2;
 const GENL_CMD_CAP_DUMP: u32 = 4;
 const GENL_CMD_CAP_HASPOL: u32 = 8;
@@ -1298,55 +2218,163 @@ const NLA_TYPE_MASK: u16 = 0x3fff;
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
+const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
+const ERANGE: i32 = 34;
 const EOPNOTSUPP: i32 = 95;
+const EAFNOSUPPORT: i32 = 97;
+const EADDRNOTAVAIL: i32 = 99;
 
 /// Answers one request `req` (the whole message) on `NETLINK_GENERIC`; `pid` is this socket's
-/// `nl_pid`. Returns the datagrams: as on Linux, the answer and the ack are one each
-/// (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
-fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
+/// `nl_pid`, `cap` is `NETLINK_CAP_ACK`, `ext` is `NETLINK_EXT_ACK`. Returns the datagrams or
+/// resumable dump: as on Linux, the answer and the ack are one each (`genlmsg_reply`,
+/// `netlink_ack`), so a program reading once gets only the answer.
+fn generic_request(req: &[u8], pid: u32, cap: bool, ext: bool) -> Vec<NetlinkItem> {
     let ty = u16::from_le_bytes([req[4], req[5]]);
     let flags = u16::from_le_bytes([req[6], req[7]]);
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
     let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, pid, payload);
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    type GenlErr<'a> = (i32, Option<&'a str>, Option<u32>);
     // Linux's netlink_rcv_skb: non-requests and control messages are acked only when an ack is
     // asked for
-    let r = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
-        Ok(None)
-    } else if ty != GENL_ID_CTRL {
-        Err(ENOENT)
-    } else if req.len() < 20 {
-        Err(EINVAL)
-    } else {
-        match req[16] {
-            // The dump is small, and as on Linux NLMSG_DONE follows in the same datagram
-            CTRL_CMD_GETFAMILY if dump => {
-                let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
-                out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
-                Ok(Some(out))
+    let r: Result<Option<NetlinkItem>, GenlErr<'_>> =
+        if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+            Ok(None)
+        } else if ty != GENL_ID_CTRL {
+            Err((ENOENT, None, None))
+        } else if req.len() < 20 {
+            Err((EINVAL, None, None))
+        } else {
+            match req[16] {
+                // As on Linux, NLMSG_DONE shares the datagram with nlctrl when both fit in the
+                // caller's buffer, and splits cleanly onto the next recv when the buffer is smaller.
+                CTRL_CMD_GETFAMILY if dump => {
+                    let mut out = DumpMessages::new();
+                    out.push(reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family()), false);
+                    out.push(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()), true);
+                    Ok(Some(NetlinkItem::dump(out)))
+                }
+                CTRL_CMD_GETFAMILY => parse_nlctrl_attrs(req)
+                    .map_err(|(e, m)| (e, m, None))
+                    .and_then(|a| a.check_nlctrl(false).map_err(|e| (e, None, None)))
+                    .map(|()| Some(NetlinkItem::reply(reply(GENL_ID_CTRL, 0, &nlctrl_family())))),
+                // Linux's ctrl_dumppolicy_start checks CTRL_ATTR_FAMILY_ID before
+                // CTRL_ATTR_FAMILY_NAME, then dumps the requested operation's policy (or all of
+                // nlctrl's policies when CTRL_ATTR_OP is absent).
+                CTRL_CMD_GETPOLICY if dump => parse_nlctrl_attrs(req)
+                    .map_err(|(e, m)| (e, m, None))
+                    .and_then(|a| {
+                        a.check_nlctrl(true).map_err(|e| (e, None, None))?;
+                        let msgs = nlctrl_policy(a.op).ok_or((ENOENT, None, a.op_offs))?;
+                        let mut out = DumpMessages::new();
+                        for m in msgs {
+                            out.push(reply(GENL_ID_CTRL, NLM_F_MULTI, &m), false);
+                        }
+                        out.push(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()), true);
+                        Ok(Some(NetlinkItem::dump(out)))
+                    }),
+                _ => Err((EOPNOTSUPP, None, None)),
             }
-            CTRL_CMD_GETFAMILY => {
-                names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
-            }
-            // Policy dumps are not implemented: it can only tell that the requested family does not
-            // exist
-            CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
-            _ => Err(EOPNOTSUPP),
-        }
-    };
+        };
     match r {
         // No separate ack after a dump (Linux's netlink_dump_start makes netlink_rcv_skb skip the
         // ack)
         Ok(answer) => {
-            let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
+            let mut out: Vec<NetlinkItem> = answer.into_iter().collect();
             if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
-                out.push(ack(req, 0, pid));
+                out.push(NetlinkItem::reply(ack(req, 0, pid)));
             }
             out
         }
-        Err(e) => vec![ack(req, e, pid)],
+        Err((e, msg, offs)) => vec![NetlinkItem::reply(ack_ext_offs(
+            req,
+            e,
+            pid,
+            msg.filter(|_| ext),
+            offs.filter(|_| ext),
+            cap,
+        ))],
     }
+}
+
+/// Builds the `CTRL_CMD_GETPOLICY` dump payloads for `nlctrl` (Linux 6.8's `ctrl_dumppolicy`):
+/// `op == None` dumps both `CTRL_CMD_GETFAMILY` (policy 0) and `CTRL_CMD_GETPOLICY` (policy 1);
+/// `op == Some(cmd)` dumps only that command (at policy index 0) or returns `None`.
+fn nlctrl_policy(op: Option<u32>) -> Option<Vec<Vec<u8>>> {
+    let hdr = || {
+        let mut p = vec![CTRL_CMD_GETPOLICY, 2, 0, 0];
+        attr(&mut p, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes());
+        p
+    };
+    let op_msg = |cmd_key: u16, do_idx: Option<u32>, dump_idx: Option<u32>| {
+        let mut inner = Vec::new();
+        if let Some(i) = do_idx {
+            attr(&mut inner, CTRL_ATTR_POLICY_DO, &i.to_le_bytes());
+        }
+        if let Some(i) = dump_idx {
+            attr(&mut inner, CTRL_ATTR_POLICY_DUMP, &i.to_le_bytes());
+        }
+        let mut outer = Vec::new();
+        attr(&mut outer, cmd_key | NLA_F_NESTED, &inner);
+        let mut p = hdr();
+        attr(&mut p, CTRL_ATTR_OP_POLICY | NLA_F_NESTED, &outer);
+        p
+    };
+    let pol_msg = |pol_idx: u16, attr_id: u16, desc: &[u8]| {
+        let mut by_attr = Vec::new();
+        attr(&mut by_attr, attr_id | NLA_F_NESTED, desc);
+        let mut by_pol = Vec::new();
+        attr(&mut by_pol, pol_idx | NLA_F_NESTED, &by_attr);
+        let mut p = hdr();
+        attr(&mut p, CTRL_ATTR_POLICY | NLA_F_NESTED, &by_pol);
+        p
+    };
+    let uint_desc = |ty: u32, max: u64| {
+        let mut d = Vec::new();
+        attr(&mut d, NL_POLICY_TYPE_ATTR_MIN_VALUE_U, &0u64.to_le_bytes());
+        attr(&mut d, NL_POLICY_TYPE_ATTR_MAX_VALUE_U, &max.to_le_bytes());
+        attr(&mut d, NL_POLICY_TYPE_ATTR_TYPE, &ty.to_le_bytes());
+        d
+    };
+    let u16_desc = uint_desc(NL_ATTR_TYPE_U16, u64::from(u16::MAX));
+    let u32_desc = uint_desc(NL_ATTR_TYPE_U32, u64::from(u32::MAX));
+    let name_desc = {
+        let mut d = Vec::new();
+        attr(&mut d, NL_POLICY_TYPE_ATTR_MAX_LENGTH, &15u32.to_le_bytes());
+        attr(
+            &mut d,
+            NL_POLICY_TYPE_ATTR_TYPE,
+            &NL_ATTR_TYPE_NUL_STRING.to_le_bytes(),
+        );
+        d
+    };
+    let push_pol = |out: &mut Vec<Vec<u8>>, pol_idx: u16, with_op: bool| {
+        out.push(pol_msg(pol_idx, CTRL_ATTR_FAMILY_ID, &u16_desc));
+        out.push(pol_msg(pol_idx, CTRL_ATTR_FAMILY_NAME, &name_desc));
+        if with_op {
+            out.push(pol_msg(pol_idx, CTRL_ATTR_OP, &u32_desc));
+        }
+    };
+    let mut out = Vec::new();
+    match op {
+        None => {
+            out.push(op_msg(u16::from(CTRL_CMD_GETFAMILY), Some(0), Some(0)));
+            out.push(op_msg(0, None, Some(1)));
+            push_pol(&mut out, 0, false);
+            push_pol(&mut out, 1, true);
+        }
+        Some(o) if o == u32::from(CTRL_CMD_GETFAMILY) => {
+            out.push(op_msg(u16::from(CTRL_CMD_GETFAMILY), Some(0), Some(0)));
+            push_pol(&mut out, 0, false);
+        }
+        Some(o) if o == u32::from(CTRL_CMD_GETPOLICY) => {
+            out.push(op_msg(0, None, Some(0)));
+            push_pol(&mut out, 0, true);
+        }
+        Some(_) => return None,
+    }
+    Some(out)
 }
 
 /// nlctrl's `CTRL_CMD_NEWFAMILY`: the genlmsghdr and attributes, the same as Linux 6.8's
@@ -1387,34 +2415,64 @@ fn nlctrl_family() -> Vec<u8> {
     p
 }
 
-/// Whether request `req` (genlmsghdr and attributes after the message header) refers to the
-/// nlctrl family: looked up by `CTRL_ATTR_FAMILY_ID` or `CTRL_ATTR_FAMILY_NAME` (Linux's
-/// `ctrl_getfamily`); EINVAL when neither is present, ENOENT when not found.
-fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
-    let (mut id, mut name) = (None, None);
-    let mut b = req.get(20..).unwrap_or_default();
-    while b.len() >= 4 {
+#[derive(Default)]
+struct NlctrlAttrs<'a> {
+    id: Option<u16>,
+    name: Option<&'a [u8]>,
+    op: Option<u32>,
+    op_offs: Option<u32>,
+}
+
+impl NlctrlAttrs<'_> {
+    fn check_nlctrl(&self, id_first: bool) -> Result<(), i32> {
+        let by_id = self.id.map(|id| id == GENL_ID_CTRL);
+        let by_name = self.name.map(|n| n == b"nlctrl");
+        let hit = if id_first {
+            by_id.or(by_name)
+        } else {
+            by_name.or(by_id)
+        };
+        match hit {
+            Some(true) => Ok(()),
+            Some(false) => Err(ENOENT),
+            None => Err(EINVAL),
+        }
+    }
+}
+
+/// Parses `CTRL_ATTR_FAMILY_ID`, `CTRL_ATTR_FAMILY_NAME`, and `CTRL_ATTR_OP` from a `nlctrl`
+/// request, rejecting attributes that fail Linux's policy validation with `ERANGE`.
+fn parse_nlctrl_attrs(req: &[u8]) -> Result<NlctrlAttrs<'_>, NlErr> {
+    let mut out = NlctrlAttrs::default();
+    let mut off = 20usize;
+    while off + 4 <= req.len() {
+        let b = &req[off..];
         let len = u16::from_le_bytes([b[0], b[1]]) as usize;
         if len < 4 || len > b.len() {
             break;
         }
         let data = &b[4..len];
         match u16::from_le_bytes([b[2], b[3]]) & NLA_TYPE_MASK {
-            CTRL_ATTR_FAMILY_ID if data.len() >= 2 => {
-                id = Some(u16::from_le_bytes([data[0], data[1]]))
+            CTRL_ATTR_FAMILY_ID => {
+                let bytes = data.get(..2).ok_or(BAD_ATTR)?;
+                out.id = Some(u16::from_le_bytes([bytes[0], bytes[1]]));
             }
             CTRL_ATTR_FAMILY_NAME => {
-                name = Some(data.split(|&c| c == 0).next().unwrap_or_default());
+                if data.len() > 16 {
+                    return Err(BAD_ATTR);
+                }
+                out.name = Some(cstr(data));
+            }
+            CTRL_ATTR_OP => {
+                let bytes = data.get(..4).ok_or(BAD_ATTR)?;
+                out.op = Some(u32::from_le_bytes(bytes.try_into().unwrap()));
+                out.op_offs = Some(off as u32);
             }
             _ => {}
         }
-        b = &b[len.next_multiple_of(4).min(b.len())..];
+        off += len.next_multiple_of(4).min(b.len());
     }
-    match (id, name) {
-        (Some(GENL_ID_CTRL), _) | (_, Some(b"nlctrl")) => Ok(()),
-        (None, None) => Err(EINVAL),
-        _ => Err(ENOENT),
-    }
+    Ok(out)
 }
 
 // ---- Netlink messages ----
@@ -1461,7 +2519,7 @@ const AF_MAX: u8 = 46;
 /// requests with a short body or a family at or past `AF_MAX` `EINVAL` and otherwise `ENOENT` (no
 /// family handler), other types `EINVAL`; non-requests and control messages are acked only when
 /// asked. `cap` is `NETLINK_CAP_ACK`.
-fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<Vec<u8>> {
+fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<NetlinkItem> {
     let ty = u16::from_le_bytes([req[4], req[5]]);
     let flags = u16::from_le_bytes([req[6], req[7]]);
     let err = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
@@ -1477,7 +2535,7 @@ fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<Vec<u8>> {
     if err == 0 && flags & NLM_F_ACK == 0 {
         return Vec::new();
     }
-    vec![ack_ext(req, err, pid, None, cap)]
+    vec![NetlinkItem::reply(ack_ext(req, err, pid, None, cap))]
 }
 
 /// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
@@ -1490,8 +2548,18 @@ fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
 /// Like [`ack`], also attaching the extack message per `NETLINK_EXT_ACK` (`NLMSGERR_ATTR_MSG`,
 /// with `NLM_F_ACK_TLVS`); `cap` means `NETLINK_CAP_ACK` is set.
 pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
-    const NLM_F_ACK_TLVS: u16 = 0x200;
-    const NLMSGERR_ATTR_MSG: u16 = 1;
+    ack_ext_offs(req, err, pid, msg, None, cap)
+}
+
+/// Like [`ack_ext`], also optionally attaching `NLMSGERR_ATTR_OFFS` (bad attribute byte offset).
+fn ack_ext_offs(
+    req: &[u8],
+    err: i32,
+    pid: u32,
+    msg: Option<&str>,
+    offs: Option<u32>,
+    cap: bool,
+) -> Vec<u8> {
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
     let mut p = (-err).to_le_bytes().to_vec();
     let mut flags = 0;
@@ -1501,14 +2569,27 @@ pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bo
     } else {
         p.extend_from_slice(req);
     }
+    extack_tlvs(&mut p, &mut flags, msg, offs);
+    message(NLMSG_ERROR, flags, seq, pid, &p)
+}
+
+/// Appends optional `NETLINK_EXT_ACK` TLVs (`NLMSGERR_ATTR_MSG`, `NLMSGERR_ATTR_OFFS`) and sets
+/// `NLM_F_ACK_TLVS`.
+fn extack_tlvs(p: &mut Vec<u8>, flags: &mut u16, msg: Option<&str>, offs: Option<u32>) {
+    const NLMSGERR_ATTR_OFFS: u16 = 2;
+    if msg.is_none() && offs.is_none() {
+        return;
+    }
+    align4(p);
     if let Some(m) = msg {
-        align4(&mut p);
         let mut s = m.as_bytes().to_vec();
         s.push(0);
-        attr(&mut p, NLMSGERR_ATTR_MSG, &s);
-        flags |= NLM_F_ACK_TLVS;
+        attr(p, NLMSGERR_ATTR_MSG, &s);
     }
-    message(NLMSG_ERROR, flags, seq, pid, &p)
+    if let Some(o) = offs {
+        attr(p, NLMSGERR_ATTR_OFFS, &o.to_le_bytes());
+    }
+    *flags |= NLM_F_ACK_TLVS;
 }
 
 fn align4(b: &mut Vec<u8>) {
@@ -1519,11 +2600,11 @@ fn align4(b: &mut Vec<u8>) {
 
 const SOL_SOCKET: i32 = 1;
 const SO_PROTOCOL: i32 = 38;
-const TCP_INFO: i32 = 11;
+pub(crate) const TCP_INFO: i32 = 11;
 /// The st column of `/proc/net` (Linux's TCP states; UDP borrows two of them too).
 const TCP_ESTABLISHED: u8 = 1;
-const TCP_CLOSE: u8 = 7;
-const TCP_LISTEN: u8 = 10;
+pub(crate) const TCP_CLOSE: u8 = 7;
+pub(crate) const TCP_LISTEN: u8 = 10;
 
 /// The tables under `/proc/net` that list sockets.
 #[derive(Clone, Copy, PartialEq)]
@@ -1593,9 +2674,7 @@ pub(crate) fn proc_listing(
         }
         // Addresses as the guest sees them (crate::netns), and mapped low ports reported as the
         // guest's (crate::portmap)
-        let me = inet.net.clone().unwrap_or_else(|| w.all[0].clone());
-        let unmap =
-            |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, w, inet, a, local);
+        let me = inet.net.as_deref().unwrap_or_else(|| w.init());
         let host_peer = appine_hal::net::sockname(fd, true).ok();
         let local = appine_hal::net::sockname(fd, false).ok().map(|a| {
             let role = crate::netns::Role::Local {
@@ -1603,20 +2682,21 @@ pub(crate) fn proc_listing(
                 vaddr: inet.vaddr,
                 peer: host_peer.as_deref(),
             };
-            crate::netns::from_host(w, &me, &unmap(a, true), role, inet.icmp6())
+            let a = crate::syscall::unmap_addr(inet, a);
+            crate::netns::from_host(w, me, &a, role, inet.icmp6())
         });
-        let peer = host_peer
-            .clone()
-            .map(|a| {
-                let role = crate::netns::Role::Peer;
-                crate::netns::from_host(w, &me, &unmap(a, false), role, inet.icmp6())
-            })
-            .or_else(|| inet.peer.clone());
+        let peer = if host_peer.is_some()
+            && let Some(p) = inet.track.as_ref().and_then(|t| t.outside_peer.as_ref())
+        {
+            Some(p.clone())
+        } else {
+            host_peer
+                .as_deref()
+                .map(|a| translate_peer(portmap, w, inet, a, false))
+                .or_else(|| inet.peer.clone())
+        };
         let state = if tcp {
-            appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
-                .ok()
-                .and_then(|b| b.first().copied())
-                .unwrap_or(TCP_CLOSE)
+            inet.tcp_state()
         } else if peer.is_some() {
             TCP_ESTABLISHED
         } else {
@@ -1694,10 +2774,7 @@ pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -
         ));
         if inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP) {
             alloc += 1;
-            let state = appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
-                .ok()
-                .and_then(|b| b.first().copied());
-            if inet.family == family && state.is_some_and(|s| s != TCP_CLOSE) {
+            if inet.family == family && inet.tcp_state() != TCP_CLOSE {
                 tcp += 1;
             }
             continue;
@@ -1817,8 +2894,7 @@ pub(crate) fn proc_snmp(
                 return false;
             };
             (inet.ty, inet.proto) == (SOCK_STREAM, IPPROTO_TCP)
-                && appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
-                    .is_ok_and(|b| b.first() == Some(&TCP_ESTABLISHED))
+                && inet.tcp_state() == TCP_ESTABLISHED
         })
         .count() as u64;
     let line = |group: &str, names: &[&str], values: &[String]| {
@@ -2007,9 +3083,15 @@ mod tests {
             routes: vec![route(1, 4)],
         };
         let got: Vec<_> = after
-            .changes(&before)
+            .changes(&before, NotifyCause::default())
             .into_iter()
-            .map(|(g, m)| (g, u16::from_le_bytes([m[4], m[5]]), m[16..].to_vec()))
+            .map(|n| {
+                (
+                    n.group,
+                    u16::from_le_bytes([n.msg[4], n.msg[5]]),
+                    n.msg[16..].to_vec(),
+                )
+            })
             .collect();
         assert_eq!(
             got,
@@ -2028,11 +3110,15 @@ mod tests {
         assert!(!s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
         s.groups = Some(1 << (RTNLGRP_IPV4_IFADDR - 1));
         assert!(s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
-        for _ in 0..=NOTE_QUEUE {
+        let cap = s.opts.rcvbuf() / (1 + NetlinkSocket::SKB_OVERHEAD);
+        for _ in 0..=cap {
             assert!(s.notify(RTNLGRP_IPV4_IFADDR, b"y"));
         }
-        assert_eq!(s.queue.len(), NOTE_QUEUE);
-        assert_eq!(s.queue[0], (b"y".to_vec(), RTNLGRP_IPV4_IFADDR));
+        assert_eq!(s.queue.len(), cap);
+        assert_eq!(
+            s.dequeue(4096, true),
+            Some((b"y".to_vec(), RTNLGRP_IPV4_IFADDR))
+        );
         assert!(s.overrun.get());
     }
 
@@ -2115,6 +3201,15 @@ mod tests {
         out
     }
 
+    /// Drains all datagrams from a netlink socket using a `max`-byte receive buffer.
+    fn drain(s: &mut NetlinkSocket, max: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some((d, _)) = s.dequeue(max, false) {
+            out.push(d);
+        }
+        out
+    }
+
     #[test]
     fn dumps_links_and_addresses() {
         let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
@@ -2141,7 +3236,7 @@ mod tests {
             },
         );
         // Interfaces, NLMSG_DONE, IPv4 addresses, NLMSG_DONE are one datagram each
-        let datagrams: Vec<_> = s.queue.drain(..).map(|(d, _)| parse(&d)).collect();
+        let datagrams: Vec<_> = drain(&mut s, 4096).iter().map(|d| parse(d)).collect();
         let types: Vec<Vec<u16>> = datagrams
             .iter()
             .map(|d| d.iter().map(|m| m.0).collect())
@@ -2197,7 +3292,7 @@ mod tests {
         };
         let mut ask = |req: Vec<u8>| -> (u16, Vec<u8>) {
             s.handle(&req, &NOTHING);
-            let d = parse(&s.queue.pop_front().unwrap().0);
+            let d = parse(&s.dequeue(4096, false).unwrap().0);
             assert!(s.queue.is_empty());
             d[0].clone()
         };
@@ -2254,9 +3349,9 @@ mod tests {
                 &message(ty, NLM_F_REQUEST | NLM_F_DUMP, 1, 0, &[0; 16]),
                 &host,
             );
-            s.queue
-                .drain(..)
-                .map(|(d, _)| {
+            drain(&mut s, 4096)
+                .into_iter()
+                .map(|d| {
                     assert!(d.len() <= 4096, "a {}-byte datagram", d.len());
                     parse(&d)
                 })
@@ -2297,7 +3392,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         let dump = |ty, family: i32| {
             message(
@@ -2350,7 +3445,7 @@ mod tests {
                 attr(&mut p, *t, d);
             }
             s.handle(&message(RTM_GETNSID, NLM_F_REQUEST, 5, 0, &p), &NOTHING);
-            s.queue.drain(..).flat_map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().flat_map(|d| parse(d)).collect()
         };
         // The other namespace is found: the answer is -1 (no number assigned), the same as what
         // `ip netns list` sees on Linux
@@ -2387,7 +3482,7 @@ mod tests {
         // The answer's datagrams, each parsed into messages
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         // Query nlctrl by name, asking for an ack: the answer and the ack are two datagrams, and
         // the ack attaches only the request's message header
@@ -2473,7 +3568,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
+            drain(&mut s, 4096).iter().map(|d| parse(d)).collect()
         };
         let dump = NLM_F_REQUEST | NLM_F_DUMP;
         // ss's inet_diag_req_v2 for TCP over IPv4, a unix_diag_req, the old TCPDIAG_GETSOCK, a
@@ -2618,6 +3713,726 @@ mod tests {
         );
         assert_eq!(ask(msg(RTM_GETLINK, 0, 1, (0, 0), &[])), None);
     }
+
+    #[test]
+    fn netlink_queue_caps_to_so_rcvbuf_and_reports_peer() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        // Minimum SO_RCVBUF is 2304 bytes
+        assert!(
+            s.opts
+                .set(8 /* SO_RCVBUF */, &1i32.to_le_bytes(), false, false)
+                == Some(Ok(()))
+        );
+        assert_eq!(s.opts.rcvbuf(), 2304);
+        assert!(s.enqueue(vec![0u8; 800], 0));
+        assert!(s.enqueue(vec![0u8; 800], 0));
+        assert!(!s.overrun.get());
+        // Next message overflows 2304 bytes (2 * (800 + 256) + (64 + 256) = 2432 > 2304)
+        assert!(!s.enqueue(vec![0u8; 64], 0));
+        assert!(s.overrun.get());
+        // Peek does not reduce queued_bytes; pop does
+        let _ = s.dequeue(4096, true);
+        assert!(!s.enqueue(vec![0u8; 64], 0));
+        s.overrun.set(false);
+        let _ = s.dequeue(4096, false);
+        let _ = s.dequeue(4096, false);
+        assert!(s.enqueue(vec![0u8; 64], 0));
+        // NETLINK_NO_ENOBUFS suppresses overrun on drop
+        s.flags |= 1 << 5; // NETLINK_NO_ENOBUFS
+        assert!(!s.enqueue(vec![0u8; 2500], 0));
+        assert!(!s.overrun.get());
+        // peer_sockaddr reflects dst_pid and dst_group
+        assert_eq!(s.peer_sockaddr(), [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        s.dst_pid = 42;
+        s.dst_group = 3;
+        let peer = s.peer_sockaddr();
+        assert_eq!(u32::from_le_bytes(peer[4..8].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(peer[8..12].try_into().unwrap()), 1 << 2);
+    }
+
+    #[test]
+    fn rtnetlink_request_flag_and_single_getneigh_validation() {
+        let host = Fake {
+            stats: IfStats::default(),
+            routes: Some(Vec::new()),
+        };
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 7;
+        // Handled rtnetlink request without NLM_F_REQUEST is skipped (or acks 0 on NLM_F_ACK)
+        let mut no_req = message(RTM_GETLINK, NLM_F_DUMP, 1, 0, &[0; 16]);
+        s.handle(&no_req, &host);
+        assert!(s.queue.is_empty());
+        no_req = message(RTM_GETLINK, NLM_F_ACK, 2, 0, &[0; 16]);
+        s.handle(&no_req, &host);
+        let (ack_msg, _) = s.dequeue(4096, false).expect("ack");
+        assert_eq!(u16::from_le_bytes([ack_msg[4], ack_msg[5]]), NLMSG_ERROR);
+        assert_eq!(i32::from_le_bytes(ack_msg[16..20].try_into().unwrap()), 0);
+
+        let getneigh_err = |s: &mut NetlinkSocket, body: &[u8]| -> i32 {
+            let req = message(RTM_GETNEIGH, NLM_F_REQUEST, 3, 0, body);
+            s.handle(&req, &host);
+            let (m, _) = s.dequeue(4096, false).expect("reply");
+            assert_eq!(u16::from_le_bytes([m[4], m[5]]), NLMSG_ERROR);
+            -i32::from_le_bytes(m[16..20].try_into().unwrap())
+        };
+        let ndm = |fam: u8, ifindex: i32, state: u16, dst: Option<&[u8]>| {
+            let mut b = vec![0u8; 12];
+            b[0] = fam;
+            b[4..8].copy_from_slice(&ifindex.to_le_bytes());
+            b[8..10].copy_from_slice(&state.to_le_bytes());
+            if let Some(d) = dst {
+                attr(&mut b, 1 /* NDA_DST */, d);
+            }
+            b
+        };
+        let lo = Some(&[127, 0, 0, 1][..]);
+        assert_eq!(getneigh_err(&mut s, &[0; 4]), EINVAL);
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 1, lo)), EINVAL);
+        assert_eq!(
+            getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, None)),
+            EINVAL
+        );
+        assert_eq!(getneigh_err(&mut s, &ndm(99, 1, 0, lo)), 97); // EAFNOSUPPORT
+        assert_eq!(
+            getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, Some(&[127, 0]))),
+            EINVAL
+        );
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 99, 0, lo)), 19); // ENODEV
+        assert_eq!(getneigh_err(&mut s, &ndm(AF_INET as u8, 1, 0, lo)), ENOENT);
+    }
+
+    #[test]
+    fn resumable_dumps_adapt_to_small_buffers_and_preserve_peek_trunc() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 77;
+        let host = Many(20);
+
+        // Links with 512B and 1024B buffers: every datagram fits, all 20 links preserved in order
+        for max in [512usize, 1024] {
+            s.handle(
+                &message(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, 0, &[0; 16]),
+                &host,
+            );
+            let dgrams = drain(&mut s, max);
+            assert!(dgrams.len() > 10);
+            assert!(dgrams.iter().all(|d| d.len() <= max));
+            let msgs: Vec<_> = dgrams.iter().flat_map(|d| parse(d)).collect();
+            assert_eq!(msgs.last().unwrap().0, NLMSG_DONE);
+            let names: Vec<_> = msgs[..msgs.len() - 1]
+                .iter()
+                .map(|(ty, p)| {
+                    assert_eq!(*ty, RTM_NEWLINK);
+                    attributes(&p[16..])[&IFLA_IFNAME].clone()
+                })
+                .collect();
+            let want: Vec<Vec<u8>> = (1..=20).map(|n| format!("eth{n}\0").into()).collect();
+            assert_eq!(names, want);
+            assert_eq!(s.queued_bytes, 0);
+        }
+
+        // Addresses, routes and rules with small buffers (256B / 128B)
+        for (ty, max, expect_ty, min_count) in [
+            (RTM_GETADDR, 256usize, RTM_NEWADDR, 40usize),
+            (RTM_GETROUTE, 256, RTM_NEWROUTE, 40),
+            (RTM_GETRULE, 96, RTM_NEWRULE, 3),
+        ] {
+            let fam = if ty == RTM_GETRULE { AF_INET as u8 } else { 0 };
+            s.handle(
+                &message(ty, NLM_F_REQUEST | NLM_F_DUMP, 2, 0, &[fam, 0, 0, 0]),
+                &host,
+            );
+            let dgrams = drain(&mut s, max);
+            assert!(dgrams.len() > 2, "ty={ty} should span multiple datagrams");
+            assert!(dgrams.iter().all(|d| d.len() <= max));
+            let msgs: Vec<_> = dgrams.iter().flat_map(|d| parse(d)).collect();
+            assert_eq!(msgs.last().unwrap().0, NLMSG_DONE);
+            assert!(msgs.len() > min_count);
+            assert!(msgs[..msgs.len() - 1].iter().all(|(t, _)| *t == expect_ty));
+            assert_eq!(s.queued_bytes, 0);
+        }
+
+        // Oversized single atomic message + MSG_PEEK probe (max=0 and max=128)
+        s.handle(
+            &message(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 3, 0, &[0; 16]),
+            &host,
+        );
+        let probe0 = s.dequeue(0, true).expect("peek 0").0;
+        let probe128 = s.dequeue(128, true).expect("peek 128").0;
+        assert_eq!(probe0, probe128);
+        assert!(probe0.len() > 128);
+        assert_eq!(parse(&probe0).len(), 1);
+        // Non-peek with 128B returns that single atomic link (truncated by caller) without
+        // losing links 2..=20 or NLMSG_DONE.
+        let first = s.dequeue(128, false).expect("first").0;
+        assert_eq!(first, probe0);
+        // Next peek/read with exact size receives eth2 intact.
+        let p2 = s.dequeue(0, true).expect("peek eth2").0;
+        let d2 = s.dequeue(p2.len(), false).expect("read eth2").0;
+        assert_eq!(d2, p2);
+        let rest: Vec<_> = drain(&mut s, 512).iter().flat_map(|d| parse(d)).collect();
+        assert_eq!(rest.last().unwrap().0, NLMSG_DONE);
+        // 1 (eth1) + 1 (eth2) + 18 (eth3..=eth20) = 20 links
+        assert_eq!(rest.len() - 1, 18);
+        assert_eq!(s.queued_bytes, 0);
+
+        // NETLINK_GENERIC dump splits GENL_ID_CTRL and NLMSG_DONE when buffer fits only one
+        let mut g = NetlinkSocket::new(NETLINK_GENERIC, SOCK_RAW);
+        g.pid = 77;
+        let greq = genl(GENL_ID_CTRL, NLM_F_DUMP, CTRL_CMD_GETFAMILY, &[]);
+        g.handle(&greq, &NOTHING);
+        let ctrl_len = g.dequeue(0, true).unwrap().0.len();
+        let gd = drain(&mut g, ctrl_len);
+        assert_eq!(gd.len(), 2);
+        assert_eq!(parse(&gd[0])[0].0, GENL_ID_CTRL);
+        assert_eq!(parse(&gd[1])[0].0, NLMSG_DONE);
+        assert_eq!(g.queued_bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_changes_sets_seq_port_route_flags_and_echo() {
+        let lo_if = lo();
+        let mut eth = Interface {
+            name: "d0".into(),
+            index: 2,
+            flags: IFF_UP | IFF_RUNNING | IFF_BROADCAST,
+            mtu: 1500,
+            mac: Some([2, 0, 0, 0, 0, 1]),
+            addrs: vec![(AF_INET, vec![10, 1, 0, 1], 24)],
+        };
+        let rt = |dst: [u8; 4], proto: u8| crate::route::Entry {
+            family: AF_INET,
+            table: 254,
+            ty: 1,
+            proto,
+            scope: 253,
+            dst: dst.to_vec(),
+            prefix: 24,
+            prefsrc: None,
+            gateway: None,
+            iface: "d0".into(),
+            index: 2,
+            metric: 0,
+            flags: 0,
+            host: false,
+        };
+        let snap = |ifaces: &[Interface], routes: &[crate::route::Entry]| Snapshot {
+            links: ifaces
+                .iter()
+                .map(|i| link_message(i, IfStats::default(), Some(1000)))
+                .collect(),
+            addrs: ifaces.iter().flat_map(|i| addr_messages(i, 0)).collect(),
+            routes: routes.iter().map(crate::route::route_message).collect(),
+        };
+        let hdr = |m: &[u8]| {
+            (
+                u16::from_le_bytes([m[4], m[5]]),
+                u16::from_le_bytes([m[6], m[7]]),
+                u32::from_le_bytes(m[8..12].try_into().unwrap()),
+                u32::from_le_bytes(m[12..16].try_into().unwrap()),
+            )
+        };
+
+        // 1. Adding an IPv4 address copies seq/port into RTM_NEWADDR (and echoes on NLM_F_ECHO),
+        //    while kernel-added routes carry NLM_F_CREATE|NLM_F_EXCL and seq/port 0 without echo.
+        let before = snap(std::slice::from_ref(&lo_if), &[]);
+        let after = snap(&[lo_if.clone(), eth.clone()], &[rt([10, 1, 0, 0], 2)]);
+        let notes = after.changes(
+            &before,
+            NotifyCause {
+                ty: RTM_NEWADDR,
+                flags: NLM_F_CREATE | NLM_F_EXCL | NLM_F_ECHO,
+                seq: 101,
+                port: 777,
+            },
+        );
+        let addr_note = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWADDR)
+            .expect("RTM_NEWADDR");
+        assert_eq!(hdr(&addr_note.msg), (RTM_NEWADDR, 0, 101, 777));
+        assert!(addr_note.echo);
+        let rt_note = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWROUTE)
+            .expect("RTM_NEWROUTE");
+        assert_eq!(
+            hdr(&rt_note.msg),
+            (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, 0, 0)
+        );
+        assert!(!rt_note.echo);
+
+        // 2. New route via RTM_NEWROUTE copies seq/port, carries NLM_F_CREATE|NLM_F_EXCL, and echoes.
+        let before_rt = snap(&[lo_if.clone(), eth.clone()], &[rt([10, 1, 0, 0], 2)]);
+        let after_rt = snap(
+            &[lo_if.clone(), eth.clone()],
+            &[rt([10, 1, 0, 0], 2), rt([10, 9, 0, 0], 3)],
+        );
+        let notes = after_rt.changes(
+            &before_rt,
+            NotifyCause {
+                ty: RTM_NEWROUTE,
+                flags: NLM_F_CREATE | NLM_F_ECHO,
+                seq: 202,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            hdr(&notes[0].msg),
+            (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, 202, 888)
+        );
+        assert!(notes[0].echo);
+
+        // 3. Replacing an existing route carries NLM_F_REPLACE (not CREATE|EXCL).
+        let after_rep = snap(
+            &[lo_if.clone(), eth.clone()],
+            &[rt([10, 1, 0, 0], 2), rt([10, 9, 0, 0], 4)],
+        );
+        let notes = after_rep.changes(
+            &after_rt,
+            NotifyCause {
+                ty: RTM_NEWROUTE,
+                flags: NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ECHO,
+                seq: 203,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_NEWROUTE, NLM_F_REPLACE, 203, 888));
+        assert!(notes[0].echo);
+
+        // 4. Deleting a route carries flags 0, copies seq/port, and echoes.
+        let notes = before_rt.changes(
+            &after_rep,
+            NotifyCause {
+                ty: RTM_DELROUTE,
+                flags: NLM_F_ECHO,
+                seq: 204,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_DELROUTE, 0, 204, 888));
+        assert!(notes[0].echo);
+
+        // 5. Link create/move, modification, and deletion all carry seq/port 0 and do not echo
+        //    (matching Linux 6.1's rtmsg_ifinfo_build_skb / rtmsg_ifinfo_send).
+        let new_link_cause = NotifyCause {
+            ty: RTM_NEWLINK,
+            flags: NLM_F_CREATE | NLM_F_ECHO,
+            seq: 205,
+            port: 888,
+        };
+        assert!(new_link_cause.is_change() && !new_link_cause.wants_echo());
+        let just_lo = snap(std::slice::from_ref(&lo_if), &[]);
+        let with_eth = snap(&[lo_if.clone(), eth.clone()], &[]);
+        let notes = with_eth.changes(&just_lo, new_link_cause);
+        let new_link = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_NEWLINK)
+            .expect("RTM_NEWLINK");
+        assert_eq!(hdr(&new_link.msg), (RTM_NEWLINK, 0, 0, 0));
+        assert!(!new_link.echo);
+
+        let del_link_cause = NotifyCause {
+            ty: RTM_DELLINK,
+            flags: NLM_F_ECHO,
+            seq: 206,
+            port: 888,
+        };
+        assert!(del_link_cause.is_change() && !del_link_cause.wants_echo());
+        let notes = just_lo.changes(&with_eth, del_link_cause);
+        let del_link = notes
+            .iter()
+            .find(|n| hdr(&n.msg).0 == RTM_DELLINK)
+            .expect("RTM_DELLINK");
+        assert_eq!(hdr(&del_link.msg), (RTM_DELLINK, 0, 0, 0));
+        assert!(!del_link.echo);
+
+        eth.mtu = 1400;
+        let after_mtu = snap(&[lo_if, eth], &[rt([10, 1, 0, 0], 2)]);
+        let notes = after_mtu.changes(
+            &before_rt,
+            NotifyCause {
+                ty: RTM_NEWLINK,
+                flags: NLM_F_ECHO,
+                seq: 207,
+                port: 888,
+            },
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(hdr(&notes[0].msg), (RTM_NEWLINK, 0, 0, 0));
+        assert!(!notes[0].echo);
+    }
+
+    fn with_attrs(base: &[u8], attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut b = base.to_vec();
+        for &(t, d) in attrs {
+            attr(&mut b, t, d);
+        }
+        b
+    }
+
+    #[test]
+    fn netlink_strict_chk_header_validation_and_filtering() {
+        let host = Fake {
+            stats: IfStats::default(),
+            routes: Some(Vec::new()),
+        };
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 77;
+        s.flags |= 1 << NETLINK_GET_STRICT_CHK;
+        s.ext_ack = true;
+        let mut dump_raw = |ty: u16, body: &[u8]| -> Vec<(u16, u16, Vec<u8>)> {
+            let req = message(ty, NLM_F_REQUEST | NLM_F_DUMP, 5, 0, body);
+            s.handle(&req, &host);
+            let mut out = Vec::new();
+            for d in drain(&mut s, 8192) {
+                let mut off = 0;
+                while off + 16 <= d.len() {
+                    let len = u32::from_le_bytes(d[off..off + 4].try_into().unwrap()) as usize;
+                    let mty = u16::from_le_bytes([d[off + 4], d[off + 5]]);
+                    let fl = u16::from_le_bytes([d[off + 6], d[off + 7]]);
+                    out.push((mty, fl, d[off + 16..off + len].to_vec()));
+                    off += len.next_multiple_of(4);
+                }
+            }
+            out
+        };
+        let done_err = |msgs: &[(u16, u16, Vec<u8>)]| -> (i32, u16) {
+            let (ty, fl, body) = msgs.last().expect("NLMSG_DONE");
+            assert_eq!(*ty, NLMSG_DONE);
+            (-i32::from_le_bytes(body[..4].try_into().unwrap()), *fl)
+        };
+        let fam_hdr = |n: usize, fam: u8| {
+            let mut b = vec![0u8; n];
+            b[0] = fam;
+            b
+        };
+
+        // 1. RTM_GETLINK strict: short header, nonzero header fields, bad attr len, unknown attr
+        assert_eq!(
+            done_err(&dump_raw(RTM_GETLINK, &[0; 4])),
+            (EINVAL, NLM_F_MULTI | NLM_F_ACK_TLVS)
+        );
+        let mut bad_ifi = [0u8; 16];
+        bad_ifi[4..8].copy_from_slice(&1i32.to_le_bytes()); // ifi_index = 1
+        assert_eq!(done_err(&dump_raw(RTM_GETLINK, &bad_ifi)).0, EINVAL);
+        assert_eq!(
+            done_err(&dump_raw(
+                RTM_GETLINK,
+                &with_attrs(&[0; 16], &[(IFLA_MASTER, &[1, 0])])
+            ))
+            .0,
+            ERANGE
+        );
+        assert_eq!(
+            done_err(&dump_raw(
+                RTM_GETLINK,
+                &with_attrs(&[0; 16], &[(IFLA_IFNAME, b"lo\0")])
+            ))
+            .0,
+            EINVAL
+        );
+        let ok_links = dump_raw(RTM_GETLINK, &[0; 16]);
+        assert_eq!(ok_links.len(), 2); // lo + DONE
+        assert_eq!(ok_links[0].0, RTM_NEWLINK);
+
+        // 2. RTM_GETADDR strict: short header, nonzero prefixlen, 16B ifinfomsg, ifa_index filter
+        assert_eq!(done_err(&dump_raw(RTM_GETADDR, &[2, 0, 0, 0])).0, EINVAL);
+        assert_eq!(
+            done_err(&dump_raw(RTM_GETADDR, &[2, 8, 0, 0, 0, 0, 0, 0])).0,
+            EINVAL
+        );
+        assert_eq!(done_err(&dump_raw(RTM_GETADDR, &fam_hdr(16, 2))).0, EINVAL);
+        // Filter by lo (index 1): sets NLM_F_DUMP_FILTERED on messages and DONE
+        let mut ifa_lo = [0u8; 8];
+        ifa_lo[0] = AF_INET as u8;
+        ifa_lo[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let lo_addrs = dump_raw(RTM_GETADDR, &ifa_lo);
+        assert_eq!(lo_addrs.len(), 2);
+        assert_eq!(lo_addrs[0].1, NLM_F_MULTI | NLM_F_DUMP_FILTERED);
+        assert_eq!(done_err(&lo_addrs), (0, NLM_F_MULTI | NLM_F_DUMP_FILTERED));
+        // Nonexistent ifa_index -> ENODEV with NLM_F_DUMP_FILTERED
+        ifa_lo[4..8].copy_from_slice(&999u32.to_le_bytes());
+        assert_eq!(
+            done_err(&dump_raw(RTM_GETADDR, &ifa_lo)),
+            (ENODEV, NLM_F_MULTI | NLM_F_DUMP_FILTERED)
+        );
+
+        // 3. RTM_GETROUTE strict: short header, 16B ifinfomsg, invalid flags/scope/attr, table/oif filter
+        assert_eq!(done_err(&dump_raw(RTM_GETROUTE, &[2, 0, 0, 0])).0, EINVAL);
+        assert_eq!(done_err(&dump_raw(RTM_GETROUTE, &[0; 16])).0, EINVAL);
+        let mut rtm = [0u8; 12];
+        rtm[0] = AF_INET as u8;
+        rtm[6] = 254; // rtm_scope nonzero -> EINVAL
+        assert_eq!(done_err(&dump_raw(RTM_GETROUTE, &rtm)).0, EINVAL);
+        rtm[6] = 0;
+        rtm[8..12].copy_from_slice(&1u32.to_le_bytes()); // invalid flag -> EINVAL
+        assert_eq!(done_err(&dump_raw(RTM_GETROUTE, &rtm)).0, EINVAL);
+        rtm[8..12].copy_from_slice(&0x200u32.to_le_bytes()); // RTM_F_CLONED -> empty filtered dump
+        let cloned = dump_raw(RTM_GETROUTE, &rtm);
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(done_err(&cloned), (0, NLM_F_MULTI | NLM_F_DUMP_FILTERED));
+        rtm[8..12].fill(0);
+        rtm[4] = 100; // nonexistent table -> ENOENT with extack + NLM_F_DUMP_FILTERED
+        assert_eq!(
+            done_err(&dump_raw(RTM_GETROUTE, &rtm)),
+            (ENOENT, NLM_F_MULTI | NLM_F_DUMP_FILTERED | NLM_F_ACK_TLVS)
+        );
+        rtm[4] = 255; // local table -> 3 IPv4 lo routes + DONE
+        let local_rts = dump_raw(RTM_GETROUTE, &rtm);
+        assert_eq!(local_rts.len(), 4);
+        assert_eq!(done_err(&local_rts), (0, NLM_F_MULTI | NLM_F_DUMP_FILTERED));
+        // RTA_OIF nonexistent -> ENODEV; short RTA_OIF -> ERANGE
+        let rtm4 = fam_hdr(12, AF_INET as u8);
+        assert_eq!(
+            done_err(&dump_raw(
+                RTM_GETROUTE,
+                &with_attrs(&rtm4, &[(4 /* RTA_OIF */, &999u32.to_le_bytes())])
+            ))
+            .0,
+            ENODEV
+        );
+        assert_eq!(
+            done_err(&dump_raw(
+                RTM_GETROUTE,
+                &with_attrs(&rtm4, &[(4 /* RTA_OIF */, &[1, 0])])
+            ))
+            .0,
+            ERANGE
+        );
+
+        // 4. RTM_GETRULE strict: nonzero header/attrs rejected; unsupported family -> DONE -EAFNOSUPPORT
+        assert_eq!(done_err(&dump_raw(RTM_GETRULE, &[2, 0, 0, 0])).0, EINVAL);
+        let mut bad_rule = fam_hdr(12, 2);
+        bad_rule[4] = 254;
+        assert_eq!(done_err(&dump_raw(RTM_GETRULE, &bad_rule)).0, EINVAL);
+        assert_eq!(done_err(&dump_raw(RTM_GETRULE, &fam_hdr(16, 2))).0, EINVAL);
+        assert_eq!(dump_raw(RTM_GETRULE, &fam_hdr(12, 2)).len(), 4); // 3 IPv4 rules + DONE
+        assert_eq!(
+            done_err(&dump_raw(RTM_GETRULE, &fam_hdr(12, 99))).0,
+            EAFNOSUPPORT
+        );
+
+        // 5. RTM_GETNEIGH strict
+        assert_eq!(done_err(&dump_raw(RTM_GETNEIGH, &[2, 0, 0, 0])).0, EINVAL);
+        let mut bad_ndm = fam_hdr(12, 2);
+        bad_ndm[4] = 1;
+        assert_eq!(done_err(&dump_raw(RTM_GETNEIGH, &bad_ndm)).0, EINVAL);
+        assert_eq!(done_err(&dump_raw(RTM_GETNEIGH, &fam_hdr(12, 2))).0, 0);
+    }
+
+    #[test]
+    fn netlink_query_validation_cap_ack_ext_ack_and_nlctrl_policy() {
+        let host = Fake {
+            stats: IfStats::default(),
+            routes: Some(Vec::new()),
+        };
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        s.pid = 77;
+        s.cap_ack = true;
+        s.ext_ack = true;
+        let ask_err = |sock: &mut NetlinkSocket, req: &[u8]| -> (i32, u16, usize) {
+            sock.handle(req, &host);
+            let (d, _) = sock.dequeue(8192, false).expect("error reply");
+            assert_eq!(u16::from_le_bytes([d[4], d[5]]), NLMSG_ERROR);
+            let fl = u16::from_le_bytes([d[6], d[7]]);
+            let err = -i32::from_le_bytes(d[16..20].try_into().unwrap());
+            (err, fl, d.len())
+        };
+        let ask_route_err = |sock: &mut NetlinkSocket, ty: u16, seq: u32, body: &[u8]| {
+            ask_err(sock, &message(ty, NLM_F_REQUEST, seq, 0, body))
+        };
+
+        // CAP_ACK + EXT_ACK on RTM_GETLINK errors and attribute policy validation
+        let (e, fl, len) = ask_route_err(&mut s, RTM_GETLINK, 1, &[0, 0]);
+        assert_eq!((e, fl), (EINVAL, NLM_F_CAPPED | NLM_F_ACK_TLVS));
+        assert!(len > 36);
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETLINK,
+                2,
+                &with_attrs(&[0; 16], &[(IFLA_IFNAME, b"")])
+            )
+            .0,
+            ERANGE
+        );
+        let mut bad_idx = [0u8; 16];
+        bad_idx[4..8].copy_from_slice(&999i32.to_le_bytes());
+        assert_eq!(
+            ask_route_err(&mut s, RTM_GETLINK, 3, &bad_idx),
+            (ENODEV, NLM_F_CAPPED, 36)
+        );
+
+        // Single RTM_GETADDR: IPv4 -> EOPNOTSUPP (capped); IPv6 short header -> EINVAL + extack;
+        // IPv6 short IFA_ADDRESS -> ERANGE; IPv6 :: -> RTM_NEWADDR; IPv6 ::2 -> EADDRNOTAVAIL
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETADDR,
+                4,
+                &[AF_INET as u8, 0, 0, 0, 1, 0, 0, 0]
+            ),
+            (EOPNOTSUPP, NLM_F_CAPPED, 36)
+        );
+        let (e, fl, _) = ask_route_err(&mut s, RTM_GETADDR, 5, &[AF_INET6 as u8, 0, 0, 0]);
+        assert_eq!((e, fl), (EINVAL, NLM_F_CAPPED | NLM_F_ACK_TLVS));
+        let ifa6 = [AF_INET6 as u8, 128, 0, 0, 1, 0, 0, 0];
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETADDR,
+                6,
+                &with_attrs(&ifa6, &[(IFA_ADDRESS, &[0; 4])])
+            )
+            .0,
+            ERANGE
+        );
+        // Fake's lo() has IPv6 address :: ([0; 16])
+        let mut lo6 = [0u8; 16];
+        s.handle(
+            &message(
+                RTM_GETADDR,
+                NLM_F_REQUEST,
+                7,
+                0,
+                &with_attrs(&ifa6, &[(IFA_ADDRESS, &lo6)]),
+            ),
+            &host,
+        );
+        let (d, _) = s.dequeue(8192, false).expect("v6 getaddr reply");
+        assert_eq!(u16::from_le_bytes([d[4], d[5]]), RTM_NEWADDR);
+        lo6[15] = 2;
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETADDR,
+                8,
+                &with_attrs(&ifa6, &[(IFA_ADDRESS, &lo6)])
+            )
+            .0,
+            EADDRNOTAVAIL
+        );
+
+        // Single RTM_GETROUTE (ip route get): short header, IPv4 short RTA_DST/RTA_FLOW -> ERANGE,
+        // IPv6 short RTA_DST -> EINVAL, IPv6 20B RTA_DST -> OK
+        let (e, fl, len) = ask_route_err(&mut s, RTM_GETROUTE, 9, &[AF_INET as u8, 0, 0, 0]);
+        assert_eq!((e, fl), (EINVAL, NLM_F_CAPPED | NLM_F_ACK_TLVS));
+        assert!(len > 36);
+        let rt4 = [AF_INET as u8, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let rt6 = [AF_INET6 as u8, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETROUTE,
+                10,
+                &with_attrs(&rt4, &[(1, &[127, 0, 0, 1]), (11 /* RTA_FLOW */, &[1, 0])])
+            )
+            .0,
+            ERANGE
+        );
+        assert_eq!(
+            ask_route_err(&mut s, RTM_GETROUTE, 11, &with_attrs(&rt6, &[(1, &[0; 4])])).0,
+            EINVAL
+        );
+        s.handle(
+            &message(
+                RTM_GETROUTE,
+                NLM_F_REQUEST,
+                12,
+                0,
+                &with_attrs(&rt6, &[(1, &[0u8; 20])]),
+            ),
+            &host,
+        );
+        let (d, _) = s.dequeue(8192, false).expect("v6 getroute reply");
+        assert_eq!(u16::from_le_bytes([d[4], d[5]]), RTM_NEWROUTE);
+
+        // RTM_GETNSID short attr -> ERANGE
+        assert_eq!(
+            ask_route_err(
+                &mut s,
+                RTM_GETNSID,
+                13,
+                &with_attrs(&[0; 4], &[(NETNSA_PID, &[1, 0])])
+            )
+            .0,
+            ERANGE
+        );
+
+        // NETLINK_GENERIC: CAP_ACK + EXT_ACK, ERANGE on short id, GETPOLICY dump & ID precedence
+        let mut g = NetlinkSocket::new(NETLINK_GENERIC, SOCK_RAW);
+        g.pid = 77;
+        g.cap_ack = true;
+        g.ext_ack = true;
+        let (e, fl, _) = ask_err(
+            &mut g,
+            &genl(
+                GENL_ID_CTRL,
+                0,
+                CTRL_CMD_GETFAMILY,
+                &[(CTRL_ATTR_FAMILY_ID, &[16])],
+            ),
+        );
+        assert_eq!((e, fl), (ERANGE, NLM_F_CAPPED | NLM_F_ACK_TLVS));
+
+        // GETPOLICY takes CTRL_ATTR_FAMILY_ID before CTRL_ATTR_FAMILY_NAME
+        let (e, fl, _) = ask_err(
+            &mut g,
+            &genl(
+                GENL_ID_CTRL,
+                NLM_F_DUMP,
+                CTRL_CMD_GETPOLICY,
+                &[
+                    (CTRL_ATTR_FAMILY_ID, &99u16.to_le_bytes()),
+                    (CTRL_ATTR_FAMILY_NAME, b"nlctrl\0"),
+                ],
+            ),
+        );
+        assert_eq!((e, fl), (ENOENT, NLM_F_CAPPED));
+
+        // GETPOLICY dump of nlctrl (all, op=3, unknown op=99)
+        let pol_all = genl(
+            GENL_ID_CTRL,
+            NLM_F_DUMP,
+            CTRL_CMD_GETPOLICY,
+            &[(CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes())],
+        );
+        g.handle(&pol_all, &NOTHING);
+        let msgs: Vec<_> = drain(&mut g, 8192).iter().flat_map(|d| parse(d)).collect();
+        assert_eq!(msgs.len(), 8); // 7 policy msgs + NLMSG_DONE
+        assert_eq!(msgs.last().unwrap().0, NLMSG_DONE);
+        let pol_op3 = genl(
+            GENL_ID_CTRL,
+            NLM_F_DUMP,
+            CTRL_CMD_GETPOLICY,
+            &[
+                (CTRL_ATTR_FAMILY_NAME, b"nlctrl\0"),
+                (CTRL_ATTR_OP, &3u32.to_le_bytes()),
+            ],
+        );
+        g.handle(&pol_op3, &NOTHING);
+        let msgs: Vec<_> = drain(&mut g, 8192).iter().flat_map(|d| parse(d)).collect();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(
+            ask_err(
+                &mut g,
+                &genl(
+                    GENL_ID_CTRL,
+                    NLM_F_DUMP,
+                    CTRL_CMD_GETPOLICY,
+                    &[
+                        (CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes()),
+                        (CTRL_ATTR_OP, &99u32.to_le_bytes()),
+                    ],
+                ),
+            )
+            .0,
+            ENOENT
+        );
+    }
 }
 
 // ---- Generic socket options ----
@@ -2674,6 +4489,11 @@ impl Default for SockOpts {
 }
 
 impl SockOpts {
+    /// Current `SO_RCVBUF` byte limit.
+    pub fn rcvbuf(&self) -> usize {
+        self.rcvbuf.max(0) as usize
+    }
+
     const DEBUG: i32 = 1;
     const REUSEADDR: i32 = 2;
     const TYPE: i32 = 3;

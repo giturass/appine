@@ -6,11 +6,12 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   owns the guest kernel and the terminal sessions; `MainActivity` shows them with tabs
   and a row of extra keys. The terminal emulator is libghostty-vt from Ghostty, linked into
   `libappine.so` (`hosts/android/src/vt.c`, `vt.rs`), and drawn by `VtView` with the bundled
-  JetBrains Mono font. `Rootfs` imports Alpine from the APK assets on first launch,
-  picks the fastest mirror, and can replace it with Debian (downloaded and checked
-  against a pinned sha256 digest). `SettingsActivity`, opened from the tab bar's menu,
-  switches the distribution, resets the rootfs, chooses the package mirror, the login
-  account and the execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
+  JetBrains Mono font. `Rootfs` imports Alpine from the APK assets on first launch
+  and can replace it with Debian (downloaded and checked against a pinned sha256 digest).
+  During import it selects the fastest package mirror measured by the time local setup finishes,
+  falling back to the official mirror if no result is available. From the tab bar's menu,
+  `SettingsActivity` lets users switch distributions, reset the rootfs, and choose the login
+  account and execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
   and release builds).
   On the first launch of a new or upgraded Alpine system, Appine checks for OpenRC.
   If it is missing, Appine installs it offline and boots it before opening a tab. An existing
@@ -58,8 +59,9 @@ signed with the debug key; GitHub Actions produces the signed APK for distributi
 by name. Archive `app/build/outputs/mapping/release/mapping.txt` with its APK to decode stack traces.
 
 Run the instrumentation tests on both a 4K-page
-and a 16K-page system image. `downloadedDistributionsRun` downloads Debian
-(about 50 MB) and the browser bridge test installs tmux/screen in a separate temporary store. Both require
+and a 16K-page system image. `downloadedDistributionsRun` and
+`debianImportsBothSourcesWithTheSelectedMirror` each import the Debian tarball (about 50 MB).
+These tests and the browser bridge test that installs tmux/screen require
 `-Pandroid.testInstrumentationRunnerArguments.network=true`. An emulator started
 with `-http-proxy` sends connections to 127.0.0.1 to the proxy too, which breaks
 `downloadsResumeWhereTheyBrokeOff`. Setting the system proxy instead

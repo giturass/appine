@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/fuse"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229)
+> Last distilled: 2026-11-24 (HEAD = 231480cb)
 >
 > The VFS side of FUSE (the `Node::Fuse` kind, `/dev/fuse` as a file kind, key bits and the sweep's view of mounts) is kernel/vfs's D47 and D51; FUSE becoming a module of its own is knowledge-loop D7.
 
@@ -39,6 +39,30 @@
 - **Tradeoffs**: A deferred release reaches the daemon at the end of the syscall rather than at the drop.
 - **Watch out**: Drops on threads that never end a syscall or exit through the guest path (none known) would keep their releases queued.
 - **Source**: 6d9a9e8
+
+### D5: FUSE `mknod` restricts the whiteout exemption to char `0:0` and enforces the cgroup device BPF filter
+
+- **What**: `syscall::fuse::mknod` exempts only character device `0:0` (`S_IFCHR && dev == 0`) from `CAP_MKNOD` and calls `bpf::check_device(..., ACC_MKNOD)` after `CAP_MKNOD`.
+- **Why**: FUSE `mknod` previously exempted block `0:0` from `CAP_MKNOD` and bypassed the cgroup device BPF filter.
+- **Tradeoffs**: `CAP_MKNOD` and cgroup device checks remain duplicated between store/overlay `mknodat` and `syscall::fuse::mknod`.
+- **Watch out**: Future changes to `mknod` device policy must keep both `syscall/fs.rs` and `syscall/fuse.rs` in sync.
+- **Source**: b51818cf
+
+### D6: FUSE mapping `fill` falls back from short read-around and loops until a full page or EOF
+
+- **What**: `syscall::fuse::fill` stores any complete pages from read-around, switches to `fill.window_from(page)` if the faulted page was not reached, and loops reading the first page's remainder until `PAGE_SIZE`, `fill.size()`, or a 0-byte EOF reply.
+- **Why**: Short `FUSE_READ` replies during read-around could leave the faulted page unmarked and cause an infinite guest fault loop.
+- **Tradeoffs**: Daemons returning sub-page chunks incur multiple `FUSE_READ` round trips to satisfy one faulted page.
+- **Watch out**: Even tiny daemon replies make bounded forward progress (`PAGE_SIZE` iterations per page) and remain interruptible by signals between reads.
+- **Source**: 0e02d7cd
+
+### D7: FUSE emits syscall-layer inotify events, syncs `O_SYNC` writes via `FUSE_FSYNC`, and uses RAII `PosGuard`
+
+- **What**: FUSE operations emit syscall-layer inotify events (`Attrs::Fuse`, `inotify::unlinked`, and `make_node` deduplicating MKNOD-fallback `IN_CREATE`), synchronous writes call `fuse::fsync` via `write_sync`, and `fuse::read`, `fuse::write` and `fuse::lseek` guard `pos_busy` with `PosGuard`.
+- **Why**: FUSE metadata/truncation/xattr/`O_TRUNC` changes missed inotify hooks, MKNOD fallback emitted `IN_CREATE` twice, `IN_EXCL_UNLINK` broke on FUSE directories, `O_SYNC` writes did not flush, and FUSE `lseek`/I/O lacked uniform RAII position locking.
+- **Tradeoffs**: Synchronous FUSE writes (`O_SYNC`/`O_DSYNC`/`RWF_SYNC`/`RWF_DSYNC`) send a `FUSE_FSYNC` round trip to the daemon, while `PosGuard::lock_if` eliminates manual error-path unlock calls.
+- **Watch out**: Genuine `FUSE_FSYNC` errors now surface to synchronous writers (`ENOSYS` is cached in `no`), and `PosGuard` must be dropped before any blocking wait outside the FUSE I/O body.
+- **Source**: ab694aab, 3a90a0ef
 
 ## Superseded
 

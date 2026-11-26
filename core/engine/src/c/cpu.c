@@ -75,6 +75,13 @@ void appine_cpu_tlb_flush(struct appine_cpu *cpu)
         }
         cpu->tlb_used[w] = 0;
     }
+    for (unsigned w = 0; w < APPINE_STLB_ENTRIES / 64; w++) {
+        for (uint64_t bits = cpu->stlb_used[w]; bits; bits &= bits - 1) {
+            unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
+            cpu->stlb[i] = (struct appine_tlb_entry){TLB_INVALID, 0, TLB_INVALID, 0};
+        }
+        cpu->stlb_used[w] = 0;
+    }
     memset(cpu->itlb, 0, sizeof(cpu->itlb));
     _Static_assert(TLB_INVALID == 0, "a zeroed entry is an invalid one");
 }
@@ -93,7 +100,8 @@ static uint32_t watched_page(const struct appine_cpu *cpu, uint64_t vpn)
 
 void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
 {
-    uintptr_t pte = appine_mmu_lookup_pte(cpu->mmu, va);
+    bool is_super = false;
+    uintptr_t pte = appine_mmu_lookup_super(cpu->mmu, va, &is_super);
     if (!pte)
         return NULL;
     uint32_t prot = (uint32_t)(pte & PTE_PROT_MASK);
@@ -104,7 +112,8 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
         return NULL;
 
     uint64_t vpn = va >> APPINE_PAGE_SHIFT;
-    uintptr_t host_page = pte & ~(uintptr_t)PAGE_MASK;
+    uintptr_t host_base = pte & ~(uintptr_t)PAGE_MASK;
+    uintptr_t host_page = is_super ? host_base + (va & (MMU_SUPER_SIZE - APPINE_PAGE_SIZE)) : host_base;
     uint64_t addend = (uint64_t)host_page - (vpn << APPINE_PAGE_SHIFT);
     if (access == APPINE_ACCESS_EXEC) {
         cpu->itlb[vpn & (APPINE_ITLB_ENTRIES - 1)] = (struct appine_itlb_entry){~vpn, addend};
@@ -126,6 +135,18 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
             (prot & rw) == rw && !watched ? ~vpn : TLB_INVALID,
             addend,
         };
+        if (is_super && LIKELY(!cpu->nwatch)) {
+            uint64_t svpn = va >> MMU_SUPER_SHIFT;
+            unsigned sidx = (unsigned)(svpn & (APPINE_STLB_ENTRIES - 1));
+            uint64_t saddend = (uint64_t)host_base - (svpn << MMU_SUPER_SHIFT);
+            cpu->stlb_used[sidx / 64] |= UINT64_C(1) << (sidx % 64);
+            cpu->stlb[sidx] = (struct appine_tlb_entry){
+                (prot & APPINE_PROT_READ) ? ~svpn : TLB_INVALID,
+                saddend,
+                (prot & rw) == rw ? ~svpn : TLB_INVALID,
+                saddend,
+            };
+        }
     }
     return (void *)(host_page + (va & PAGE_MASK));
 }
@@ -153,8 +174,10 @@ static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
         /* Check quickly with a plain load first, and clear with an atomic exchange only when there
          * really is a request, so a concurrently arriving kick is not swallowed */
         if (UNLIKELY(__atomic_load_n(&cpu->pending, __ATOMIC_RELAXED)) &&
-            __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE))
+            __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE)) {
+            clear_exclusive(cpu);
             return APPINE_EXIT_KICK;
+        }
         uint64_t pc = cpu->pc, page = pc >> APPINE_PAGE_SHIFT;
         enum appine_exit r;
         if (UNLIKELY((pc & 3) || cpu->nbrk)) {
@@ -255,10 +278,11 @@ void appine_cpu_kick(struct appine_cpu *cpu)
 
 int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
-                            size_t off_tlb, size_t off_v)
+                            size_t off_tlb, size_t off_v, size_t off_stlb)
 {
     return size == sizeof(struct appine_cpu) && off_tlb == offsetof(struct appine_cpu, tlb) &&
            off_v == offsetof(struct appine_cpu, v) &&
+           off_stlb == offsetof(struct appine_cpu, stlb) &&
            off_x == offsetof(struct appine_cpu, x) && off_pc == offsetof(struct appine_cpu, pc) &&
            off_tpidr == offsetof(struct appine_cpu, tpidr_el0) &&
            off_pending == offsetof(struct appine_cpu, pending) &&

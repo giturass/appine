@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/exec"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00)
+> Last distilled: 2026-11-24 (HEAD = 231480cb)
 >
 > Decisions on execve and the ELF loader made before kernel/exec was split from kernel/process keep their `kernel/process` tags and live in `.agents/decisions/kernel/process.md`: D7, D17, D31, D41, D43, D46 and D51.
 
@@ -30,6 +30,38 @@
 - **Tradeoffs**: Software SHA-256 is slower than hardware-accelerated `sha2`, though it runs at most once per host process on the 723 KB bundled musl image.
 - **Watch out**: Keep this helper scoped to fixed-size file verification in `loader.rs`, not general high-throughput or constant-time cryptographic use.
 - **Source**: 6b59a1b4, c8f01dbf, 189c6c98
+
+### D4: `execve` clears `TaskState::restart` at the point of no return
+
+- **What**: `execve` clears `cx.t.restart = None` alongside `altstack` and `saved_sigmask` at the point of no return in `syscall/proc.rs`, paired with clearing it on `EINTR` conversion in `signal::deliver`.
+- **Why**: Leaving `TaskState::restart` populated across `execve` allowed a subsequent `restart_syscall` in the new image to resume a stale sleep or futex.
+- **Tradeoffs**: None.
+- **Watch out**: Keep `execve`'s point-of-no-return state reset synchronized if future per-syscall restart state is added to `TaskState`.
+- **Source**: 849bf98a
+
+### D5: `execve` enforces `ETXTBSY` on scripts and `PT_INTERP`, pins mounts, and skips ptrace exec stops on doomed images
+
+- **What**: `execve` checks `open_for_write` on the initial target, every `#!` hop and `PT_INTERP`, propagates `image.doomed` to `exec_done` so doomed images flush hardware debug slots, skip `ptrace::exec`/`ptrace::syscall_exit` and deliver the forced `SIGSEGV` immediately, and pins executable/interpreter mounts on segment VMAs (`label_image`/`interp_label`) and `ExeFile`.
+- **Why**: `execve` missed `ETXTBSY` on nested `#!` scripts and `PT_INTERP`, reported ptrace exec/syscall-exit stops for doomed images, and left executable/interpreter mounts unpinned for `umount2`.
+- **Tradeoffs**: `execve`/`execveat` return `Result<bool, Errno>` instead of `Result<(), Errno>`, and `exec` runs `evict_unlinked_tmpfs` after `close_on_exec`.
+- **Watch out**: `LoadError::Interpreter` passes `Errno::ETXTBSY` straight through `load_error`, so future loader error wrapping must keep `ETXTBSY` intact.
+- **Source**: 0e02d7cd
+
+### D6: Secure `execve` computes `Args::arg_limit` before clamping the 8 MB stack limit
+
+- **What**: `loader::Args` carries an explicit `arg_limit` computed via `loader::arg_limit(stack_limit)` in `syscall/proc.rs::exec` before clamping `stack_limit` to `STACK_SIZE` (8 MB) for secure execs, and `loader::build_stack` enforces `args.arg_limit`.
+- **Why**: Clamping `RLIMIT_STACK` to 8 MB before computing the argument limit capped secure-exec arguments at 2 MB instead of Linux 6.1's up-to-6 MB pre-clamp limit.
+- **Tradeoffs**: Adds an explicit `arg_limit` field to `loader::Args` (initialized in `machine.rs` and loader tests) to decouple stack sizing from argument-limit sizing.
+- **Watch out**: `Machine::spawn` passes `arg_limit(STACK_SIZE)` directly because host-spawned processes start with the default 8 MB stack limit.
+- **Source**: 2609ab43
+
+### D7: Non-leader `execve` takeover clears stale `leader_serial` and `leader_tracer`
+
+- **What**: `kill_other_threads` clears `g.leader_serial = None` and `g.leader_tracer = None` alongside `g.leader_exit = None` when a non-leader thread takes over `tgid` during `execve`.
+- **Why**: Replacing the thread-group leader in a non-leader `execve` otherwise left stale `leader_serial` and `leader_tracer` fields on `ThreadGroup`.
+- **Tradeoffs**: Adds two reset lines in `syscall/proc.rs` to keep `ThreadGroup` leader-exit invariants self-consistent across exec handover.
+- **Watch out**: Keep `kill_other_threads` updated if additional leader-exit fields are added to `ThreadGroup`.
+- **Source**: 13dd5ae4
 
 ## Superseded
 

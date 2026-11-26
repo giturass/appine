@@ -3,247 +3,266 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/android/vt.md` for the paired decision history (it still holds the pre-split decisions for `android/vtcore`; earlier decisions remain D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 in `.agents/decisions/android/terminal.md`).
 >
-> Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
+> Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: list android/vtgestures alongside android/vtview and android/vtrender)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: OSC 52 read capture, preview dismissal and writer invalidation across user resets and program RIS)
 
 ## Responsibilities
 
-`android/vt` owns the Kotlin session of each terminal tab and its kernel console:
+`android/vt` owns the Kotlin session of each terminal tab and its kernel console wrapper:
 
-- opening the console and login shell lazily, starting the pump, writer and waiter threads,
-  resizing, waiting for exit and closing exactly once;
-- the session's progress and status records, pending clipboard reads and main-thread events to
-  the service, including command completion and tmux-detach notices;
-- selecting a snapshot or transcript when restoring, keeping the last transcript for saving,
-  pending messages, and the session-side clear/reset and cursor-setting calls.
+- opening the console and spawning `login.sh` lazily on the first known grid, creating or restoring
+  the native terminal, starting the `vt-writer`, `vt-pump` and `vt-waiter` threads, resizing,
+  waiting for exit and closing the console exactly once;
+- bridging native `vt-pump` callbacks onto the main thread (`Events`), queuing asynchronous OSC 52
+  clipboard reads, and managing OSC 9;4 progress and OSC 7501 program-status records;
+- staging restored snapshots/transcripts/notices, serving capped primary-screen transcripts and
+  three-way native snapshots for persistence, and executing session-side message, cursor, clear
+  and reset actions.
 
-Root: `VtSession.kt` and `ConsolePty.kt` in
+Root: `VtSession.kt`, `ClipboardReads.kt` and `ConsolePty.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`.
 
 Outside the module: `VtNative`, JNI, the pump implementation, terminal ownership and locks,
 protocol parsing, command timing, snapshots, reset semantics and compression (`android/vtcore`);
-view lifecycle, input and search (`android/vtview`), gestures/selection/scrolling
-(`android/vtgestures`), frame encoding and drawing (`android/vtrender`),
-the surrounding screen (`android/terminal`), session ownership and persistence policy
-(`android/service`), the kernel console (`kernel/tty`), kernel JNI (`android/native`), and the
+view lifecycle, input and search (`android/vtview`); gestures, selection and scrolling
+(`android/vtgestures`); frame encoding and drawing (`android/vtrender`); the surrounding screen
+(`android/terminal`); session ownership, notifications and persistence policy (`android/service`,
+`android/reports`); the kernel console (`kernel/tty`); kernel JNI (`android/native`); and the
 login script and prompt-mark producers (`android/setup`).
 
 ## Key types
 
-- `VtSession` — a tab owned by the service: its `id` (from the service, naming the tab in a
-  notification's intent), its `ConsolePty`, the terminal handle (0 until the shell starts, never
-  reset), the view showing it (`view`, read on the pump thread), a restored tab's snapshot (a
-  loader the service gives) and transcript, the pending notice and messages, its login and the
-  account an `auto` login resolved to (`resolvedLogin`, written by the service), the file of its
-  last saved snapshot (`savedSnapshot`, used by the service's worker only), the last transcript
-  (its last 256 K characters, also returned while the screen is unchanged), the last progress
-  report (`progress`, a
-  `Progress`), the program status records by id (`Status`, least recently updated first, at most
-  64) and the one most in need of the user (`status`), the clipboard reads waiting for an answer
-  (the clipboard each named), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
-  `vt-writer` executor, the cursor's default shape and blinking (`setCursor`, from the service);
-  `Events` (title changed, bell, clipboard write, notification, clipboard read, progress or status
-  changed, a command finished, tmux's control mode detached, the shell finished) go
-  to the service on the main thread; `busy` (closing it would end something: the shell runs, has
-  started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
-  kernel). Its companion holds
-  libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
-- `ConsolePty` — `start` (open a console, spawn `login.sh` through `sh -c` with the tab's login
-  and cwd and a fixed environment, `TERM=xterm-256color` among it), `waitFor`, `close`; `console`
-  is −1 until started and keeps its number after `close` (`VtSession.consoleOpen` tells whether it
-  is still open, for the routing of kill reports in android/service).
+- `VtSession` — per-tab session owned by `TerminalService`: holds `id`, `ConsolePty`, `machine`,
+  `Events`, `@Volatile tab` (`0L` until created; never reset on `release`), `@Volatile view` (read
+  on `vt-pump`), `console` (`pty.console`), `consoleOpen` (`pty.console >= 0 && !hungUp`),
+  `isRunning` (`exit == null`, true before start as well), `busy` (`isRunning && tab != 0L &&
+  VtNative.busy(tab)`), restore staging (`restoredSnapshot`, `restoredText`, `pending`),
+  `lastTranscript` (capped to `Tabs.MAX_TRANSCRIPT` = 256 K chars), worker-only `@Volatile` save
+  metadata (`resolvedLogin`, `savedSnapshot`), cursor defaults (`cursorStyle`, `cursorBlink`),
+  grid cache, main-thread `progress` (`Progress?`, 15 s `dropProgress` timer) and `status`
+  (`Status?` selected from `LinkedHashMap<String, Status> records`, LRU-ordered, max 64),
+  synchronized `reports` handoff buffer from `vt-pump`, `clipboardReads` (`ClipboardReads`), `AtomicBoolean
+  hungUp`, and single-thread `vt-writer` executor.
+- `ClipboardReads` — main-thread OSC 52 read queue per session (max 64 targets, 60 s wait timer
+  and active preview). Each reply carries a `Token` with the local queue generation and the
+  native generation applied to that batch. The latest observed native generation is atomic.
+- `VtSession.Events` — main-thread callback interface implemented by `TerminalService`:
+  `onTitleChanged`, `onBell`, `onClipboard`, `onNotification`, `onClipboardRead`,
+  `onStatusChanged`, `onCommandFinished`, `onTmuxDetached`, `onFinished`.
+- `VtSession.Progress(state, percent)` & `VtSession.Status(id, state, kind, percent, title,
+  message)` — value types for OSC 9;4 progress and OSC 7501 status; companion defines protocol
+  constants (`PROGRESS_*`, `STATUS_*`, `KIND_*`) and localized `describe(context, status)`.
+- `ConsolePty` — per-tab kernel PTY handle and login-shell launcher (`machine`, `script`, `login`,
+  `cwd`, optional `ConsoleTracker`, `@Volatile console` starting at `-1` and retained after
+  `close`, `@Volatile openedEpoch`, `@Volatile closedEpoch`, `pid`). Companion holds `LOGIN_AUTO`,
+  `LOGIN_ROOT`, cached `script(context)` (`login.sh`), `argv(script, login, cwd)` and `ENVIRONMENT`.
 
 ## Public entry points
 
-- Lifecycle: `VtSession.start`, `resize`, `write`, `finishIfRunning`, `release`;
-  `ConsolePty.start`, `waitFor`, `close`, `script`, `argv` and `ENVIRONMENT`.
-- State and saving: `tab`, `view`, `console`, `consoleOpen`, `login`, `resolvedLogin`, `id`,
-  `title`, `isRunning`, `busy`, `cwd`, `setRestored`, `transcriptText`, `takeSnapshot`,
-  `savedSnapshot`, `showMessage`, `setCursor`, `clear` and `reset`.
-- Program reports: `progress`, `status`, `statusSeen`, `describe`, `answerClipboardRead`,
-  and `Events`; native pump callbacks `onOutput`, `onTitle`, `onBell`, `onClipboard`,
-  `onNotification`, `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished`,
-  `onTmuxDetached` and `onForeground`.
-- Calls run on the main thread except the native pump callbacks and the saving fields/methods
-  used on the service's worker. Callbacks post service events to the main thread; `onOutput`
-  invalidates the attached view from the pump thread.
+- Lifecycle: `VtSession.start`, `resize`, `write`, `finishIfRunning`, `release`, `ownedConsoleAt`;
+  `ConsolePty.start`, `waitFor`, `close`, `script`, `argv`, `ENVIRONMENT`, `LOGIN_AUTO`,
+  `LOGIN_ROOT`.
+- State and saving: `id`, `login`, `resolvedLogin`, `savedSnapshot`, `tab`, `view`, `console`,
+  `consoleOpen`, `title`, `isRunning`, `busy`, `cwd`, `setRestored`, `transcriptText`,
+  `takeSnapshot`, `showMessage`, `setCursor`, `clear`, `reset`.
+- Program reports and native pump callbacks: `progress`, `status`, `statusSeen`, `describe`,
+  `answerClipboardRead`, `Events`; JNI callbacks invoked on `vt-pump`: `onOutput`, `onTitle`,
+  `onBell`, `onClipboard`, `onNotification`, `onClipboardReset`, `onClipboardRead`, `onProgress`, `onStatus`,
+  `onForeground`, `onCommandFinished`, `onTmuxDetached`.
 
 ## Data flow / lifecycle
 
-### Start and end
+### Start, execution and teardown
 
-- A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
-  and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
-  opens a console of the grid's size and spawns the login. `createTerminal` tries a restored
-  snapshot through `VtNative.restore`, otherwise makes a terminal with `VtNative.create` and
-  prints the restored transcript when present. Both use android/vtcore's terminal options.
-  The session applies the user's cursor shape and blinking immediately after creation, before
-  the pending notice and messages; then it starts the writer, pump and waiter.
-- If opening the console or spawning fails, the reason is printed, the console is closed and the
-  tab counts as ended (127), with no "Process completed" line and no writer. If the terminal cannot
-  be made (the kernel is gone, libghostty-vt fails, a panic), the tab ends (127) without a word,
-  and later messages for it are refused.
-- A restore replaces whatever was pending with its notice; a message shown before the terminal
-  exists is queued after it as a plain yellow line, not inserted as below.
-- The `vt-pump` thread runs android/vtcore's `VtNative.pump`, including while no view shows the
-  tab. It reads the console, feeds the terminal and delivers callbacks; the session invalidates
-  its view and posts events to the service. The native implementation owns reply writes,
-  protocol parsing and termination conditions.
-- The waiter waits for the shell (−9, "signal 9", once the kernel is gone), gives the pump up to
-  0.5 s to take the last output, then on the main thread closes the console (once), stops the
-  writer and, unless the tab was released, drops the tab's progress and status records, prints
-  "[Process completed (code N | signal N) - press Enter]" and reports the end.
-- `release` (the tab closed, or its kernel going away) hangs up the console once, stops the writer
-  (writes already queued still run) and destroys the terminal handle; a running pump keeps the
-  terminal until it returns.
+- `TerminalService.createSession` builds `ConsolePty` and `VtSession` and calls `setCursor`;
+  restored tabs also call `setRestored(text, snapshotLoader, notice)`. While unstarted (`tab == 0L`),
+  `isRunning` is true, `busy` is false, `console` is `-1`, `transcriptText` returns `null` (so
+  `saveTabs` preserves the original unshown tab record), and `showMessage` appends yellow ANSI
+  lines to `pending`.
+- `VtSession.start(cols, rows, cellWidth, cellHeight)` runs once on the main thread when a view
+  first reports its grid (`Host.onGrid`):
+  1. Calls `ConsolePty.start(cols, rows)` -> `Native.openConsole(machine, rows, cols)` and
+     `Native.spawn(machine, console, "/bin/sh", argv, ENVIRONMENT)` (passing `HOME=/root`, `PATH`,
+     `TERM=xterm-256color`, `LANG=C.UTF-8`, `SHELL=/bin/sh`, `USER=root`, `LOGNAME=root`,
+     `BROWSER=/usr/local/bin/xdg-open`, `NMAP_UNPRIVILEGED=1`), catching `IOException` into `error`.
+  2. `createTerminal` invokes and clears `restoredSnapshot` and `restoredText`: tries
+     `VtNative.restore` if a snapshot exists (logging and falling back on `0L`), else calls
+     `VtNative.create` and prints `restoredText` if present; JNI `IOException` yields `0L`.
+  3. **Terminal-creation failure (`t == 0L`)**: calls `hangUp()` and `exited(127)` (silent — no
+     completion line, no `view?.onStarted()`, no threads, and later `showMessage` returns `false`).
+  4. **Terminal initialized (`t != 0L`)**: sets `tab = t`, applies `VtNative.setCursor` before
+     printing and clearing `pending`, and caches grid dimensions.
+  5. **Console/spawn failure (`error != null`)**: prints `"\r\n[$error]\r\n"`, calls `hangUp()`,
+     sets `exit = 127` directly (no `"[Process completed ...]"` line, no `writer`), calls
+     `view?.onStarted()` and `events.onFinished(this)`, and returns without starting threads.
+  6. **Normal start**: starts `vt-writer` (single-thread `ExecutorService`), non-daemon `vt-pump`
+     (`VtNative.pump(t, this)`), and non-daemon `vt-waiter` (`pty.waitFor()`, `pump.join(500)`,
+     then posts `exited(code)` on `main`), and calls `view?.onStarted()`.
+- `exited(code)` (main thread, idempotent on `exit != null`): sets `exit = code`, calls `hangUp()`
+  (cancelling queued `vt-writer` tasks via `shutdownNow()` before closing the console), calls
+  `writer?.shutdownNow()`, cancels `dropProgress`, returns early if `released`, else calls
+  `clearStatus()` (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing
+  `progress`/`status`, and firing `onStatusChanged` if any existed), prints
+  `"[Process completed (code N | signal N) - press Enter]"` (omitting reason for exit 0),
+  invalidates `view`, and fires `events.onFinished(this)`.
+- `release()` (idempotent on `released`): sets `released = true`, calls `finishIfRunning()` ->
+  `hangUp()` (`AtomicBoolean.compareAndSet(false, true)` cancelling queued writes with
+  `writer?.shutdownNow()` before `pty.close()` so a closed console number reused by the kernel
+  can never be closed twice or receive drained writes), calls `writer?.shutdownNow()`, cancels
+  `dropProgress`, and calls `VtNative.destroy(tab)` (removing the handle from native `TABS` while
+  any running `vt-pump` retains its `Arc<Tab>` until return).
 
-### Clipboard, progress and status
+### Pump callbacks, clipboard, progress and status
 
-- Clipboard reads, as Ghostty's default `clipboard-read = ask`: the session queues them (the
-  clipboard each named) and tells the service once for the reads that come before an answer; the
-  user is asked in the tab in front (android/terminal), and `VtSession.answerClipboardRead` writes
-  one answer per read through the tab's writer, in Ghostty's form `ESC ] 52 ; <clipboard> ; <base64>
-  ESC \` (ST, whatever ended the request): the text when allowed, nothing (an empty clipboard, as
-  libghostty-vt answers a read it refuses, so the program does not wait for a timeout) when denied,
-  dismissed or asked from a tab not in front.
-- Progress and status (`VtSession`, main thread): a progress report replaces the last one (a
-  removal clears it) and lasts 15 s without another, as in Ghostty. Status reports of a read are
-  applied together, as the specification keeps them: one record per id, a report replacing its
-  record whole, a clear removing the record and those beneath it (`build` takes `build/test`; an
-  empty id, as after a full reset, takes all), at most 64 records, the one updated longest ago
-  dropped; text direction controls are removed from titles and messages. `status` is the record
-  most in need of the user: blocked, then error, done, working, idle, the most recently updated
-  among equals. A change of either (by value) is reported to the service (`onStatusChanged`).
-- The pump stands in for shell integration's prompt mark, which only some shells send: after a
-  read that carried a progress or status report it notes the console's foreground process group
-  (`Machine::console_foreground`; a failed lookup notes none, and that report then waits for its
-  timeout, being seen or the shell's end), and on a later read where another group (or none) has
-  the foreground it calls `onForeground`,
-  which drops the progress and the working, blocked and idle records, keeping done and error ones
-  until seen. Seeing the tab (`statusSeen`, from the service) drops done and error records; the
-  shell's end drops everything.
-- Native command timing and tmux control-mode detection arrive as `onCommandFinished` and
-  `onTmuxDetached`; the session posts them to `Events` unless released. The service decides
-  which notices to show. Parsing and the tmux detach itself belong to android/vtcore.
+- `onOutput()` runs directly on `vt-pump` without checking `released` and calls
+  `view?.postInvalidateOnAnimation()`. All other native callbacks post to `main`: `onProgress` and
+  `applyReports` guard `!released && isRunning`; `onTitle`, `onBell`, `onClipboard`,
+  `onNotification`, `onCommandFinished` and `onTmuxDetached` guard `!released`.
+  `onForeground` uses the progress and status queues.
+- `ClipboardReads` retains up to 64 OSC 52 targets per session. The first read starts a 60 s
+  main-handler timeout and notifies the service. Further reads share the first deadline and
+  question. Excess requests receive empty replies immediately. The activity claims a batch
+  before reading the clipboard and cancels the timer. An open preview has no timeout.
+- An answer formats one ST-terminated OSC 52 reply per queued target with unwrapped base64
+  text. Denial, timeout and an empty clipboard send empty payloads. Reset, shell exit and
+  release cancel the timer, clear the batch and dismiss any preview without a reply.
+- `onClipboardReset(generation)` publishes the generation on the pump thread before posting
+  `resetTo` to main. `onClipboardRead(kind, count, generation)` rejects stale reads on the pump
+  and checks again on main, where the session must still be running and unreleased. A newer
+  read generation clears the old batch. An equal or older reset leaves the current batch alone.
+- Progress (`OSC 9;4`): `onProgress` maps `PROGRESS_REMOVE` to `null`, else `Progress(state,
+  percent)`. `setProgress` cancels and re-posts the 15 s `dropProgress` timer (`PROGRESS_TIMEOUT_MS`)
+  before checking `p == progress`, so identical heartbeats extend the timeout without firing
+  `onStatusChanged`.
+- Status (`OSC 7501`): `onStatus` strips Unicode direction controls (`U+202A..202E`,
+  `U+2066..2069`, `U+200E`, `U+200F`, `U+061C`) from `title` and `message` (not `id`) on `vt-pump`,
+  appends to `synchronized(reports)`, and posts `::applyReports` when `reports.size == 1`.
+  `applyReports` drains `reports` on `main`: `STATUS_CLEAR` clears all records when `id` is empty
+  or removes `id` and any `id + "/..."` descendants; other states replace `id` at the tail of
+  `records` (`LinkedHashMap`), evicting the oldest entry past `MAX_STATUS_RECORDS` (64).
+  `updateStatus` selects the most urgent record (`blocked > error > done > working > idle`, ties to
+  most recently updated) and fires `events.onStatusChanged` on value change.
+- A command end or primary prompt expires earlier progress and transient status records. A later
+  report in the same read survives. A foreground process-group change observed on a read without
+  reports sends the same progress removal and ordered status expiry through `onForeground`.
+  Done and error records remain until `statusSeen()` when the tab is in front. Shell exit clears all.
+- `onCommandFinished(hasExit, exit, millis)` converts `exit.takeIf { hasExit }` and forwards to
+  `Events`; `onTmuxDetached` forwards to `Events` (where `TerminalService` displays a notice).
 
-### Saving, messages and cursor actions
+### Saving, messages, actions and shell integration
 
-- Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
-  wraps joined, trailing blanks trimmed) and returns its last 256 K characters
-  (`Tabs.MAX_TRANSCRIPT`, all that saving keeps), which it also keeps; on the alternate screen,
-  when nothing changed the screen since the last transcript (no output, message, resize, clearing
-  or reset), or when formatting fails, it returns the last transcript taken on the primary one (""
-  when none was). The service also takes the terminal's snapshot (android/vtcore's Snapshots and restoring).
-- `setRestored` keeps the transcript, lazy snapshot loader and notice until the first start.
-  `takeSnapshot` forwards android/vtcore's three-way result: null before start or when no new
-  snapshot exists, empty when none can be taken, bytes for a new snapshot. `Tabs` owns version
-  checks, files and deflation; `savedSnapshot` identifies the file to keep on a null result.
-- `showMessage` queues a plain yellow line before the terminal exists (unless creation already
-  failed); afterwards it calls `VtNative.message`, which refuses the alternate screen and inserts
-  the notice above the cursor line. The insertion and parser recovery are android/vtcore's.
-- `resize` ignores an unchanged grid/cell size, calls `VtNative.resize` for terminal reflow and
-  the console's SIGWINCH, and sends its replies immediately through the writer. `write` queues
-  input on the tab's executor only while the shell is running.
-- `clear` calls `VtNative.clear`: -1 leaves an alternate screen unchanged; 1 writes a form feed
-  (^L) for the shell to redraw its prompt; 0 needs no form feed. `reset` similarly sends ^L
-  when `VtNative.reset` says the cursor was at a prompt, invalidates the view and reports a title
-  change. Neither session action drops progress or status records; the native screen/mode
-  semantics are in android/vtcore's Clearing and resetting.
-
-### Shell integration
-
-- `busy` is false before the terminal exists or after the shell exits; otherwise it negates
-  `VtNative.atPrompt`. At-prompt means the cursor is in the primary screen's marked prompt or
-  input, so a typed command counts as busy after Enter until the next prompt; background jobs
-  alone do not. A shell without marks remains busy while it runs.
-- android/setup supplies the login environment and shell hooks; android/vtcore interprets the
-  marks and times commands. Changes to prompt parsing or timing read that map as well as the
-  session callback contract here.
+- `transcriptText` (main thread): returns `null` when `tab == 0L`. Otherwise calls
+  `VtNative.transcript(tab)`: a non-null result (primary screen changed) is truncated to its last
+  `Tabs.MAX_TRANSCRIPT` (256 K) characters, cached in `lastTranscript` and returned; a `null`
+  result (unchanged, alternate screen, or error) returns `lastTranscript.orEmpty()`.
+- `takeSnapshot()` (service worker): returns `null` if `tab == 0L`, else forwards
+  `VtNative.snapshot(t)`'s three-way result (`null` = unchanged -> keep `savedSnapshot`; empty
+  `ByteArray` = failed / >16 MiB -> clear `savedSnapshot`; non-empty bytes -> write new snapshot).
+  `resolvedLogin` caches `Rootfs.loginAccount(LOGIN_AUTO)` on the service worker on first save.
+- `showMessage(text)` queues yellow ANSI lines in `pending` before `start()`, returns `false` if
+  `started && tab == 0L`, or calls `VtNative.message` + `view?.invalidate()` (refused on alternate
+  screen). `setCursor` updates defaults and applies via `VtNative.setCursor` + `view?.invalidate()`
+  if started.
+- `resize(cols, rows, cellWidth, cellHeight)` skips unchanged dimensions or `tab == 0L`, calls
+  `VtNative.resize` (reflow + console `SIGWINCH`), and immediately passes any non-empty replies
+  (e.g. mode 2048 size reports) to `write(replies)`. `write(data)` queues `Native.write` on
+  `vt-writer` while `writer != null && isRunning && !hungUp.get() && pty.console >= 0`, rechecking
+  `!hungUp.get()` inside the write runnable before calling `Native.write` (swallowing
+  `RejectedExecutionException`).
+- `clear()` calls `VtNative.clear(tab)`: `-1` (alt screen / gone) is a no-op; `0` invalidates
+  `view`; `1` (at prompt) writes `^L` (`0x0c`) and invalidates. `reset()` clears clipboard work
+  immediately, then returns early if `tab == 0L || released`. It applies the magnitude of a
+  nonzero `VtNative.reset` result and writes `^L` for a positive result (at prompt). It calls `clearStatus()`
+  (cancelling `dropProgress`, clearing buffered `reports`/`records`, zeroing `progress`/`status`,
+  and firing `onStatusChanged` when any existed), invalidates `view`, and emits
+  `events.onTitleChanged(this)`.
+- `busy` is `isRunning && tab != 0L && VtNative.busy(tab)` (OSC 133 prompt state first, falling
+  back to foreground-process detection for unmarked shells and busybox ash whose `PS1` lost its
+  marks). `cwd()` calls `Native.consoleCwd(machine, pty.console)` only when `isRunning &&
+  consoleOpen` (taking the kernel BKL on the caller's thread).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `TerminalService` creates and holds sessions, reads their state, saves/restores them, applies
-  cursor settings, answers clipboard reads, consumes `Events` and releases the sessions.
-- `MainActivity` reads `busy`, `cwd`, `progress` and `status` and calls `clear`/`reset`.
-- `VtView` attaches through `view`, starts/resizes the session, uses its `tab` handle for
-  android/vtcore operations, and sends encoded input through `write`.
-- android/vtcore's pump calls the session's `on*` callbacks on the pump thread.
+- `android/service` (`TerminalService`, `Notifications`): constructs/restores/saves/releases
+  sessions (passing `ConsoleTracker` to `ConsolePty`), implements `Events`, reads
+  `isRunning`/`transcriptText`/`console`/`consoleOpen`/`tab`/`id`/`title`/`progress`/`status`,
+  calls `ownedConsoleAt`, mutates `resolvedLogin`/`savedSnapshot`, calls `setCursor`,
+  `setRestored`, `showMessage`, `takeSnapshot`, `answerClipboardRead`, `statusSeen` and `describe`.
+- `android/terminal` (`MainActivity`): calls `start`, `cwd`, `clear`, `reset`, `write`,
+  `answerClipboardRead`; reads `id`, `tab`, `busy`, `isRunning`, `progress`, `status`.
+- `android/tabbar` (`TabBarView`, `TabListView`, `TabMarks`, `ProgressLine`): reads `id`, `title`,
+  `isRunning`, `progress`, `status`, `describe` and protocol constants.
+- `android/vtview` (`VtView`): sets `view`, reads `tab`, calls `resize`.
+- `android/vtcore` (`vt.rs`): invokes the session callbacks on `vt-pump`.
+- `android/setup` / `android/settings` (`Rootfs`, `Settings`, `SettingsActivity`): reuse
+  `ConsolePty.LOGIN_AUTO`, `LOGIN_ROOT`, `script`, `argv` and `ENVIRONMENT`.
 
 ### Outbound
 
-- android/vtcore: `VtNative` terminal handles, creation/restoration, pump, title and at-prompt
-  queries, cursor defaults, resize, messages, transcript/snapshot, clear/reset and destruction.
-- android/service through main-thread `Events` and `Tabs.MAX_TRANSCRIPT`; android/vtview through
-  `view` invalidation and `onStarted`.
-- android/native's `Native` (`openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`,
-  `consoleCwd`), hence kernel/tty; android/setup's `login.sh` and shell environment.
+- `android/vtcore` (`VtNative`): `create`, `restore`, `setCursor`, `print`, `pump`, `destroy`,
+  `title`, `atPrompt`, `busy`, `transcript`, `snapshot`, `message`, `resize`, `clear`, `reset`.
+- `android/native` (`Native`): `openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`,
+  `consoleCwd`.
+- `android/service`: `VtSession.Events` and `Tabs.MAX_TRANSCRIPT`.
+- `android/vtview`: `VtView` (`onStarted`, `invalidate`, `postInvalidateOnAnimation`).
+- `android/setup`: `assets/login.sh`; Android framework (`Handler`, `Base64`, `R.string.status_*`).
 
 ## Invariants and gotchas
 
-- `ConsolePty.ENVIRONMENT` sets `BROWSER=/usr/local/bin/xdg-open`; browser requests use the
-  service's independent endpoint, with no VT escape sequence or per-tab capability.
-
-- The console opens lazily, so restored tabs that were never shown have no console and no shell.
-- `openConsole`, `spawn` and `closeConsole` run on the main thread and take the kernel's BKL, as
-  does a resize (`VtNative.resize`, which resizes the kernel console from `vt.rs`; `Native.resize`
-  is no longer used by the app); input is written on each tab's own thread, so a program that stops
-  reading blocks only its tab.
-- Console numbers are freed at close and reused lowest-first by the kernel, and a close carries no
-  generation, so closing a stale number closes whichever console now has it.
-- A `VtSession` closes its console exactly once (`hangUp`), so a later close cannot hang up a tab
-  that reused the number.
-- Snapshots are recorded with the libghostty-vt version that wrote them (`1.0.0`; the copy in
-  Ghostty 1.4.0 recorded `ghostty-1.4.0/0.1.0-dev`). One from another version is not decoded,
-  since the snapshot format is versioned apart from the library and outside its ABI promise, and
-  an app update is the commonest way a run ends with tabs to restore; those tabs come back from
-  their transcripts.
-- A progress or status report from a command that exits at once (a `printf` at the prompt) is
-  usually dropped as soon as it shows: the read after it finds the shell back in the foreground. A
-  report made after the reporting group has already given the terminal back is kept until the next
-  command takes the foreground. A program in the background reporting is tracked against whatever
-  group was in the foreground then.
-- The status records live on the main thread only; the pump hands reports over through a locked
-  list drained by one post, so the reports of one read are usually applied together and a passing
-  state between two of them notifies no one. A program's full reset (RIS) arrives as a clear of
-  every record and a removal of the progress, before libghostty-vt's reset callback (which only
-  forgets how the prompt moves its cursor); the app's Reset terminal sends neither, nor calls the
-  callback, so vt.c forgets that itself there (android/vtcore's Clearing and resetting).
-- Shell integration lives in the guest (`/etc/profile.d/appine.sh` and the files it has the shells
-  read): a tab's behaviour (closing
-  without asking, jumps, Select output) follows whatever the shell in it sends, so a user's own
-  prompt or shell changes it, and a remote shell over ssh can send marks too.
-- Native operations must go through android/vtcore's locking contract. Release sessions and
-  close consoles before shutting down the kernel so the pump can return; its per-call kernel
-  lookup must not be replaced with a session-long `Arc<Machine>`.
-- The clipboard question is asynchronous: answer through the session's writer, never from a
-  native callback holding the terminal lock. The reason and unsupported protocols are in
-  android/vtcore.
+- `ConsolePty.start(columns, rows)` swaps argument order to `Native.openConsole(machine, rows,
+  columns)`.
+- `ConsolePty.console` retains its integer after `close()` (for kill-report routing to ended tabs
+  via disjoint `[openedEpoch, closedEpoch]` lifetimes recorded through `ConsoleTracker` and checked
+  by `ownedConsoleAt`); active-ownership checks must use `consoleOpen` (`pty.console >= 0 &&
+  !hungUp.get()`), and `hangUp()`'s `AtomicBoolean` cancels queued writes (`shutdownNow()`) before
+  closing the console at most once so a reused console number is never closed or written by another
+  tab.
+- `VtSession.tab` is never zeroed on `release()`; subsequent `VtNative.*` calls rely on `vt.rs`'s
+  `TABS` lookup returning `None`.
+- `openConsole`, `spawn`, `closeConsole`, `VtNative.resize` and `VtSession.cwd()` take the kernel
+  BKL on the caller's thread (main thread unless called on the service worker); per-tab `vt-writer`
+  isolates blocked PTY writes.
+- `ConsolePty.ENVIRONMENT` sets `BROWSER=/usr/local/bin/xdg-open` without VT transport state.
+- `VtNative.create` and `VtNative.restore` omit `@Throws(IOException::class)` in Kotlin though JNI
+  throws `IOException` when the machine is stopped, caught by `VtSession.start`.
+- If `openConsole` throws, `pty.console` remains `-1` and is passed to `createTerminal` (cast to
+  `u32::MAX` in `vt.rs`), which is harmless only because `error != null` prevents `vt-pump` from
+  starting and `pty.close()` guards `console >= 0`.
+- Re-entrant `statusSeen()`: when a `STATUS_DONE`/`STATUS_ERROR` report arrives for the foreground
+  tab, `updateStatus()` -> `onStatusChanged` -> `Notifications.status` calls `statusSeen()`
+  synchronously and re-enters `updateStatus()` (terminating on the second pass).
+- Both a program's RIS (via libghostty-vt callbacks) and `VtSession.reset()` clear `progress`,
+  `dropProgress`, buffered `reports`, `records` and `status`.
+- Same-read OSC 52 `?` requests collapse to the last clipboard target's `kind` in `vt.c`; separate
+  reads preserve individual targets in `clipboardReads`. Clipboard replies go through the
+  session's `vt-writer` after native terminal locks are released.
+- Native `AppineVt` owns the clipboard generation for both `VtSession.reset()` and a program's RIS.
+  Reads retain the generation captured under the terminal lock. The writer checks both token
+  generations before calling `Native.write`. Once a write passes this final check, it can
+  complete across reset, including when it is already inside the native console call.
+- Release sessions and close consoles before stopping the kernel so `vt-pump` can return; native
+  pumps must not hold a session-long `Arc<Machine>`.
 
 ## Confirmed bugs / technical debt
 
-- Progress and status records still follow the foreground process group rather than the next
-  prompt, although android/vtcore installs the OSC 133 callback for command timing. A report
-  from an already-exited or background program can therefore outlive its intended command.
-- Shell mark coverage and native parsing limitations remain in android/vtcore's Shell integration
-  debt; `busy` and command-completion events inherit those limitations.
+- **Shell mark coverage limits inherited from `android/vtcore`:** local unmarked shells (dash,
+  mksh, tcsh, elvish, ash with overwritten `PS1`) now have foreground-process fallback for `busy`,
+  command titles and exit-code-less completion timing, and Alpine `doas -s` preserves ash marks;
+  remote shells over ssh without OSC 133 marks (where the local foreground process is `ssh`) and
+  in-shell builtins in unmarked shells still stay busy without prompt marks, and prompt
+  jumping/output selection/prompt taps still require OSC 133 marks.
 
 ## Open questions
 
-- Should a status notification name the record's `app` when it has no title, as a key for grouping
-  (the specification says it is not a label), rather than the tab's title?
-- Should a background tab's progress and status be dropped at the next prompt mark rather than
-  when the foreground group changes?
-- Should the menu's Reset terminal also drop the tab's progress and status records, as a program's
-  RIS does?
+- Should a status notification name the record's `app` when it has no title rather than the tab's
+  title?
 
 ## To verify
 
-- Session behavior was tried only on a Pixel 4a API 34 emulator (4 KB pages), not real or
-  16 KB-page devices: progress/status from real programs (cargo, systemd, AI coding CLIs) and
-  the copy toast on Android 12 and earlier remain unverified.
-- End-to-end restore with images, bash's marks, a program on the alternate screen at saving,
-  or across a library version change remains unverified; the native checks and shell coverage
-  residuals are in android/vtcore.
+- Session behavior on physical and 16 KB-page devices: progress/status from real programs (`cargo`,
+  `systemd`, AI coding CLIs), clipboard copy toast on Android 12 and earlier, and end-to-end
+  restore with Kitty images, bash prompt marks, alternate-screen saves, or across a libghostty-vt
+  version change.

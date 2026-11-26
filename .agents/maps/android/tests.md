@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (split out of the android/native full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU and bash-account coverage alongside retained activity, resize-background and tab-list regressions)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's raw ash prompt paths and titles in the login test alongside the retained GPU, bash-account, resize-background and tab-list coverage; upstream's `TerminalFilesTest` is not carried)
 
 ## Responsibilities
 
@@ -72,10 +72,19 @@ debug variant, manifest and network-security configuration belong to `android/bu
 - `TerminalInputTest` uses an isolated store and native terminal, a shell-free session and a
   capturing view host to exercise IME replacement/commit/composition and clipboard menu callbacks.
   It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
-  ordinary Chinese composition/Enter, and trailing-newline removal without trimming other
-  whitespace (including unsafe/empty remainders and changed terminal modes) on API 34. The
+  ordinary Chinese composition/Enter, trailing-newline removal without trimming other
+  whitespace (including unsafe/empty remainders and changed terminal modes), stale clicks on
+  either paste action after a session switch, preservation of preedit through both surrounding-text
+  deletion methods until `finishComposingText` sends it to the terminal, `attach(null)` preedit/blink cleanup,
+  mode 1004 focus events preserving scrolled-back viewports, `VtSession.reset` progress/status
+  clearing, and `VtSession` queued-write cancellation on hangup. A guest printf drives the real
+  console pump to check status and progress on both sides of a primary prompt or command end,
+  including continuation prompts and retention of done and error records. A session test checks
+  that a queued foreground change preserves the next program's reports. The
   `screenshots=true` runner argument saves `cache/paste-preview.png` for visual inspection of
-  the terminal-themed dialog; the tests do not drive Gboard's UI.
+  the terminal-themed dialog; the tests do not drive Gboard's UI. A MainActivity case opens
+  two temporary service sessions and checks that OSC 52 can ask again after a notification
+  switches tabs and after the activity stops and resumes.
 - `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
 - `BrowserTest` imports separate temporary stores and checks custom launcher preservation,
   launching without a TTY or stdio, root and `su` users, endpoint replacement with a surviving
@@ -83,7 +92,9 @@ debug variant, manifest and network-security configuration belong to `android/bu
   Its `network=true` test installs tmux/screen and checks reattach on another console and nesting.
   It does not perform a real OAuth login.
 - `RunPolicyTest` uses a separate preference file for legacy migration and remembered toggle
-  targets, and checks idle expiry, activity, failed samples and delayed delivery with a fake clock.
+  targets, checks idle expiry, activity, failed samples and delayed delivery with a fake clock,
+  and checks `ConsoleTracker`/`TerminalService.sessionForKill` routing across reused console
+  numbers.
   `MachineTest.guestCpuTimeTracksRunningAndExitedThreads` checks both tiers, exited and pooled
   threads, idle stability and stopped handles.
 - `MachineTest` runs in the debug app's own process against the app's real store and
@@ -92,14 +103,20 @@ debug variant, manifest and network-security configuration belong to `android/bu
   them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
   trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
   the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
-  rules following a password set later, saved tabs, the Files provider (default-off access including
+  rules in a separate Alpine store (first-poll password change, in-place shadow and group
+  rewrites, retry after a failed refresh, and unrelated changes on both 4 KB and 16 KB pages),
+  saved tabs (including 32-bit hash-colliding `/Aa` vs `/BB`
+  cwd layouts), the Files provider (default-off access including
   legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
-  home, no home, writes,
-  changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
-  mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
+  canonical `%XX` validation and `%2E`/`%2F` tree-grant rejection, home, no home including regular-file
+  homes and `rootsChanged` cache invalidation, writes,
+  changes both ways, persisted grant selection and stale descendant IDs through direct and symlink paths after deleting and recreating a directory),
+  import-time mirror selection (partial results, ties, official fallback, guest edits and deletion;
+  both Debian source URIs in the network-enabled test), verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
-  prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
+  prompt marks (busybox ash's with root's shell set to `/bin/sh`, including the raw visible
+  path and the OSC title for a directory with a control character and a literal backslash), and a
   new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
   install, the `/bin/sh` fallback, bash's marks and nested shells', root and `adduser`-copied
   `.bash_profile`/`.bashrc` loading and ownership, and non-interactive `bash -lc` skipping
@@ -118,8 +135,8 @@ debug variant, manifest and network-security configuration belong to `android/bu
   caches and an existing dependency-only OpenRC installation with custom configuration.
   `interruptedOpenRcSetupKeepsTheUpgradeRecoverable` restarts between apk transactions, repairs
   a custom inittab from a login after verification fails, and finishes setup on the next start.
-  Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
-  from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
+  Both `downloadedDistributionsRun` and `debianImportsBothSourcesWithTheSelectedMirror` require
+  `network=true` and import the pinned Debian tarball (about 50 MB) into separate stores; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
@@ -147,6 +164,10 @@ debug variant, manifest and network-security configuration belong to `android/bu
   and CRs (bash puts its marks and bracketed paste right before the output).
 - Tests that require test hooks must use the debug build; successful API 34 runs do not
   establish physical-device, real keyboard or 16 KB-page behavior.
+
+## Confirmed bugs / technical debt
+
+None.
 
 ## Open questions
 

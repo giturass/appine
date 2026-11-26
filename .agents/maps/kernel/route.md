@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/route.md` for the paired decision history (not yet created; decisions from before the split are D4 and the routing parts of D3, D9 and D12 in `.agents/decisions/kernel/net.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-25 (targeted verification only since the split; latest change: `RTA_IIF` input-route lookups in `route::get`)
 
 ## Responsibilities
 
@@ -51,10 +53,16 @@ callbacks (`android/service`, `android/native`).
 
 ### Lookups, netlink messages and `/proc/net`
 
-- `ip route get` (`route::get`): families other than IPv4 and IPv6, and `RTA_IIF`, are
-  `EOPNOTSUPP`; local-table hits are answered in process; virtual routes and new namespaces choose
-  the source themselves; otherwise the source is `RTA_SRC` or what the host chooses by connecting a
-  UDP socket (`appine_hal::net::source_for`), and the interface and gateway follow; a 464xlat
+- `ip route get` (`route::get`): families other than IPv4 and IPv6 are `EOPNOTSUPP`; `RTA_IIF`
+  performs Linux 6.1 input-route lookups (`ENODEV` for unknown `iif`; IPv4 requires a valid
+  non-martian `RTA_SRC` and checks `route_localnet` for loopback `EINVAL`, returns `EXDEV` if
+  `iif` is down or lacks an IPv4 address, returns `EHOSTUNREACH` for forwarded routes when
+  `ip_forward` is 0, routes local/broadcast input via `lo` with `RTA_IIF` and without
+  `RTA_PREFSRC`/`RTA_UID`; IPv6 rejects `::1` on non-`lo` `iif` with `ENETUNREACH`, omits
+  `RTA_PREFSRC`, and keeps `RTA_IIF` including under `RTM_F_FIB_MATCH`); for output lookups,
+  local-table hits are answered in process, virtual routes and new namespaces choose the source
+  themselves, otherwise the source is `RTA_SRC` or what the host chooses by connecting a UDP
+  socket (`appine_hal::net::source_for`), and the interface and gateway follow; a 464xlat
   fallback covers hosts with no main route; `RTM_F_FIB_MATCH` returns the matched route with its
   own table, while other IPv4 answers always name table main.
 - Rules (`rule_messages`): IPv4 0/32766/32767, IPv6 0/32766, and the multicast routing families'
@@ -91,7 +99,7 @@ callbacks (`android/service`, `android/native`).
 
 ## Confirmed bugs / technical debt
 
-- **`ip route get` with `iif` is `EOPNOTSUPP`:** Linux 6.1 answers input-route lookups (`RTA_IIF`).
+- None.
 
 ## Open questions
 

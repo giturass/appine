@@ -5,6 +5,7 @@
 //! and fd tables are accessed only while holding the BKL ([`crate::kernel`]).
 
 use std::fs::File;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -67,6 +68,10 @@ pub mod oflags {
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// Path only.
     pub const O_PATH: u32 = 0o10000000;
+    /// `__O_TMPFILE`: unnamed temporary file bit (must be combined with [`O_DIRECTORY`]).
+    pub const O_TMPFILE_BIT: u32 = 0o20000000;
+    /// Create an unnamed temporary file in the named directory.
+    pub const O_TMPFILE: u32 = O_TMPFILE_BIT | O_DIRECTORY;
     /// The flags fcntl(F_SETFL) can change.
     pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_ASYNC | O_DIRECT | O_NOATIME;
 }
@@ -161,9 +166,10 @@ pub enum FileKind {
         /// `data` was just generated at open and has not been read or written yet: the first
         /// read from 0 need not regenerate it.
         fresh: bool,
-        /// `/proc/<pid>/mem`: the address space of that process at open time. As on Linux, after
-        /// the process execs, reads and writes still go to it (EOF once it has been freed), not
-        /// to the new program's.
+        /// `/proc/<pid>/mem` and `/proc/<pid>/pagemap`: the address space of that process at open
+        /// time. As on Linux, after the process execs or exits (even if its pid is reused), reads
+        /// and writes still go to this address space (EOF once it has been freed), not to the new
+        /// program's.
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
         /// A namespace file (nsfs): keeps that namespace alive while open; used by setns and
         /// `NS_GET_*`.
@@ -233,13 +239,20 @@ impl ProcEvent {
 
 /// An open file.
 pub struct OpenFile {
+    /// Store inode, pinned object and host write access for an O_PATH reopen through procfs.
+    /// An overlay path keeps its overlay node separately from this backing inode.
+    pub(crate) path_object: Option<(Ino, File, bool)>,
+    /// A queue inode pinned by an O_PATH description, even after mq_unlink.
+    pub(crate) mq_path: Option<Rc<RefCell<crate::syscall::MessageQueue>>>,
+    /// Keeps an O_PATH node in the FUSE cache for the lifetime of the description.
+    fuse_path: Option<Rc<()>>,
     /// The kind.
     pub kind: FileKind,
     /// Access mode and status flags (without `O_CLOEXEC`).
     pub flags: u32,
     /// File position; for a directory, the index of the next entry.
     pub pos: u64,
-    /// The path `/proc/<pid>/fd/<n>` shows (the absolute path at open time).
+    /// Display name at open time, also used for files without a tracked dentry.
     pub path: Option<Rc<[u8]>>,
     /// The last directory and name passed through when opened by path: when it is used as a
     /// mount point through `/proc/<pid>/fd/<n>` (bubblewrap mounts this way), the mount records
@@ -249,10 +262,9 @@ pub struct OpenFile {
     /// ([`OpenFile::node`]): flags such as read-only and noexec are taken from it. Directory and
     /// `O_PATH` nodes carry their mount already.
     pub mnt: crate::vfs::MountId,
-    /// A regular file, device node or FIFO opened through an overlay: the overlay node (in
-    /// mount [`OpenFile::mnt`]), while the kind holds the store inode reads and writes go to.
-    /// Changes to the file's metadata go through the node ([`OpenFile::node`]), never to that
-    /// inode directly.
+    /// The overlay node in mount [`OpenFile::mnt`] for a regular file, device, FIFO or an
+    /// `O_PATH` descriptor with a pinned backing file. Reads and writes use the backing inode.
+    /// Metadata changes go through the overlay node ([`OpenFile::node`]).
     pub ovl: Option<crate::vfs::overlay::OvlId>,
     /// The overlay nodes it names (its directory or `O_PATH` node, [`OpenFile::ovl`], the
     /// directory of [`OpenFile::dentry`]), kept from being forgotten while it is open
@@ -327,6 +339,9 @@ impl OpenFile {
             _ => Vec::new(),
         };
         Rc::new(RefCell::new(OpenFile {
+            path_object: None,
+            mq_path: None,
+            fuse_path: None,
             kind,
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
@@ -350,6 +365,15 @@ impl OpenFile {
             pseudo: false,
             tree: None,
         }))
+    }
+
+    pub(crate) fn pin_fuse_path(&mut self, vfs: &crate::vfs::Vfs) -> Result<(), Errno> {
+        if let FileKind::Path(Node::Fuse(_, id)) = self.kind {
+            let mut fuse = vfs.fuse_mut();
+            let node = fuse.get_mut(id).ok_or(Errno::ENOTCONN)?;
+            self.fuse_path = Some(node.pin_path());
+        }
+        Ok(())
     }
 
     /// Whether it is readable.
@@ -381,15 +405,42 @@ impl OpenFile {
         }
     }
 
-    /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).
+    /// Store inode, backing file and host write access for metadata or a magic-link reopen.
+    pub(crate) fn regular_backing(&self) -> Option<(Ino, &File, bool)> {
+        match &self.kind {
+            FileKind::Regular { ino, file, cow } => Some((*ino, file, self.writable() && !cow)),
+            FileKind::Path(_) => {
+                let (ino, file, writable) = self.path_object.as_ref()?;
+                Some((*ino, file, *writable))
+            }
+            _ => None,
+        }
+    }
+
+    /// Queue behind a normal descriptor or an O_PATH reference to the same queue.
+    pub(crate) fn message_queue(&self) -> Option<&Rc<RefCell<crate::syscall::MessageQueue>>> {
+        match &self.kind {
+            FileKind::MessageQueue(q) => Some(q),
+            _ => self.mq_path.as_ref(),
+        }
+    }
+
+    pub(crate) fn dentry_unlinked(&self) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(crate::syscall::Opened::is_unlinked)
+    }
+
+    /// The corresponding filesystem node (host fds, anonymous pipes and devpts/master PTYs have
+    /// none; `/dev/tty` and `/dev/console` keep their device node).
     pub fn node(&self) -> Option<Node> {
         if let Some(o) = self.ovl {
             return Some(Node::Overlay(self.mnt, o));
         }
         match &self.kind {
             FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
+            FileKind::Pty(end) => end.dev_ino.map(|ino| Node::Store(self.mnt, ino)),
             FileKind::Host(_)
-            | FileKind::Pty(_)
             | FileKind::Socket(_)
             | FileKind::Epoll(_)
             | FileKind::EventFd(_)
@@ -412,9 +463,23 @@ impl OpenFile {
         }
     }
 
+    /// Mount ID reported by statx and procfs fdinfo, including for node-less descriptors.
+    pub(crate) fn mnt_id(&self) -> crate::vfs::MountId {
+        self.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt())
+    }
+
     /// The inode in the store (chmod, chown and the like only make sense for these).
     pub fn ino(&self) -> Option<Ino> {
         self.node()?.ino()
+    }
+
+    /// The opened name follows renames independently of other hard links to the same inode.
+    pub(crate) fn current_dentry(&self) -> Option<crate::vfs::Dentry> {
+        let entry = self.dentry.as_ref()?;
+        self.watch
+            .as_ref()
+            .and_then(|w| w.dentry(&entry.0))
+            .or_else(|| Some(entry.clone()))
     }
 
     /// The store inode whose data a regular file reads and writes: for a file opened through an
@@ -460,10 +525,19 @@ impl Drop for OpenFile {
     /// was in may have been detached and now be unused ([`crate::vfs::released`]).
     fn drop(&mut self) {
         crate::vfs::released(self.mnt);
+        if let Some(node) = self.node() {
+            let mnt = node.mnt();
+            if mnt != self.mnt {
+                crate::vfs::released(mnt);
+            }
+        }
         if let FileKind::Pty(end) = &self.kind
             && end.pin
         {
             crate::vfs::released(end.mnt);
+        }
+        if self.tree.is_some() {
+            crate::vfs::released(crate::vfs::ANY_MOUNT);
         }
         match &self.kind {
             FileKind::Socket(s)
@@ -710,23 +784,67 @@ struct Slot {
     cloexec: bool,
 }
 
+/// Initial logical descriptor-table capacity (Linux's `NR_OPEN_DEFAULT = BITS_PER_LONG`).
+const MIN_CAPACITY: usize = 64;
+
 /// A process's fd table.
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
+    /// Logical table capacity (`fdt->max_fds`): starts at 64 and grows in powers of two, capped
+    /// at the kernel's `nr_open` rounded up to 64 when expanding. Closing a file clears its slot
+    /// without shrinking the table.
+    capacity: usize,
     /// fds taken by [`reserve`](Self::reserve) for a file not made yet (Linux's
     /// `get_unused_fd_flags`: an open_fds bit with no file): new fds skip them, dup2 onto one is
     /// EBUSY, and every other call sees them closed.
     reserved: Vec<usize>,
-    /// New fds must be below this (the soft limit of `RLIMIT_NOFILE`, synced from prlimit).
-    pub limit: usize,
     /// Has taken POSIX record locks (the locks belong to the fd table, see `crate::locks`).
     pub holds_locks: bool,
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            capacity: MIN_CAPACITY,
+            reserved: Vec::new(),
+            holds_locks: false,
+        }
+    }
+}
+
+/// Logical capacity for `need` slots: at least 64, power-of-two growth, capped at `nr_open`
+/// rounded up to 64 (never below the 64-aligned slot count required for `need`).
+fn capacity_for(need: usize, nr_open: usize) -> usize {
+    let min_cap = need.next_multiple_of(MIN_CAPACITY).max(MIN_CAPACITY);
+    let pow2 = need.max(MIN_CAPACITY).next_power_of_two();
+    let cap = nr_open.next_multiple_of(MIN_CAPACITY).max(min_cap);
+    pow2.min(cap)
 }
 
 impl FdTable {
     /// An empty table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Logical capacity of the descriptor table (`fdt->max_fds`).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Expands the table's logical capacity to hold descriptor `fd` (Linux's `expand_files` and
+    /// `alloc_fdtable`): when `fd` already fits, no expansion occurs; otherwise refuses `fd >=
+    /// nr_open` with `EMFILE` and grows by powers of two capped at `nr_open` rounded up to 64.
+    fn grow_for(&mut self, fd: usize, nr_open: usize) -> Result<(), Errno> {
+        if fd < self.capacity {
+            return Ok(());
+        }
+        if fd >= nr_open {
+            return Err(Errno::EMFILE);
+        }
+        self.capacity = capacity_for(fd + 1, nr_open).max(self.capacity);
+        Ok(())
     }
 
     /// 0/1/2 are the host's stdin/stdout/stderr respectively.
@@ -739,31 +857,57 @@ impl FdTable {
             (1, oflags::O_WRONLY | oflags::O_LARGEFILE),
             (2, oflags::O_WRONLY | oflags::O_LARGEFILE),
         ] {
-            t.install(OpenFile::new(FileKind::Host(fd), flags), false, 0)
-                .unwrap();
+            t.install(
+                OpenFile::new(FileKind::Host(fd), flags),
+                false,
+                0..DEFAULT_NOFILE.0,
+            )
+            .unwrap();
         }
         t
     }
 
-    /// Installs at the lowest free fd not below `min`.
-    pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        let fd = self.free_slot(min)?;
-        self.install_at(fd, file, cloexec)?;
+    /// Installs at the lowest free fd in the allocating process's range.
+    pub fn install(
+        &mut self,
+        file: FileRef,
+        cloexec: bool,
+        range: Range<usize>,
+    ) -> Result<i32, Errno> {
+        self.install_capped(file, cloexec, range, MAX_FDS)
+    }
+
+    /// Installs at the lowest free fd in `range`, respecting `nr_open` when expanding the table.
+    pub fn install_capped(
+        &mut self,
+        file: FileRef,
+        cloexec: bool,
+        range: Range<usize>,
+        nr_open: usize,
+    ) -> Result<i32, Errno> {
+        let fd = self.free_slot(range)?;
+        self.grow_for(fd as usize, nr_open)?;
+        self.replace_slot(fd as usize, Slot { file, cloexec });
         Ok(fd)
     }
 
-    /// The lowest free fd not below `min`.
-    pub fn free_slot(&self, min: usize) -> Result<i32, Errno> {
-        (min..self.limit)
+    /// The lowest free fd in the requested range.
+    pub fn free_slot(&self, mut range: Range<usize>) -> Result<i32, Errno> {
+        range
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none) && !self.reserved.contains(&i))
             .map(|i| i as i32)
             .ok_or(Errno::EMFILE)
     }
 
-    /// Takes the lowest free fd not below `min` for a file to be made later (accept4 before it
-    /// waits), until [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
-    pub fn reserve(&mut self, min: usize) -> Result<i32, Errno> {
-        let fd = self.free_slot(min)?;
+    /// Takes the lowest free fd in `range` for a file to be made later (accept4 before it waits,
+    /// or AF_UNIX `SCM_RIGHTS` delivery), respecting `nr_open` when expanding the table, until
+    /// [`fill`](Self::fill) or [`unreserve`](Self::unreserve).
+    pub fn reserve(&mut self, range: Range<usize>, nr_open: usize) -> Result<i32, Errno> {
+        let fd = self.free_slot(range)?;
+        self.grow_for(fd as usize, nr_open)?;
+        if self.slots.len() <= fd as usize {
+            self.slots.resize(fd as usize + 1, None);
+        }
         self.reserved.push(fd as usize);
         Ok(fd)
     }
@@ -773,9 +917,6 @@ impl FdTable {
     pub fn fill(&mut self, fd: i32, file: FileRef, cloexec: bool) {
         let i = fd as usize;
         self.reserved.retain(|&r| r != i);
-        if self.slots.len() <= i {
-            self.slots.resize(i + 1, None);
-        }
         self.slots[i] = Some(Slot { file, cloexec });
     }
 
@@ -790,20 +931,39 @@ impl FdTable {
         fd: i32,
         file: FileRef,
         cloexec: bool,
+        limit: usize,
+    ) -> Result<Option<FileRef>, Errno> {
+        self.install_at_capped(fd, file, cloexec, limit, MAX_FDS)
+    }
+
+    /// Installs at `fd`, respecting `nr_open` when expanding (returning `EBADF`, as Linux's
+    /// `do_dup2` / `replace_fd` maps `expand_files`'s `EMFILE` to `EBADF`).
+    pub fn install_at_capped(
+        &mut self,
+        fd: i32,
+        file: FileRef,
+        cloexec: bool,
+        limit: usize,
+        nr_open: usize,
     ) -> Result<Option<FileRef>, Errno> {
         let i = usize::try_from(fd)
             .ok()
-            .filter(|&i| i < self.limit)
+            .filter(|&i| i < limit)
             .ok_or(Errno::EBADF)?;
         // An fd reserved for a file still being made (do_dup2)
         if self.reserved.contains(&i) {
             return Err(Errno::EBUSY);
         }
+        self.grow_for(i, nr_open).map_err(|_| Errno::EBADF)?;
+        Ok(self.replace_slot(i, Slot { file, cloexec }))
+    }
+
+    /// Both allocation and dup3 have already checked the slot against the caller's limit and reservations.
+    fn replace_slot(&mut self, i: usize, slot: Slot) -> Option<FileRef> {
         if self.slots.len() <= i {
             self.slots.resize(i + 1, None);
         }
-        let old = self.slots[i].replace(Slot { file, cloexec });
-        Ok(old.map(|s| s.file))
+        self.slots[i].replace(slot).map(|old| old.file)
     }
 
     /// Gets the open file for an fd.
@@ -875,6 +1035,57 @@ impl FdTable {
         closed
     }
 
+    /// Linux's dup_fd sizes the copy from the highest open bitmap bit. Reservations count
+    /// towards the size but have no file to copy. close_range may exclude a range of fds.
+    pub fn copy_len(&self, keep: impl Fn(usize) -> bool) -> usize {
+        let file = self
+            .slots
+            .iter()
+            .enumerate()
+            .rfind(|(i, slot)| slot.is_some() && keep(*i));
+        let reserved = self.reserved.iter().copied().filter(|&i| keep(i)).max();
+        file.map(|(i, _)| i).max(reserved).map_or(0, |i| i + 1)
+    }
+
+    fn copy_slots(&self, len: usize, nr_open: usize) -> Self {
+        Self {
+            slots: self.slots[..len].to_vec(),
+            capacity: capacity_for(len, nr_open),
+            reserved: Vec::new(),
+            holds_locks: false,
+        }
+    }
+
+    /// Clones the table, sizing its logical capacity for the surviving descriptors capped by
+    /// `nr_open` rounded up to 64 (Linux's `dup_fd`).
+    pub fn clone_capped(&self, nr_open: usize) -> Self {
+        self.copy_slots(self.copy_len(|_| true), nr_open)
+    }
+
+    /// Applies close_range while unsharing. Size the new table for the surviving bitmap
+    /// and return every closed file for lock, notification and FUSE cleanup.
+    pub fn unshare_close_range(
+        &self,
+        first: usize,
+        last: usize,
+        cloexec: bool,
+        nr_open: usize,
+    ) -> Result<(Self, Vec<FileRef>), Errno> {
+        let len = self.copy_len(|fd| cloexec || fd < first || fd > last);
+        if len.next_multiple_of(MIN_CAPACITY) > nr_open {
+            return Err(Errno::EMFILE);
+        }
+        let mut copy = self.copy_slots(len, nr_open);
+        let mut closed = copy.close_range(first, last, cloexec);
+        closed.extend(self.slots[len..].iter().flatten().map(|s| s.file.clone()));
+        Ok((copy, closed))
+    }
+
+    /// Open file descriptions in descriptor order, including duplicate references.
+    pub(crate) fn files(&self) -> impl Iterator<Item = &FileRef> {
+        self.slots.iter().flatten().map(|slot| &slot.file)
+    }
+
     /// All open fds, in increasing order.
     pub fn open_fds(&self) -> Vec<i32> {
         self.slots
@@ -886,27 +1097,11 @@ impl FdTable {
     }
 }
 
-impl Default for FdTable {
-    fn default() -> Self {
-        FdTable {
-            slots: Vec::new(),
-            reserved: Vec::new(),
-            limit: DEFAULT_NOFILE.0,
-            holds_locks: false,
-        }
-    }
-}
-
 impl Clone for FdTable {
     /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
     /// and are not copied with it, nor are reserved fds (dup_fd clears their bits).
     fn clone(&self) -> Self {
-        FdTable {
-            slots: self.slots.clone(),
-            reserved: Vec::new(),
-            limit: self.limit,
-            holds_locks: false,
-        }
+        self.clone_capped(MAX_FDS)
     }
 }
 
@@ -929,25 +1124,51 @@ mod tests {
     fn allocates_lowest_free_fd() {
         let mut t = FdTable::with_host_stdio();
         let f = OpenFile::new(FileKind::Host(1), oflags::O_WRONLY);
-        assert_eq!(t.install(f.clone(), false, 0), Ok(3));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(3));
         t.close(1).unwrap();
-        assert_eq!(t.install(f.clone(), true, 0), Ok(1));
+        assert_eq!(t.install(f.clone(), true, 0..DEFAULT_NOFILE.0), Ok(1));
         assert_eq!(t.cloexec(1), Ok(true));
-        assert_eq!(t.install(f.clone(), false, 10), Ok(10));
+        assert_eq!(t.install(f.clone(), false, 10..DEFAULT_NOFILE.0), Ok(10));
         assert_eq!(t.close(7).err(), Some(Errno::EBADF));
         assert_eq!(t.get(-1).err(), Some(Errno::EBADF));
         // New fds cannot exceed RLIMIT_NOFILE
-        t.limit = 11;
+        let limit = 11;
         for fd in [4, 5, 6, 7, 8, 9] {
-            assert_eq!(t.install(f.clone(), false, 0), Ok(fd));
+            assert_eq!(t.install(f.clone(), false, 0..limit), Ok(fd));
         }
-        assert_eq!(t.install(f.clone(), false, 0), Err(Errno::EMFILE));
+        assert_eq!(t.install(f.clone(), false, 0..limit), Err(Errno::EMFILE));
         // A starting point beyond the limit also means no free slot (the caller checks F_DUPFD's
         // EINVAL)
-        assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EMFILE));
+        assert_eq!(t.install(f.clone(), false, 11..limit), Err(Errno::EMFILE));
         // fds created by dup share one open file
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);
+    }
+
+    #[test]
+    fn table_capacity_after_copy() {
+        let mut parent = FdTable::with_host_stdio();
+        let file = parent.get(1).unwrap();
+        parent
+            .install_at(100, file.clone(), false, DEFAULT_NOFILE.0)
+            .unwrap();
+        parent.reserve(200..DEFAULT_NOFILE.0, MAX_FDS).unwrap();
+        let child = parent.clone();
+        assert_eq!(child.capacity(), 256);
+        assert_eq!(child.free_slot(200..DEFAULT_NOFILE.0), Ok(200));
+        parent.unreserve(200);
+        assert_eq!(parent.capacity(), 256);
+        assert_eq!(parent.clone().capacity(), 128);
+
+        let (private, closed) = parent.unshare_close_range(100, 200, false, 64).unwrap();
+        assert_eq!(private.capacity(), 64);
+        assert_eq!(closed.len(), 1);
+        assert!(Rc::ptr_eq(&closed[0], &file));
+        assert!(parent.get(100).is_ok());
+        let (marked, closed) = parent.unshare_close_range(100, 200, true, 128).unwrap();
+        assert_eq!(marked.capacity(), 128);
+        assert_eq!(marked.cloexec(100), Ok(true));
+        assert!(closed.is_empty());
     }
 
     /// A reserved fd is skipped by new fds, closed to everything else, EBUSY to dup2, not copied
@@ -956,18 +1177,78 @@ mod tests {
     fn reserved_fds() {
         let mut t = FdTable::with_host_stdio();
         let f = OpenFile::new(FileKind::Host(1), oflags::O_WRONLY);
-        assert_eq!(t.reserve(0), Ok(3));
-        assert_eq!(t.install(f.clone(), false, 0), Ok(4));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0, MAX_FDS), Ok(3));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(4));
         assert_eq!(t.get(3).err(), Some(Errno::EBADF));
         assert_eq!(t.close(3).err(), Some(Errno::EBADF));
-        assert_eq!(t.install_at(3, f.clone(), false).err(), Some(Errno::EBUSY));
+        assert_eq!(
+            t.install_at(3, f.clone(), false, DEFAULT_NOFILE.0).err(),
+            Some(Errno::EBUSY)
+        );
         assert_eq!(t.open_fds(), [0, 1, 2, 4]);
         let mut child = t.clone();
-        assert_eq!(child.install(f.clone(), false, 0), Ok(3));
+        assert_eq!(child.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(3));
         t.fill(3, f.clone(), true);
         assert_eq!(t.cloexec(3), Ok(true));
-        assert_eq!(t.reserve(0), Ok(5));
+        assert_eq!(t.reserve(0..DEFAULT_NOFILE.0, MAX_FDS), Ok(5));
         t.unreserve(5);
-        assert_eq!(t.install(f.clone(), false, 0), Ok(5));
+        assert_eq!(t.install(f.clone(), false, 0..DEFAULT_NOFILE.0), Ok(5));
+    }
+
+    #[test]
+    fn table_growth_respects_nr_open_cap() {
+        let mut t = FdTable::with_host_stdio();
+        let f = t.get(1).unwrap();
+        assert_eq!(t.capacity(), 64);
+
+        // Lowered nr_open (192) caps expansion instead of rounding up to 256.
+        assert!(
+            t.install_at_capped(150, f.clone(), false, 4096, 192)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(t.capacity(), 192);
+        // Expanding past nr_open fails with EBADF for dup3/install_at and EMFILE for alloc/reserve.
+        assert_eq!(
+            t.install_at_capped(192, f.clone(), false, 4096, 192).err(),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            t.install_capped(f.clone(), false, 192..4096, 192),
+            Err(Errno::EMFILE)
+        );
+        assert_eq!(t.reserve(192..4096, 192), Err(Errno::EMFILE));
+        // Reserve itself also caps expansion at nr_open and leaves no reservation on EMFILE.
+        let mut r = FdTable::with_host_stdio();
+        assert_eq!(r.reserve(150..4096, 192), Ok(150));
+        assert_eq!(r.capacity(), 192);
+        assert_eq!(r.reserve(192..4096, 192), Err(Errno::EMFILE));
+        assert_eq!(r.capacity(), 192);
+        assert_eq!(r.free_slot(192..4096), Ok(192));
+        // Slot 191 still fits within the already-expanded capacity (192).
+        assert_eq!(t.install_capped(f.clone(), false, 191..4096, 192), Ok(191));
+        assert_eq!(t.capacity(), 192);
+
+        // Lowering nr_open further does not shrink existing capacity; fds within existing capacity
+        // still succeed, while fds requiring expansion past nr_open fail.
+        assert!(
+            t.install_at_capped(180, f.clone(), false, 4096, 128)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(t.capacity(), 192);
+        assert_eq!(
+            t.install_capped(f.clone(), false, 192..4096, 128),
+            Err(Errno::EMFILE)
+        );
+
+        // Cloning with nr_open=192 also keeps capacity capped at 192.
+        let copy = t.clone_capped(192);
+        assert_eq!(copy.capacity(), 192);
+
+        // Unsharing with close_range caps the new table at nr_open as well.
+        let (unshared, closed) = t.unshare_close_range(180, 191, false, 192).unwrap();
+        assert_eq!(unshared.capacity(), 192);
+        assert_eq!(closed.len(), 2);
     }
 }

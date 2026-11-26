@@ -11,7 +11,7 @@ use super::{SysResult, get, put};
 use crate::cell::RefCell;
 use crate::cred::cap;
 use crate::errno::Errno;
-use crate::fd::{FileKind, oflags};
+use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigAction, SigInfo};
@@ -29,6 +29,7 @@ const TCSETAF: u32 = 0x5408;
 const TCSBRK: u32 = 0x5409;
 const TCXONC: u32 = 0x540a;
 const TCFLSH: u32 = 0x540b;
+const TIOCGEXCL: u32 = 0x8004_5440;
 const TIOCEXCL: u32 = 0x540c;
 const TIOCNXCL: u32 = 0x540d;
 const TIOCSCTTY: u32 = 0x540e;
@@ -43,6 +44,8 @@ const TIOCNOTTY: u32 = 0x5422;
 const TIOCSETD: u32 = 0x5423;
 const TIOCGETD: u32 = 0x5424;
 const TCSBRKP: u32 = 0x5425;
+const TIOCSBRK: u32 = 0x5427;
+const TIOCCBRK: u32 = 0x5428;
 const TIOCGSID: u32 = 0x5429;
 const TIOCVHANGUP: u32 = 0x5437;
 /// `struct termios2`: adds input and output speeds (since glibc 2.42, tcgetattr and tcsetattr use
@@ -54,12 +57,15 @@ const TCSETSF2: u32 = 0x402c_542d;
 /// Packet mode of the master: set and query ([`crate::tty::pkt`]).
 const TIOCPKT: u32 = 0x5420;
 const TIOCGPKT: u32 = 0x8004_5438;
+const TIOCGDEV: u32 = 0x8004_5432;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 const TIOCGPTLCK: u32 = 0x8004_5439;
 /// Sends a signal through the master to the slave's foreground process group (only SIGINT,
 /// SIGQUIT, SIGTSTP).
 const TIOCSIG: u32 = 0x4004_5436;
+
+const N_TTY: i32 = 0;
 
 // ---- Allocation and opening ----
 
@@ -119,6 +125,7 @@ pub(crate) fn open_slave(
         .ok_or(Errno::ENOENT)?;
     {
         let t = tty.borrow();
+        check_reopen(cx, &t)?;
         if t.locked || t.masters == 0 {
             return Err(Errno::EIO);
         }
@@ -160,26 +167,39 @@ pub(crate) fn open_peer(
         let t = tty.borrow();
         (t.fs, t.index)
     };
-    let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
-    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
     // The path is <number> in that devpts mount (used by the fd's link and ttyname)
     let vfs = cx.vfs()?;
     let node = crate::vfs::Node::Pseudo(mnt, crate::pseudo::PseudoNode::Pts(fs, index));
-    let path = vfs.path_of(&cx.view(&vfs), &cx.root(), &node).ok();
-    let file = crate::fd::OpenFile::with_path(
-        kind,
-        flags & keep | oflags::O_LARGEFILE,
-        path.map(Rc::from),
-    );
-    Ok(cx
-        .fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)? as u64)
+    let path = vfs
+        .path_of(&cx.view(&vfs), &cx.root(), &node)
+        .ok()
+        .map(Rc::from);
+    let file = if flags & oflags::O_PATH != 0 {
+        let file = OpenFile::with_path(FileKind::Path(node), flags, path);
+        // ptm_open_peer passes the raw flags to dentry_open, including O_CLOEXEC.
+        file.borrow_mut().flags = flags;
+        file
+    } else {
+        let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
+        let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
+        OpenFile::with_path(kind, flags & keep | oflags::O_LARGEFILE, path)
+    };
+    Ok(cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)? as u64)
 }
 
-/// Opens `/dev/tty`: the caller's controlling terminal.
-pub(crate) fn open_ctty(cx: &mut Cx<'_>) -> Result<FileKind, Errno> {
+/// Opens `/dev/tty` (5:0) or `/dev/console` (5:1): the caller's controlling terminal, keeping the
+/// opened device node `ino` for metadata and procfs identity.
+pub(crate) fn open_ctty(cx: &mut Cx<'_>, ino: crate::vfs::store::Ino) -> Result<FileKind, Errno> {
     let tty = cx.t.group.borrow().ctty.clone().ok_or(Errno::ENXIO)?;
-    Ok(FileKind::Pty(PtyEnd::new(tty, false)))
+    check_reopen(cx, &tty.borrow())?;
+    Ok(FileKind::Pty(PtyEnd::new(tty, false).with_device(ino)))
+}
+
+fn check_reopen(cx: &Cx<'_>, tty: &Tty) -> Result<(), Errno> {
+    if tty.exclusive[0] && !cx.cred().capable(cap::SYS_ADMIN) {
+        return Err(Errno::EBUSY);
+    }
+    Ok(())
 }
 
 // ---- Reading and writing ----
@@ -425,18 +445,20 @@ fn slave_write(
                 return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
             }
             let echoed = t.echoes_before_write();
-            let n = t.output_room().min(data.len() - done);
-            if n > 0 {
+            let rest = &data[done..];
+            let n = if !rest.is_empty() {
                 // Noted for the host console: a job the shell left in the background writes
                 // while another group (the shell at its prompt) has the terminal
                 let pgid = cx.t.group.borrow().pgid;
                 if t.fg.is_some_and(|fg| fg != pgid) {
-                    t.write_background(&data[done..done + n]);
+                    t.write_background(rest)
                 } else {
-                    t.write_output(&data[done..done + n]);
+                    t.write_output(rest)
                 }
-                done += n;
-            }
+            } else {
+                0
+            };
+            done += n;
             if n > 0 || echoed {
                 request_wake_object(wake::of(tty));
             }
@@ -643,26 +665,47 @@ pub(crate) fn ioctl(
             request_wake_object(wake::of(tty));
             Ok(0)
         }
-        TCSBRK | TCSBRKP | TIOCSETD => {
+        TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => {
             if !master {
                 check_background(cx, tty, Signal::TTOU)?;
             }
             Ok(0)
         }
-        TIOCEXCL | TIOCNXCL => Ok(0),
-        TIOCGETD => put(cx, arg, 0i32.to_le_bytes()).map(|()| 0),
+        TIOCEXCL | TIOCNXCL => {
+            tty.borrow_mut().exclusive[master as usize] = request == TIOCEXCL;
+            Ok(0)
+        }
+        TIOCGEXCL => {
+            let value = i32::from(tty.borrow().exclusive[master as usize]);
+            put(cx, arg, value.to_le_bytes()).map(|()| 0)
+        }
+        TIOCGETD => put(cx, arg, N_TTY.to_le_bytes()).map(|()| 0),
+        TIOCSETD => {
+            // Linux 6.1 checks job control before tiocsetd reads the discipline. Selecting the
+            // current discipline is a no-op in tty_set_ldisc, and Appine supports only N_TTY.
+            if !master {
+                check_background(cx, tty, Signal::TTOU)?;
+            }
+            let ldisc = i32::from_le_bytes(get(cx, arg)?);
+            if ldisc != N_TTY {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
         FIONREAD => {
             let t = tty.borrow();
             let n = if master {
-                t.output_len()
+                t.master_readable_len()
             } else {
                 t.input_len()
             };
             put(cx, arg, (n as i32).to_le_bytes()).map(|()| 0)
         }
-        TIOCOUTQ => {
-            let n = tty.borrow().output_len() as i32;
-            put(cx, arg, n.to_le_bytes()).map(|()| 0)
+        // A PTY driver has no transmit queue. Bytes already written belong to its peer.
+        TIOCOUTQ => put(cx, arg, 0i32.to_le_bytes()).map(|()| 0),
+        TIOCGDEV => {
+            let dev = crate::vfs::dev::rdev(crate::tty::PTS_MAJOR, tty.borrow().index) as u32;
+            put(cx, arg, dev.to_le_bytes()).map(|()| 0)
         }
         // Linux's tiocsti: only on the caller's controlling terminal, which a master never is, or
         // with CAP_SYS_ADMIN; otherwise anyone holding a terminal fd (inherited across setsid or
@@ -728,22 +771,42 @@ pub(crate) fn ioctl(
             put(cx, arg, fg.to_le_bytes()).map(|()| 0)
         }
         TIOCSPGRP => {
-            if !is_ctty(cx, tty) {
-                return Err(Errno::ENOTTY);
+            // Linux's tiocspgrp: tty_check_change turns EIO (orphaned background caller) into
+            // ENOTTY, then reads and checks the pgid before the ctty check
+            match check_background(cx, tty, Signal::TTOU) {
+                Ok(()) => {}
+                Err(Errno::EIO) => return Err(Errno::ENOTTY),
+                Err(e) => return Err(e),
             }
-            check_background(cx, tty, Signal::TTOU)?;
             let pgid = i32::from_le_bytes(get(cx, arg)?);
             if pgid < 0 {
                 return Err(Errno::EINVAL);
             }
-            let pgid = cx.pid_in(pgid);
             let sid = cx.t.group.borrow().sid;
-            let exists = cx
-                .kr()
-                .groups
-                .values()
-                .any(|g| g.borrow().pgid == pgid && g.borrow().sid == sid);
-            if !exists {
+            if !is_ctty(cx, tty) || tty.borrow().session != Some(sid) {
+                return Err(Errno::ENOTTY);
+            }
+            if pgid == 0 {
+                return Err(Errno::ESRCH);
+            }
+            let pgid = cx.pid_in(pgid);
+            let k = cx.kr();
+            let mut in_session = false;
+            let mut known = k.groups.contains_key(&pgid) || k.tasks.contains_key(&pgid);
+            for g in k.groups.values() {
+                let g = g.borrow();
+                if g.pgid == pgid {
+                    known = true;
+                    if g.sid == sid {
+                        in_session = true;
+                        break;
+                    }
+                }
+            }
+            if !known {
+                return Err(Errno::ESRCH);
+            }
+            if !in_session {
                 return Err(Errno::EPERM);
             }
             tty.borrow_mut().fg = Some(pgid);
@@ -770,10 +833,15 @@ pub(crate) fn ioctl(
                 let g = cx.t.group.borrow();
                 (g.sid, g.pgid, g.tgid, g.ctty.is_some())
             };
+            // Linux's tiocsctty: only a session leader may succeed (even when this terminal is
+            // already its controlling terminal)
+            if sid != tgid {
+                return Err(Errno::EPERM);
+            }
             if is_ctty(cx, tty) {
                 return Ok(0);
             }
-            if sid != tgid || has_ctty {
+            if has_ctty {
                 return Err(Errno::EPERM);
             }
             // Linux's tiocsctty: the controlling terminal of another session can be taken over
@@ -1000,4 +1068,195 @@ fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Opti
         signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
     }
     request_wake_object(wake::of(tty));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::Shared;
+    use crate::process::Tier;
+    use std::sync::Arc;
+
+    #[test]
+    fn pty_line_discipline_validates_the_argument_and_preserves_terminal_state() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (_, arg, _cpu) = crate::pseudo::tests::add_task(&mut kernel, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(kernel));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        for master in [true, false] {
+            let tty = Rc::new(RefCell::new(Tty::new(0)));
+            let end = (master, 0);
+            for request in [TIOCGETD, TIOCSETD] {
+                assert_eq!(
+                    ioctl(&mut cx, &tty, end, true, request, 0),
+                    Err(Errno::EFAULT)
+                );
+            }
+            put(&cx, arg, (-1i32).to_le_bytes()).unwrap();
+            assert_eq!(ioctl(&mut cx, &tty, end, true, TIOCGETD, arg), Ok(0));
+            assert_eq!(i32::from_le_bytes(get(&cx, arg).unwrap()), 0);
+
+            let termios = {
+                let mut t = tty.borrow_mut();
+                t.termios.lflag &= !flags::ECHO;
+                t.write_input(b"in\n");
+                t.write_output(b"out");
+                t.termios.encode()
+            };
+            assert_eq!(ioctl(&mut cx, &tty, end, true, TIOCSETD, arg), Ok(0));
+            {
+                let mut t = tty.borrow_mut();
+                assert_eq!(t.termios.encode(), termios);
+                assert_eq!(t.take_output(4), b"out");
+                let mut line = [0; 3];
+                assert_eq!(t.read(&mut line), Some(3));
+                assert_eq!(&line, b"in\n");
+            }
+
+            for disc in [-1, 1, 2, 29, 30, 256, i32::MIN, i32::MAX] {
+                put(&cx, arg, disc.to_le_bytes()).unwrap();
+                assert_eq!(
+                    ioctl(&mut cx, &tty, end, true, TIOCSETD, arg),
+                    Err(Errno::EINVAL)
+                );
+            }
+            vhangup(cx.k(), &tty, master);
+            assert_eq!(
+                ioctl(&mut cx, &tty, end, true, TIOCSETD, 0),
+                Err(Errno::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn pty_setd_checks_background_job_control_before_reading_the_discipline() {
+        use crate::pseudo::tests::add_task;
+
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (_, _, _parent_cpu) = add_task(&mut kernel, 10, 0, true, b"");
+        let (_, arg, _cpu) = add_task(&mut kernel, 20, 0, true, b"");
+        let (_, _, _peer_cpu) = add_task(&mut kernel, 21, 0, true, b"");
+        let tty = Rc::new(RefCell::new(Tty::new(0)));
+        tty.borrow_mut().session = Some(10);
+        tty.borrow_mut().fg = Some(10);
+        // The foreground parent keeps the caller's process group from being orphaned.
+        for (tid, parent) in [(20, 10), (21, 20)] {
+            let mut g = kernel.groups[&tid].borrow_mut();
+            g.ppid = parent;
+            g.pgid = 20;
+            g.sid = 10;
+            g.ctty = Some(tty.clone());
+        }
+        let shared = Arc::new(Shared::new(kernel));
+        let k = shared.lock();
+        let task = k.tasks[&20].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        let sig = Signal::TTOU;
+
+        let negative = arg;
+        let unsupported = arg + 4;
+        let n_tty = arg + 8;
+        for (addr, disc) in [(negative, -1i32), (unsupported, 1), (n_tty, 0)] {
+            put(&cx, addr, disc.to_le_bytes()).unwrap();
+        }
+        for addr in [0, negative, unsupported, n_tty] {
+            assert_eq!(
+                ioctl(&mut cx, &tty, (false, 0), true, TIOCSETD, addr),
+                Err(Errno::ERESTARTSYS)
+            );
+            for tid in [20, 21] {
+                let mut g = cx.kr().groups[&tid].borrow_mut();
+                assert_eq!(g.pending.set(), sig.bit());
+                g.pending.discard(sig.bit());
+            }
+            assert_eq!(cx.kr().groups[&10].borrow().pending.set(), 0);
+        }
+
+        // A background master, or a slave with SIGTTOU ignored or blocked, reaches the argument.
+        let check_argument = |cx: &mut Cx<'_>, master| {
+            for (addr, expected) in [
+                (0, Err(Errno::EFAULT)),
+                (unsupported, Err(Errno::EINVAL)),
+                (n_tty, Ok(0)),
+            ] {
+                assert_eq!(ioctl(cx, &tty, (master, 0), true, TIOCSETD, addr), expected);
+            }
+        };
+        check_argument(&mut cx, true);
+        let sighand = cx.t.group.borrow().sighand.clone();
+        sighand.borrow_mut().set(
+            sig,
+            SigAction {
+                handler: SigAction::IGNORE,
+                ..Default::default()
+            },
+        );
+        check_argument(&mut cx, false);
+        sighand.borrow_mut().set(sig, SigAction::default());
+        task.sigmask.set(sig.bit());
+        check_argument(&mut cx, false);
+        task.sigmask.set(0);
+
+        // Reparenting the caller leaves no member with a parent in the foreground group.
+        cx.t.group.borrow_mut().ppid = 1;
+        for addr in [0, negative, unsupported, n_tty] {
+            assert_eq!(
+                ioctl(&mut cx, &tty, (false, 0), true, TIOCSETD, addr),
+                Err(Errno::EIO)
+            );
+        }
+        for tid in [20, 21] {
+            assert_eq!(cx.kr().groups[&tid].borrow().pending.set(), 0);
+        }
+    }
+
+    #[test]
+    fn pty_breaks_preserve_data_and_queue_ioctls_report_the_receiving_end() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (_, arg, _cpu) = crate::pseudo::tests::add_task(&mut kernel, 10, 0, true, b"");
+        let shared = Arc::new(Shared::new(kernel));
+        let k = shared.lock();
+        let task = k.tasks[&10].clone();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(&shared, k, &task, &mut state);
+        let tty = Rc::new(RefCell::new(Tty::new(260)));
+        {
+            let mut t = tty.borrow_mut();
+            t.termios.lflag &= !flags::ECHO;
+            t.write_input(b"abc\n");
+            t.write_output(&[b'x'; 5000]);
+        }
+
+        for master in [true, false] {
+            let end = (master, 0);
+            const IGNBRK: u32 = 1;
+            const BRKINT: u32 = 2;
+            for break_flags in [IGNBRK, BRKINT] {
+                tty.borrow_mut().termios.iflag = break_flags;
+                for req in [TIOCSBRK, TIOCCBRK, TCSBRK, TCSBRKP] {
+                    assert_eq!(ioctl(&mut cx, &tty, end, true, req, 0), Ok(0));
+                }
+            }
+            for (req, expected) in [
+                (FIONREAD, if master { 4095 } else { 4 }),
+                (TIOCOUTQ, 0),
+                (TIOCGDEV, 0x108804),
+            ] {
+                put(&cx, arg, u32::MAX.to_le_bytes()).unwrap();
+                assert_eq!(ioctl(&mut cx, &tty, end, true, req, arg), Ok(0));
+                assert_eq!(u32::from_le_bytes(get(&cx, arg).unwrap()), expected);
+                assert_eq!(ioctl(&mut cx, &tty, end, true, req, 0), Err(Errno::EFAULT));
+            }
+        }
+        let mut t = tty.borrow_mut();
+        assert!(t.take_signals().is_empty());
+        assert_eq!(t.take_output(5001), [b'x'; 5000]);
+        let mut line = [0; 4];
+        assert_eq!(t.read(&mut line), Some(4));
+        assert_eq!(&line, b"abc\n");
+    }
 }

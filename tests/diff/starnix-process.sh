@@ -8,9 +8,6 @@
 # kernel/process: PI futexes inherit no priority (the second fails natively in this container too)
 SKIP="FutexTest.LockPiBoostsOwnerPriorityInProcStat"
 SKIP="$SKIP:FutexTest.LockPiRealtimeWaiterBoostsOwnerPriorityInProcStat"
-# kernel/vfs: splice into a file stops quietly at RLIMIT_FSIZE
-SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileTruncatedByFSize"
-SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileWithExplicitOffset"
 # kernel/procfs: absent per-process files (attr/, clear_refs, io, oom_adj, sched, schedstat,
 # timerslack_ns, wchan)
 SKIP="$SKIP:ZombieProcTest.Attr*:ZombieProcTest.ClearRefs:ZombieProcTest.Io:ZombieProcTest.OomAdj"

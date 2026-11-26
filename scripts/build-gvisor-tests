@@ -7,8 +7,9 @@
 #   scripts/build-gvisor-tests --all    every program, into target/gvisor-tests/all/ (for a full
 #                                       run by hand; difftest does not install it)
 #
-# The programs are the ones named after `run.sh gvisor "$SKIP"` in tests/diff/gvisor-*.sh, plus
-# every helper the tests run (targets not ending in _test); the tarball's name and its VERSION
+# The programs are the ones named after `run.sh gvisor "$SKIP"` in tests/diff/gvisor-*.sh and in
+# tests/diff/gtest/gvisor.filters, plus every helper the tests run (targets not ending in _test).
+# The tarball's name and its VERSION
 # carry a hash of that list, so a case naming another program makes a new tarball, which
 # scripts/difftest then installs into its store at /usr/lib/gvisor-tests (older tarballs are
 # removed). They are built in an Alpine arm64 container of the rootfs's version with clang,
@@ -34,11 +35,14 @@ benchmark_version=1.10.0
 benchmark_sha256=acc5c7c0fbed855c4aaa2d7c3c36fb82b0c15c28f4e151e3f679c2fc0aa404af
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-# The programs after `run.sh gvisor "$SKIP"`, across continuation lines
-programs=$(cat "$root"/tests/diff/gvisor-*.sh | awk '
-    /\\$/ { line = line substr($0, 1, length($0) - 1); next }
-    { line = line $0; if (sub(/.*run\.sh gvisor "\$SKIP"/, "", line)) print line; line = "" }' |
-    tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ')
+# Legacy groups name programs after `run.sh gvisor "$SKIP"`, across continuation lines.
+programs=$({
+    awk '
+        /\\$/ { line = line substr($0, 1, length($0) - 1); next }
+        { line = line $0; if (sub(/.*run\.sh gvisor "\$SKIP"/, "", line)) print line; line = "" }' \
+        "$root"/tests/diff/gvisor-*.sh | tr ' ' '\n'
+    awk 'NF && !/^#/ {print $2}' "$root/tests/diff/gtest/gvisor.filters"
+} | awk 'NF' | sort -u | tr '\n' ' ')
 case ${1:-} in
 --list)
     echo "$programs" | tr ' ' '\n' | awk 'NF'

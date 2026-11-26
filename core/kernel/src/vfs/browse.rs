@@ -207,20 +207,22 @@ pub enum Change {
     },
     /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
     /// truncated if `truncated`; with `unshared` it shared its object until then and now has one
-    /// of its own, which the kernel's open files of it must move to.
+    /// of its own, which its open descriptions must follow.
     Opened {
         ino: Ino,
         parent: (Ino, Vec<u8>),
         truncated: bool,
         unshared: bool,
     },
+    /// The object switch committed but the subsequent provider open failed.
+    Unshared(Ino),
     /// A regular file opened for writing was closed: something was written (the other side
     /// writes the host object directly, and the kernel does not see each write).
     Written { ino: Ino, parent: (Ino, Vec<u8>) },
 }
 
-/// The most names one create tries (`a (1).txt`, `a (2).txt`, ...).
-const MAX_TRIES: u32 = 100;
+/// The last numbered alternative after the requested name is taken.
+const MAX_NAME_SUFFIX: u32 = 100;
 
 /// Creates a file (0644) or directory (0755) in directory `dir` inside `top`, owned by `uid` and
 /// `gid`. When the name is taken another one is used ([`numbered`]); returns the name actually
@@ -235,28 +237,96 @@ pub fn create(
     changes: &mut Vec<Change>,
 ) -> Result<Vec<u8>, Errno> {
     check_name(name)?;
-    let dir = dir_in(store, top, dir)?;
-    for n in 0..=MAX_TRIES {
-        let name = if n == 0 {
+    let (dir, name) = store.transaction(|s| {
+        let dir = dir_in(s, top, dir)?;
+        let name = with_available_name(name, directory, |candidate| {
+            if directory {
+                s.mkdir(dir, candidate, 0o755, uid, gid).map(drop)
+            } else {
+                s.create_file(dir, candidate, 0o644, uid, gid).map(drop)
+            }
+        })?;
+        Ok((dir, name))
+    })?;
+    changes.push(Change::Created {
+        dir,
+        name: name.clone(),
+        is_dir: directory,
+    });
+    Ok(name)
+}
+
+/// Streams one file into a detached directory, then publishes it in the account's home.
+/// The open store pins the staging directory during the copy. Boot reclaims it after a crash.
+pub fn import_file(
+    store: &Store,
+    home: &[u8],
+    name: &[u8],
+    (uid, gid): (u32, u32),
+    fill: impl FnOnce(&File) -> Result<(), Errno>,
+    changes: &mut Vec<Change>,
+) -> Result<Vec<u8>, Errno> {
+    check_name(name)?;
+    let (dir, stage, ino, file) = store.transaction(|s| {
+        let (dir, _) = top_of(s, home)?;
+        let stage = s.create_detached_dir(0o700, uid, gid)?;
+        let (ino, file) = s.create_file(stage, b"data", 0o644, uid, gid)?;
+        Ok((dir, stage, ino, file))
+    })?;
+    // Release the SQLite writer even when this is the only connection. A provider may block.
+    store.commit()?;
+    let copy_and_publish = || -> Result<_, Errno> {
+        fill(&file)?;
+        file.sync_all()
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        let name = store.transaction(|s| {
+            let (current_dir, _) = top_of(s, home)?;
+            if current_dir != dir {
+                return Err(Errno::ESTALE);
+            }
+            let name = with_available_name(name, false, |candidate| {
+                s.rename(stage, b"data", dir, candidate, true, false)
+            })?;
+            s.remove_detached_dir(stage)?;
+            Ok(name)
+        })?;
+        store.commit()?;
+        Ok(name)
+    };
+    let name = copy_and_publish().inspect_err(|_| {
+        // A failed cleanup leaves only a detached tree for boot to reclaim.
+        let _ = store.remove_detached_dir(stage);
+    })?;
+    let parent = (dir, name.clone());
+    changes.push(Change::Created {
+        dir,
+        name: name.clone(),
+        is_dir: false,
+    });
+    changes.push(Change::Opened {
+        ino,
+        parent: parent.clone(),
+        truncated: false,
+        unshared: false,
+    });
+    changes.push(Change::Written { ino, parent });
+    Ok(name)
+}
+
+fn with_available_name(
+    name: &[u8],
+    directory: bool,
+    mut install: impl FnMut(&[u8]) -> Result<(), Errno>,
+) -> Result<Vec<u8>, Errno> {
+    for n in 0..=MAX_NAME_SUFFIX {
+        let candidate = if n == 0 {
             name.to_vec()
         } else {
             numbered(name, n, directory)
         };
-        check_name(&name)?;
-        let r = if directory {
-            store.mkdir(dir, &name, 0o755, uid, gid).map(drop)
-        } else {
-            store.create_file(dir, &name, 0o644, uid, gid).map(drop)
-        };
-        match r {
-            Ok(()) => {
-                changes.push(Change::Created {
-                    dir,
-                    name: name.clone(),
-                    is_dir: directory,
-                });
-                return Ok(name);
-            }
+        check_name(&candidate)?;
+        match install(&candidate) {
+            Ok(()) => return Ok(candidate),
             Err(Errno::EEXIST) => continue,
             Err(e) => return Err(e),
         }
@@ -286,8 +356,14 @@ pub fn remove(
     path: &[u8],
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
-    let (dir, name) = entry_in(store, top, path)?;
-    remove_tree(store, dir, &name, changes)
+    let mut removed = Vec::new();
+    store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        remove_tree(s, dir, &name, &mut removed)?;
+        s.retire_document(dir, &name)
+    })?;
+    changes.extend(removed);
+    Ok(())
 }
 
 fn remove_tree(
@@ -324,11 +400,15 @@ pub fn rename(
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
     check_name(new_name)?;
-    let (dir, name) = entry_in(store, top, path)?;
-    if name == new_name {
-        return Ok(());
-    }
-    moved(store, (dir, &name), (dir, new_name), changes)
+    let change = store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        if name == new_name {
+            return Ok(None);
+        }
+        moved(s, (dir, &name), (dir, new_name)).map(Some)
+    })?;
+    changes.extend(change);
+    Ok(())
 }
 
 /// Moves to another directory `to` inside `top`, keeping the name; EEXIST if it is already there,
@@ -340,9 +420,13 @@ pub fn move_to(
     to: &[u8],
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
-    let (dir, name) = entry_in(store, top, path)?;
-    let to = dir_in(store, top, to)?;
-    moved(store, (dir, &name), (to, &name), changes)
+    let change = store.transaction(|s| {
+        let (dir, name) = entry_in(s, top, path)?;
+        let to = dir_in(s, top, to)?;
+        moved(s, (dir, &name), (to, &name))
+    })?;
+    changes.push(change);
+    Ok(())
 }
 
 /// A new name: not empty, `.` or `..`, no `/` or NUL, at most 255 bytes.
@@ -375,7 +459,7 @@ fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Er
 
 /// Directory `dir` inside `top` (following symlinks).
 fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
-    let top = top_of(store, top)?;
+    let (_, top) = top_of(store, top)?;
     let (ino, real) = walk(store, dir)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
@@ -387,22 +471,19 @@ fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
 }
 
 /// Moves `ino` from `from` to `to` (without overwriting) and records it.
-fn moved(
-    store: &Store,
-    from: (Ino, &[u8]),
-    to: (Ino, &[u8]),
-    changes: &mut Vec<Change>,
-) -> Result<(), Errno> {
+fn moved(store: &Store, from: (Ino, &[u8]), to: (Ino, &[u8])) -> Result<Change, Errno> {
     let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
     let is_dir = store.kind(ino)? == mode::S_IFDIR;
     store.rename(from.0, from.1, to.0, to.1, true, false)?;
-    changes.push(Change::Moved {
+    if from != to {
+        store.retire_document(from.0, from.1)?;
+    }
+    Ok(Change::Moved {
         from: (from.0, from.1.to_vec()),
         to: (to.0, to.1.to_vec()),
         ino,
         is_dir,
-    });
-    Ok(())
+    })
 }
 
 /// Opens a regular file inside `top` for reading and writing (following symlinks; the file pointed
@@ -417,15 +498,23 @@ pub fn open_write(
     append: bool,
     changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
-    let (ino, parent) = writable_file(store, top, path)?;
-    let unshared = store.held(ino)?;
-    // Truncated first: a file sharing its object then gets an empty one of its own rather than a
-    // copy (Store::make_private)
-    if truncate {
-        store.truncate(ino, 0)?;
+    let (ino, parent, file, unshared) = store.transaction(|s| {
+        let (ino, parent) = writable_file(s, top, path)?;
+        let (file, unshared) = s.open_provider_object(ino, truncate, append)?;
+        Ok((ino, parent, file, unshared))
+    })?;
+    let finish = || {
+        if truncate {
+            store.truncate_host_object(&file)?;
+        }
+        store.host_opened(ino, path)
+    };
+    if let Err(e) = finish() {
+        if unshared {
+            changes.push(Change::Unshared(ino));
+        }
+        return Err(e);
     }
-    let file = store.open_object_append(ino, append)?;
-    store.host_opened(ino, path)?;
     changes.push(Change::Opened {
         ino,
         parent,
@@ -445,7 +534,7 @@ pub fn written(
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
     store.host_closed(path);
-    let (ino, parent) = writable_file(store, top, path)?;
+    let (ino, parent) = store.snapshot(|s| writable_file(s, top, path))?;
     changes.push(Change::Written { ino, parent });
     Ok(())
 }
@@ -453,7 +542,7 @@ pub fn written(
 /// Regular file `path` inside `top` (following symlinks; the file pointed at must also be inside
 /// `top`): its inode, and the directory and name it has on its real path.
 fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, Vec<u8>)), Errno> {
-    let top = top_of(store, top)?;
+    let (_, top) = top_of(store, top)?;
     let (ino, mut real) = walk(store, path)?;
     if !real.starts_with(&top) {
         return Err(Errno::EACCES);
@@ -468,17 +557,82 @@ fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, V
     Ok((ino, (dir, name)))
 }
 
-/// The components of `top`'s real path; it must be a directory other than the root directory
-/// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
-fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+/// Resolves the provider's write boundary to a directory in a login home tree.
+fn top_of(store: &Store, top: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
+    if !top.starts_with(b"/") || top.contains(&0) {
+        return Err(Errno::EACCES);
+    }
     let (ino, real) = walk(store, top)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
     }
-    if real.is_empty() {
-        return Err(Errno::EACCES);
+    let allowed = match real.first().map(Vec::as_slice) {
+        Some(b"root") => true,
+        Some(b"home") => real.len() >= 2,
+        None
+        | Some(
+            b"bin" | b"sbin" | b"usr" | b"lib" | b"lib64" | b"etc" | b"proc" | b"sys" | b"dev"
+            | b"run" | b"boot" | b"var" | b"tmp" | b"opt" | b"srv" | b"mnt" | b"media"
+            | b"lost+found",
+        ) => false,
+        Some(_) => custom_home(store, &real)?,
+    };
+    if allowed {
+        Ok((ino, real))
+    } else {
+        Err(Errno::EACCES)
     }
-    Ok(real)
+}
+
+// The caller has already excluded protected first components. A nonempty canonical
+// home that prefixes this path therefore cannot authorize a protected tree.
+fn custom_home(store: &Store, real: &[Vec<u8>]) -> Result<bool, Errno> {
+    use std::io::{BufRead, BufReader};
+    let passwd = match super::open_config_file(store, b"/etc/passwd") {
+        Ok(file) => file,
+        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EINVAL) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for line in BufReader::new(passwd).split(b'\n') {
+        let line = line.map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        if let Some(home) = login_home(&line)
+            && let Ok((_, home)) = walk(store, home)
+            && !home.is_empty()
+            && real.starts_with(&home)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn login_home(line: &[u8]) -> Option<&[u8]> {
+    let mut fields = line
+        .strip_suffix(b"\r")
+        .unwrap_or(line)
+        .split(|&b| b == b':');
+    let name = fields.next()?;
+    let uid = fields.nth(1)?;
+    let home = fields.nth(2)?;
+    let shell = fields.next()?;
+    if name.is_empty()
+        || line.contains(&0)
+        || fields.next().is_some()
+        || !home.starts_with(b"/")
+        || !uid.iter().all(u8::is_ascii_digit)
+        || std::str::from_utf8(uid).ok()?.parse::<u32>().ok()? < 1000
+        || matches!(
+            shell,
+            b"" | b"/sbin/nologin"
+                | b"/usr/sbin/nologin"
+                | b"/bin/false"
+                | b"/usr/bin/false"
+                | b"/sbin/false"
+        )
+    {
+        return None;
+    }
+    Some(home)
 }
 
 // ---- Paths for the host ----
@@ -525,19 +679,17 @@ pub fn encode_path(bytes: &[u8]) -> String {
     out
 }
 
-/// The reverse of [`encode_path`]; a `%` not followed by two hex digits is kept as it is.
+/// The reverse of [`encode_path`]; a `%` not followed by two ASCII hex digits is kept as it is.
 pub fn decode_path(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%'
-            && let Some(v) = b
-                .get(i + 1..i + 3)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let Some(&[hi, lo]) = b.get(i + 1..i + 3)
+            && let (Some(hi), Some(lo)) = (hex_digit(hi), hex_digit(lo))
         {
-            out.push(v);
+            out.push((hi << 4) | lo);
             i += 3;
             continue;
         }
@@ -545,6 +697,15 @@ pub fn decode_path(s: &str) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---- Path resolution ----
@@ -561,6 +722,38 @@ pub fn resolve(store: &Store, path: &[u8]) -> Result<Ino, Errno> {
 /// [`resolve`], also giving the components of the real path (with every symlink replaced by where
 /// it points, like realpath).
 fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
+    walk_with(store, path, |_, _| Ok(()))
+}
+
+/// SAF identifiers retain the original path until a provider mutation retires an entry traversed
+/// by the walk. Include intermediate symlinks and their targets, even across an absolute link.
+pub fn document_generations(store: &Store, paths: &[Vec<u8>]) -> Result<Vec<u64>, Errno> {
+    store.snapshot(|s| {
+        if !s.has_retired_documents()? {
+            return Ok(vec![0; paths.len()]);
+        }
+        paths
+            .iter()
+            .map(|path| {
+                let mut newest = 0;
+                let r = walk_with(s, path, |dir, name| {
+                    newest = newest.max(s.document_generation(dir, name)?);
+                    Ok(())
+                });
+                match r {
+                    Ok(_) | Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => Ok(newest),
+                    Err(e) => Err(e),
+                }
+            })
+            .collect()
+    })
+}
+
+fn walk_with(
+    store: &Store,
+    path: &[u8],
+    mut visit: impl FnMut(Ino, &[u8]) -> Result<(), Errno>,
+) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
     // The components not walked yet, in reverse (the top of the stack is the next one); following
     // a symlink pushes the target's components
     let mut pending: Vec<Vec<u8>> = components(path).rev().collect();
@@ -579,6 +772,7 @@ fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
             inos.pop();
             continue;
         }
+        visit(dir, &name)?;
         let ino = store.lookup(dir, &name)?.ok_or(Errno::ENOENT)?;
         if store.kind(ino)? == mode::S_IFLNK {
             links += 1;
@@ -652,6 +846,148 @@ mod tests {
         s.mknod(alice, b"fifo", mode::S_IFIFO | 0o644, 0, 1000, 1000)
             .unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn provider_tops_are_resolved_home_directories() {
+        let (s, dir) = sample("tops");
+        let mkdir = |parent, name: &[u8]| s.mkdir(parent, name, 0o755, 0, 0).unwrap();
+        let root = mkdir(ROOT, b"root");
+        mkdir(root, b"100% home");
+        let users = mkdir(ROOT, b"users");
+        let bob = mkdir(users, b"bob");
+        mkdir(bob, b"sub");
+        mkdir(users, b"svc");
+        mkdir(users, b"daemon");
+        mkdir(users, b"bob2");
+        let etc = resolve(&s, b"/etc").unwrap();
+        mkdir(etc, b"custom");
+        for name in [b"usr".as_slice(), b"bin", b"sbin", b"var", b"tmp"] {
+            mkdir(ROOT, name);
+        }
+        for (name, target) in [
+            (b"system".as_slice(), b"/etc".as_slice()),
+            (b"all", b"/"),
+            (b"homes", b"/home"),
+            (b"bob-home", b"/users/bob"),
+        ] {
+            s.symlink(ROOT, name, target, 0, 0).unwrap();
+        }
+        assert_eq!(top_of(&s, b"/users/bob"), Err(Errno::EACCES));
+        super::super::write_file(
+            &s,
+            b"/etc/passwd",
+            b"bob:x:1000:1::/bob-home:/bin/sh\n\
+            daemon:x:2:2::/sbin:/bin/sh\nsystem:x:2:2::/users/daemon:/bin/sh\n\
+            nobody:x:65534:1::/:/bin/sh\nsvc:x:1000:1::/users/svc:/sbin/nologin\n\
+            admin:x:1000:1::/system/custom:/bin/sh\n",
+            0o644,
+            true,
+        )
+        .unwrap();
+        for top in [
+            b"/root".as_slice(),
+            b"/root/100% home",
+            b"/home/alice",
+            b"/home/alice/Docs",
+            b"/users/bob",
+            b"/users/bob/sub",
+        ] {
+            assert!(top_of(&s, top).is_ok(), "{top:?}");
+        }
+        for top in [
+            b"".as_slice(),
+            b"/",
+            b"/home",
+            b"/etc",
+            b"/usr",
+            b"/bin",
+            b"/sbin",
+            b"/var",
+            b"/tmp",
+            b"home/alice",
+            b"/home/alice\0",
+            b"/system",
+            b"/all",
+            b"/homes",
+            b"/users/svc",
+            b"/users/daemon",
+            b"/users/bob2",
+            b"/etc/custom",
+        ] {
+            assert_eq!(top_of(&s, top), Err(Errno::EACCES), "{top:?}");
+        }
+        assert_eq!(top_of(&s, b"/missing"), Err(Errno::ENOENT));
+        assert_eq!(top_of(&s, b"/etc/motd"), Err(Errno::ENOTDIR));
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_revalidates_custom_home_on_publication_and_writer_close() {
+        let (s, dir) = sample("custom-home-changes");
+        let users = s.mkdir(ROOT, b"users", 0o755, 0, 0).unwrap();
+        let bob = s.mkdir(users, b"bob", 0o700, 1000, 1000).unwrap();
+        let top = b"/users/bob";
+        let path = b"/users/bob/data";
+        let ino = s.create_file(bob, b"data", 0o644, 1000, 1000).unwrap().0;
+        let passwd = |data: &[u8]| super::super::write_file(&s, b"/etc/passwd", data, 0o644, true);
+        passwd(b"bob:x:1000:1000::/users/bob:/bin/sh\n").unwrap();
+        let mut changes = Vec::new();
+        let file = open_write(&s, top, path, false, false, &mut changes).unwrap();
+        assert!(s.host_writing(ino).unwrap());
+        changes.clear();
+        assert_eq!(
+            import_file(
+                &s,
+                top,
+                b"pending",
+                (1000, 1000),
+                |_| passwd(b""),
+                &mut changes
+            ),
+            Err(Errno::EACCES)
+        );
+        assert!(changes.is_empty());
+        assert_eq!(s.lookup(bob, b"pending"), Ok(None));
+        drop(file);
+        assert_eq!(written(&s, top, path, &mut changes), Err(Errno::EACCES));
+        assert!(!s.host_writing(ino).unwrap());
+        assert!(changes.is_empty());
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retired_document_ids_follow_aliases_and_survive_reopen() {
+        let (s, dir) = sample("document-ids");
+        let top = b"/home/alice";
+        let source = b"/home/alice/Docs";
+        let paths = [
+            b"/home/alice/Docs/Notes.txt".to_vec(),
+            b"/home/alice/rel".to_vec(),
+            b"/home/alice/motd".to_vec(),
+        ];
+        let mut changes = Vec::new();
+        rename(&s, top, source, b"Docs", &mut changes).unwrap();
+        assert_eq!(
+            rename(&s, top, source, b"motd", &mut changes),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(document_generations(&s, &paths).unwrap(), [0, 0, 0]);
+        rename(&s, top, source, b"moved", &mut changes).unwrap();
+        rename(&s, top, b"/home/alice/moved", b"Docs", &mut changes).unwrap();
+        let first = document_generations(&s, &paths).unwrap();
+        assert!(first[0] > 0);
+        assert_eq!(first, [first[0], first[0], 0]);
+        remove(&s, top, source, &mut changes).unwrap();
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        let next = document_generations(&s, &paths).unwrap();
+        assert!(next[0] > first[0]);
+        assert_eq!(next, [next[0], next[0], 0]);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -765,7 +1101,7 @@ mod tests {
         }
         assert_eq!(encode_path(b"/a%b\tc"), "/a%25b%09c");
         assert_eq!(encode_path("中".as_bytes()), "中");
-        assert_eq!(decode_path("/x%zz%4"), b"/x%zz%4");
+        assert_eq!(decode_path("/x%zz%4%+a%+0"), b"/x%zz%4%+a%+0");
     }
 
     #[test]

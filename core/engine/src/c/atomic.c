@@ -16,12 +16,6 @@
 #define BIT(x, n) ((unsigned)(((x) >> (n)) & 1u))
 #define FIELD(x, hi, lo) ((unsigned)(((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1)))
 
-static enum appine_exit undef(struct appine_cpu *c, uint32_t insn)
-{
-    c->exit_info = insn;
-    return APPINE_EXIT_UNDEF;
-}
-
 static enum appine_exit next(struct appine_cpu *c)
 {
     c->pc += 4;

@@ -18,9 +18,12 @@
 //! pastes, selects, searches and copies, and reads the title and transcript; the service's worker
 //! takes snapshots for saving tabs and compresses every tab's scrollback when memory is trimmed;
 //! the `vt-compress` thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not
-//! thread-safe, so every call into vt.c holds the tab's lock; the frame buffer it returns is only
-//! written by `frame`, which only the main thread calls, so the main thread may read it after the
-//! lock is released.
+//! thread-safe, so every terminal call into vt.c holds the tab's terminal lock (`term`); frames
+//! hold a separate render lock (`render`, always acquired before `term`), taking `term` only for
+//! the short snapshot phase (`appine_vt_frame_begin`) and releasing it before deferred style work
+//! and row encoding (`appine_vt_frame_end`). The frame buffer `appine_vt_frame_end` returns is
+//! only written by `frame`, which only the main thread calls, so the main thread may read it after
+//! the render lock is released.
 //!
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
@@ -31,7 +34,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use appine_kernel::Machine;
+use appine_kernel::{ConsoleForeground, Machine};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jfloat, jint, jintArray, jlong, jobject, jstring};
@@ -40,6 +43,11 @@ use super::{machine, string, throw};
 
 #[repr(C)]
 struct AppineVt {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+struct AppineVtRender {
     _opaque: [u8; 0],
 }
 
@@ -61,6 +69,8 @@ struct RawEffects {
     statuses_len: usize,
     clipboard_reads: u32,
     clipboard_read_kind: u8,
+    clipboard_reset: bool,
+    clipboard_generation: u64,
     command_finished: bool,
     command_has_exit: bool,
     command_exit: i32,
@@ -78,6 +88,20 @@ const STATUS_HEADER_BYTES: usize = 7;
 /// vt.c's `APPINE_COMPRESS_STEP` and `APPINE_COMPRESS_WAIT` (`APPINE_COMPRESS_DONE` is any other).
 const COMPRESS_STEP: i32 = 1;
 const COMPRESS_WAIT: i32 = 2;
+
+/// vt.c's `APPINE_PROMPT_*` semantic-prompt modes.
+const PROMPT_NONE: i32 = 0;
+const PROMPT_FULL: i32 = 1;
+const PROMPT_ASH: i32 = 2;
+
+/// Bounded follow-up probe delays after a shell without preexec leaves its prompt or echoes a
+/// newline while its foreground group is still the shell, catching silent commands (e.g. `sleep`)
+/// once `fork`+`tcsetpgrp`+`execve` settle without polling idle tabs.
+const FG_PROBE_DELAYS: [Duration; 3] = [
+    Duration::from_millis(15),
+    Duration::from_millis(35),
+    Duration::from_millis(75),
+];
 
 /// How long a tab's terminal must stay unchanged before its scrollback is compressed, and the
 /// pause between two steps of a pass, in which the pump and the main thread get the lock: Ghostty's
@@ -109,8 +133,13 @@ unsafe extern "C" {
     fn appine_vt_resize(vt: *mut AppineVt, cols: u16, rows: u16, cell_width: u32, cell_height: u32);
     fn appine_vt_scroll(vt: *mut AppineVt, delta: i32);
     fn appine_vt_at_prompt(vt: *mut AppineVt) -> bool;
+    fn appine_vt_is_alternate(vt: *mut AppineVt) -> bool;
+    fn appine_vt_prompt_mode(vt: *mut AppineVt) -> i32;
     fn appine_vt_jump_prompt(vt: *mut AppineVt, delta: i32);
-    fn appine_vt_frame(vt: *mut AppineVt, full: bool, len: *mut usize) -> *const u8;
+    fn appine_vt_render_new() -> *mut AppineVtRender;
+    fn appine_vt_render_free(render: *mut AppineVtRender);
+    fn appine_vt_frame_begin(vt: *mut AppineVt, render: *mut AppineVtRender, full: bool) -> bool;
+    fn appine_vt_frame_end(render: *mut AppineVtRender, len: *mut usize) -> *const u8;
     fn appine_vt_image(
         vt: *mut AppineVt,
         id: u32,
@@ -193,7 +222,7 @@ unsafe extern "C" {
     fn appine_vt_search_rows(vt: *mut AppineVt, len: *mut usize, selected: *mut i64) -> *const u32;
     fn appine_vt_search_end(vt: *mut AppineVt);
     fn appine_vt_clear(vt: *mut AppineVt) -> i32;
-    fn appine_vt_reset(vt: *mut AppineVt) -> bool;
+    fn appine_vt_reset(vt: *mut AppineVt, clipboard_generation: *mut u64) -> bool;
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
     fn appine_vt_take_effects(vt: *mut AppineVt, out: *mut RawEffects);
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -238,13 +267,24 @@ unsafe extern "C" {
     fn AndroidBitmap_unlockPixels(env: *mut jni::sys::JNIEnv, bitmap: jobject) -> i32;
 }
 
-/// Owns one vt.c terminal.
-struct Term(*mut AppineVt);
+/// Owns one vt.c terminal (`.0`) and an optional foreground-process fallback title (`.1`, used
+/// while a command runs under busybox ash or an unmarked shell and has set no OSC 0/2 title).
+struct Term(*mut AppineVt, Option<String>);
 
 // SAFETY: the terminal is only used under the tab's lock (module docs)
 unsafe impl Send for Term {}
 
 impl Term {
+    fn prompt_state(&self) -> PromptState {
+        unsafe {
+            PromptState {
+                at_prompt: appine_vt_at_prompt(self.0),
+                alternate: appine_vt_is_alternate(self.0),
+                mode: appine_vt_prompt_mode(self.0),
+            }
+        }
+    }
+
     /// Feeds bytes and returns the replies they produced. `background`: the console's foreground
     /// process group did not write them (`Machine::read_console_run`).
     fn feed(&mut self, data: &[u8], background: bool) -> Vec<u8> {
@@ -263,9 +303,7 @@ impl Term {
         unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 
-    /// The bells, clipboard write, notification, progress and status reports and clipboard reads
-    /// programs sent, the last command the shell's prompt marks saw finish, and whether tmux's
-    /// control mode, which vt.c detached, ended, since the last call.
+    /// Takes the pending effects and copies their payloads before releasing the terminal lock.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -283,6 +321,8 @@ impl Term {
             statuses_len: 0,
             clipboard_reads: 0,
             clipboard_read_kind: 0,
+            clipboard_reset: false,
+            clipboard_generation: 0,
             command_finished: false,
             command_has_exit: false,
             command_exit: 0,
@@ -312,6 +352,8 @@ impl Term {
                 .then(|| (text(raw.title, raw.title_len), text(raw.body, raw.body_len))),
             progress: (raw.progress_state >= 0).then_some((raw.progress_state, raw.progress)),
             statuses: StatusReport::decode(bytes(raw.statuses, raw.statuses_len)),
+            clipboard_generation: raw.clipboard_generation,
+            clipboard_reset: raw.clipboard_reset,
             clipboard_reads: (raw.clipboard_reads > 0)
                 .then_some((raw.clipboard_reads, raw.clipboard_read_kind)),
             command: raw.command_finished.then_some((
@@ -341,6 +383,18 @@ impl Drop for Term {
     }
 }
 
+/// Owns one vt.c render state and frame buffers, locked independently from [`Term`].
+struct Render(*mut AppineVtRender);
+
+// SAFETY: the render state is only used under the tab's render lock (module docs)
+unsafe impl Send for Render {}
+
+impl Drop for Render {
+    fn drop(&mut self) {
+        unsafe { appine_vt_render_free(self.0) };
+    }
+}
+
 /// What programs asked of the app in one read of the console: the bell (any number of BELs
 /// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
 /// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none), the
@@ -355,6 +409,9 @@ struct Effects {
     notification: Option<(String, String)>,
     progress: Option<(i32, i32)>,
     statuses: Vec<StatusReport>,
+    /// Shared by the last RIS and all subsequent clipboard reads in this batch.
+    clipboard_generation: u64,
+    clipboard_reset: bool,
     clipboard_reads: Option<(u32, u8)>,
     command: Option<(Option<i32>, u64)>,
     tmux_detached: bool,
@@ -398,6 +455,25 @@ impl StatusReport {
     }
 }
 
+fn deliver_command_finished(
+    env: &mut JNIEnv<'_>,
+    session: &JObject<'_>,
+    exit: Option<i32>,
+    ms: u64,
+) -> bool {
+    let args = [
+        JValue::Bool(u8::from(exit.is_some())),
+        JValue::Int(exit.unwrap_or(0)),
+        JValue::Long(i64::try_from(ms).unwrap_or(i64::MAX)),
+    ];
+    env.call_method(session, "onCommandFinished", "(ZIJ)V", &args)
+        .is_ok()
+}
+
+fn clipboard_generation(generation: u64) -> jlong {
+    (generation & i64::MAX as u64) as jlong
+}
+
 impl Effects {
     /// Whether a program reported its progress or status, which lasts while its process group
     /// keeps the foreground ([`pump`]).
@@ -406,10 +482,9 @@ impl Effects {
     }
 
     /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
-    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`, `onCommandFinished`,
-    /// `onTmuxDetached`);
-    /// false when a call threw. The strings are
-    /// local references, deleted after each call: the pump stays in native code for the tab's
+    /// `onProgress`, `onStatus` for each status report, `onClipboardReset`, `onClipboardRead`,
+    /// `onCommandFinished`, `onTmuxDetached`). Returns false when a call threw. The strings
+    /// are local references, deleted after each call: the pump stays in native code for the tab's
     /// whole life, so they would otherwise pile up.
     fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
         if self.bell && env.call_method(session, "onBell", "()V", &[]).is_err() {
@@ -475,27 +550,31 @@ impl Effects {
                 return false;
             }
         }
+        let generation = JValue::Long(clipboard_generation(self.clipboard_generation));
+        if self.clipboard_reset
+            && env
+                .call_method(session, "onClipboardReset", "(J)V", &[generation])
+                .is_err()
+        {
+            return false;
+        }
         if let Some((count, kind)) = self.clipboard_reads {
-            let args = [JValue::Int(i32::from(kind)), JValue::Int(count as i32)];
+            let args = [
+                JValue::Int(i32::from(kind)),
+                JValue::Int(count as i32),
+                generation,
+            ];
             if env
-                .call_method(session, "onClipboardRead", "(II)V", &args)
+                .call_method(session, "onClipboardRead", "(IIJ)V", &args)
                 .is_err()
             {
                 return false;
             }
         }
-        if let Some((exit, ms)) = self.command {
-            let args = [
-                JValue::Bool(u8::from(exit.is_some())),
-                JValue::Int(exit.unwrap_or(0)),
-                JValue::Long(i64::try_from(ms).unwrap_or(i64::MAX)),
-            ];
-            if env
-                .call_method(session, "onCommandFinished", "(ZIJ)V", &args)
-                .is_err()
-            {
-                return false;
-            }
+        if let Some((exit, ms)) = self.command
+            && !deliver_command_finished(env, session, exit, ms)
+        {
+            return false;
         }
         if self.tmux_detached
             && env
@@ -515,6 +594,9 @@ struct Tab {
     machine: jlong,
     console: u32,
     term: Mutex<Term>,
+    /// Separate from `term` so row encoding and deferred style work run without holding the
+    /// terminal lock. Lock order: `render` before `term` before `COMPRESS`.
+    render: Mutex<Render>,
     /// Output changed the terminal since the last frame. The pump tells the view only when it sets
     /// this, so a burst of output asks for one frame; `frame` clears it before capturing.
     dirty: AtomicBool,
@@ -617,7 +699,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
             throw(&mut env, "cannot create a terminal");
             return 0;
         }
-        register(handle, console, raw)
+        let Some(id) = register(handle, console, raw) else {
+            throw(&mut env, "cannot create a terminal");
+            return 0;
+        };
+        id
     })
 }
 
@@ -652,24 +738,31 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_restore<'l>(
         if raw.is_null() {
             return 0;
         }
-        register(handle, console, raw)
+        register(handle, console, raw).unwrap_or(0)
     })
 }
 
-/// Registers a new terminal of kernel `machine`'s `console` in [`TABS`]; returns its handle.
-fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> jlong {
+/// Registers a new terminal of kernel `machine`'s `console` in [`TABS`]; returns its handle, or
+/// None when the render state cannot be allocated (freeing `raw`).
+fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> Option<jlong> {
+    let term = Term(raw, None);
+    let render_raw = unsafe { appine_vt_render_new() };
+    if render_raw.is_null() {
+        return None;
+    }
     let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
     let tab = Tab {
         id,
         machine,
         console: console as u32,
-        term: Mutex::new(Term(raw)),
+        term: Mutex::new(term),
+        render: Mutex::new(Render(render_raw)),
         dirty: AtomicBool::new(false),
     };
     TABS.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(id, Arc::new(tab));
-    id
+    Some(id)
 }
 
 /// Sets the cursor's default shape (`style`, libghostty-vt's `GhosttyCursorStyle`) and whether it
@@ -710,21 +803,152 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
     })
 }
 
+/// Sanitizes a foreground process command line (falling back to `comm`) for use as a fallback tab
+/// title: replaces control characters with `?` and truncates cleanly at 256 bytes. Returns `None`
+/// for Appine's own `login.sh` startup wrapper.
+fn sanitize_fg_title(fg: &ConsoleForeground) -> Option<String> {
+    if fg
+        .cmdline
+        .starts_with("sh -c # Login for an Appine terminal tab")
+        || fg.cmdline.contains(" appine-login ")
+    {
+        return None;
+    }
+    let src = if fg.cmdline.is_empty() || fg.cmdline.contains('\n') {
+        fg.comm.as_str()
+    } else {
+        fg.cmdline.as_str()
+    };
+    let trimmed = src.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    const MAX_BYTES: usize = 256;
+    let mut out = String::with_capacity(trimmed.len().min(MAX_BYTES));
+    for ch in trimmed.chars() {
+        let c = if ch.is_control() { '?' } else { ch };
+        if out.len() + c.len_utf8() > MAX_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+struct PromptState {
+    at_prompt: bool,
+    alternate: bool,
+    mode: i32,
+}
+
+impl PromptState {
+    fn idle_shell(&self, fg: &ConsoleForeground) -> bool {
+        !self.alternate
+            && fg.interactive_shell
+            && (self.mode == PROMPT_NONE || (self.mode == PROMPT_ASH && !fg.canonical_input))
+    }
+}
+
+/// A pump iteration after feeding console output, or after a probe timeout (no effects).
+struct PumpRead {
+    prompt: PromptState,
+    effects: Option<Effects>,
+    titled: bool,
+    foreground_newline: bool,
+}
+
+struct FallbackTracker {
+    command: Option<(i32, Instant)>,
+    explicit_title: bool,
+    // Index into FG_PROBE_DELAYS. At the end the next read waits indefinitely.
+    probe_step: usize,
+}
+
+#[derive(Default)]
+struct FallbackUpdate {
+    // None keeps the current title. Some(None) clears it.
+    title: Option<Option<String>>,
+    finished_ms: Option<u64>,
+}
+
+impl FallbackTracker {
+    fn new() -> Self {
+        Self {
+            command: None,
+            explicit_title: false,
+            probe_step: FG_PROBE_DELAYS.len(),
+        }
+    }
+
+    fn update(&mut self, read: &PumpRead, fg: Option<&ConsoleForeground>) -> FallbackUpdate {
+        if read.effects.is_none() {
+            self.probe_step += 1;
+        }
+        let mut update = FallbackUpdate::default();
+        if read.prompt.at_prompt || read.prompt.mode == PROMPT_FULL {
+            *self = Self::new();
+            update.title = Some(None);
+            return update;
+        }
+        if read.titled {
+            self.explicit_title = true;
+            update.title = Some(None);
+        }
+        match fg {
+            Some(fg) if !fg.interactive_shell => {
+                self.probe_step = FG_PROBE_DELAYS.len();
+                if self.command.is_none_or(|(pgid, _)| pgid != fg.pgid) {
+                    self.command = Some((fg.pgid, Instant::now()));
+                    self.explicit_title = read.titled;
+                }
+                if !self.explicit_title {
+                    update.title = Some(sanitize_fg_title(fg));
+                }
+            }
+            Some(fg) if read.prompt.idle_shell(fg) => {
+                if let Some((_, start)) = self.command.take() {
+                    self.explicit_title = false;
+                    update.title = Some(None);
+                    if read.effects.as_ref().is_none_or(|e| e.command.is_none()) {
+                        update.finished_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                }
+                if read.foreground_newline {
+                    self.probe_step = 0;
+                }
+            }
+            Some(_) if !read.prompt.alternate => {
+                // Ash may still be running a canonical builtin or about to resume raw input.
+                // Only new output rearms the probes. The final timeout clears a stale title.
+                if read.prompt.mode == PROMPT_ASH && self.command.is_some() {
+                    if read.effects.is_some() {
+                        self.probe_step = 0;
+                    } else if self.probe_step >= FG_PROBE_DELAYS.len() {
+                        *self = Self::new();
+                        update.title = Some(None);
+                    }
+                } else if read.foreground_newline {
+                    self.probe_step = 0;
+                }
+            }
+            _ => self.probe_step = FG_PROBE_DELAYS.len(),
+        }
+        update
+    }
+}
+
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
-/// `session.onTitle()` when a program set the title, `onBell`, `onClipboard`, `onNotification`,
-/// `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished` and `onTmuxDetached` for what
-/// programs asked of the app and what the shell's prompt marks told ([`Effects`]), and
-/// `onForeground()` once the process group that was in the foreground when progress or a status
-/// was last reported no longer is.
+/// `session.onTitle()` when a program or foreground-process fallback changed the title, `onBell`,
+/// `onClipboard`, `onNotification`, `onProgress`, `onStatus`, `onClipboardReset`, `onClipboardRead`,
+/// `onCommandFinished` and `onTmuxDetached` for what programs asked of the app and what the
+/// shell's prompt marks (or foreground-process fallback) told ([`Effects`]), and `onForeground()`
+/// once the process group that was in the foreground when progress or a status was last reported
+/// no longer is.
 ///
-/// That stands in for the shell's next prompt (OSC 133), which only some shells mark (the guest's
-/// login shells, bash, busybox ash and zsh, android/setup): the program status specification drops a
-/// program's `working` and `blocked` records when the next prompt starts or the program exits.
-/// Without it, a program that exits without clearing them
-/// (killed, or interrupted with Ctrl-C) would leave its tab working forever. The group is the one
-/// in the foreground after the read that carried the report, so a report from a command that has
-/// already exited by then lasts until the next command takes the foreground.
+/// vt.c expires transient reports at a command end or primary prompt. The foreground group
+/// supplies a fallback for shells without marks (progress/status expiry, command titles, busy
+/// state and command-completion timing) and for busybox ash's missing preexec command titles.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     mut env: JNIEnv<'l>,
@@ -736,45 +960,74 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
         let Some(tab) = tab(handle) else { return };
         let mut buf = vec![0u8; 64 * 1024];
         // The foreground process group when progress or a status was last reported, while that
-        // report lasts
+        // report lasts.
         let mut reporter = None;
+        let mut fallback = FallbackTracker::new();
         loop {
-            // Looked up again for every read, so the kernel is not kept once the service stops it
+            // Looked up again for every read, so the kernel is not kept once the service stops it.
             let Some(m) = tab.machine() else { break };
-            let (n, background) = match m.read_console_run(tab.console, &mut buf) {
-                Ok((0, _)) | Err(_) => break,
-                Ok(read) => read,
+            let timeout = FG_PROBE_DELAYS.get(fallback.probe_step).copied();
+            let read = match m.read_console_run_timeout(tab.console, &mut buf, timeout) {
+                Ok(Some((0, _))) | Err(_) => break,
+                Ok(Some((n, background))) => {
+                    // Sample the password cursor before locking the terminal. Feed the run and
+                    // take its effects and prompt state together, then unlock before writing replies.
+                    let password = m.console_password_input(tab.console).unwrap_or(false);
+                    let (replies, titled, effects, prompt) = {
+                        let mut term = tab.term();
+                        unsafe { appine_vt_set_password_input(term.0, password) };
+                        let replies = term.feed(&buf[..n], background);
+                        let titled = unsafe { appine_vt_take_title_changed(term.0) };
+                        let effects = term.take_effects();
+                        (replies, titled, effects, term.prompt_state())
+                    };
+                    if !replies.is_empty() && !tab.write(&m, &replies) {
+                        break;
+                    }
+                    PumpRead {
+                        prompt,
+                        effects: Some(effects),
+                        titled,
+                        foreground_newline: !background && buf[..n].contains(&b'\n'),
+                    }
+                }
+                Ok(None) => PumpRead {
+                    prompt: tab.term().prompt_state(),
+                    effects: None,
+                    titled: false,
+                    foreground_newline: false,
+                },
             };
-            // Whether a password is read now, for the cursor: programs turn echo off before they
-            // print their prompt, so it is known by the time this output shows. Asked before the
-            // tab's lock is taken, so the kernel's lock is not held under it
-            let password = m.console_password_input(tab.console).unwrap_or(false);
-            let (replies, titled, effects) = {
-                let mut term = tab.term();
-                unsafe { appine_vt_set_password_input(term.0, password) };
-                let replies = term.feed(&buf[..n], background);
-                let titled = unsafe { appine_vt_take_title_changed(term.0) };
-                (replies, titled, term.take_effects())
-            };
-            // A program waiting for an answer (DA, DSR) does not read further until it comes
-            if !replies.is_empty() && !tab.write(&m, &replies) {
-                break;
-            }
-            let mut gave_back = false;
-            if effects.reported() {
-                reporter = m.console_foreground(tab.console).ok();
-            } else if let Some(group) = reporter
-                && m.console_foreground(tab.console).ok() != Some(group)
-            {
-                reporter = None;
-                gave_back = true;
-            }
-            // Not kept across the calls into Java either
+            let fg = m.console_foreground_process(tab.console).ok();
             drop(m);
-            let output = !tab.dirty.swap(true, Ordering::AcqRel);
+
+            let mut gave_back = false;
+            if let Some(effects) = &read.effects {
+                let pgid = fg.as_ref().map(|f| f.pgid);
+                if effects.reported() {
+                    reporter = pgid;
+                } else if reporter.is_some() && reporter != pgid {
+                    reporter = None;
+                    gave_back = true;
+                }
+            }
+            let update = fallback.update(&read, fg.as_ref());
+            let mut title_notify = read.titled;
+            if let Some(next_title) = update.title {
+                let mut term = tab.term();
+                if term.1 != next_title {
+                    term.1 = next_title;
+                    title_notify = true;
+                }
+            }
+
+            let output = read.effects.is_some() && !tab.dirty.swap(true, Ordering::AcqRel);
             if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
-                || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
-                || !effects.deliver(&mut env, &session)
+                || (title_notify && env.call_method(&session, "onTitle", "()V", &[]).is_err())
+                || !read.effects.is_none_or(|e| e.deliver(&mut env, &session))
+                || !update
+                    .finished_ms
+                    .is_none_or(|ms| deliver_command_finished(&mut env, &session, None, ms))
                 || (gave_back
                     && env
                         .call_method(&session, "onForeground", "()V", &[])
@@ -787,7 +1040,8 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     })
 }
 
-/// The title a program set (OSC 0/2); null when none.
+/// The title a program set (OSC 0/2), or the foreground-process fallback title while a command
+/// runs without setting one under busybox ash or an unmarked shell; null when none.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
     mut env: JNIEnv<'l>,
@@ -799,6 +1053,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
             return std::ptr::null_mut();
         };
         let term = tab.term();
+        if let Some(title) = &term.1 {
+            return env
+                .new_string(title)
+                .map_or(std::ptr::null_mut(), JString::into_raw);
+        }
         let mut len = 0;
         let p = unsafe { appine_vt_title(term.0, &mut len) };
         term.text(&mut env, p, len)
@@ -818,6 +1077,34 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_atPrompt<'l>(
     })
 }
 
+/// Whether closing the tab would interrupt a running command: false at an OSC 133 prompt, or (for
+/// unmarked shells and busybox ash whose PS1 lost its marks) when the primary screen's foreground
+/// process is an interactive shell waiting for input.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_busy<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("VtNative.busy", 0, {
+        let Some(tab) = tab(handle) else {
+            return 0;
+        };
+        let prompt = tab.term().prompt_state();
+        if prompt.at_prompt {
+            return 0;
+        }
+        if prompt.alternate || prompt.mode == PROMPT_FULL {
+            return 1;
+        }
+        let idle = tab
+            .machine()
+            .and_then(|m| m.console_foreground_process(tab.console).ok())
+            .is_some_and(|fg| prompt.idle_shell(&fg));
+        jboolean::from(!idle)
+    })
+}
+
 /// Captures a frame (vt.c's format) of the rows that changed, or of all rows with `full`. The
 /// buffer stays valid until the next call, which only the main thread makes.
 #[unsafe(no_mangle)]
@@ -832,12 +1119,21 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_frame<'l>(
             return std::ptr::null_mut();
         };
         tab.dirty.store(false, Ordering::Release);
+        let render = tab.render.lock().unwrap_or_else(PoisonError::into_inner);
+        let ok = {
+            let term = tab.term();
+            unsafe { appine_vt_frame_begin(term.0, render.0, full != 0) }
+        };
+        if !ok {
+            return std::ptr::null_mut();
+        }
         let mut len = 0;
-        let p = unsafe { appine_vt_frame(tab.term().0, full != 0, &mut len) };
+        let p = unsafe { appine_vt_frame_end(render.0, &mut len) };
+        drop(render);
         if p.is_null() {
             return std::ptr::null_mut();
         }
-        // SAFETY: vt.c keeps the frame until the next appine_vt_frame call (above)
+        // SAFETY: vt.c keeps the frame until the next appine_vt_frame_end call (above)
         match unsafe { env.new_direct_byte_buffer(p as *mut u8, len) } {
             Ok(b) => b.into_raw(),
             Err(_) => std::ptr::null_mut(),
@@ -1585,16 +1881,22 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_clear<'l>(
     })
 }
 
-/// Resets the terminal (a full reset, RIS); true when the shell was at its prompt (the caller
-/// sends it a form feed to draw it again).
+/// Returns the new clipboard generation, positive at a shell prompt, negative otherwise.
+/// Zero means the tab is gone.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_reset<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-) -> jboolean {
+) -> jlong {
     guarded!("VtNative.reset", 0, {
-        tab(handle).is_some_and(|tab| unsafe { appine_vt_reset(tab.term().0) }) as jboolean
+        let Some(tab) = tab(handle) else { return 0 };
+        let mut term = tab.term();
+        term.1 = None;
+        let mut generation = 0;
+        let prompt = unsafe { appine_vt_reset(term.0, &mut generation) };
+        let generation = clipboard_generation(generation).max(1);
+        if prompt { generation } else { -generation }
     })
 }
 

@@ -194,11 +194,17 @@ internal class VtRenderer(
                     x++
                     continue
                 }
+                val span = if (wide == WIDE) 2 else 1
+                if (!drawsForeground(a)) {
+                    flush()
+                    x += span
+                    continue
+                }
                 val code = cp[i]
                 val color = fgOf(i)
                 val paint = paintOf(i)
                 val decor = a and DECORATIONS
-                val plain = clusters[i] == null && wide == NARROW && a and INVISIBLE == 0 &&
+                val plain = clusters[i] == null && wide == NARROW &&
                     (code == 0 || code in 0x20..0x7e)
                 if (plain) {
                     if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor)) flush()
@@ -213,8 +219,7 @@ internal class VtRenderer(
                     continue
                 }
                 flush()
-                val span = if (wide == WIDE) 2 else 1
-                if (a and INVISIBLE == 0) drawGlyph(c, i, x, span, top, color, paint)
+                drawGlyph(c, i, x, span, top, color, paint)
                 decorate(c, decor, x, x + span, top, color)
                 x += span
             }
@@ -371,7 +376,7 @@ internal class VtRenderer(
                 // A block: the cell's glyph in the background colour on top
                 c.withClip(l, t, r, b) {
                     c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
-                    if (s.attrs[i] and INVISIBLE == 0) drawGlyph(c, i, s.cursorX, span, t, bgOf(i), paintOf(i))
+                    if (drawsForeground(s.attrs[i])) drawGlyph(c, i, s.cursorX, span, t, bgOf(i), paintOf(i))
                 }
             }
         }
@@ -426,6 +431,9 @@ internal class VtRenderer(
     }
 
     companion object {
+        /** SGR 8 conceals the glyph and every decoration over the cell background. */
+        fun drawsForeground(attrs: Int): Boolean = attrs and INVISIBLE == 0
+
         // Cell attributes (vt.c)
         private const val BOLD = 1
         private const val ITALIC = 2

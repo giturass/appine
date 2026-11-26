@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: condense verbose type field lists, unused API catalog and repeated invariants while keeping all verified facts)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: clipboard generations in reset results, pump effects and JNI callbacks)
 
 ## Responsibilities
 
@@ -32,27 +32,32 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Key types
 
-- `VtNative` — 48 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
+- `VtNative` — 49 `@JvmStatic external` functions on the native library, plus raw libghostty-vt
   cursor style (`CURSOR_*`), selection gesture (`GESTURE_*`) and adjustment (`ADJUST_*`) constants
   that must match libghostty-vt's headers.
-- In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, `dirty` flag) in
-  monotonically keyed `TABS` (handles from 1, never reused); `TermGuard` (releases the tab lock and
-  schedules compression when work remains); `Term` (owns `AppineVt`, freed on drop); `RawEffects`
-  (C-ABI mirror of `AppineVtEffects`) decoded into `Effects` (`StatusReport` queue, clipboard
-  reads, last finished command, `tmux_detached`); `COMPRESS` (`Due` per tab) served by `vt-compress`
-  (`compressor`).
-- In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal, render
-  state, key/mouse encoders, grid/cell geometry, shared reply/frame/scratch/text buffers, resize
-  settle and synchronized-output/password flags, selection-gesture and search scratch, queued
-  `AppineVtEffects`, OSC/DCS prefix scanners and `tmux_control` state, command-timing and
-  `prompt_click` state, compression/transcript/snapshot dirty flags, and the render state's
-  `Placement` list with its generation. Process-wide (`install_sys`, installed with the first
-  terminal): the Wuffs PNG decoder and `on_log` (sharing a 20 lines/s rate limit with
-  `on_unknown_sequence`, `log_allowed`).
+- In `vt.rs`: `Tab` (handle, kernel handle, console number, mutex-guarded `Term`, separately
+  mutex-guarded `Render`, `dirty` flag) in monotonically keyed `TABS` (handles from 1, never
+  reused); `TermGuard` (releases the tab's terminal lock and schedules compression when work
+  remains); `Term` (owns `AppineVt` and optional foreground-process `fallback_title`, freed on
+  drop); `Render` (owns `AppineVtRender`, freed on drop); `RawEffects` (C-ABI mirror of
+  `AppineVtEffects`) decoded into `Effects` (`StatusReport` queue, optional clipboard reset and
+  reads tagged with the captured generation, last finished command, `tmux_detached`);
+  `COMPRESS` (`Due` per tab) served by `vt-compress` (`compressor`).
+- In `vt.c`: `AppineVt` — per-terminal native state holding the libghostty-vt terminal,
+  key/mouse encoders, grid/cell geometry, shared reply/text buffers, resize settle and
+  synchronized-output (`held_state`, `held`, `held_since`)/password flags, selection-gesture and
+  search scratch, clipboard generation and pending reset flag, queued effects, OSC/DCS prefix
+  scanners and `tmux_control` state, command-timing, `prompt_click` and `lf_resumed` state, and compression/transcript/snapshot dirty
+  flags. `AppineVtRender` — per-tab render state guarded by `Tab.render`, holding the
+  `GhosttyRenderState`, row/cell/image iterators, frame/extras/grapheme buffers, viewport search
+  marks (`marks`/`marks_sent`), Kitty `Placement` list with generation/validity, and the
+  `FrameSnap` captured under `Tab.term` in `appine_vt_frame_begin`. Process-wide (`install_sys`,
+  installed with the first terminal): the Wuffs PNG decoder and `on_log` (sharing a 20 lines/s
+  rate limit with `on_unknown_sequence`, `log_allowed`).
 
 ## Public entry points
 
-- `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `frame`,
+- `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `busy`, `frame`,
   `image`, `passwordInput`, `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`,
   `gesturePress`, `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`,
   `selectContext`, `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`, `selectAll`,
@@ -60,7 +65,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   `searchSelect`, `searchRows`, `searchEnd`, `clear`, `reset`, `message`, `transcript`, `snapshot`,
   `version`, `compressAll`, `dropImages`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
-  `onStatus`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground` back;
+  `onStatus`, `onClipboardReset`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground` back;
   `snapshot`, `compressAll` and `dropImages` run on the service's worker, `version` wherever `Tabs`
   needs it, the rest on the main thread.
 
@@ -78,8 +83,8 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   (`wrap` only turns blinking on over libghostty-vt's steady block, and the session sets the user's
   choice right after, `VtNative.setCursor`, before the pending text; android/vtrender's Frames and
   drawing); grapheme clustering, mode 2027, on by default as in Ghostty; the render state asks for
-  one overscan row below the viewport; the OSC 133 callback (command timing) and unimplemented OSC
-  and APC strings reported with 16 bytes kept, of which only an OSC's leading number or an APC's
+  one overscan row below the viewport; the OSC 133 callback for command timing and report expiry;
+  unimplemented OSC and APC strings reported with 16 bytes kept, of which only an OSC's leading number or an APC's
   first letter is logged (a malformed string may start with the program's data); Kitty graphics on,
   with 32 MiB of decoded images per screen (Ghostty's default is 320 MB) and only data sent in the
   escape sequences (the file, temporary file and shared memory media, which would name the host's
@@ -128,10 +133,14 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   with the first clipboard the last one named (`p` or `s`, else `c`), which every read of the
   batch is answered for; the last command the prompt marks saw finish (Shell integration); the end
   of tmux's control mode, which vt.c detached (below), delivered last (`onTmuxDetached`).
+  `appine_vt_take_effects` captures the clipboard generation under `Tab.term` and consumes the
+  reset flag and read count. After unlocking, the pump delivers `onClipboardReset(generation)`
+  before `onClipboardRead(kind, count, generation)` when both occur in one batch.
   libghostty-vt's clipboard-read
   callback is left unset: it must answer before returning, under the tab's lock, which rules out
   asking the user; so OSC 5522 reads are refused and Kitty paste events never sent. What the app
-  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. Where they go
+  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. A RIS in
+  those bytes still advances the generation captured with the next clipboard read. Where effects go
   is android/service's choice; the bell of the tab in front comes back as `VtView.bell`.
 - tmux's control mode (`tmux -CC`), which libghostty-vt built for apps does not parse (Confirmed
   bugs / technical debt), would leave the tab showing nothing while keys reach tmux as commands.
@@ -144,14 +153,13 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   so and that `tmux attach` brings the session back (android/service; nothing on the alternate
   screen). Other DCS strings (DECRQSS, XTGETTCAP, tmux passthrough) only cost two extra stops each. Nothing
   retries when tmux does not detach.
-- The pump stands in for shell integration's prompt mark, which only some shells send: after a
-  read that carried a progress or status report it notes the console's foreground process group
-  (`Machine::console_foreground`; a failed lookup notes none, and that report then waits for its
-  timeout, being seen or the shell's end), and on a later read where another group (or none) has
-  the foreground it calls `onForeground`,
-  which drops the progress and the working, blocked and idle records, keeping done and error ones
-  until seen. Seeing the tab (`statusSeen`, from the service) drops done and error records; the
-  shell's end drops everything.
+- At an OSC 133 command end or primary prompt start after a report, the progress slot records
+  removal and the ordered status queue records expiry of transient records. Later reports in the
+  same read take effect in order. This also works when no command was timed. The pump also samples
+  the foreground group after a report (`Machine::console_foreground`). If it recorded a group
+  and a later report-free read sees a different one or none, `onForeground` expires progress and
+  working, blocked and idle records. This covers shells without marks. The service's `statusSeen`
+  drops done and error records when the user sees the tab. Shell exit clears all records.
 - Kill reports go through `VtNative.message` (a yellow line inserted above the cursor line: a CAN
   first when the parser is not at ground (`VT_GROUND`, which includes the UTF-8 decoder), so a
   program that died inside an OSC, DCS or APC string does not swallow it; then as many line feeds
@@ -178,7 +186,9 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   64 KiB.
 - Memory trimming (`VtNative.compressAll`, from android/service) compresses every tab's cold pages
   at once, idle or not, one tab's lock at a time.
-- Under memory pressure the service also cuts the images of the tabs not shown
+- When trimming background tabs (after 60 s with the UI hidden, after 60 s unseen or beyond 2
+  recently left background tabs while switching, on periodic saves for already-trimmed unseen tabs,
+  or under system memory pressure), the service also cuts the images of tabs not shown
   (`VtNative.dropImages`): vt.c lowers the tab's Kitty storage limit to 4 MiB and puts it back to
   32 MiB, the only way libghostty-vt gives image memory back. On each screen it deletes whole
   images with their placements, those no placement shows first, then the oldest sent, until the
@@ -231,29 +241,35 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   reset (RIS) of both screens, the scrollback, modes, the palette, the title and images, keeping
   the app's options and the colours set with OSC 10, 11 and 12; the selection, a
   synchronized-output hold and the prompt's way of moving its cursor end, a shell that was at its
-  prompt gets a form feed (^L) to draw it
-  on the empty screen, and the tab bar hears that the title went. Unlike a program's RIS, it
-  reports no removal of the progress and no clear of the status records (libghostty-vt reports
-  them only from the stream), so the tab keeps them (the progress still lapses 15 s after its last
-  report).
+  prompt gets a form feed (^L) to redraw, and the tab bar hears that the title went. The session
+  clears progress and status directly. A program's RIS clears them through stream callbacks.
+- `on_reset` advances the native clipboard generation on each program RIS, drops earlier reads
+  in the feed and sets the reset flag. Later reads use the new generation. `appine_vt_reset`
+  advances the same counter, clears buffered reads and the pending reset flag, and returns the
+  generation to JNI through an output parameter. `VtNative.reset` returns zero for a missing tab,
+  the positive generation at a prompt, or its negative otherwise.
 - Clearing writes its sequences as the app's own (`write_own`, as kill reports do): after a CAN
   when the parser is inside a sequence a program left unfinished, keeping the console's replies
-  as they were; resetting calls libghostty-vt's reset directly.
+  as they were. Resetting uses the same cancellation before libghostty-vt resets the screens.
+  Both paths clear `osc_open`, `dcs_open` and `tmux_control`.
 
 ### Shell integration
 
-- The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks the
-  prompt, the typed command and the output's start, and so does zsh where it reads the profile;
-  busybox ash the prompt and the typed command, asking with `appine_lf=output` for its line feeds
-  to be read, below; fish 4 and nushell send their own,
-  all four marks, fish's prompt start with `click_events=1` and nushell's with no way for taps to
-  move the cursor). libghostty-vt keeps the marks in the rows and cells it writes (prompt, input,
-  output) and the cursor's place among them, which closing, jumping, Select output and taps on the
-  input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click selects a
-  command's output through libghostty-vt's selection gesture, and a right-click looks for one for
-  the menu's Select output. A shell without the marks (zsh on Debian, dash, mksh, tcsh, elvish, a
-  nested non-login shell other than busybox ash and, on Alpine, bash, a remote one over ssh that sends none) leaves every cell output: it is
-  never at a prompt, there is nothing to jump to and no output to select, and no command is timed.
+- The guest's login and interactive shells mark their prompts with OSC 133 (android/setup's
+  profile and rc hooks: bash marks the prompt, multi-line continuation rows, typed command and
+  output start on both distros including nested shells; zsh does likewise including on Debian via
+  `/etc/appine/zsh/.zshenv` and in nested shells via `/etc/zsh/zshrc`, wrapping `RPROMPT`/`RPS2`
+  so right prompts are not counted as input; busybox ash marks the prompt, continuation rows and
+  typed command, asking with `appine_lf=output` for its line feeds to be read, below; fish 4 and
+  nushell send their own, all four marks, fish's prompt start with `click_events=1` and nushell's
+  with no way for taps to move the cursor). libghostty-vt keeps the marks in the rows and cells it
+  writes (prompt, input, output) and the cursor's place among them, which closing, jumping, Select
+  output and taps on the input read through vt.c's shell integration functions; a mouse's
+  Ctrl+triple-click selects a command's output through libghostty-vt's selection gesture, and a
+  right-click looks for one for the menu's Select output. A shell without the marks (dash, mksh,
+  tcsh, elvish, an ash started through `doas -s`, a remote shell over ssh that sends none) leaves
+  every cell output: it is never at a prompt, there is nothing to jump to and no output to select,
+  and no command is timed.
 - A prompt start or prompt mark (OSC 133;A or P, on the primary screen) with `appine_lf=output`
   has `appine_vt_feed` read the shell's line feeds from there on, outside OSC and DCS strings,
   until one ends the input: a line feed after two carriage returns is ash breaking a long command
@@ -265,12 +281,33 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   not write are not read so: the pump reads output in runs by writer
   (`Machine::read_console_run`, kernel/tty) and feeds each with whether another group wrote it,
   so a line from a job left in the background ends no input. At the prompt vt.c marks such bytes
-  as output itself: an output start before them, and after them a continuation prompt with no
-  text and an input start (OSC 133;P;k=s and B), unless an OSC or DCS string is open. So the
-  cursor stays at the prompt, what is typed after them is input again, and they are selected as
-  one output (from the prompt's row down to the row the input resumes on). A primary prompt without the option, a program's
-  full reset and the app's Reset terminal end the reading. So a command of several rows is all
-  input: the cursor stays at the prompt while it is typed, and its rows are not selected as output.
+  as output itself: an output start before them, and after them, when the output moved to a new
+  row, a continuation prompt with no text and an input start (OSC 133;P;k=s and B) plus a tracked
+  `lf_resumed` reference on that row (or only OSC 133;B when it stayed on the same row), unless
+  an OSC or DCS string is open. So the cursor stays at the prompt, what is typed after them is
+  input again, they are selected as one output, and `appine_vt_prompt_click` rejects taps above
+  `lf_resumed` and never treats `lf_resumed` as an ash-broken row. A primary prompt without the
+  option, a program's full reset and the app's Reset terminal end the reading and clear
+  `lf_resumed`. So a command of several rows is all input: the cursor stays at the prompt while it
+  is typed, and its rows are not selected as output.
+- Foreground-process fallback (`vt.rs` + `vt.c`'s `prompt_mode` (`NONE`/`FULL`/`ASH`) and
+  `is_alternate`, querying `Machine::console_foreground_process` and bounded 15/35/75 ms
+  `read_console_run_timeout` probes only after a foreground newline while the shell still holds the
+  foreground, zero idle wakeups):
+  - For busybox ash (`APPINE_PROMPT_ASH`, which has no preexec hook) and unmarked shells
+    (`APPINE_PROMPT_NONE`), while a non-shell foreground process runs and has not emitted OSC 0/2
+    during that command, `Term`'s fallback title holds its sanitized command line (falling back to
+    `comm`, skipping Appine's `login.sh` wrapper) and notifies `onTitle`; any explicit OSC 0/2
+    title wins immediately, and returning to the prompt clears the fallback title.
+  - `VtNative.busy` checks `appine_vt_at_prompt` first, treats alternate screens and full OSC 133
+    shells (`bash`/`zsh`/`fish`/`nushell`) as busy when `!at_prompt`, and otherwise marks the tab
+    idle when `console_foreground_process` reports an interactive shell (requiring `!canonical_input`
+    for `APPINE_PROMPT_ASH` so ash canonical builtins like `read` stay busy while an overwritten
+    `PS1` in raw-mode `read_line_input` recovers idle).
+  - For unmarked shells (`APPINE_PROMPT_NONE`) and ash that lost its `PS1` marks (`!canonical_input`
+    with no OSC 133 `D`), transitioning from a tracked non-shell foreground command back to an
+    interactive shell delivers `onCommandFinished(hasExit = false, 0, millis)` without double-firing
+    when OSC 133 already reported the command.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
   starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
   none, when a feed ends with the cursor no longer at the prompt where the one before left it there
@@ -315,7 +352,7 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   providing terminal state, render state with one overscan row, input/selection/search/formatter
   APIs, OSC 133 semantic prompts, progress/status callbacks, scrollback compression, snapshots with
   continuation tracking and Kitty graphics; `libjnigraphics` (used by android/vtrender);
-  `Machine::{read_console_run, write_console, resize_console, console_foreground,
+  `Machine::{read_console_run_timeout, write_console, resize_console, console_foreground_process,
   console_password_input}` (`kernel/tty`); `android/native`'s `guarded!`, handle table and string
   helpers.
 - Deliberately unused libghostty-vt C surfaces: standalone parsers/encoders superseded by terminal
@@ -339,13 +376,18 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
   continuation limit, terminfo name and clipboard/unknown-sequence limits are not in the snapshot
   and must be re-applied after `settle` (before `VtNative.setCursor`); `settle`'s DECSTR resets the
   cursor to its defaults.
-- libghostty-vt is not thread-safe: every `vt.c` call holds the tab lock (recovered if poisoned),
-  so callbacks must never block on the main thread (hence async OSC 52 reads and refused OSC 5522
-  reads). `frame` writes the frame buffer only on the main thread; the shared text buffer (title,
-  copy, link, transcript) is copied to a Java string under the lock.
+- libghostty-vt is not thread-safe: every terminal `vt.c` call holds `Tab.term` (recovered if
+  poisoned), while `VtNative.frame` holds `Tab.render` around `appine_vt_frame_begin` (which
+  takes `Tab.term` only for `ghostty_render_state_begin_update`, images/search and metadata) and
+  `appine_vt_frame_end` (which runs `ghostty_render_state_end_update` and row encoding with
+  `Tab.term` released). `on_render_hold` captures mode-2026 holds into `vt->held_state` under
+  `Tab.term` alone and hands it off to `AppineVtRender` under both locks. Callbacks must never
+  block on the main thread (hence async OSC 52 reads and refused OSC 5522 reads). `frame` writes
+  the frame buffer only on the main thread; the shared text buffer (title, copy, link,
+  transcript) is copied to a Java string under `Tab.term`.
 - Compression schedules only when `TermGuard` drops, so mutating calls must lock via `Tab::term`,
   while `compressor`/`compressAll` lock the mutex directly to avoid self-rescheduling. Lock order:
-  tab lock before `COMPRESS` lock, never reversed.
+  `Tab.render` before `Tab.term` before `COMPRESS`, never reversed.
 - Because libghostty-vt's activity token ignores read-triggered decompression, any `vt.c` path
   reading beyond the viewport must set `compress_touched`; any path mutating terminal state must
   clear `transcribed`.
@@ -389,15 +431,12 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Confirmed bugs / technical debt
 
-- **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
-  (not for nested non-login shells other than ash and, on Alpine, bash, or zsh on Debian, whose
-  zprofile does not read `/etc/profile`;
-  fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
-  of several lines are not continuation rows; after a background
-  job's output at ash's prompt, a tap on a row above the one the input resumed on counts arrow
-  keys as if ash had broken the command there (ash still has its cursor on the prompt's row),
-  and an ash PS1 set after its `ENV` file was read has none. The related progress/status lifetime
-  debt belongs to android/vt; the native OSC 133 callback currently serves command timing only.
+- **Shell integration is partial**: the profile, rc hooks and Alpine `doas.d` `setenv` rules mark
+  prompts for bash, busybox ash (including `doas -s`) and zsh (fish and nushell mark their own);
+  local unmarked shells (dash, mksh, tcsh, elvish, and ash after `PS1` is overwritten past `ENV`)
+  get foreground-process fallback for `busy`, command titles and exit-code-less completion timing,
+  while prompt jumping, Select output, prompt taps, and remote shells over ssh without OSC 133
+  marks still require OSC 133 marks.
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),
   XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
   (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and
@@ -416,15 +455,13 @@ the host console (`kernel/tty`); `guarded!` and the kernel handle table (`androi
 
 ## Open questions
 
-- Should zsh on Debian get prompt marks too (the app would have to write or inject a zprofile)?
-- Should native prompt events also drive android/vt's progress/status lifetime? The current pump
-  reports foreground-group changes; the session owns the records and the reset-policy question.
+(None currently.)
 
 ## To verify
 
-- Tried only on a Pixel 4a API 34 emulator (4 KB pages) and through vt.c's harnesses on a macOS
-  build, where the figures for scrollback rows and memory also come from; not on real or 16 KB-page
-  devices. Unverified beyond that:
+- Native checks include a Pixel 4a API 34 emulator (4 KB pages), prompt expiry on an API 37
+  emulator (16 KB pages) and vt.c harnesses on macOS, the source of the scrollback measurements.
+  Unverified on physical devices and in these cases:
   - shell integration: zsh's marks in the app, bash's on Debian (on Alpine only closing a tab at
     its prompt was tried), and those fish 4.6 and nushell 0.104 send themselves (all seen only in
     containers); the console's password state at sudo, passwd, ssh or

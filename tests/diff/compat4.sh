@@ -241,6 +241,7 @@ cat > waitkinds.c <<'C'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -248,6 +249,12 @@ cat > waitkinds.c <<'C'
 static int quit(void *arg) {
     (void)arg;
     return 3;
+}
+
+static int traced_quit(void *arg) {
+    (void)arg;
+    if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0) return 1;
+    return 7;
 }
 
 static pid_t spawn(int exit_signal) {
@@ -259,6 +266,51 @@ static const char *res(pid_t r, pid_t want) {
     if (r == want) return "reaped";
     if (r == 0) return "none";
     return strerror(errno);
+}
+
+static void caught(int sig) { (void)sig; }
+
+static void autoreap(void) {
+    sigset_t mask, saved;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, &saved);
+    struct timespec now = {0};
+    // Clear any SIGCHLD left by an earlier child.
+    while (sigtimedwait(&mask, NULL, &now) > 0) {}
+    struct sigaction old;
+    sigaction(SIGUSR2, &(struct sigaction){.sa_handler = caught}, NULL);
+    for (int ignore = 0; ignore < 2; ignore++) {
+        struct sigaction action = {.sa_handler = ignore ? SIG_IGN : caught, .sa_flags = SA_NOCLDWAIT};
+        sigaction(SIGCHLD, &action, ignore ? NULL : &old);
+        int signals[] = {SIGCHLD, SIGUSR2, 0};
+        for (size_t i = 0; i < 3; i++) {
+            pid_t pid = spawn(signals[i]);
+            int status = 0;
+            pid_t r = waitpid(pid, &status, __WALL);
+            int reaped = r == -1 && errno == ECHILD;
+            siginfo_t info = {0};
+            int sig = sigtimedwait(&mask, &info, &now);
+            printf("autoreap %d signal %d: auto %d waited %d notification %d status %d\n",
+                   ignore, signals[i], reaped, r == pid && WEXITSTATUS(status) == 3,
+                   sig > 0 ? sig : 0, sig > 0 && info.si_pid == pid && info.si_status == 3);
+        }
+    }
+    // A parent tracing its own child can wait even with SIGCHLD ignored and a clone exit signal.
+    for (int i = 0; i < 2; i++) {
+        char *stack = malloc(65536);
+        pid_t pid = clone(traced_quit, stack + 65536, i ? SIGUSR2 : SIGCHLD, NULL);
+        siginfo_t info;
+        int status = 0;
+        int seen = waitid(P_PID, pid, &info, WEXITED | WNOWAIT | __WALL);
+        pid_t r = waitpid(pid, &status, 0);
+        printf("traced child %d seen %d waited %d\n", i, seen == 0,
+               r == pid && WIFEXITED(status) && WEXITSTATUS(status) == 7);
+        free(stack);
+    }
+    sigaction(SIGCHLD, &old, NULL);
+    sigprocmask(SIG_SETMASK, &saved, NULL);
 }
 
 static void script(int n, int depth) {
@@ -315,6 +367,7 @@ int main(void) {
     w = waitid(P_PID, z, &si, WEXITED);
     printf("waitid(exits): %d %d\n", w, si.si_pid == z);
 
+    autoreap();
     script(1, 5);
     script(2, 6);
     return 0;

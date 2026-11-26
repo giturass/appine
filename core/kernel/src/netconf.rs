@@ -180,6 +180,8 @@ pub(crate) struct NetConf {
     /// interfaces in the initial namespace), by interface index; `default`'s when absent. Those of
     /// virtual devices are kept on the device.
     pub other: BTreeMap<u32, (Conf, Conf)>,
+    /// Run IPv4 hooks on traffic switched between ports of a bridge in this namespace.
+    pub bridge_call_iptables: bool,
     /// `core/somaxconn`.
     pub somaxconn: i64,
     /// `ipv4/ip_local_port_range`.
@@ -200,6 +202,7 @@ impl Default for NetConf {
             all6: Conf::new(true, true),
             dflt6: Conf::new(true, false),
             other: BTreeMap::new(),
+            bridge_call_iptables: true,
             somaxconn: 4096,
             port_range: (32768, 60999),
             prot_sock: 1024,

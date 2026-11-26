@@ -29,6 +29,7 @@ import androidx.core.graphics.ColorUtils
 import androidx.core.view.WindowCompat
 import androidx.core.view.isVisible
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
@@ -55,6 +56,10 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
+        set(value) {
+            if (field !== value) dismissClipboardQuestion()
+            field = value
+        }
 
     /** [current]'s position when the tabs were last shown, where its successor is taken from. */
     private var currentIndex = 0
@@ -176,18 +181,26 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onResume() {
         super.onResume()
         updatePermissionPrompts()
+        // Lifecycle reaches RESUMED after onResume returns, even if the window already has focus.
+        layout.root.post { deliverClipboardRead() }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) deliverClipboardRead()
     }
 
     override fun onPause() {
         closeTabList()
         if (Settings.privacyMode(this)) {
             toast?.cancel()
-            clipboardQuestion?.dismiss()
+            dismissClipboardQuestion()
         }
         super.onPause()
     }
 
     override fun onStop() {
+        dismissClipboardQuestion()
         service?.removeListener(this)
         unbindService(connection)
         service = null
@@ -205,6 +218,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     /** Called by the shared gate only when this resumed page can be used. */
     override fun onPrivacyUnlocked() {
         onNotice()
+        deliverClipboardRead()
     }
 
     // ---- Permission prompts ----
@@ -280,25 +294,32 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     override fun onOpenUrl(url: String): Boolean = !Privacy.locked(this) && hasWindowFocus() && links.openBrowser(url)
 
     /**
-     * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
-     * it holds shown, as Ghostty's clipboard-read = ask does; nothing to read (an empty clipboard,
-     * or no text) is answered at once. Denying, or leaving the question unanswered, gives the
-     * program an empty clipboard.
+     * Claim the current tab's OSC 52 reads before accessing the clipboard. An empty clipboard
+     * gets an immediate reply. For text, the preview stays open until answered or dismissed.
      */
-    override fun onClipboardRead() {
-        val session = current ?: return
-        if (Privacy.locked(this)) {
-            session.answerClipboardRead(null)
-            return
-        }
-        if (clipboardQuestion != null) return
+    override fun onClipboardRead(sessionId: Int): Boolean {
+        val session = current?.takeIf { it.id == sessionId } ?: return false
+        if (service?.current !== session) return false
+        if (clipboardQuestion != null) return session.clipboardReads.promptActive
+        val claimed = session.clipboardReads.beginPrompt(
+            resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            focused = hasWindowFocus(),
+            locked = Privacy.locked(this),
+            dismiss = {
+                val dialog = clipboardQuestion
+                clipboardQuestion = null
+                dialog?.dismiss()
+            },
+        )
+        if (!claimed) return false
         val clip = getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }
         val text = clip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
         if (text.isEmpty()) {
             session.answerClipboardRead("")
-            return
+            return true
         }
         confirmClipboardRead(session, text)
+        return true
     }
 
     /** A tab's reports changed: refresh the bar, the open list and the progress line. */
@@ -343,20 +364,31 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
     // ---- Clipboard and notices ----
 
-    /** Answers the requesting session even if another tab becomes current while the dialog is open. */
+    private fun deliverClipboardRead() {
+        current?.let { onClipboardRead(it.id) }
+    }
+
+    /** Settle the old session's reads before a switch or stop. A queued dismiss callback is stale. */
+    private fun dismissClipboardQuestion() {
+        if (clipboardQuestion != null) current?.clipboardReads?.denyPrompt()
+    }
+
     private fun confirmClipboardRead(session: VtSession, text: String) {
         val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
+        fun mayAllow() = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && !Privacy.locked(this)
         var allowed = false
         clipboardQuestion = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.clipboard_read_title)
             .setMessage(getString(R.string.clipboard_read, preview))
-            .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
+            .setPositiveButton(R.string.allow) { _, _ -> allowed = mayAllow() }
             .setNegativeButton(R.string.deny, null)
-            .setOnDismissListener {
+            .setOnDismissListener { dialog ->
+                if (clipboardQuestion !== dialog) return@setOnDismissListener
                 clipboardQuestion = null
-                session.answerClipboardRead(if (allowed && !Privacy.locked(this)) text else null)
+                session.answerClipboardRead(if (allowed && mayAllow()) text else null)
                 // The terminal takes the keyboard again
                 layout.screen.requestFocus()
+                deliverClipboardRead()
             }
             .showPrivate()
     }
@@ -408,6 +440,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         layout.screen.attach(session)
         layout.screen.requestFocus()
         renderTabs()
+        deliverClipboardRead()
     }
 
     /**
@@ -511,10 +544,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
     }
 
+    private fun confirmClose(session: VtSession) = confirmClose(listOf(session))
+
     /**
-     * `×` and the menu: closes [targets] at once when none is [busy][VtSession.busy] (their shells
-     * have ended or wait at their prompts), else after asking, as closing hangs a shell up and with
-     * it, usually, the programs it runs. A shell without prompt marks always counts as busy.
+     * Ask before closing any [busy][VtSession.busy] shell, since hanging it up usually ends its
+     * programs. A running shell without prompt marks always counts as busy.
      */
     private fun confirmClose(targets: List<VtSession>) {
         if (targets.none { it.busy }) {
@@ -559,6 +593,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     private fun openSearch() {
         if (current == null) return
         closeTabList()
+        layout.keys.cancelPresses()
         layout.tabBar.isVisible = false
         layout.searchBar.open()
         closeSearchOnBack.isEnabled = true
@@ -567,6 +602,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
     /** Ends the search and brings the tab bar back; the terminal takes the keyboard again. */
     private fun closeSearch() {
         if (!layout.searchBar.isVisible) return
+        layout.keys.cancelPresses()
         layout.searchBar.isVisible = false
         layout.tabBar.isVisible = true
         layout.screen.endSearch()
@@ -643,7 +679,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
             !event.isShiftPressed -> return false
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
-            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let(::confirmClose)
             event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
             event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return layout.screen.jumpToPrompt(-1)
             event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return layout.screen.jumpToPrompt(1)
@@ -710,6 +746,11 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
             }
         }
 
+        override fun onFocus(session: VtSession, data: ByteArray) {
+            if (Privacy.locked(this@MainActivity)) return
+            if (session.isRunning) session.write(data)
+        }
+
         override fun onZoom(fontPx: Int) {
             getPreferences(MODE_PRIVATE).edit { putFloat(PREF_FONT_SIZE, fontPx / resources.displayMetrics.density) }
         }
@@ -735,7 +776,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
 
         override fun closeCurrent() {
             closeTabList()
-            current?.let { confirmClose(listOf(it)) }
+            current?.let(::confirmClose)
         }
 
         override fun newTab() = newSession()
@@ -750,7 +791,7 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         }
 
         override fun close(session: VtSession) {
-            if (canUse(session)) confirmClose(listOf(session))
+            if (canUse(session)) confirmClose(session)
         }
 
         override fun dismiss() = closeTabList()
@@ -768,16 +809,34 @@ class MainActivity : FragmentActivity(), TerminalService.Listener, Privacy.Liste
         override fun close() = closeSearch()
     }
 
-    /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
+    /**
+     * The extra keys go to the search bar while its input has focus (never leaking to the
+     * terminal), and otherwise to the terminal view, which reads the one-shot modifiers through
+     * [Host].
+     */
     private inner class Keys : ExtraKeysView.Target {
         override fun key(keyCode: Int) {
-            closeTabList()
-            layout.screen.press(keyCode)
+            SearchExtraKeys.routeKey(
+                keyCode = keyCode,
+                locked = Privacy.locked(this@MainActivity),
+                searchFocused = layout.searchBar.hasInputFocus,
+                onBeforeDispatch = ::closeTabList,
+                onSearchKey = { layout.searchBar.extraKey(it, layout.keys.ctrl, layout.keys.alt, layout.keys.shift) },
+                onTerminalKey = layout.screen::press,
+                onSearchModifiersUsed = layout.keys::modifiersUsed,
+            )
         }
 
         override fun text(text: String) {
-            closeTabList()
-            layout.screen.type(text)
+            SearchExtraKeys.routeText(
+                text = text,
+                locked = Privacy.locked(this@MainActivity),
+                searchFocused = layout.searchBar.hasInputFocus,
+                onBeforeDispatch = ::closeTabList,
+                onSearchText = { layout.searchBar.extraText(it, layout.keys.ctrl, layout.keys.alt) },
+                onTerminalText = layout.screen::type,
+                onSearchModifiersUsed = layout.keys::modifiersUsed,
+            )
         }
 
         override fun notice(text: String) = showToast(text)

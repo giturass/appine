@@ -1,16 +1,16 @@
 //! Memory syscalls (the kernel/mm map; process_mrelease: the kernel/oom map).
 
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 
-use appine_engine::{PAGE_SIZE, prot};
+use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
 use super::SysResult;
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
-use crate::mm::flags;
-use crate::process::RLIMIT_MEMLOCK;
+use crate::mm::{FileSource, Fill, Mm, MsyncStep, MsyncTarget, PopulateStep, PopulateWalk, flags};
 use crate::vfs::dev::Device;
 use crate::vfs::ms;
 
@@ -42,6 +42,10 @@ const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
     | 0xfc00_0000; // page-size bits above MAP_HUGE_SHIFT
 const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+const MADV_NORMAL: i32 = 0;
+const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
 const MADV_DONTNEED: i32 = 4;
 const MADV_REMOVE: i32 = 9;
 const MADV_DONTFORK: i32 = 10;
@@ -51,6 +55,11 @@ const MADV_DONTDUMP: i32 = 16;
 const MADV_DODUMP: i32 = 17;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
+const MADV_COLD: i32 = 20;
+const MADV_PAGEOUT: i32 = 21;
+const MADV_POPULATE_READ: i32 = 22;
+const MADV_POPULATE_WRITE: i32 = 23;
+const MADV_DONTNEED_LOCKED: i32 = 24;
 const MCL_CURRENT: u32 = 1;
 const MCL_FUTURE: u32 = 2;
 const MCL_ONFAULT: u32 = 4;
@@ -87,22 +96,24 @@ pub(super) fn mmap(
     };
     let mut flags = (flags & !MAP_TYPE) | kind;
     // Shared anonymous memory cannot grow down
-    const MAP_GROWSDOWN: u32 = 0x0100;
-    let growsdown = flags & MAP_GROWSDOWN != 0;
+    let growsdown = flags & flags::MAP_GROWSDOWN != 0;
     if growsdown && flags & flags::MAP_ANONYMOUS != 0 && kind == flags::MAP_SHARED {
         return Err(Errno::EINVAL);
     }
     // A shared mapping of /dev/zero opened read-only: no write permission, now or later
     let mut deny_write = false;
-    // The path and inode shown for a file mapping in /proc/<pid>/maps
+    // The path and inode shown for a file mapping in /proc/<pid>/maps, and the mount it came from
     let mut label = None;
+    let mut file_mnt = None;
     let mut deny_exec = false;
     let low =
         flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
-    // A FUSE file has no page cache to map: the mapping reads its pages into a host file as they
-    // are touched (crate::mm::Fill)
+    // FUSE mappings share a sparse host file populated on demand (crate::mm::Fill).
     let mut gpu_mapping = None;
     let mut fuse_fill = None;
+    let mut mapping_object = None;
+    let mut accessed = None;
+    let mut file_source = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -124,25 +135,19 @@ pub(super) fn mmap(
         if implies_exec && !on_noexec(cx, &file.borrow()) {
             prot |= prot::EXEC;
         }
-        // A shared mapping that can be made writable writes the file's object in place, and a
-        // mapping does not follow a file to another object: a held file gets its own first
-        if kind == flags::MAP_SHARED && file.borrow().readable() && file.borrow().writable() {
-            super::fs::prepare_write(cx, &file, None)?;
-        }
-        // A shared writable mapping, or an executable one on a noexec mount, is refused below
-        let refused = kind == flags::MAP_SHARED && prot & prot::WRITE != 0
+        // Check access before asking the daemon for attributes.
+        let shared = kind == flags::MAP_SHARED;
+        let shared_write = shared && prot & prot::WRITE != 0;
+        let refused = shared_write && !file.borrow().writable()
             || on_noexec(cx, &file.borrow()) && prot & prot::EXEC != 0;
-        fuse_fill = super::fuse::map_fill(cx, &file, kind == flags::MAP_SHARED, refused)?;
-        let f = file.borrow();
-        let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
+        fuse_fill = super::fuse::map_fill(cx, &file, shared, refused)?;
+        let mut f = file.borrow();
         match &f.kind {
-            FileKind::Regular {
-                file: host, ino, ..
-            } => {
+            FileKind::Regular { .. } => {
+                use crate::vfs::store::inode_flags;
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }
-                label = Some((f.path.clone(), *ino));
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
                 }
@@ -154,30 +159,82 @@ pub(super) fn mmap(
                     }
                     deny_exec = true;
                 }
+                // An overlay file opened before copy-up maps its copied-up upper object
+                // (Linux 6.1's `ovl_mmap` calling `ovl_realfile`).
+                if f.ovl.is_some() {
+                    drop(f);
+                    super::fs::follow_copy_up(cx, &file)?;
+                    f = file.borrow();
+                }
+                let FileKind::Regular {
+                    file: host, ino, ..
+                } = &f.kind
+                else {
+                    return Err(Errno::EBADF);
+                };
+                label = Some((f.path.clone(), *ino));
+                if !f.pseudo {
+                    file_mnt = Some(f.mnt);
+                }
+                let inode_flags = super::fs::file_inode_flags(cx, &f)?;
+                if shared && f.writable() && inode_flags & inode_flags::APPEND != 0 {
+                    return Err(Errno::EACCES);
+                }
                 // A memfd sealed against writes cannot have a writable shared mapping, now or later
                 let sealed = cx
                     .kr()
                     .seals
                     .get(ino)
                     .is_some_and(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0);
-                if sealed && kind == flags::MAP_SHARED {
-                    if prot & prot::WRITE != 0 {
-                        return Err(Errno::EPERM);
-                    }
-                    Some((host.as_raw_fd(), offset, false))
-                } else {
-                    Some((host.as_raw_fd(), offset, f.writable()))
+                if shared_write && (sealed || inode_flags & inode_flags::IMMUTABLE != 0) {
+                    return Err(Errno::EPERM);
                 }
+                let protected = inode_flags & inode_flags::PROTECTED != 0;
+                let may_write = f.writable() && !(shared && (sealed || protected));
+                let mut fd = host.as_raw_fd();
+                let vfs = cx.vfs()?;
+                let ino = *ino;
+                let tmpfs_dev = f.node().and_then(|n| vfs.mapped_tmpfs_dev(&n, ino));
+                if !f.pseudo {
+                    drop(f);
+                    let writable = shared && may_write;
+                    mapping_object = loop {
+                        match vfs.store().mapping_object(ino, writable) {
+                            Err(Errno::EAGAIN) => super::fs::make_private(cx, ino, None)?,
+                            result => break result?,
+                        }
+                    };
+                    if let Some(object) = &mapping_object {
+                        super::fs::reconcile_mapping(cx.kr(), ino, object)?;
+                        fd = object.as_raw_fd();
+                        file_source = Some(FileSource::PinnedStore);
+                    } else {
+                        f = file.borrow();
+                        let FileKind::Regular { file: object, .. } = &f.kind else {
+                            return Err(Errno::EBADF);
+                        };
+                        fd = object.as_raw_fd();
+                    }
+                }
+                if let Some(dev) = tmpfs_dev {
+                    let mapping = crate::vfs::TmpfsMapping::new(vfs, dev, ino, fd)?;
+                    file_source = Some(FileSource::Tmpfs(mapping));
+                }
+                accessed = Some(file.clone());
+                Some((fd, offset, may_write))
             }
             FileKind::Render { ino, file } => {
                 if !f.readable() || (shared_write && !f.writable()) {
                     return Err(Errno::EACCES);
                 }
-                if kind != flags::MAP_SHARED || prot & prot::EXEC != 0 || growsdown {
+                if !shared || prot & prot::EXEC != 0 || growsdown {
                     return Err(Errno::EINVAL);
                 }
                 gpu_mapping = Some(file.mapping(offset, len)?);
                 label = Some((f.path.clone(), *ino));
+                if !f.pseudo {
+                    file_mnt = Some(f.mnt);
+                }
                 deny_write = !f.writable();
                 None
             }
@@ -189,7 +246,7 @@ pub(super) fn mmap(
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }
-                if kind == flags::MAP_SHARED && !f.writable() {
+                if shared && !f.writable() {
                     if prot & prot::WRITE != 0 {
                         return Err(Errno::EACCES);
                     }
@@ -198,12 +255,8 @@ pub(super) fn mmap(
                 flags |= flags::MAP_ANONYMOUS;
                 None
             }
-            // Read on demand into a host file: a shared mapping can never be written (its writes
-            // would not reach the file), and noexec mounts refuse execution as for store files
-            // In do_mmap's order: not readable, then shared writable (EACCES), then executable on
-            // a noexec mount (EPERM); the fill was made only for a mapping passing them
             FileKind::Fuse(h) => {
-                if !f.readable() || shared_write {
+                if !f.readable() || shared_write && !f.writable() {
                     return Err(Errno::EACCES);
                 }
                 if on_noexec(cx, &f) {
@@ -217,38 +270,44 @@ pub(super) fn mmap(
                 };
                 let ino = cx.vfs()?.fuse().get(h.id).map_or(0, |n| n.attr.ino);
                 label = Some((f.path.clone(), ino));
-                Some((fill.fd(), offset, false))
+                file_mnt = Some(f.mnt);
+                Some((fill.fd(), offset, f.writable()))
             }
             FileKind::Path(_) => return Err(Errno::EBADF),
             _ => return Err(Errno::ENODEV),
         }
     };
-    const MAP_LOCKED: u32 = 0x2000;
-    if flags & MAP_LOCKED != 0 {
-        check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
+    if let Some(aligned) = len.checked_next_multiple_of(PAGE_SIZE).filter(|&l| l != 0) {
+        let map_locked = flags & flags::MAP_LOCKED != 0;
+        if map_locked && cx.memlock_limit() == 0 {
+            // Linux 6.1 `do_mmap`: MAP_LOCKED checks `can_do_mlock` before `mlock_future_check`.
+            return Err(Errno::EPERM);
+        }
+        if map_locked || cx.mm().lock_future {
+            check_memlock_future(cx, aligned)?;
+        }
     }
-    let fill = fuse_fill;
     let start = if let Some(mapping) = gpu_mapping {
         cx.mm_mut().mmap_gpu(addr, len, prot, flags, mapping)?
+    } else if let Some(fill) = &fuse_fill {
+        cx.mm_mut()
+            .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?
     } else {
-        match &fill {
-            Some(fill) => cx
-                .mm_mut()
-                .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
-            None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
-        }
+        cx.mm_mut().map(addr, len, prot, flags, file, file_source)?
     };
+    drop(mapping_object);
+    if let Some(file) = accessed {
+        super::fs::file_accessed(cx, &file.borrow());
+    }
     // MAP_FIXED may have replaced a segment's last attachment
     if flags & flags::MAP_FIXED != 0 {
         crate::ipc::reap_shm(cx.k());
     }
-    // MAP_GROWSDOWN on a file mapping does not grow (on Linux the grown part also maps the file,
-    // and no program uses it that way)
-    if growsdown && file.is_none() && kind == flags::MAP_PRIVATE {
-        cx.mm_mut().set_growsdown(start);
-    }
     if let Some((name, ino)) = label {
         cx.mm_mut().label(start, len, name, ino);
+    }
+    if let Some(mnt) = file_mnt {
+        cx.mm_mut().set_mnt(start, len, mnt);
     }
     if deny_write {
         cx.mm_mut().deny_write(start, len);
@@ -256,7 +315,7 @@ pub(super) fn mmap(
     if deny_exec {
         cx.mm_mut().deny_exec(start, len);
     }
-    if flags & MAP_LOCKED != 0 {
+    if flags & flags::MAP_LOCKED != 0 {
         cx.mm_mut().set_locked(start, len, true)?;
     }
     // MAP_POPULATE (not with MAP_NONBLOCK), MAP_LOCKED and mlockall(MCL_FUTURE) all bring the
@@ -264,22 +323,10 @@ pub(super) fn mmap(
     const MAP_POPULATE: u32 = 0x8000;
     const MAP_NONBLOCK: u32 = 0x10000;
     let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE
-        || flags & MAP_LOCKED != 0
+        || flags & flags::MAP_LOCKED != 0
         || cx.mm().lock_future && !cx.mm().lock_onfault;
     if populate {
-        cx.mm().populate(start, len);
-        // A FUSE file's pages are read now, the BKL released (errors are not reported, as on
-        // Linux)
-        if fill.is_some() && prot != 0 {
-            loop {
-                let Some(w) = cx.mm().first_unread(start, len, 0) else {
-                    break;
-                };
-                if super::fuse::fill(cx, w).is_err() {
-                    break;
-                }
-            }
-        }
+        let _ = populate_range(cx, start, len, false);
     }
     Ok(start)
 }
@@ -292,21 +339,8 @@ pub(super) fn mremap(
     flags: u32,
     new_addr: u64,
 ) -> SysResult {
-    let r = remap(cx, old, old_len, new_len, flags, new_addr);
-    // What was moved or grown may be writable shared file mappings: the no-BKL futex must know
-    // where they are now
-    cx.mm().note_shared_maps(true);
-    r
-}
-
-fn remap(
-    cx: &mut Cx<'_>,
-    old: u64,
-    old_len: u64,
-    new_len: u64,
-    flags: u32,
-    new_addr: u64,
-) -> SysResult {
+    // `Mm::insert_vma`, `Mm::move_range` and `Mm::munmap` keep `shared_maps` updated before any
+    // moved or newly installed writable shared PTEs become visible to the no-BKL futex path.
     const MREMAP_MAYMOVE: u32 = 1;
     const MREMAP_FIXED: u32 = 2;
     const MREMAP_DONTUNMAP: u32 = 4;
@@ -322,50 +356,85 @@ fn remap(
     }
     if flags & MREMAP_DONTUNMAP != 0 {
         let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
-        // Map the store file again at the old address of a private file mapping; if it cannot be
-        // opened (for example deleted and reclaimed), empty anonymous memory is all that is left
-        let vfs = cx.vfs()?;
+        // MREMAP_FIXED may have unmapped a destroyed SysV segment's last attachment
+        crate::ipc::reap_shm(cx.k());
+        // Refill from the moved mapping's retained description, even after unlink.
         for r in refill {
-            let file = (r.ino != 0)
-                .then(|| vfs.store().open_object(r.ino, false).ok())
-                .flatten();
             let mut mm = cx.mm_mut();
-            match &file {
+            match &r.file {
                 Some(f) => {
                     let flags = flags::MAP_PRIVATE | flags::MAP_FIXED;
                     let src = Some((f.as_raw_fd(), r.offset, false));
-                    mm.mmap(r.start, r.len, r.prot, flags, src)?;
-                    mm.label(r.start, r.len, r.name, r.ino);
+                    mm.map(
+                        r.start,
+                        r.len,
+                        r.prot,
+                        flags,
+                        src,
+                        r.tmpfs.clone().map(FileSource::Tmpfs),
+                    )?;
+                    mm.label(r.start, r.len, r.name.clone(), r.ino);
+                    if let Some(mnt) = r.mnt {
+                        mm.set_mnt(r.start, r.len, mnt);
+                    }
                 }
                 None => mm.map_anonymous(r.start, r.len, r.prot)?,
             }
-            mm.set_locked(r.start, r.len, false)?;
+            mm.apply_refill_flags(&r);
         }
         return Ok(new);
     }
-    // Growing a private file mapping maps the rest of that store file, so open it first
-    let ino = (new_len > old_len)
-        .then(|| cx.mm().private_file_ino(old + old_len.max(1) - 1))
-        .flatten();
-    let file = match ino {
-        Some(ino) => Some(cx.vfs()?.store().open_object(ino, false)?),
-        None => None,
-    };
-    let r = cx.mm_mut().mremap(
+    let memlock = cx.memlock_limit();
+    let r = cx.mm_mut().mremap_limited(
         old,
         old_len,
         new_len,
         flags & MREMAP_MAYMOVE != 0,
         fixed,
-        file.as_ref().map(|f| f.as_raw_fd()),
+        memlock,
     );
     // A shrunk or replaced segment attachment may have been the last one
     crate::ipc::reap_shm(cx.k());
+    if let Ok(dst) = r
+        && let (Some(ol), Some(nl)) = (
+            old_len.checked_next_multiple_of(PAGE_SIZE),
+            new_len.checked_next_multiple_of(PAGE_SIZE),
+        )
+        && nl > ol
+        && {
+            let mm = cx.mm();
+            !mm.lock_onfault && mm.is_locked_at(dst + ol)
+        }
+    {
+        let _ = populate_range(cx, dst + ol, nl - ol, false);
+    }
     r
 }
 
+pub(super) fn brk(cx: &mut Cx<'_>, new: u64) -> SysResult {
+    let exec = read_implies_exec(cx);
+    let memlock = cx.memlock_limit();
+    let (old, cur, populate) = {
+        let mut mm = cx.mm_mut();
+        let old = mm.brk_current();
+        let cur = mm.brk_limited(new, exec, memlock);
+        (old, cur, mm.lock_future && !mm.lock_onfault)
+    };
+    if populate
+        && cur > old
+        && let (Some(start), Some(end)) = (
+            old.checked_next_multiple_of(PAGE_SIZE),
+            cur.checked_next_multiple_of(PAGE_SIZE),
+        )
+        && end > start
+    {
+        let _ = populate_range(cx, start, end - start, false);
+    }
+    Ok(cur)
+}
+
 /// Reads pieces of private file mappings from their files again after `MADV_DONTNEED`
-/// ([`Mm::discard`](crate::mm::Mm::discard)): zeros past the end of the file, and zeros for all of
+/// ([`Mm::discard_range`](crate::mm::Mm::discard_range)): zeros past the end of the file, and zeros for all of
 /// a piece whose file can no longer be opened (deleted and reclaimed).
 fn reread(cx: &mut Cx<'_>, rereads: Vec<crate::mm::Reread>) -> Result<(), Errno> {
     if rereads.is_empty() {
@@ -416,7 +485,7 @@ pub(super) fn remap_file_pages(
         .ok_or(Errno::EINVAL)?;
     cx.mm_mut().remap_file_pages(start, size, offset)?;
     if flags & MAP_NONBLOCK == 0 {
-        cx.mm().populate(start, size);
+        let _ = populate_range(cx, start, size, false);
     }
     Ok(0)
 }
@@ -447,7 +516,7 @@ fn on_noexec(cx: &Cx<'_>, f: &OpenFile) -> bool {
 
 /// Whether mapping at `addr` is refused: below `vm.mmap_min_addr` without `CAP_SYS_RAWIO`
 /// (Linux's cap_mmap_addr, EPERM).
-fn below_min_addr(cx: &Cx<'_>, addr: u64) -> bool {
+pub(super) fn below_min_addr(cx: &Cx<'_>, addr: u64) -> bool {
     use std::sync::atomic::Ordering;
     addr < crate::mm::MMAP_MIN_ADDR.load(Ordering::Relaxed) && !cx.cred().capable(cap::SYS_RAWIO)
 }
@@ -469,20 +538,29 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     if len == 0 {
         return Ok(0);
     }
-    if advice == MADV_REMOVE {
-        return cx.mm_mut().remove(addr, len).map(|()| 0);
-    }
-    let (locked, private_anon) = cx.mm().advice_range(addr, len)?;
     match advice {
-        MADV_DONTNEED if locked => Err(Errno::EINVAL),
-        // The other advice only affects performance and can be ignored; after DONTNEED anonymous
-        // memory must read back as 0, and private file mappings as the file
-        MADV_DONTNEED => {
-            let rereads = cx.mm_mut().discard(addr, len)?;
-            reread(cx, rereads)?;
-            Ok(0)
+        MADV_REMOVE => {
+            let plan = cx.mm_mut().remove(addr, len);
+            for r in plan.tmpfs {
+                super::fs::punch_tmpfs_maps(cx, r.mapping.ino, r.offset, r.offset + r.len);
+                r.mapping.punch(r.offset, r.len)?;
+            }
+            for (fill, start, end) in plan.fuse {
+                super::fuse::remove_mapped(cx, &fill, start, end)?;
+            }
+            plan.result.map(|()| 0)
         }
-        MADV_FREE | MADV_WIPEONFORK if !private_anon => Err(Errno::EINVAL),
+        // After DONTNEED / DONTNEED_LOCKED anonymous memory must read back as 0, and private file
+        // mappings as the file. DONTNEED_LOCKED also discards mlock'd ranges without unlocking.
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED => {
+            let (rereads, res) =
+                cx.mm_mut()
+                    .discard_range(addr, len, advice == MADV_DONTNEED_LOCKED);
+            reread(cx, rereads)?;
+            res.map(|()| 0)
+        }
+        MADV_FREE => cx.mm().check_free(addr, len).map(|()| 0),
+        MADV_COLD | MADV_PAGEOUT => cx.mm().check_lru(addr, len).map(|()| 0),
         MADV_WIPEONFORK | MADV_KEEPONFORK => cx
             .mm_mut()
             .set_wipeonfork(addr, len, advice == MADV_WIPEONFORK)
@@ -496,8 +574,147 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             .mm_mut()
             .set_dontdump(addr, len, advice == MADV_DONTDUMP)
             .map(|()| 0),
-        _ => Ok(0),
+        MADV_POPULATE_READ | MADV_POPULATE_WRITE => {
+            madvise_populate(cx, addr, len, advice == MADV_POPULATE_WRITE)
+        }
+        // Forward readahead/access-pattern hints to the host outside the BKL so host readahead
+        // never stalls other guest threads, and prefill soft PTEs for read-only file mappings.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED => {
+            let willneed = advice == MADV_WILLNEED;
+            let (ranges, res) = {
+                let mm = cx.mm();
+                if willneed {
+                    mm.prefill_file_ptes(addr, len);
+                }
+                let ranges = mm.advise_ranges(addr, len, !willneed);
+                let res = mm.check_mapped(addr, len);
+                (ranges, res)
+            };
+            if !ranges.is_empty() {
+                cx.unlocked(move || {
+                    for range in ranges {
+                        range.apply(advice);
+                    }
+                });
+            }
+            if willneed && cx.mm().has_fills() {
+                willneed_fuse(cx, addr, addr.saturating_add(len));
+            }
+            res.map(|()| 0)
+        }
+        _ => unreachable!("advice validated above"),
     }
+}
+
+/// Drives a resumable FUSE `Fill` cursor walk across `[start, end)`, fetching cold pages outside
+/// the BKL. With `strict`, daemon read errors return `ENOMEM` (`EINTR` on kill); otherwise errors
+/// skip the remainder of that VMA.
+fn fill_vma_range(
+    cx: &mut Cx<'_>,
+    start: u64,
+    end: u64,
+    strict: bool,
+    mut next: impl FnMut(&Mm, &mut u64, u64) -> Result<Option<(Rc<Fill>, u64, u64)>, Errno>,
+) -> Result<(), Errno> {
+    let mut cursor = start;
+    let mut retries = 0;
+    while cursor < end {
+        let prev = cursor;
+        let Some((fill, fpage, vma_stop)) = next(&cx.mm(), &mut cursor, end)? else {
+            break;
+        };
+        if cursor > prev {
+            retries = 0;
+        } else {
+            retries += 1;
+            if retries > super::FUSE_RETRIES {
+                if strict {
+                    return Err(Errno::ENOMEM);
+                }
+                cursor = vma_stop;
+                retries = 0;
+                continue;
+            }
+        }
+        if let Err(e) = super::fuse::fill(cx, (fill, fpage)) {
+            if strict {
+                return Err(if e == Errno::EINTR {
+                    Errno::EINTR
+                } else {
+                    Errno::ENOMEM
+                });
+            }
+            cursor = vma_stop;
+            retries = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Advisory FUSE demand-readahead for `madvise(MADV_WILLNEED)`: fetches missing `Fill` pages in
+/// `[addr, end)` outside the BKL without surfacing daemon I/O errors (still returning `ENOMEM`
+/// from the caller if any unmapped gap existed).
+fn willneed_fuse(cx: &mut Cx<'_>, addr: u64, end: u64) {
+    let _ = fill_vma_range(cx, addr, end, false, |mm, cursor, end| {
+        Ok(mm
+            .next_unread_fill(*cursor, end)
+            .map(|(page, stop, fill, fpage)| {
+                *cursor = page;
+                (fill, fpage, stop)
+            }))
+    });
+}
+
+/// Populates `[start, start + len)` for `mlock`, `mlock2`, `mlockall`, `MAP_POPULATE`/`MAP_LOCKED`,
+/// and `remap_file_pages`, fetching cold FUSE `Fill` pages outside the BKL. With `fail_on_none`
+/// (`mlock`/`mlock2`), `PROT_NONE` and FUSE daemon read errors stop and return `ENOMEM` (`EINTR`
+/// on kill); otherwise (`mlockall`, `MAP_POPULATE`, `remap_file_pages`), errors are ignored.
+fn populate_range(cx: &mut Cx<'_>, start: u64, len: u64, fail_on_none: bool) -> Result<(), Errno> {
+    fill_vma_range(
+        cx,
+        start,
+        start.saturating_add(len),
+        fail_on_none,
+        |mm, cursor, end| mm.populate_mlock_step(cursor, end, fail_on_none),
+    )
+}
+
+/// Synchronous prefaulting (Linux 6.1's `madvise_populate`): validates permissions (`EINVAL`) and
+/// backing extents (`EFAULT`), faults host/tmpfs/FUSE pages, breaks CoW on write, and reports
+/// skipped unmapped gaps as `ENOMEM` at the end.
+fn madvise_populate(cx: &mut Cx<'_>, addr: u64, len: u64, write: bool) -> SysResult {
+    let mut walk = PopulateWalk::new(addr, len);
+    let mut retries = 0;
+    loop {
+        let prev = walk.cursor;
+        let step = cx.mm_mut().populate_step(&mut walk, write)?;
+        match step {
+            PopulateStep::Done => break,
+            PopulateStep::Advise(range) => {
+                retries = 0;
+                cx.unlocked(move || range.apply(MADV_WILLNEED));
+            }
+            PopulateStep::Fill(fill, page) => {
+                if walk.cursor > prev {
+                    retries = 0;
+                } else {
+                    retries += 1;
+                    if retries > super::FUSE_RETRIES {
+                        return Err(Errno::EFAULT);
+                    }
+                }
+                match super::fuse::fill(cx, (fill, page)) {
+                    Ok(()) => {}
+                    Err(Errno::EINTR) => return Err(Errno::EINTR),
+                    Err(_) => return Err(Errno::EFAULT),
+                }
+            }
+        }
+    }
+    if walk.has_gap {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(0)
 }
 
 /// mlock, munlock, mlock2: records which mappings are locked (host memory is never swapped out
@@ -529,7 +746,7 @@ pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool
     }
     cx.mm_mut().set_locked(start, span, lock)?;
     if lock && flags & MLOCK_ONFAULT == 0 {
-        cx.mm().populate(start, span);
+        populate_range(cx, start, span, true)?;
     }
     Ok(0)
 }
@@ -548,10 +765,10 @@ pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         check_memlock(cx, more)?;
         cx.mm_mut().set_all_locked(true);
         if flags & MCL_ONFAULT == 0 {
-            cx.mm().populate(0, u64::MAX);
+            let _ = populate_range(cx, 0, u64::MAX, false);
         }
-    } else {
-        check_memlock(cx, 0)?;
+    } else if cx.memlock_limit() == 0 {
+        return Err(Errno::EPERM);
     }
     let mut mm = cx.mm_mut();
     mm.lock_future = flags & MCL_FUTURE != 0;
@@ -570,21 +787,30 @@ pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
 /// Without `CAP_IPC_LOCK`, locked memory may not exceed `RLIMIT_MEMLOCK` (nothing can be locked
 /// when it is 0). `more` is the bytes newly locked by this call.
 fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
-    if cx.cred().capable(cap::IPC_LOCK) {
-        return Ok(());
-    }
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_MEMLOCK as usize].0;
+    let limit = cx.memlock_limit();
     if limit == 0 {
         return Err(Errno::EPERM);
     }
-    if cx.mm().locked_bytes() + more > limit {
+    if !cx.mm().can_lock(more, limit) {
         return Err(Errno::ENOMEM);
     }
     Ok(())
 }
 
-/// msync: shared mappings are host file mappings themselves and need no write-back, so only the
-/// arguments are checked.
+/// Linux 6.1's `mlock_future_check`: without `CAP_IPC_LOCK`, locking `more` additional bytes for
+/// future mappings (`MCL_FUTURE`, `MAP_LOCKED`, `shmat`) fails with `EAGAIN` when exceeding
+/// `RLIMIT_MEMLOCK`.
+pub(super) fn check_memlock_future(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
+    if !cx.mm().can_lock(more, cx.memlock_limit()) {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(())
+}
+
+/// msync of shared files waits for the host object or the FUSE daemon.
+/// Walks VMAs in `[addr, end)` like Linux 6.1's `msync`: skips unmapped gaps (returning `ENOMEM`
+/// at the end), stops immediately with `EBUSY` on a locked VMA under `MS_INVALIDATE`, and syncs
+/// each shared file VMA in turn with the BKL released.
 pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
     const MS_ASYNC: u32 = 1;
     const MS_INVALIDATE: u32 = 2;
@@ -595,28 +821,52 @@ pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResu
     {
         return Err(Errno::EINVAL);
     }
-    cx.mm().check_mapped(addr, len)?;
-    // Locked pages cannot be invalidated
-    if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
-        return Err(Errno::EBUSY);
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
+    if end == addr {
+        return Ok(0);
     }
-    // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC leaves the
-    // write-back to the host and waits with the BKL released. If another thread tears down the
-    // mapping meanwhile the host reports ENOMEM, which is ignored (unmapping already handed the
-    // data to the host page cache)
-    if flags & MS_SYNC != 0 {
-        let ranges = cx.mm().shared_file_ranges(addr, len);
-        if !ranges.is_empty() {
-            cx.unlocked(move || {
-                ranges
-                    .into_iter()
-                    .try_for_each(|(a, n)| match appine_hal::msync(a, n) {
-                        Err(libc::ENOMEM) => Ok(()),
-                        r => r,
-                    })
-            })
-            .map_err(Errno)?;
+    let sync = flags & MS_SYNC != 0;
+    let invalidate = flags & MS_INVALIDATE != 0;
+    let mut cursor = addr;
+    let mut unmapped = false;
+    while cursor < end {
+        let step = cx.mm().next_msync(cursor, end, sync);
+        match step {
+            MsyncStep::Unmapped => return Err(Errno::ENOMEM),
+            MsyncStep::Vma {
+                start,
+                stop,
+                locked,
+                target,
+            } => {
+                if start > cursor {
+                    unmapped = true;
+                }
+                // Locked pages cannot be invalidated (`EBUSY` takes precedence over earlier gaps).
+                if invalidate && locked {
+                    return Err(Errno::EBUSY);
+                }
+                // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC
+                // leaves the write-back to the host and waits with the BKL released.
+                if let Some(target) = target {
+                    match target {
+                        MsyncTarget::Fuse(fill, fstart, fend) => {
+                            super::fuse::sync_mapping(cx, &fill, fstart, fend)?;
+                        }
+                        MsyncTarget::Host(host) => {
+                            cx.unlocked(move || host.sync())?;
+                        }
+                    }
+                }
+                cursor = stop;
+            }
         }
+    }
+    if unmapped {
+        return Err(Errno::ENOMEM);
     }
     Ok(0)
 }
@@ -629,18 +879,32 @@ pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
 }
 
 /// mincore: reports whether each page is resident, by host memory.
+/// Matches Linux 6.1's `mincore`: walks contiguous mapped VMAs from `addr` in chunks of at most
+/// `PAGE_SIZE` pages, writing each chunk to `vec` (without growing the stack) before advancing,
+/// and stops on the first unmapped page (`ENOMEM`) or write fault (`EFAULT`).
 pub(super) fn mincore(cx: &mut Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResult {
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
-    let out: Vec<u8> = cx
-        .mm()
-        .residency(addr, len)?
-        .into_iter()
-        .map(u8::from)
-        .collect();
-    cx.mm()
-        .write(crate::uaccess::UserSlice::new(vec, out.len()), &out)?;
+    let end = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .and_then(|l| addr.checked_add(l))
+        .filter(|&e| e <= 1 << VA_BITS)
+        .ok_or(Errno::ENOMEM)?;
+    let pages = (end - addr) / PAGE_SIZE;
+    if vec.checked_add(pages).is_none_or(|e| e > 1 << VA_BITS) {
+        return Err(Errno::EFAULT);
+    }
+    let mut cursor = addr;
+    let mut out_addr = vec;
+    let mut buf = Vec::new();
+    while cursor < end {
+        let next = cx.mm().residency_chunk(cursor, end, &mut buf)?;
+        cx.mm()
+            .write(crate::uaccess::UserSlice::new(out_addr, buf.len()), &buf)?;
+        out_addr += buf.len() as u64;
+        cursor = next;
+    }
     Ok(0)
 }
 
@@ -669,7 +933,7 @@ pub(super) fn process_mrelease(cx: &mut Cx<'_>, pidfd: i32, flags: u32) -> SysRe
             .map(|t| t.res.borrow().mm.clone())
     };
     let mm = mm_of(&group.borrow()).ok_or(Errno::ESRCH)?;
-    let dying = |g: &crate::process::ThreadGroup| g.exiting.is_some() && g.core.is_none();
+    let dying = |g: &crate::process::ThreadGroup| will_free_mem(k, g);
     let sharers_dying = k
         .groups
         .values()
@@ -690,4 +954,55 @@ pub(super) fn process_mrelease(cx: &mut Cx<'_>, pidfd: i32, flags: u32) -> SysRe
         m.release();
     }
     Ok(0)
+}
+
+/// Linux 6.1's `task_will_free_mem`: true when the thread group is not writing a core file and
+/// either group exit has started (by `exit_group`, `SIGKILL`, fatal signal delivery, OOM kill,
+/// or a non-coredumping fatal signal pending for an unblocked, untraced thread as Linux's
+/// `complete_signal` sets `SIGNAL_GROUP_EXIT` on send), or it is a single-thread group (no
+/// zombie leader and only one thread) whose thread has entered `exit(2)`.
+fn will_free_mem(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> bool {
+    if g.core.is_some() {
+        return false;
+    }
+    crate::oom::will_free_mem(k, g) || has_fatal_pending(k, g)
+}
+
+/// Whether `g` has a pending non-coredumping fatal signal that Linux 6.1's `complete_signal`
+/// turns into `SIGNAL_GROUP_EXIT` immediately when sent: default action is terminate (not
+/// ignored, stop, continue, or coredump), the process is not an unkillable pid-namespace init,
+/// and a live, untraced thread does not block it.
+fn has_fatal_pending(k: &crate::kernel::Kernel, g: &crate::process::ThreadGroup) -> bool {
+    let unkillable = g.pid_ns.level > 0 && g.pid_ns.reaper.get() == Some(g.tgid) && !g.killable;
+    if unkillable {
+        return false;
+    }
+    let sighand = g.sighand.borrow();
+    let is_fatal_no_core = |sig: crate::process::Signal| {
+        sighand.get(sig).handler == crate::signal::SigAction::DEFAULT
+            && !sig.ignored_by_default()
+            && !sig.is_stop()
+            && sig != crate::process::Signal::CONT
+            && !crate::coredump::dumps_core(sig)
+    };
+    let group_pending = g.pending.set();
+    for tid in &g.threads {
+        let Some(t) = k.tasks.get(tid) else {
+            continue;
+        };
+        if t.trace.borrow().tracer.is_some() {
+            continue;
+        }
+        let mut bits = (group_pending | t.pending.borrow().set()) & !t.sigmask.get();
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            bits &= bits - 1;
+            if let Some(sig) = crate::process::Signal::new(bit as i32 + 1)
+                && is_fatal_no_core(sig)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }

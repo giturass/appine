@@ -265,7 +265,7 @@ impl Machine {
         let io_err = |e: Errno| RunError::Io(io::Error::from_raw_os_error(e.0));
         let mut k = self.shared.lock();
         let vfs = k.vfs.clone();
-        let offline = crate::pseudo::Offline;
+        let offline = crate::pseudo::Offline::Boot;
         let file = match &vfs {
             Some(vfs) => read_executable(
                 vfs,
@@ -288,6 +288,7 @@ impl Machine {
             ids: [0; 4],
             secure: false,
             stack_limit: loader::STACK_SIZE,
+            arg_limit: loader::arg_limit(loader::STACK_SIZE),
         };
         let mut mm = Mm::new();
         mm.share_files(&k.file_maps);
@@ -297,6 +298,11 @@ impl Machine {
         };
         let image =
             loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
+        if image.doomed {
+            return Err(RunError::Load(loader::LoadError::Malformed(
+                "program image cannot be mapped",
+            )));
+        }
         let walked = vfs.as_ref().and_then(|vfs| {
             vfs.walk(
                 &offline,
@@ -334,7 +340,8 @@ impl Machine {
             &root,
             &image,
         );
-        crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program)), interp);
+        let main_mnt = walked.as_ref().map(|(n, _)| n.mnt());
+        crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program), main_mnt), interp);
         // Record the program file as execve does (ETXTBSY, the key of pooled translations, the
         // group sharing translations)
         mm.exe = Some(ino_of(program)).filter(|&ino| ino != 0);
@@ -361,7 +368,9 @@ impl Machine {
                 group.ctty = Some(tty);
                 let mut table = FdTable::new();
                 for fd in 0..3 {
-                    table.install_at(fd, slave.clone(), false).unwrap();
+                    table
+                        .install_at(fd, slave.clone(), false, group.nofile())
+                        .unwrap();
                 }
                 table
             }
@@ -398,6 +407,7 @@ impl Machine {
             vfork_done: None,
             restart: None,
             fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
         };
         let ns = k.init_ns.clone();
         let started = Task::new(tid, tid, &cpu, state, ns, 0, comm_of(program))
@@ -454,15 +464,31 @@ impl Machine {
     /// wrote these bytes: a job the shell left in the background, or a process of another session.
     /// What the line discipline echoes counts as the foreground's.
     pub fn read_console_run(&self, id: u32, buf: &mut [u8]) -> Result<(usize, bool), Errno> {
+        self.read_console_run_timeout(id, buf, None)?
+            .ok_or(Errno::EAGAIN)
+    }
+
+    /// As [`Machine::read_console_run`], returning `Ok(None)` when `timeout` elapses before output
+    /// arrives or the session ends.
+    pub fn read_console_run_timeout(
+        &self,
+        id: u32,
+        buf: &mut [u8],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<(usize, bool)>, Errno> {
         let objects = terminal::wake_objects(&self.shared.lock(), id);
-        let (out, background) = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        let Some(result) = self.wait_deadline(wake::FILE, objects.as_deref(), deadline, |k| {
             on_console(k, id, "Machine::read_console_run", |k| {
                 terminal::take_output_run(k, id, buf.len())
             })
             .transpose()
-        })?;
+        }) else {
+            return Ok(None);
+        };
+        let (out, background) = result?;
         buf[..out.len()].copy_from_slice(&out);
-        Ok((out.len(), background))
+        Ok(Some((out.len(), background)))
     }
 
     /// Writes input to the console (through the line discipline), waiting while the input queue is
@@ -474,16 +500,15 @@ impl Machine {
         let objects = terminal::wake_objects(&self.shared.lock(), id);
         self.wait_objects(wake::FILE, objects.as_deref(), |k| {
             on_console(k, id, "Machine::write_console", |k| {
+                if terminal::ended(k, id)? {
+                    return Err(Errno::EIO);
+                }
                 let room = terminal::input_room(k, id)?;
                 if room > 0 {
                     let n = room.min(data.len());
                     return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
                 }
-                // The input queue is full, but no process will read it any more
-                match terminal::take_output(k, id, 0) {
-                    Ok(Some(_)) => Err(Errno::EIO),
-                    _ => Ok(None),
-                }
+                Ok(None)
             })
             .transpose()
         })
@@ -519,6 +544,17 @@ impl Machine {
         let k = self.shared.lock();
         crate::bug::host_call("Machine::console_foreground", || terminal::fg_pgrp(&k, id))
             .unwrap_or(Err(Errno::EIO))
+    }
+
+    /// Snapshot of console `id`'s foreground process group (name, command line, canonical mode and
+    /// whether it looks like an interactive shell), for automatic command titles and fallback
+    /// busy/completion tracking (the android/vt and android/vtcore maps). ESRCH when none.
+    pub fn console_foreground_process(&self, id: u32) -> Result<crate::ConsoleForeground, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_foreground_process", || {
+            terminal::fg_process(&k, id)
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// The current directory of console `id`'s foreground process group (the shells of tabs the
@@ -656,7 +692,7 @@ impl Machine {
         let text = crate::bug::host_call("Machine::inittab", || {
             let k = self.shared.lock();
             let vfs = k.vfs.as_ref()?;
-            let offline = crate::pseudo::Offline;
+            let offline = crate::pseudo::Offline::Boot;
             let root = Cred::root();
             match vfs.resolve(
                 &offline,
@@ -687,7 +723,7 @@ impl Machine {
         if let Some(program) = crate::inittab::program(process) {
             // Checked with the BKL held: earlier once commands may already be running (see
             // [`Machine::inittab`])
-            let offline = crate::pseudo::Offline;
+            let offline = crate::pseudo::Offline::Boot;
             let found = crate::bug::host_call("Machine::boot", || {
                 let k = self.shared.lock();
                 k.vfs.as_ref().is_some_and(|vfs| {
@@ -807,6 +843,40 @@ impl Machine {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
         })
         .unwrap_or_default()
+    }
+
+    /// Samples paths in the root filesystem seen by host-spawned programs under one BKL hold.
+    /// Missing paths have no metadata. Nodes requiring a guest syscall cannot be sampled here.
+    pub fn rootfs_stats(
+        &self,
+        paths: &[&[u8]],
+    ) -> Result<Vec<Option<crate::vfs::store::Stat>>, Errno> {
+        crate::bug::host_call("Machine::rootfs_stats", || {
+            let k = self.shared.lock();
+            let vfs = k.vfs.as_ref().ok_or(Errno::ENOENT)?;
+            let root = Cred::root();
+            let mut stats = Vec::with_capacity(paths.len());
+            for &path in paths {
+                let node = vfs.resolve_mountpoint(
+                    &crate::pseudo::Offline::HostStat,
+                    &root,
+                    &Node::ROOT,
+                    &Node::ROOT,
+                    path,
+                    true,
+                );
+                let stat = match node {
+                    Ok(Node::Store(_, ino)) => Some(vfs.store().stat(ino)?),
+                    Ok(Node::Overlay(_, node)) => Some(vfs.overlay_stat(node)?),
+                    Ok(_) => return Err(Errno::EOPNOTSUPP),
+                    Err(Errno::ENOENT | Errno::ENOTDIR) => None,
+                    Err(err) => return Err(err),
+                };
+                stats.push(stat);
+            }
+            Ok(stats)
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// Takes the store paths of directories whose entries the guest changed (created, deleted,
@@ -975,6 +1045,15 @@ fn timers(shared: Arc<Shared>) {
                     "kernel panic while committing the inode store"
                 )),
             }
+        }
+        // Periodic dirty-page writeback for shared FUSE mappings (honours
+        // vm.dirty_writeback_centisecs without blocking the timer thread)
+        match crate::bug::catch(|| crate::vfs::fuse::flush_dirty(&k)) {
+            Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
+            Some(None) => {}
+            None => crate::bug::report(format_args!(
+                "kernel panic while flushing dirty FUSE mappings"
+            )),
         }
         // Signal-driven I/O: every change wakes this thread, which checks along the way; host
         // sockets are waited on together
@@ -1169,8 +1248,18 @@ pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::brow
     if changes.is_empty() {
         return;
     }
+    let kernels = kernels_using(store);
+    for shared in kernels {
+        let k = shared.lock();
+        for c in changes {
+            crate::syscall::host_change(&k, c);
+        }
+    }
+}
+
+fn kernels_using(store: &std::path::Path) -> Vec<Arc<Shared>> {
     let dir = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
-    let kernels: Vec<Arc<Shared>> = {
+    {
         let mut running = RUNNING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1180,11 +1269,52 @@ pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::brow
             .filter(|(d, _)| *d == dir)
             .filter_map(|(_, w)| w.upgrade())
             .collect()
-    };
-    for shared in kernels {
-        let k = shared.lock();
-        for c in changes {
-            crate::syscall::host_change(&k, c);
-        }
     }
+}
+
+/// A host shrink must invalidate cached guest translations before shortening their backing.
+/// Hold each affected kernel through ftruncate so a fault cannot refill the tail between
+/// the shootdown and the shrink. BKL ownership is thread-local; multiple machines sharing
+/// one store acquire their locks in registry order on distinct host threads.
+pub(crate) fn truncate_host_object(
+    store: &std::path::Path,
+    file: &std::fs::File,
+) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
+    fn truncate(
+        kernels: &[Arc<Shared>],
+        file: &std::fs::File,
+        id: (u64, u64),
+    ) -> Result<(), Errno> {
+        let Some((shared, rest)) = kernels.split_first() else {
+            return file
+                .set_len(0)
+                .map_err(|e| Errno(e.raw_os_error().unwrap_or(libc::EIO)));
+        };
+        let kernel = shared.lock();
+        let mut seen = std::collections::HashSet::new();
+        for task in kernel.tasks.values() {
+            let mm = task.res.borrow().mm.clone();
+            if seen.insert(Rc::as_ptr(&mm)) {
+                let mut mm = mm.borrow_mut();
+                if mm.file_truncated(id.0, id.1, 0) {
+                    mm.sync_except(None);
+                }
+            }
+        }
+        if rest.is_empty() {
+            return truncate(rest, file, id);
+        }
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .spawn_scoped(scope, || truncate(rest, file, id))
+                .map_err(|_| Errno::EAGAIN)?
+                .join()
+                .map_err(|_| Errno::EIO)?
+        })
+    }
+    let meta = file
+        .metadata()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    truncate(&kernels_using(store), file, (meta.dev(), meta.ino()))
 }

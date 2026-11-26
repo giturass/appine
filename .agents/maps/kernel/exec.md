@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: ELF memop symbol discovery and file-offset cache)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: post-syscall sweeps and `Mm::sync` on successful execve/execveat)
 
 ## Responsibilities
 
@@ -38,7 +38,8 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - `loader::Executable`, `ExeCache` (32 opened executables, least recently used dropped), `Args`,
   `Prepared` (the hand-off between the locked and unlocked exec phases), `Image` (with `doomed`);
   `process::ExeFile` (the process's `exe_file`: path, store mount and inode, dentry, host file, and
-  for a program found through an overlay its overlay node, held while recorded).
+  for a program found through an overlay its overlay node, held while recorded; its `Drop` reports
+  its mount to `vfs::released`).
 - `loader::LoadError` — why loading failed, turned into an errno by `load_error`.
 
 ## Public entry points
@@ -64,13 +65,22 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
   relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`); a
   script run by fd through a close-on-exec directory is `ENOENT`.
-- `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
-  interpreter is opened) or to the final executable (memfds never count as writers).
+- `ETXTBSY` if a writable open file refers to the initial file, any nested `#!` script being run
+  (checked before its interpreter is opened), the final executable, or its ELF `PT_INTERP`
+  interpreter (memfds never count as writers). A writable FUSE open pinned by mmap still counts
+  after its descriptor is closed.
+- `ExecOpens` records the open and positive reads of each file, including header reads served
+  by the executable cache. Across FUSE retries it reuses the matching prefix of opens and
+  reports each read once. An open accepted by the daemon counts even if copying the file fails.
+  Scripts close in reverse order after interpreter loading. The new address space retains the
+  main program's open. File-backed interpreter segments retain theirs until unmapped, except
+  on overlay where the mapping holds the real layer file.
 - Credentials: setuid and setgid (the latter with group execute) apply unless `no_new_privs`,
   nosuid, or the owner/group are unmapped; file capabilities come from the xattr; a tracer without
   `CAP_SYS_PTRACE` or a fs context shared with another process makes the execution unsafe, so it
   gains nothing (`kernel/cred`). A secure exec clamps the stack limit to 8 MB (written back to
-  `RLIMIT_STACK`).
+  `RLIMIT_STACK`) after computing `Args::arg_limit` from the pre-clamp limit (allowing up to 6 MB
+  per Linux 6.1).
 - Under the BKL the main ELF is parsed and the interpreter file opened, read and its headers
   checked; then the BKL is released while a new address space (sharing the kernel's read-only file
   mappings, the vDSO image, host random bytes) and initial stack are built. Back under the BKL, a
@@ -86,10 +96,12 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   the personality (arm64's `SET_PERSONALITY`) and on a privileged exec the other
   `PER_CLEAR_ON_SETID` flags (`kernel/cred`); commit the credentials; clear POSIX timers and AIO;
   unshare and reset signal handlers; release the old address space (robust list,
-  `clear_child_tid`, vfork) and install the new one with the CPU state reset, reaping shm
-  segments marked for removal it held last; reset the alternate stack and comm; set PC and SP;
-  force the `SIGSEGV` of a doomed image; re-kick if interrupted. The run loop then re-attaches the
-  translator.
+  `clear_child_tid`, vfork), write back its shared FUSE mappings, and install the new one with the CPU state reset, reaping shm
+  segments marked for removal it held last; reset the alternate stack, `TaskState::restart` and
+  comm; set PC and SP;
+  force the `SIGSEGV` of a doomed image; re-kick if interrupted. For a doomed image, `exec_done`
+  flushes ptrace hardware debug state, skips `PTRACE_EVENT_EXEC` and `ptrace::syscall_exit`, and
+  delivers the fatal signal immediately; otherwise the run loop re-attaches the translator.
 
 ### ELF loader
 
@@ -144,8 +156,9 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 ### Inbound
 
-- The syscall dispatcher (`kernel/process`): execve and execveat; a successful execve returns
-  before the post-syscall sweeps and `Mm::sync`.
+- The syscall dispatcher (`kernel/process`): execve and execveat; a successful exec runs the
+  shared post-syscall sweeps (`post_syscall_sweeps`), drops `InSyscall` before any ptrace/signal
+  stops, and runs `Mm::sync` on the new address space before `exec_done`.
 - `Machine::spawn` (`kernel/boot`): `loader::load` for a host-started process.
 - `kernel/procfs`: `/proc/<pid>/exe` and `/proc/<pid>/fd/<n>` as targets, the mapping names.
 
@@ -153,6 +166,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 - `kernel/process`: killing and waiting for the other threads, the tgid takeover and
   `leader_exit`, vfork completion (`release_mm`), `fast_changed`, `ExeFile`.
+- `kernel/inotify`: the file and parent watches reached by each exec open, read and close.
 - `kernel/time`: POSIX timer state cleared at execve.
 - `kernel/mm`: `Mm::new`, `share_files`, `into_shared`, `set_layout`, `mmap` and `munmap`
   (segments), `map_anonymous`, `map_vvar`, `find_free` (interpreter and vDSO placement),
@@ -161,35 +175,27 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `kernel/ns` (the time namespace for children and its vDSO stubs), `kernel/signal` (handler reset,
   `force_fatal`), `kernel/ptrace` (exec event), `kernel/vdso` (image), `kernel/vfs`, `kernel/files` and
   `kernel/mount` (resolution, noexec and nosuid, writers, close-on-exec), `kernel/fuse`
-  (`open_fuse`, the close-on-exec flush), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
+  (`open_fuse`, close-on-exec flush and mapped writeback), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
   exec), `engine` (the Go register set).
 
 ## Invariants and gotchas
 
 - execve changes no process state before killing the other threads: a FUSE retry runs the handler
   again from the start (`kernel/process`'s dispatcher), so everything before the last walk must be
-  repeatable.
+  repeatable. The dispatcher keeps the exec open records across these retries.
 - The unlocked build of the new image touches only the new address space and structures that lock
   themselves (the kernel's file mappings), and re-checks after re-taking the BKL whether the thread
   was killed meanwhile.
-- A doomed image commits like any other and dies only afterwards, so callers that skip the commit
-  (`Machine::spawn`) must check `Image::doomed` themselves.
+- A doomed image commits like any other on execve and dies only afterwards; `Machine::spawn`
+  checks `Image::doomed` and fails with `LoadError::Malformed` instead of starting it.
 
 ## Confirmed bugs / technical debt
 
-- **`ETXTBSY` misses the ELF interpreter and nested scripts:** the script itself and the final
-  program are checked, but running a program whose `PT_INTERP` interpreter is open for writing, or
-  a script whose interpreter is another script open for writing, succeeds where Linux returns
-  `ETXTBSY`.
-- **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
-  whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **Doomed images:** `Machine::spawn` ignores `Image::doomed` and starts the program at pc 0 and
-  sp 0 instead of failing the spawn; execve reports its ptrace exec event (and a successful syscall
-  exit) for a doomed image, where Linux fails the exec before the event.
+None.
 
 ## Open questions
 
-- Should a successful execve run the post-syscall sweeps and `Mm::sync` that it now skips?
+None.
 
 ## To verify
 

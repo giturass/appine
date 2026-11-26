@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: capture the creator’s message queue soft limit in each new user namespace)
 
 ## Responsibilities
 
@@ -36,7 +36,7 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 ## Key types
 
 - `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
-  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups,
+  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, parent message queue charge limit, setgroups,
   whether the creator had `CAP_SETFCAP`; held in credentials), `PidNs` (parent, level, owner,
   global↔local tables, reaper, dead; held per thread group), `MntNs` (held in `FsContext`), `NsRef`
   (a strong reference to any namespace), `NsSet`; `Counted` (the eight counted kinds and their
@@ -66,11 +66,13 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
   time namespace becomes time-for-children, which a non-`CLONE_VM` child enters.
 - unshare: `CLONE_NEWUSER` implies a new thread and fs scope, `CLONE_VM` implies signal handlers,
   which imply a thread, `CLONE_NEWNS` implies fs; asking for (or implying) a thread, signal
-  handlers or memory is `EINVAL` for a multithreaded caller or one sharing them. It creates and
-  charges a new user namespace, checks `CAP_SYS_ADMIN` and the counts, creates a pid namespace,
-  then applies: fd table and fs copies (`EMFILE` above `nr_open`), credentials, mount namespace,
-  pid-for-children, the semaphore exit for `CLONE_SYSVSEM`/`CLONE_NEWIPC`, and a new `NsProxy`
-  (time, cgroup, net, UTS, IPC); a new mount namespace copies the whole mount tree
+  handlers or memory is `EINVAL` for a multithreaded caller or one sharing them. All fallible
+  checks and allocations run before any state mutates: it checks `CAP_SYS_ADMIN` and namespace
+  counts (after creating a new user namespace when requested), checks `CLONE_FILES` `nr_open`
+  (`EMFILE`), allocates any new network namespace (`ENOMEM` if no loopback block is free) and
+  creates any new pid namespace, then commits atomically: fd table and fs copies, credentials,
+  mount namespace, pid-for-children, the semaphore exit for `CLONE_SYSVSEM`/`CLONE_NEWIPC`, and a
+  new `NsProxy` (time, cgroup, net, UTS, IPC); a new mount namespace copies the whole mount tree
   (`kernel/mount`), a new cgroup namespace is rooted at the creator's cgroup.
 - Pid namespaces nest to level 32 and user namespaces to 33 (`ENOSPC` beyond); a new pid
   namespace's owner must descend from its parent's owner (`EPERM`). Time namespaces follow the
@@ -96,8 +98,10 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 - setns accepts a namespace file (type 0 or its own) or a pidfd (any non-empty combination of
   types; the process's main thread must be alive and the caller allowed to ptrace it); every part
   is validated in Linux order (`validate_nsset`: user, mount, UTS, IPC, pid, cgroup, net, time)
-  before anything switches, then all switch together (a new mount namespace moves root and cwd to
-  its root).
+  before anything switches, then all switch together (entering a user namespace clears `dumpable`
+  and `pdeathsig` when `!new.caps_subset_of(&old)` in `kernel/cred`; entering a mount namespace
+  moves root and cwd to its root, first allocating a private `FsContext` copy when `FsContext` is
+  shared with another task so sibling fs sharers keep their mount namespace, root and cwd).
 
 ### User namespaces
 
@@ -161,10 +165,7 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 
 ## Confirmed bugs / technical debt
 
-- **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`, no free loopback
-  block) leaves the earlier fd-table, fs, credential, mount, pid-for-children and semaphore changes
-  in place. A pidfd `setns` combining `CLONE_NEWNS` with other types while the fs is shared
-  switches the mount namespace of every fs sharer (Linux switches only the caller's).
+- None recorded.
 
 ## Open questions
 

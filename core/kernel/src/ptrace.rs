@@ -120,7 +120,7 @@ impl Regs {
         s.sp = self.sp;
         s.pc = self.pc;
         set_pstate(s, self.pstate);
-        s.fpcr = self.fpcr;
+        s.fpcr = self.fpcr & appine_engine::fpcr_write_mask();
         s.fpsr = self.fpsr;
         s.tpidr_el0 = self.tpidr;
         s.v = self.v;
@@ -218,9 +218,10 @@ impl Trace {
         self.tracer.is_some() && self.options & (1 << e) != 0
     }
 
-    /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
+    /// In a ptrace-stop and not in PTRACE_LISTEN or already resumed: the tracer can send it
+    /// requests.
     pub fn stopped(&self) -> bool {
-        self.stop.is_some() && !self.listening
+        self.stop.is_some() && !self.listening && self.resume.is_none()
     }
 
     /// Whether the tracer had `CAP_SYS_PTRACE` over user namespace `ns` when tracing began
@@ -288,17 +289,27 @@ impl HwDebug {
     }
 }
 
+/// Outcome of checking for a group-stop or `PTRACE_INTERRUPT` trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopResult {
+    /// No stop was pending.
+    None,
+    /// Stopped and was later resumed or detached.
+    Stopped,
+    /// Killed while stopped.
+    Killed,
+}
+
 // ---- Signal-delivery stops and group-stops ----
 
 /// Joins a group-stop (the thread group was stopped by a stop signal): stops in a ptrace-stop and
-/// reports to the tracer. Does nothing when there is no group-stop to join. Returns false when
-/// the thread is killed.
-pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+/// reports to the tracer. Does nothing when there is no group-stop to join.
+pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> StopResult {
     let (sig, seized) = {
         let mut t = cx.task.trace.borrow_mut();
         match t.group_stop.take() {
             Some(sig) if t.tracer.is_some() => (sig, t.seized),
-            _ => return true,
+            _ => return StopResult::None,
         }
     };
     let (why, info) = if seized {
@@ -313,17 +324,19 @@ pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     } else {
         (Stop::Group(sig), None)
     };
-    stop(cx, cpu, why, info, 0).is_some()
+    match stop(cx, cpu, why, info, 0) {
+        Some(_) => StopResult::Stopped,
+        None => StopResult::Killed,
+    }
 }
 
 /// PTRACE_INTERRUPT, or a new thread auto-attached under SEIZE: stops once at
-/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due. Returns false when the thread is
-/// killed.
-pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due.
+pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> StopResult {
     {
         let mut t = cx.task.trace.borrow_mut();
         if !std::mem::take(&mut t.trap) || t.tracer.is_none() {
-            return true;
+            return StopResult::None;
         }
     }
     let sig = Signal::TRAP;
@@ -334,7 +347,10 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
         cx.pid_out(cx.tid()),
         cx.cred().uid_out(cx.cred().ruid),
     );
-    stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
+    match stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0) {
+        Some(_) => StopResult::Stopped,
+        None => StopResult::Killed,
+    }
 }
 
 /// Before signal `sig` is delivered (signal-delivery stop). Returns the signal the tracer lets
@@ -609,14 +625,16 @@ pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
 /// waiting if killed by SIGKILL during the stop.
 pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
     cx.task.begin_exit(cx.kr(), &cx.t.group, status);
-    if !cx.task.trace.borrow().enabled(event::EXIT) {
+    if cx.kr().stopping || !cx.task.trace.borrow().enabled(event::EXIT) {
         return;
     }
     let killed = cx.task.killed.replace(false);
-    cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+    let cgroup = cx.t.group.borrow().cgroup;
+    crate::cgroup::task_changed(cx.kr(), cgroup);
     if event(cx, cpu, event::EXIT, status.wait_status() as u64) {
         cx.task.killed.set(killed);
-        cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+        let cgroup = cx.t.group.borrow().cgroup;
+        crate::cgroup::task_changed(cx.kr(), cgroup);
     }
 }
 
@@ -662,6 +680,7 @@ pub(crate) fn stop(
         t.siginfo = info;
         t.message = message;
     }
+    signal::participate_group_stop(cx.kr(), &cx.t.group, cx.task);
     notify(cx.kr(), cx.task);
     let (tid, uid) = (cx.pid_out(cx.tid()), cx.cred().uid_out(cx.cred().ruid));
     let resumed = loop {
@@ -794,6 +813,7 @@ pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     }
     task.syscall_traced.store(false, Ordering::Relaxed);
     task.stepping.store(false, Ordering::Relaxed);
+    task.step_again.store(false, Ordering::Relaxed);
     signal::wake(task);
 }
 
@@ -957,5 +977,15 @@ mod tests {
         hw.brk[0] = (0x4000, 0xf << 5 | 4 | 1);
         assert_eq!(hw.watchpoints(), vec![(0x1004, 0x1008, 3)]);
         assert_eq!(hw.breakpoints(), vec![0x4000]);
+    }
+
+    #[test]
+    fn regs_restore_masks_fpcr() {
+        let mmu = appine_engine::Mmu::new();
+        let mut cpu = unsafe { Cpu::new(&mmu) };
+        let mut regs = Regs::save(cpu.state());
+        regs.fpcr = u64::MAX;
+        regs.restore(cpu.state_mut());
+        assert_eq!(cpu.state().fpcr, appine_engine::fpcr_write_mask());
     }
 }

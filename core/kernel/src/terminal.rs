@@ -18,7 +18,7 @@ use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Kernel, Shared, Tid, block_for, request_wake, request_wake_object, wake};
-use crate::process::Signal;
+use crate::process::{Signal, ThreadGroup};
 use crate::signal::{self, SigInfo};
 use crate::tty::flags::{ECHO, ICANON};
 use crate::tty::{PtyEnd, Tty, Winsize};
@@ -143,14 +143,25 @@ fn taken(
     ended.then(|| (Vec::new(), false))
 }
 
+/// Whether the console's session has ended (a session was attached and every slave end is now
+/// closed).
+pub(crate) fn ended(k: &Kernel, id: u32) -> Result<bool, Errno> {
+    let console = k.consoles.get(&id).ok_or(Errno::ENOENT)?;
+    Ok(console.attached && console.master.tty.borrow().slaves == 0)
+}
+
 /// How many more bytes the input queue can hold.
 pub(crate) fn input_room(k: &Kernel, id: u32) -> Result<usize, Errno> {
     Ok(tty_of(k, id)?.borrow().input_room())
 }
 
 /// Hands host input to the line discipline and sends the resulting signals to the foreground
-/// process group.
+/// process group. Fails with EIO once the console's session has ended so input (and echoes) are
+/// never accepted after EOF.
 pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
+    if ended(k, id)? {
+        return Err(Errno::EIO);
+    }
     let tty = tty_of(k, id)?;
     let signals = tty.borrow_mut().write_input(data);
     request_wake_object(wake::of(&tty));
@@ -170,20 +181,207 @@ pub(crate) fn fg_pgrp(k: &Kernel, id: u32) -> Result<Tid, Errno> {
     tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)
 }
 
+/// Snapshot of a console's foreground process group (the android/vt and android/vtcore maps):
+/// used to report automatic command titles for shells without a preexec hook (busybox ash) and
+/// fallback busy/command-completion state when a shell emits no OSC 133 marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleForeground {
+    /// Foreground process group id (`tty.fg`).
+    pub pgid: i32,
+    /// Controlling session leader id (`tty.session`), if any.
+    pub session: Option<i32>,
+    /// Representative process in the foreground group (group leader if alive, else first member).
+    pub pid: i32,
+    /// Process name (`comm`, up to 15 bytes).
+    pub comm: String,
+    /// Space-joined command line read from `mm.args` (bounded), or empty if unavailable.
+    pub cmdline: String,
+    /// Whether the console line discipline is in canonical input mode (`ICANON`).
+    pub canonical_input: bool,
+    /// Whether the foreground process appears to be an interactive shell waiting for commands
+    /// (rather than a non-interactive script/command or non-shell program).
+    pub interactive_shell: bool,
+}
+
+/// Maximum bytes read from guest `mm.args` when building [`ConsoleForeground::cmdline`].
+const FG_CMDLINE_MAX: usize = 512;
+
+/// Prefer the process group leader, falling back to a live member if the leader exited.
+fn fg_member(k: &Kernel, fg: Tid) -> Result<(Tid, Tid), Errno> {
+    let member = |group: &Rc<RefCell<ThreadGroup>>| {
+        let g = group.borrow();
+        if g.pgid != fg {
+            return None;
+        }
+        Some((g.tgid, *g.threads.first()?))
+    };
+    k.groups
+        .get(&fg)
+        .and_then(member)
+        .or_else(|| k.groups.values().find_map(member))
+        .ok_or(Errno::ESRCH)
+}
+
+/// Snapshot of the console's foreground process group (leader process, or first member if the
+/// leader has exited). ESRCH when there is no foreground process group or live thread in it.
+pub(crate) fn fg_process(k: &Kernel, id: u32) -> Result<ConsoleForeground, Errno> {
+    let tty = tty_of(k, id)?;
+    let (fg, session, canonical_input) = {
+        let t = tty.borrow();
+        (
+            t.fg.ok_or(Errno::ESRCH)?,
+            t.session,
+            t.termios.lflag & ICANON != 0,
+        )
+    };
+    let (tgid, tid) = fg_member(k, fg)?;
+    let task = k.tasks.get(&tid).ok_or(Errno::ESRCH)?;
+    let raw_comm = task.comm.get();
+    let comm_end = raw_comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(raw_comm.len());
+    let comm = String::from_utf8_lossy(&raw_comm[..comm_end]).into_owned();
+    let raw_args = {
+        let res = task.res.borrow();
+        let mm = res.mm.borrow();
+        let (start, end) = mm.args;
+        if end > start {
+            let len = usize::try_from(end - start)
+                .unwrap_or(FG_CMDLINE_MAX)
+                .min(FG_CMDLINE_MAX);
+            let mut buf = vec![0u8; len];
+            if mm
+                .read(crate::uaccess::UserSlice::new(start, len), &mut buf)
+                .is_ok()
+            {
+                buf
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    };
+    let args = split_args(&raw_args);
+    let cmdline = args
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let interactive_shell = is_interactive_shell(&comm, &args);
+    Ok(ConsoleForeground {
+        pgid: fg,
+        session,
+        pid: tgid,
+        comm,
+        cmdline,
+        canonical_input,
+        interactive_shell,
+    })
+}
+
+fn split_args(raw: &[u8]) -> Vec<&[u8]> {
+    let Some(last) = raw.iter().rposition(|&b| b != 0) else {
+        return Vec::new();
+    };
+    raw[..=last].split(|&b| b == 0).collect()
+}
+
+fn shell_basename(arg: &str) -> &str {
+    let base = arg.rsplit('/').next().unwrap_or(arg);
+    base.strip_prefix('-').unwrap_or(base)
+}
+
+fn is_known_shell(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "ash"
+            | "dash"
+            | "bash"
+            | "zsh"
+            | "mksh"
+            | "ksh"
+            | "ksh93"
+            | "pdksh"
+            | "oksh"
+            | "csh"
+            | "tcsh"
+            | "fish"
+            | "nu"
+            | "elvish"
+            | "osh"
+            | "ysh"
+            | "ion"
+            | "xonsh"
+    )
+}
+
+/// Classifies whether `(comm, args)` looks like an interactive shell rather than a non-shell
+/// command or a non-interactive shell invocation (`sh -c ...`, `bash script.sh`).
+fn is_interactive_shell(comm: &str, args: &[&[u8]]) -> bool {
+    let Some((argv0, mut rest)) = args.split_first() else {
+        return is_known_shell(comm.strip_prefix('-').unwrap_or(comm));
+    };
+    let mut shell = String::from_utf8_lossy(argv0);
+    if shell_basename(&shell) == "busybox" {
+        let Some((applet, options)) = rest.split_first() else {
+            return false;
+        };
+        shell = String::from_utf8_lossy(applet);
+        rest = options;
+    }
+    if !is_known_shell(shell_basename(&shell)) {
+        return false;
+    }
+    let mut read_stdin = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = String::from_utf8_lossy(rest[i]);
+        if arg == "--" || arg == "-" {
+            return read_stdin || i + 1 >= rest.len();
+        }
+        if arg.starts_with("--") {
+            if arg == "--command" || arg.starts_with("--command=") {
+                return false;
+            }
+            if matches!(
+                arg.as_ref(),
+                "--rcfile" | "--init-file" | "--config" | "--env-config"
+            ) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (arg.starts_with('-') || arg.starts_with('+')) && arg.len() > 1 {
+            let bytes = arg.as_bytes();
+            let is_minus = bytes[0] == b'-';
+            let mut takes_next = false;
+            for &b in &bytes[1..] {
+                match b {
+                    b'c' if is_minus => return false,
+                    b's' if is_minus => read_stdin = true,
+                    b'o' | b'O' => takes_next = true,
+                    _ => {}
+                }
+            }
+            i += if takes_next { 2 } else { 1 };
+            continue;
+        }
+        return read_stdin;
+    }
+    true
+}
+
 /// The current directory of the console's foreground process group (where restored tabs start after
 /// the app is killed, the android/service map, and new tabs, the android/terminal map): the leader's, or any process in the group's once the
 /// leader has exited; the path is relative to that process's root (as its `/proc/<pid>/cwd` is).
 /// ESRCH when there is no foreground process group (the shell has exited).
 pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
-    let fg = tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)?;
-    let leader = k.groups.get(&fg).filter(|g| g.borrow().pgid == fg);
-    let group = leader
-        .or_else(|| k.groups.values().find(|g| g.borrow().pgid == fg))
-        .ok_or(Errno::ESRCH)?;
-    let (tgid, tid) = {
-        let g = group.borrow();
-        (g.tgid, *g.threads.first().ok_or(Errno::ESRCH)?)
-    };
+    let fg = fg_pgrp(k, id)?;
+    let (tgid, tid) = fg_member(k, fg)?;
     let task = k.tasks.get(&tid).ok_or(Errno::ESRCH)?;
     let (root, cwd) = {
         let res = task.res.borrow();
@@ -197,6 +395,7 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
         tid,
         tgid,
         cred: None,
+        opening: false,
     };
     vfs.path_of(&view, &root, &cwd)
 }
@@ -391,4 +590,62 @@ fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
         .get(&id)
         .map(|c| c.master.tty.clone())
         .ok_or(Errno::ENOENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Tier;
+
+    #[test]
+    fn feed_returns_eio_after_console_session_ends() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let id = open(&mut k, Winsize::default());
+        // Before any session attaches, input is accepted.
+        assert!(!ended(&k, id).unwrap());
+        feed(&k, id, b"pre").unwrap();
+        let _ = take_output(&k, id, 64).unwrap();
+
+        // Attach a session leader and then close its slave fd (session ended).
+        let (slave, _tty) = attach(&mut k, id, 10).unwrap();
+        assert!(!ended(&k, id).unwrap());
+        feed(&k, id, b"a").unwrap();
+        assert_eq!(take_output(&k, id, 64).unwrap(), Some(b"a".to_vec()));
+
+        drop(slave);
+        assert!(ended(&k, id).unwrap());
+        assert_eq!(feed(&k, id, b"after"), Err(Errno::EIO));
+        // Echoes must not have been produced after session end.
+        assert_eq!(take_output(&k, id, 64).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn interactive_shell_classification_covers_shells_and_commands() {
+        let check = |comm: &str, argv: &[&[u8]]| is_interactive_shell(comm, argv);
+        // Interactive shells (login, non-login, options, busybox applet form).
+        assert!(check("ash", &[b"-ash"]));
+        assert!(check("ash", &[b"/bin/ash", b"-l"]));
+        assert!(check("sh", &[b"/bin/sh"]));
+        assert!(check("dash", &[b"dash", b"-i"]));
+        assert!(check("bash", &[b"bash", b"--rcfile", b"/tmp/rc", b"-i"]));
+        assert!(check("sh", &[b"sh", b"-o", b"vi"]));
+        assert!(check("ash", &[b"busybox", b"ash", b"-l"]));
+        assert!(check("sh", &[b"sh", b"-s", b"arg1"]));
+        assert!(check("sh", &[b"sh", b"--"]));
+        assert!(check("mksh", &[]));
+        assert!(check("tcsh", &[b"-tcsh"]));
+        assert!(check("elvish", &[b"/usr/bin/elvish"]));
+
+        // Non-interactive shells and regular commands.
+        assert!(!check("sh", &[b"sh", b"-c", b"sleep 5"]));
+        assert!(!check("sh", &[b"sh", b"-lc", b"echo hi"]));
+        assert!(!check("bash", &[b"bash", b"build.sh"]));
+        assert!(!check("sh", &[b"sh", b"--", b"script.sh"]));
+        assert!(!check("fish", &[b"fish", b"--command", b"sleep 1"]));
+        assert!(!check("sleep", &[b"busybox", b"sleep", b"5"]));
+        assert!(!check("sleep", &[b"sleep", b"0.2"]));
+        assert!(!check("doas", &[b"doas", b"-s"]));
+        assert!(!check("su", &[b"su", b"alice", b"-c", b"exec sh -l"]));
+        assert!(!check("ssh", &[b"ssh", b"example.com"]));
+    }
 }

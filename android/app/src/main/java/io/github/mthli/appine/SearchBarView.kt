@@ -119,9 +119,47 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         target.search(field.text.toString())
     }
 
+    /** Whether the search bar is shown and it (or its text field) currently holds input focus. */
+    val hasInputFocus: Boolean get() = isVisible && hasFocus()
+
     /** The count of [total] matches, [selected] the selected one's place (0 for none). */
     fun setCount(total: Int, selected: Int) {
         count.text = if (field.text.isEmpty()) "" else "%d/%d".format(selected, total)
+    }
+
+    /** Applies a special key from [ExtraKeysView] while the search bar has input focus. */
+    fun extraKey(keyCode: Int, ctrl: Boolean, alt: Boolean, shift: Boolean) {
+        applyExtraKeyResult(SearchExtraKeys.handleKey(keyCode, ctrl, alt, shift, editState()))
+    }
+
+    /** Applies plain text from [ExtraKeysView] while the search bar has input focus. */
+    fun extraText(text: String, ctrl: Boolean, alt: Boolean) {
+        applyExtraKeyResult(SearchExtraKeys.handleText(text, ctrl, alt, editState()))
+    }
+
+    private fun editState() = SearchEditState(
+        text = field.text.toString(),
+        selectionStart = field.selectionStart,
+        selectionEnd = field.selectionEnd,
+    )
+
+    private fun applyExtraKeyResult(result: SearchExtraKeyResult) {
+        when (result) {
+            SearchExtraKeyResult.Close -> target.close()
+            is SearchExtraKeyResult.Step -> target.step(older = result.older)
+            is SearchExtraKeyResult.Edit -> {
+                val editable = field.text
+                if (result.replacement != null) {
+                    editable.replace(result.replaceStart, result.replaceEnd, result.replacement)
+                }
+                val length = editable.length
+                field.setSelection(
+                    result.selectionStart.coerceIn(0, length),
+                    result.selectionEnd.coerceIn(0, length),
+                )
+            }
+            SearchExtraKeyResult.Consume -> Unit
+        }
     }
 
     /**
@@ -144,5 +182,172 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
     private companion object {
         /** The room before the text and around the count (dp). */
         const val BAR_PADDING_DP = 12
+    }
+}
+
+/** Snapshot of the search input's text and selection anchor/cursor positions. */
+internal data class SearchEditState(
+    val text: String,
+    val selectionStart: Int,
+    val selectionEnd: Int,
+)
+
+/** Outcome of applying an extra key to the focused search bar. */
+internal sealed interface SearchExtraKeyResult {
+    data object Close : SearchExtraKeyResult
+    data class Step(val older: Boolean) : SearchExtraKeyResult
+    data class Edit(
+        val replaceStart: Int,
+        val replaceEnd: Int,
+        val replacement: String?,
+        val selectionStart: Int,
+        val selectionEnd: Int,
+    ) : SearchExtraKeyResult
+    data object Consume : SearchExtraKeyResult
+}
+
+/**
+ * Pure routing and editing logic for [ExtraKeysView] while the search bar is open.
+ *
+ * When the search bar holds input focus, extra keys never reach the terminal: Esc closes search,
+ * Up/Down step through matches, Left/Right/Home/End move or extend the selection, Del removes a
+ * character or selection, plain symbols insert at the cursor (replacing any active selection), and
+ * Ctrl/Alt combinations or terminal-only keys (Tab, F1-F12, PgUp/PgDn) are consumed.
+ */
+internal object SearchExtraKeys {
+    fun routeKey(
+        keyCode: Int,
+        locked: Boolean,
+        searchFocused: Boolean,
+        onBeforeDispatch: () -> Unit,
+        onSearchKey: (Int) -> Unit,
+        onTerminalKey: (Int) -> Unit,
+        onSearchModifiersUsed: () -> Unit,
+    ) = route(keyCode, locked, searchFocused, onBeforeDispatch, onSearchKey, onTerminalKey, onSearchModifiersUsed)
+
+    fun routeText(
+        text: String,
+        locked: Boolean,
+        searchFocused: Boolean,
+        onBeforeDispatch: () -> Unit,
+        onSearchText: (String) -> Unit,
+        onTerminalText: (String) -> Unit,
+        onSearchModifiersUsed: () -> Unit,
+    ) = route(text, locked, searchFocused, onBeforeDispatch, onSearchText, onTerminalText, onSearchModifiersUsed)
+
+    private fun <T> route(
+        input: T,
+        locked: Boolean,
+        searchFocused: Boolean,
+        onBeforeDispatch: () -> Unit,
+        onSearch: (T) -> Unit,
+        onTerminal: (T) -> Unit,
+        onSearchModifiersUsed: () -> Unit,
+    ) {
+        if (locked) return
+        onBeforeDispatch()
+        if (searchFocused) {
+            onSearch(input)
+            onSearchModifiersUsed()
+        } else {
+            onTerminal(input)
+        }
+    }
+
+    fun handleKey(
+        keyCode: Int,
+        ctrl: Boolean,
+        alt: Boolean,
+        shift: Boolean,
+        state: SearchEditState,
+    ): SearchExtraKeyResult {
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE) return SearchExtraKeyResult.Close
+        if (ctrl || alt) return SearchExtraKeyResult.Consume
+        return when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP -> SearchExtraKeyResult.Step(older = true)
+            KeyEvent.KEYCODE_DPAD_DOWN -> SearchExtraKeyResult.Step(older = false)
+            KeyEvent.KEYCODE_DPAD_LEFT -> moveCursor(state, shift) { anchor, cursor, _ ->
+                if (!shift && anchor != cursor) minOf(anchor, cursor) else (cursor - 1).coerceAtLeast(0)
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> moveCursor(state, shift) { anchor, cursor, length ->
+                if (!shift && anchor != cursor) maxOf(anchor, cursor) else (cursor + 1).coerceAtMost(length)
+            }
+            KeyEvent.KEYCODE_MOVE_HOME -> moveCursor(state, shift) { _, _, _ -> 0 }
+            KeyEvent.KEYCODE_MOVE_END -> moveCursor(state, shift) { _, _, length -> length }
+            KeyEvent.KEYCODE_DEL -> deleteBackward(state)
+            else -> SearchExtraKeyResult.Consume
+        }
+    }
+
+    fun handleText(
+        text: String,
+        ctrl: Boolean,
+        alt: Boolean,
+        state: SearchEditState,
+    ): SearchExtraKeyResult {
+        if (ctrl || alt) return SearchExtraKeyResult.Consume
+        val sanitized = text.replace("\r", "").replace("\n", "")
+        if (sanitized.isEmpty()) return SearchExtraKeyResult.Consume
+        val (anchor, cursor) = normalizedSelection(state)
+        val lo = minOf(anchor, cursor)
+        val hi = maxOf(anchor, cursor)
+        val caret = lo + sanitized.length
+        return SearchExtraKeyResult.Edit(
+            replaceStart = lo,
+            replaceEnd = hi,
+            replacement = sanitized,
+            selectionStart = caret,
+            selectionEnd = caret,
+        )
+    }
+
+    fun applyEdit(state: SearchEditState, edit: SearchExtraKeyResult.Edit): SearchEditState {
+        val updatedText = if (edit.replacement != null) {
+            state.text.replaceRange(edit.replaceStart, edit.replaceEnd, edit.replacement)
+        } else {
+            state.text
+        }
+        val length = updatedText.length
+        return SearchEditState(
+            text = updatedText,
+            selectionStart = edit.selectionStart.coerceIn(0, length),
+            selectionEnd = edit.selectionEnd.coerceIn(0, length),
+        )
+    }
+
+    private fun moveCursor(
+        state: SearchEditState,
+        shift: Boolean,
+        targetPosition: (anchor: Int, cursor: Int, length: Int) -> Int,
+    ): SearchExtraKeyResult.Edit {
+        val length = state.text.length
+        val (anchor, cursor) = normalizedSelection(state)
+        val next = targetPosition(anchor, cursor, length).coerceIn(0, length)
+        val start = if (shift) anchor else next
+        return SearchExtraKeyResult.Edit(
+            replaceStart = 0,
+            replaceEnd = 0,
+            replacement = null,
+            selectionStart = start,
+            selectionEnd = next,
+        )
+    }
+
+    private fun deleteBackward(state: SearchEditState): SearchExtraKeyResult {
+        val (anchor, cursor) = normalizedSelection(state)
+        val lo = minOf(anchor, cursor)
+        val hi = maxOf(anchor, cursor)
+        return when {
+            lo != hi -> SearchExtraKeyResult.Edit(lo, hi, "", lo, lo)
+            lo > 0 -> SearchExtraKeyResult.Edit(lo - 1, lo, "", lo - 1, lo - 1)
+            else -> SearchExtraKeyResult.Consume
+        }
+    }
+
+    private fun normalizedSelection(state: SearchEditState): Pair<Int, Int> {
+        val length = state.text.length
+        val anchor = if (state.selectionStart < 0) length else state.selectionStart.coerceIn(0, length)
+        val cursor = if (state.selectionEnd < 0) length else state.selectionEnd.coerceIn(0, length)
+        return anchor to cursor
     }
 }

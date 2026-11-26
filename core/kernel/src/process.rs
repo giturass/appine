@@ -330,6 +330,10 @@ pub(crate) struct ThreadGroup {
     pub rlimits: [(u64, u64); RLIM_NLIMITS],
     /// How it ends while exiting as a whole (exit_group, fatal signal).
     pub exiting: Option<ExitStatus>,
+    /// `exiting` was set by [`crate::task::Task::begin_exit`] (all remaining live threads entered
+    /// single-thread `exit(2)` rather than `exit_group` or a fatal signal): needed by
+    /// `process_mrelease` to match Linux 6.1's `SIGNAL_GROUP_EXIT` vs `thread_group_empty`.
+    pub single_exit: bool,
     /// How the leader itself ended, a fallback for abnormal cleanup; on a normal exit the last
     /// thread to enter the exit path decides `exiting` (task::Task::begin_exit).
     pub leader_status: ExitStatus,
@@ -340,6 +344,14 @@ pub(crate) struct ThreadGroup {
     /// reaped, as Linux keeps the leader as a zombie task. None while it runs, after a non-main
     /// thread's execve took its place, and for the virtual init, which never had one.
     pub leader_exit: Option<([u8; 16], CpuTime)>,
+    /// The exited main thread's task serial ([`crate::task::Task::serial`]), kept alongside
+    /// `leader_exit` so that CPU-clock reads and POSIX timers on the zombie leader's thread clock
+    /// stay valid (stopped) until the process is reaped or a non-leader execve replaces it.
+    pub leader_serial: Option<u64>,
+    /// Weak reference to the main thread's network namespace captured when it exits, so
+    /// `/proc/<pid>/net/*` keeps resolving to the process's network namespace while other threads
+    /// run or while that namespace lives.
+    pub leader_net: Option<std::rc::Weak<crate::nsproxy::NetNs>>,
     /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
     /// none.
     pub exit_signal: i32,
@@ -352,6 +364,9 @@ pub(crate) struct ThreadGroup {
     pub tty_old_pgrp: Option<Tid>,
     /// The whole thread group has been stopped by a stop signal.
     pub stopped: bool,
+    /// Live threads that have not yet entered the current group-stop (`group_stop_count`); once
+    /// this reaches 0, `stop_report` is set and the parent is notified with `CLD_STOPPED`.
+    pub stop_pending: usize,
     /// Its cgroup or an ancestor of it is frozen (`cgroup.freeze`): threads stop before returning
     /// to the guest; unlike a stop signal, the parent and wait do not see it.
     pub frozen: bool,
@@ -386,16 +401,20 @@ pub(crate) struct ThreadGroup {
     /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants are reparented to the nearest such ancestor
     /// instead of init ([`finish_group`]); not inherited by fork, kept by execve.
     pub child_subreaper: bool,
-    /// `PR_SET_DUMPABLE`, inherited by fork.
+    /// `PR_SET_DUMPABLE` / `fs.suid_dumpable`: true iff `SUID_DUMP_USER` (1), kept as `bool` so
+    /// procfs ownership and ptrace checks treat both `SUID_DUMP_DISABLE` (0) and
+    /// `SUID_DUMP_ROOT` (2) as non-user-dumpable; inherited by fork.
     pub dumpable: bool,
+    /// True iff dumpable mode is `SUID_DUMP_ROOT` (2, `suidsafe`); inherited by fork.
+    pub dumpable_root: bool,
     /// The user namespace of the address space (Linux's `mm->user_ns`): the credentials' at
     /// execve, or the nearest ancestor where the owner and group of a program file (or
     /// interpreter) the caller could not read are mapped (`would_dump`); kept by fork. A process
     /// that is not dumpable can be traced only with `CAP_SYS_PTRACE` over it. None until the first
     /// execve: the credentials' namespace.
     pub mm_user_ns: Option<Rc<crate::cred::UserNs>>,
-    /// `PR_SET_NO_NEW_PRIVS`, kept by both fork and execve.
-    pub no_new_privs: bool,
+    /// Saved for procfs once the main thread exits.
+    pub leader_no_new_privs: bool,
     /// `/proc/<pid>/oom_score_adj` (-1000–1000), inherited by fork. Used when the OOM killer picks
     /// a process ([`crate::oom`]); -1000 means never pick it.
     pub oom_score_adj: i32,
@@ -442,6 +461,11 @@ pub(crate) struct ThreadGroup {
 }
 
 impl ThreadGroup {
+    /// Exclusive upper bound for new descriptors installed in this process.
+    pub fn nofile(&self) -> usize {
+        self.rlimits[RLIMIT_NOFILE as usize].0 as usize
+    }
+
     pub fn new(tgid: Tid, ppid: Tid, sighand: Rc<RefCell<SigHandlers>>) -> ThreadGroup {
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         ThreadGroup {
@@ -460,13 +484,17 @@ impl ThreadGroup {
             sighand,
             rlimits: default_rlimits(),
             exiting: None,
+            single_exit: false,
             leader_status: ExitStatus::Exited(0),
             zombie: None,
             leader_exit: None,
+            leader_serial: None,
+            leader_net: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             tty_old_pgrp: None,
             stopped: false,
+            stop_pending: 0,
             frozen: false,
             stop_signal: Signal::STOP,
             stop_report: None,
@@ -482,8 +510,9 @@ impl ThreadGroup {
             cpu_itimers: [None; 2],
             child_subreaper: false,
             dumpable: true,
+            dumpable_root: false,
             mm_user_ns: None,
-            no_new_privs: false,
+            leader_no_new_privs: false,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             cred: Cred::root(),
@@ -514,9 +543,26 @@ impl ThreadGroup {
     }
 
     /// What decides access to a process that is not dumpable ([`crate::cred::Cred::may_ptrace`]):
-    /// whether it is dumpable, and its address space's user namespace.
+    /// whether it is user-dumpable (`SUID_DUMP_USER`), and its address space's user namespace.
     pub fn dump_scope(&self) -> (bool, Option<&crate::cred::UserNs>) {
         (self.dumpable, self.mm_user_ns.as_deref())
+    }
+
+    /// Current dumpable mode (Linux's `get_dumpable`: 0 = disable, 1 = user, 2 = root/suidsafe).
+    pub fn dumpable_mode(&self) -> u8 {
+        if self.dumpable {
+            crate::coredump::SUID_DUMP_USER
+        } else if self.dumpable_root {
+            crate::coredump::SUID_DUMP_ROOT
+        } else {
+            crate::coredump::SUID_DUMP_DISABLE
+        }
+    }
+
+    /// Sets the dumpable mode (0 = disable, 1 = user, 2 = root/suidsafe).
+    pub fn set_dumpable_mode(&mut self, mode: u8) {
+        self.dumpable = mode == crate::coredump::SUID_DUMP_USER;
+        self.dumpable_root = mode == crate::coredump::SUID_DUMP_ROOT;
     }
 
     /// The sample before execve replaces the address space: a process that was forked, has not
@@ -698,6 +744,33 @@ impl ExeFile {
             ovl: ovl.map(|(mnt, o)| (mnt, o, Hold::new(o))),
         }
     }
+
+    /// The guest node for mount and identity checks, its store inode and the pinned host file.
+    pub(crate) fn backing(&self, vfs: &Vfs) -> Result<(Node, Ino, &File), Errno> {
+        let host = self.host.as_deref().ok_or(Errno::ENOENT)?;
+        if let Some((mnt, o, _)) = &self.ovl {
+            let real = vfs.overlay().real_of(*o).ok_or(Errno::ENOENT)?;
+            Ok((Node::Overlay(*mnt, *o), real, host))
+        } else {
+            let (mnt, ino) = self.node.ok_or(Errno::ENOENT)?;
+            Ok((Node::Store(mnt, ino), ino, host))
+        }
+    }
+
+    /// The mount the program file was executed through (store or overlay), when known.
+    pub(crate) fn mnt(&self) -> Option<MountId> {
+        self.node
+            .map(|(mnt, _)| mnt)
+            .or_else(|| self.ovl.as_ref().map(|(mnt, _, _)| *mnt))
+    }
+}
+
+impl Drop for ExeFile {
+    fn drop(&mut self) {
+        if let Some(mnt) = self.mnt() {
+            crate::vfs::released(mnt);
+        }
+    }
 }
 
 /// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
@@ -709,17 +782,7 @@ pub(crate) fn open_exe_file(
     cred: &Cred,
     exe: &ExeFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let (ino, node) = match (exe.node, &exe.ovl) {
-        (Some((mnt, ino)), _) => (ino, Node::Store(mnt, ino)),
-        (None, Some((mnt, o, _))) => {
-            let ino = vfs.overlay().real_of(*o).ok_or(Errno::ENOENT)?;
-            (ino, Node::Overlay(*mnt, *o))
-        }
-        (None, None) => return Err(Errno::ENOENT),
-    };
-    let Some(host) = &exe.host else {
-        return Err(Errno::ENOENT);
-    };
+    let (node, ino, host) = exe.backing(vfs)?;
     let st = vfs.store().stat_open(ino, host)?;
     if st.kind() != mode::S_IFREG {
         return Err(Errno::EACCES);
@@ -746,10 +809,10 @@ pub(crate) fn open_open_file(
     cred: &Cred,
     f: &crate::fd::OpenFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let crate::fd::FileKind::Regular { ino, file, .. } = &f.kind else {
+    let Some((ino, file, _)) = f.regular_backing() else {
         return Err(Errno::EACCES);
     };
-    let st = vfs.store().stat_open(*ino, file)?;
+    let st = vfs.store().stat_open(ino, file)?;
     if st.kind() != mode::S_IFREG {
         return Err(Errno::EACCES);
     }
@@ -757,7 +820,7 @@ pub(crate) fn open_open_file(
     let flags = if f.pseudo {
         0
     } else {
-        vfs.mount_flags(&Node::Store(f.mnt, *ino)).unwrap_or(0)
+        vfs.mount_flags(&Node::Store(f.mnt, ino)).unwrap_or(0)
     };
     if flags & crate::vfs::ms::NOEXEC != 0 {
         return Err(Errno::EACCES);
@@ -891,7 +954,11 @@ pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, fr
 /// affected: the parent and the host can always wait for it to end, and the cleanup of its
 /// children, its tracees, orphaned process groups and SysV IPC does not get stuck because an
 /// earlier step failed.
-pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+pub(crate) fn finish_group(
+    k: &mut Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    sem_undo: Option<Rc<crate::ipc::SemUndo>>,
+) {
     let (tgid, pgid, sid) = {
         let g = group.borrow();
         (g.tgid, g.pgid, g.sid)
@@ -949,6 +1016,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             let Some(child) = k.groups.get(&c).cloned() else {
                 continue;
             };
+            if reaper != INIT {
+                k.groups[&reaper].borrow_mut().children.push(c);
+            }
             let zombie = {
                 let mut cg = child.borrow_mut();
                 cg.ppid = reaper;
@@ -957,22 +1027,25 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);
                 }
+                if cg.exit_tracer == Some(reaper) {
+                    // The new parent already received the tracer notification. Its ordinary
+                    // wait now owns this zombie, so discard the duplicate external-tracer event.
+                    cg.exit_tracer = None;
+                    k.trace_exits
+                        .retain(|e| !(e.process && e.pid == c && e.tracer == reaper));
+                    continue;
+                }
                 // A zombie the tracer has not taken yet goes to the new parent; once the tracer
                 // has taken it, the new parent reaps it
                 cg.zombie.filter(|_| cg.exit_tracer.is_none())
             };
-            if reaper != INIT {
-                k.groups[&reaper].borrow_mut().children.push(c);
-            }
             match zombie {
                 Some(_) if reaper == INIT => {
                     k.groups.remove(&c);
                     k.release_pid(c);
                 }
                 // The new parent must reap it: notify once more, as Linux's reparent_leader does
-                Some(status) => {
-                    hand_to_parent(k, &child, (c, reaper, Signal::CHLD.number()), status)
-                }
+                Some(status) => hand_to_parent(k, &child, status),
                 None if reaper == INIT => k.groups[&INIT].borrow_mut().children.push(c),
                 None => {}
             }
@@ -984,7 +1057,11 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         send_pdeath(k, orphaned, tgid, ruid)
     });
     step(k, tgid, 4, "releasing SysV IPC", |k| {
-        crate::ipc::exit(k, tgid)
+        if let Some(undo) = sem_undo
+            && Rc::strong_count(&undo) == 1
+        {
+            crate::ipc::exit(k, undo.id, tgid);
+        }
     });
     step(k, tgid, 5, "releasing the controlling terminal", |k| {
         release_ctty(k, group)
@@ -1113,10 +1190,10 @@ pub(crate) fn finish_reported(
     group: &Rc<RefCell<ThreadGroup>>,
     mut pgrps: Vec<Tid>,
 ) {
-    let (tgid, ppid, pgid, sid, status, exit_signal) = {
+    let (tgid, ppid, pgid, sid, status) = {
         let g = group.borrow();
         let status = g.exiting.unwrap_or(g.leader_status);
-        (g.tgid, g.ppid, g.pgid, g.sid, status, g.exit_signal)
+        (g.tgid, g.ppid, g.pgid, g.sid, status)
     };
     if let Some(slot) = k.watched.get_mut(&tgid) {
         *slot = Some(status);
@@ -1130,7 +1207,7 @@ pub(crate) fn finish_reported(
         step(k, tgid, 7, "handing it to its parent", |k| {
             // Reporting to the tracer failed: stop waiting for the tracer to take it
             group.borrow_mut().exit_tracer = None;
-            hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
+            hand_to_parent(k, group, status);
         });
     }
     // The processes it traces are no longer traced
@@ -1195,45 +1272,58 @@ fn step<R>(
 /// parent, the same as what Linux's `wait_task_zombie` and `__ptrace_detach` do with zombies
 /// ([`crate::ptrace`]).
 pub(crate) fn tracer_released(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let (ids, status) = {
+    let status = {
         let mut g = group.borrow_mut();
         g.exit_tracer = None;
-        let Some(status) = g.zombie else {
-            return;
-        };
-        ((g.tgid, g.ppid, g.exit_signal), status)
+        g.leader_tracer = None;
+        g.zombie
     };
-    hand_to_parent(k, group, ids, status);
-    request_wake_on(wake::CHILD);
+    if let Some(status) = status {
+        hand_to_parent(k, group, status);
+        request_wake_on(wake::CHILD);
+    }
 }
 
-/// Hands an exited process (`tgid`, `ppid`, `exit_signal`) to its parent: when the parent is
-/// init, is gone, or ignores SIGCHLD (SIG_IGN, SA_NOCLDWAIT), the process is reaped directly;
-/// otherwise it becomes a zombie and the parent is notified.
-fn hand_to_parent(
-    k: &mut Kernel,
-    group: &Rc<RefCell<ThreadGroup>>,
-    (tgid, ppid, exit_signal): (Tid, Tid, i32),
-    status: ExitStatus,
-) {
+/// Reports a group exit. An untraced SIGCHLD child may be reaped immediately while its parent
+/// still receives the notification (SA_NOCLDWAIT). The virtual init always reaps directly.
+fn hand_to_parent(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>, status: ExitStatus) {
+    let (tgid, ppid, exit_signal, parent_traces) = {
+        let g = group.borrow();
+        (
+            g.tgid,
+            g.ppid,
+            Signal::new(g.exit_signal),
+            g.leader_tracer == Some(g.ppid),
+        )
+    };
     let parent = k.groups.get(&ppid).cloned();
-    let reap = ppid == INIT
-        || parent.as_ref().is_none_or(|p| {
-            let act = p.borrow().sighand.borrow().get(Signal::CHLD);
-            act.handler == SigAction::IGNORE || act.flags & sa::NOCLDWAIT != 0
-        });
-    if reap {
-        k.groups.remove(&tgid);
-        k.release_pid(tgid);
-        if let Some(p) = &parent {
-            p.borrow_mut().children.retain(|&c| c != tgid);
+    if let Some(p) = parent.as_ref().filter(|_| ppid != INIT) {
+        let (notify, reap) = match exit_signal {
+            Some(Signal::CHLD) if !parent_traces => {
+                let act = p.borrow().sighand.borrow().get(Signal::CHLD);
+                if act.handler == SigAction::IGNORE {
+                    (None, true)
+                } else {
+                    (exit_signal, act.flags & sa::NOCLDWAIT != 0)
+                }
+            }
+            _ => (exit_signal, false),
+        };
+        if !reap {
+            group.borrow_mut().zombie = Some(status);
         }
-    } else {
-        group.borrow_mut().zombie = Some(status);
-        if let (Some(sig), Some(p)) = (Signal::new(exit_signal), &parent) {
+        if let Some(sig) = notify {
             let pid = k.pid_seen_by(ppid, tgid);
             let info = signal::exit_info(&group.borrow().cred, &p.borrow().cred, pid, status);
             signal::send_to_group(k, ppid, sig, info);
         }
+        if !reap {
+            return;
+        }
+    }
+    k.groups.remove(&tgid);
+    k.release_pid(tgid);
+    if let Some(p) = parent {
+        p.borrow_mut().children.retain(|&c| c != tgid);
     }
 }

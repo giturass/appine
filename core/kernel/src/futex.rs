@@ -319,11 +319,16 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     }
 }
 
-/// A thread has exited: each PI lock with waiters whose owner no longer exists goes to its first
+/// A thread has exited or called `execve`: each PI lock with waiters whose owner no longer exists
+/// (or matches `released_tid`, the thread leaving its address space in `execve`) goes to its first
 /// waiter (Linux's `exit_pi_state_list` handing the rt_mutex over, and the new owner's
 /// `fixup_pi_state_owner`). The word becomes the waiter's tid with `FUTEX_WAITERS` and
 /// `FUTEX_OWNER_DIED`, whether or not the lock was on the owner's robust list.
-pub(crate) fn pi_owners_exited(k: &crate::kernel::Kernel, futexes: &mut Futexes) {
+pub(crate) fn pi_owners_exited(
+    k: &crate::kernel::Kernel,
+    futexes: &mut Futexes,
+    released_tid: Option<Tid>,
+) {
     for (id, w) in futexes.pi_heads() {
         let Some(task) = k.tasks.get(&w.tid) else {
             continue;
@@ -343,7 +348,7 @@ pub(crate) fn pi_owners_exited(k: &crate::kernel::Kernel, futexes: &mut Futexes)
         if owner != 0
             && ns
                 .find(owner as Tid)
-                .is_some_and(|g| k.tasks.contains_key(&g))
+                .is_some_and(|g| Some(g) != released_tid && k.tasks.contains_key(&g))
         {
             continue;
         }

@@ -1,7 +1,7 @@
 /*
  * Classic BPF filters on TCP sockets when the host refuses them. A host with Linux 5d39580f68e6
  * lets only CAP_NET_ADMIN attach SO_ATTACH_FILTER to a TCP socket, and the app never has it, so
- * Appine keeps the program itself; a test hook of debug builds (appine-run must set
+ * Appine enforces supported constant verdicts itself. A test hook of debug builds (appine-run sets
  * APPINE_TEST_HOOKS=1) makes any host act that way. With the hook on, a guest with CAP_NET_ADMIN
  * attaches, reads back, replaces and detaches the program as on Linux, sockets accepted from a
  * listener inherit it, a locked filter cannot be changed, a bad program is still refused, and
@@ -9,6 +9,8 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,39 +18,13 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define TEST_SYSCALL 0xa991
-#define HOOK_REFUSE_TCP_FILTERS 14
+#include "sockfilter.h"
 
-/* linux/filter.h and linux/capability.h, which musl-gcc does not see */
-struct sock_filter {
-    uint16_t code;
-    uint8_t jt, jf;
-    uint32_t k;
-};
-struct sock_fprog {
-    unsigned short len;
-    struct sock_filter *filter;
-};
-#define BPF_LD 0x00
-#define BPF_W 0x00
-#define BPF_LEN 0x80
-#define BPF_RET 0x06
-#define BPF_K 0x00
-#ifndef SO_ATTACH_FILTER
-#define SO_ATTACH_FILTER 26
-#endif
-#ifndef SO_DETACH_FILTER
-#define SO_DETACH_FILTER 27
-#endif
-#ifndef SO_GET_FILTER
-#define SO_GET_FILTER SO_ATTACH_FILTER
-#endif
-#ifndef SO_LOCK_FILTER
-#define SO_LOCK_FILTER 44
-#endif
+/* linux/capability.h */
 #define CAP_VERSION_3 0x20080522
 #define CAP_NET_ADMIN 12
 struct cap_header {
@@ -70,6 +46,7 @@ struct cap_data {
     } while (0)
 
 static struct sock_filter drop[1] = {{BPF_RET | BPF_K, 0, 0, 0}};
+static struct sock_filter partial = {BPF_RET | BPF_K, 0, 0, 8};
 static struct sock_filter pass[2] = {{BPF_LD | BPF_W | BPF_LEN, 0, 0, 0},
                                      {BPF_RET | BPF_K, 0, 0, 0xffffffff}};
 
@@ -101,6 +78,92 @@ static void hook(int on)
     CHECK(syscall(TEST_SYSCALL, HOOK_REFUSE_TCP_FILTERS, on) == 0, "hook %d", on);
 }
 
+static void test_deferred_listen(void)
+{
+    /* A filtered listener reserves the port, but cannot queue a connection for detach. */
+    int gated = tcp();
+    int one = 1;
+    CHECK(setsockopt(gated, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "reuse");
+    CHECK(attach(gated, drop, 1, sizeof(struct sock_fprog)) == 0, "install drop");
+    CHECK(listen(gated, -1) == 0, "deferred listen");
+    struct sockaddr_in local;
+    socklen_t size = sizeof local;
+    CHECK(getsockname(gated, (void *)&local, &size) == 0 && local.sin_port, "autobind");
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int client = tcp();
+    CHECK(connect(client, (void *)&local, size) < 0 && errno == ECONNREFUSED, "closed port");
+    close(client);
+    int competitor = tcp();
+    CHECK(setsockopt(competitor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "reuse peer");
+    CHECK(bind(competitor, (void *)&local, size) < 0 && errno == EADDRINUSE, "reserved port");
+    close(competitor);
+    struct pollfd pfd = {.fd = gated, .events = POLLIN | POLLOUT};
+    CHECK(poll(&pfd, 1, 0) == 0, "filtered readiness");
+    CHECK(fcntl(gated, F_SETFL, O_NONBLOCK) == 0, "nonblock");
+    CHECK(accept(gated, NULL, NULL) < 0 && errno == EAGAIN, "filtered accept");
+    CHECK(attach(gated, &partial, 1, sizeof(struct sock_fprog)) < 0 && errno == EOPNOTSUPP,
+          "unsupported replacement");
+    CHECK(setsockopt(gated, SOL_SOCKET, SO_DETACH_FILTER, &one, sizeof one) == 0, "open port");
+    CHECK(accept(gated, NULL, NULL) < 0 && errno == EAGAIN, "empty on detach");
+    client = tcp();
+    CHECK(connect(client, (void *)&local, size) == 0, "open connection");
+    int peer = accept(gated, NULL, NULL);
+    CHECK(peer >= 0, "accept after detach");
+    CHECK(attach(peer, drop, 1, sizeof(struct sock_fprog)) < 0 && errno == EOPNOTSUPP,
+          "connected drop");
+    close(peer);
+    close(client);
+    close(gated);
+}
+
+static void test_deferred_shutdown(void)
+{
+    int one = 1;
+    int stopped = tcp();
+    CHECK(attach(stopped, drop, 1, sizeof(struct sock_fprog)) == 0, "attach before shutdown");
+    CHECK(listen(stopped, 1) == 0, "listen before shutdown");
+    CHECK(shutdown(stopped, SHUT_WR) == 0, "listener write shutdown");
+    int listening = 0;
+    socklen_t size = sizeof listening;
+    CHECK(getsockopt(stopped, SOL_SOCKET, SO_ACCEPTCONN, &listening, &size) == 0 && listening,
+          "still listening");
+    struct timeval tv = {.tv_usec = 30000};
+    CHECK(setsockopt(stopped, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0, "accept timeout");
+    CHECK(accept(stopped, NULL, NULL) < 0 && errno == EAGAIN, "timed accept under RET 0");
+    CHECK(shutdown(stopped, SHUT_RD) == 0, "listener read shutdown");
+    CHECK(getsockopt(stopped, SOL_SOCKET, SO_ACCEPTCONN, &listening, &size) == 0 && !listening,
+          "not listening after shutdown");
+    CHECK(setsockopt(stopped, SOL_SOCKET, SO_DETACH_FILTER, &one, sizeof one) == 0,
+          "detach after shutdown");
+    CHECK(accept(stopped, NULL, NULL) < 0 && errno == EINVAL, "detach did not reopen");
+    close(stopped);
+}
+
+static void test_activation_conflict(void)
+{
+    /* A pre-existing shared bind can prevent activation. Keep RET 0 for a later retry. */
+    int gated = tcp(), competitor = tcp();
+    int one = 1;
+    struct sock_filter got[1];
+    CHECK(setsockopt(gated, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "shared bind");
+    CHECK(setsockopt(competitor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "shared peer");
+    struct sockaddr_in local = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t size = sizeof local;
+    CHECK(bind(gated, (void *)&local, size) == 0, "bind before attach");
+    CHECK(getsockname(gated, (void *)&local, &size) == 0, "shared address");
+    CHECK(bind(competitor, (void *)&local, size) == 0 && listen(competitor, 1) == 0,
+          "prior listener");
+    CHECK(attach(gated, drop, 1, sizeof(struct sock_fprog)) == 0 && listen(gated, 1) == 0,
+          "hold already bound port");
+    CHECK(setsockopt(gated, SOL_SOCKET, SO_DETACH_FILTER, &one, sizeof one) < 0 &&
+              errno == EADDRINUSE, "activation conflict");
+    CHECK(get(gated, got, 1) == 1 && memcmp(got, drop, sizeof drop) == 0, "kept on conflict");
+    close(competitor);
+    CHECK(setsockopt(gated, SOL_SOCKET, SO_DETACH_FILTER, &one, sizeof one) == 0,
+          "retry activation");
+    close(gated);
+}
+
 int main(void)
 {
     struct sock_filter got[4];
@@ -108,7 +171,12 @@ int main(void)
         printf("skipped: not root\n");
         return 0;
     }
+    alarm(30);
     hook(1);
+
+    test_deferred_listen();
+    test_deferred_shutdown();
+    test_activation_conflict();
 
     /* Attach, read back, replace */
     int s = tcp();
@@ -189,6 +257,16 @@ int main(void)
     printf("ok capability\n");
 
     hook(0);
+    /* On a host permitting TCP attachment, ordinary filters still go to the host.
+     * On a restricted host an unsupported verdict must leave the socket unfiltered. */
+    int native = tcp();
+    int result = attach(native, &partial, 1, sizeof(struct sock_fprog));
+    if (result == 0) {
+        CHECK(get(native, got, 1) == 1 && got[0].k == partial.k, "native partial filter");
+    } else {
+        CHECK(errno == EOPNOTSUPP && get(native, NULL, 0) == 0, "unsupported partial filter");
+    }
+    close(native);
     printf("all ok\n");
     return 0;
 }

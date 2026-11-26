@@ -4,6 +4,8 @@ set -e
 cd /tmp
 cat > tracer.c <<'C'
 #define _GNU_SOURCE
+#include <assert.h>
+#include <sys/prctl.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -578,6 +580,52 @@ static void exitkill(void)
 
 static char message[32] = "hello from the child";
 
+/* A subreaper becomes the natural parent of a zombie whose tracer is the subreaper itself. */
+static void adopt_tracee(int consumed)
+{
+    struct sigaction old;
+    assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    assert(sigaction(SIGCHLD, &(struct sigaction){.sa_handler = SIG_IGN}, &old) == 0);
+    int ready[2], middle_gate[2], child_gate[2];
+    assert(pipe(ready) == 0 && pipe(middle_gate) == 0 && pipe(child_gate) == 0);
+    pid_t middle = fork();
+    assert(middle >= 0);
+    char byte;
+    if (middle == 0) {
+        signal(SIGCHLD, SIG_DFL);
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            assert(read(child_gate[0], &byte, 1) == 1);
+            _exit(17);
+        }
+        assert(write(ready[1], &child, sizeof child) == sizeof child);
+        assert(read(middle_gate[0], &byte, 1) == 1);
+        _exit(7);
+    }
+    pid_t child;
+    assert(read(ready[0], &child, sizeof child) == sizeof child);
+    assert(ptrace(PTRACE_ATTACH, child, 0, 0) == 0);
+    assert(WIFSTOPPED(wait_for(child)));
+    assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
+    assert(write(child_gate[1], "g", 1) == 1);
+    siginfo_t info;
+    assert(waitid(P_PID, child, &info, WEXITED | __WALL | (consumed ? 0 : WNOWAIT)) == 0);
+    assert(write(middle_gate[1], "m", 1) == 1);
+    assert(waitpid(middle, NULL, 0) < 0 && errno == ECHILD);
+    int status;
+    for (int i = 0; i < 2; i++) {
+        pid_t r = waitpid(child, &status, __WALL | WNOHANG);
+        printf("adopted tracee consumed %d wait %d: exited %d no child %d\n", consumed, i,
+               r == child && WIFEXITED(status) && WEXITSTATUS(status) == 17, r < 0 && errno == ECHILD);
+    }
+    for (int i = 0; i < 2; i++) {
+        close(ready[i]); close(middle_gate[i]); close(child_gate[i]);
+    }
+    assert(prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
+    assert(sigaction(SIGCHLD, &old, NULL) == 0);
+}
+
 /* process_vm_readv/writev and PTRACE_PEEKDATA: the same address in the child after fork */
 static void memory(void)
 {
@@ -585,6 +633,14 @@ static void memory(void)
     int go[2], back[2];
     pipe(go);
     pipe(back);
+    const size_t page = 4096;
+    char *guard = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(guard + page - 4, "12345678", 8);
+    mprotect(guard, 2 * page, PROT_NONE);
+    char *reserved = mmap(NULL, 16 << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open("force-read.tmp", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    char *filemap = mmap(NULL, 2 * page, PROT_NONE, MAP_PRIVATE, fd, 0);
+    munmap(guard + 2 * page, page);
     pid_t pid = fork();
     if (pid == 0) {
         char c;
@@ -612,6 +668,28 @@ static void memory(void)
     errno = 0;
     ptrace(PTRACE_PEEKDATA, pid, (void *)16, 0);
     printf("peek unmapped %s\n", strerror(errno));
+    word = ptrace(PTRACE_PEEKDATA, pid, guard + page - 4, 0);
+    printf("peek protected cross-page word %.8s\n", (char *)&word);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/mem", pid);
+    int mem = open(path, O_RDONLY);
+    memset(buf, 0, sizeof buf);
+    ssize_t n = pread(mem, buf, 8, (off_t)(guard + page - 4));
+    printf("mem protected %zd %.8s\n", n, buf);
+    printf("mem across hole %zd\n", pread(mem, buf, 8, (off_t)(guard + 2 * page - 4)));
+    buf[0] = 1;
+    n = pread(mem, buf, 1, (off_t)reserved);
+    printf("mem reserved %zd zero %d\n", n, buf[0] == 0);
+    pwrite(fd, "g", 1, 0);
+    n = pread(mem, buf, 1, (off_t)filemap);
+    printf("mem grown file %zd data %d\n", n, buf[0] == 'g');
+    n = pread(mem, buf, 1, (off_t)(filemap + page));
+    printf("mem past eof %d\n", n == -1 && errno == EIO);
+    remote = (struct iovec){guard, 1};
+    n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    printf("ordinary read protected %d\n", n == -1 && errno == EFAULT);
+    close(mem);
+    close(fd);
     status(pid, 1);
     ptrace(PTRACE_DETACH, pid, 0, 0);
     status(pid, 0);
@@ -813,6 +891,8 @@ int main(void)
     threads();
     exitkill();
     memory();
+    adopt_tracee(0);
+    adopt_tracee(1);
     breakpoints();
     errors();
     return 0;

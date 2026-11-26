@@ -168,8 +168,10 @@ pub(super) fn msgrcv(
         cx.wait(None, &mut [])?;
     };
     let n = msg.text.len().min(max);
-    put(cx, msgp, msg.mtype.to_le_bytes())?;
-    cx.mm().write(UserSlice::new(msgp + 8, n), &msg.text[..n])?;
+    super::copy_result(cx, |cx| put(cx, msgp, msg.mtype.to_le_bytes()))?;
+    super::copy_result(cx, |cx| {
+        cx.mm().write(UserSlice::new(msgp + 8, n), &msg.text[..n])
+    })?;
     Ok(n as u64)
 }
 
@@ -260,11 +262,17 @@ fn encode_msqid(perm: &Perm, cred: &Cred, q: &MsgQueue, pid: impl Fn(Tid) -> Tid
 // ---- Semaphores ----
 
 pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysResult {
-    let [semmsl, _, _, semmni] = cx.ipc().tunables.sem;
+    let [semmsl, semmns, _, semmni] = cx.ipc().tunables.sem;
     let n = usize::try_from(nsems)
         .ok()
         .filter(|&n| n as u64 <= semmsl)
         .ok_or(Errno::EINVAL)?;
+    let used_sems: u64 = cx
+        .ipc()
+        .sem
+        .iter()
+        .map(|(_, _, s)| s.vals.len() as u64)
+        .sum();
     let cred = cx.cred();
     let owner = ipc_owner(cx);
     cx.ipc_mut()
@@ -283,10 +291,12 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
             },
             || {
                 if n == 0 {
-                    Err(Errno::EINVAL)
-                } else {
-                    SemSet::new(n)
+                    return Err(Errno::EINVAL);
                 }
+                if used_sems.saturating_add(n as u64) > semmns {
+                    return Err(Errno::ENOSPC);
+                }
+                SemSet::new(n)
             },
         )
         .map(|id| id as u64)
@@ -472,6 +482,7 @@ pub(super) fn semtimedop(
     let cred = cx.cred();
     let owner = ipc_owner(cx);
     let tgid = cx.tgid();
+    let undo_id = cx.t.sem_undo.id;
     let alter = ops.iter().any(|o| o.op != 0);
     let mut waited = false;
     loop {
@@ -485,10 +496,10 @@ pub(super) fn semtimedop(
             return Err(Errno::EFBIG);
         }
         perm.check(&cred, &owner, if alter { WRITE } else { READ })?;
-        let adj = undo.entry((tgid, id)).or_default();
+        let adj = undo.entry((undo_id, id)).or_default();
         let blocked = set.apply(&ops, adj, tgid)?;
         if adj.iter().all(|&a| a == 0) {
-            undo.remove(&(tgid, id));
+            undo.remove(&(undo_id, id));
         }
         let Some(i) = blocked else {
             return Ok(0);
@@ -531,6 +542,12 @@ pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysRes
     let tgid = cx.tgid();
     reap_shm(cx.k());
     let t = cx.ipc().tunables;
+    let used_pages: u64 = cx
+        .ipc()
+        .shm
+        .iter()
+        .map(|(_, _, s)| s.size.div_ceil(PAGE_SIZE))
+        .sum();
     cx.ipc_mut()
         .shm
         .get_or_create(
@@ -554,6 +571,13 @@ pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysRes
                 // segment
                 if flags & SHM_HUGETLB != 0 {
                     return Err(Errno::EINVAL);
+                }
+                let pages = size.div_ceil(PAGE_SIZE);
+                if used_pages
+                    .checked_add(pages)
+                    .is_none_or(|tot| tot > t.shmall)
+                {
+                    return Err(Errno::ENOSPC);
                 }
                 Ok(ShmSeg {
                     mem: SharedMemory::new(size)?,
@@ -583,6 +607,9 @@ pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResul
     if addr == 0 && flags & SHM_REMAP != 0 {
         return Err(Errno::EINVAL);
     }
+    if addr != 0 && super::mem::below_min_addr(cx, addr) {
+        return Err(Errno::EPERM);
+    }
     let (mut want, mut prot) = if flags & SHM_RDONLY != 0 {
         (READ, prot::READ)
     } else {
@@ -599,6 +626,9 @@ pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResul
         perm.check(&cred, &owner, want)?;
         seg.mem.clone()
     };
+    if cx.mm().lock_future {
+        super::mem::check_memlock_future(cx, mem.len())?;
+    }
     let ns = cx.task.ns.borrow().ipc.id;
     let at = cx.mm_mut().attach_shm(
         (addr != 0).then_some(addr),

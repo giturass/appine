@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-21 (targeted verification only since the full mapping; latest change: split the Tier 1 dynamic binary translator into engine/dbt)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: clear the local exclusive monitor on exceptions, signal delivery, signal return and debug stops)
 
 ## Responsibilities
 
@@ -41,7 +41,7 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - `struct appine_cpu` / `CpuState` — one per guest thread: X0–X30, SP, PC, NZCV, FPCR, FPSR,
   TPIDR_EL0, exit and fault information, the `pending` kick flag, the bound page table, the
   exclusive monitor (`excl_addr`, `excl_value`, `excl_size`; size 0 means none), Tier 1 scratch and
-  group slots (`dbt_groups[4]`), `ivau_page`, the data TLB (4096) and ITLB (512), V0–V31,
+  group slots (`dbt_groups[8]`), `ivau_page`, the data TLB (4096) and ITLB (512), V0–V31,
   `tlb_used`, DIT, and 16 hardware breakpoint and 16 watchpoint slots. Fields before the TLB are
   addressed by `engine/dbt` with immediate offsets.
 - `Cpu` — owns one state (pooled: up to 8 spares); `Send`, not `Sync`.
@@ -54,9 +54,9 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 - **CPU**: `Cpu::new`, `reset`, `run` (guarded loop until an exit), `step` (one instruction, ignores
   kicks), `exec_insn` (run a given word; tests and lockstep only), `translate`, `tlb_flush`,
-  `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`.
+  `state`/`state_mut`, `kicker`; `CpuState::set_hw_debug`, `hw_breakpoints_active`, `clear_exclusive`.
 - **Process-wide**: `install_fault_guard`, `guest_hwcap`, `guest_hwcap2`, `guest_midr`,
-  `layout_matches`.
+  `fpcr_write_mask`, `layout_matches`.
 - **C-internal** (used across engine files and by `engine/dbt`):
   `appine_interp_step`/`appine_interp_exec`, `appine_native_exec`, `appine_simd_dp_decode`,
   `appine_atomic_exec`, `appine_id_register`, `appine_guard_run`/`hold`/`hold_fn`/`drop`/`fail`,
@@ -98,8 +98,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - A failing or undefined instruction leaves PC and registers untouched; only `svc` and `ic ivau`
   exits advance PC.
 - Data addresses have the top byte ignored (TBI); PC and branch targets are not untagged.
-- Memory accesses check every page touched before copying anything, so a fault has no side
-  effects; SP-based accesses require 16-byte SP alignment; watchpoints are checked on every access.
+- Memory accesses check every page touched before copying anything, so faults cause no
+  partial writes or register writeback. SP-based accesses require 16-byte SP alignment, and every access checks watchpoints.
 - Ordinary single-register integer loads and stores use fixed-width copies on same-page data TLB hits
   when the thread has no watchpoints. Misses, cross-page accesses and watched threads use the
   shared memory helpers.
@@ -137,7 +137,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 - LDXR records address, size and the loaded value; STXR succeeds only if address and size match
   and a compare-and-swap against the recorded value succeeds on the host address (ABA allowed).
-  Every STXR clears the monitor; CLREX and `svc` clear it. Natural alignment is required.
+  STXR, STXP and CLREX clear the local monitor. SVC, FAULT, KICK, UNDEF and BRK clear it on exit
+  in both tiers, including faults the kernel resolves by retrying the same PC. Natural alignment is required.
 - 16-byte pairs use host `ldaxp`/`stlxp`; LDAR/STLR are C acquire/release accesses; LDAPR
   and LDAPUR are implemented as acquire; LSE and CAS/CASP run as native stubs on the translated
   host pointer. (`engine/dbt` implements the same compare-and-swap semantics inline for Tier 1.)
@@ -157,9 +158,11 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - Adding a SIMD/FP extension only needs whitelisting its encodings: Tier 0 executes them through
   native stubs and `engine/dbt` copies them.
 - The same set feeds `AT_HWCAP`/`AT_HWCAP2`, `/proc/cpuinfo` and `mrs` of the ID registers
-  (op0=3, op1=0, CRn=0, CRm 0–7): MIDR is the host value (0 if the host does not advertise CPUID),
-  MPIDR has only bit 31, PFR0 (AArch64-only EL0/EL1 plus FP, AdvSIMD, DIT) and ISAR0/ISAR1 are
-  derived from the set, every other register in that range reads 0; CRm 8–15 is undefined.
+  (op0=3, op1=0, CRn=0, matching Linux 6.1 `is_emulated`/`emulate_id_reg`): CRm=0 allows only
+  MIDR (op2=0, host value or 0 without CPUID), MPIDR (op2=5, bit 31 only) and REVIDR (op2=6,
+  reads 0) with all other CRm=0 encodings undefined; CRm=1 is undefined; CRm=2–7 expose PFR0
+  (AArch64-only EL0/EL1 plus FP, AdvSIMD, DIT) and ISAR0/ISAR1 from the set and read 0 otherwise;
+  CRm=8–15 is undefined.
 - DIT is kept in the CPU state; the host thread's DIT follows the guest's at each entry.
 
 ### Host fault guard
@@ -191,8 +194,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   `appine_map_code` and the fault guard (`appine_guard_run`/`hold`/`hold_fn`/`drop`/`fail`).
 - `kernel/process`: task run loop (`Cpu::run`/`step`, exit handling, `ivau_page`, kicks).
 - `kernel/mmu`: `Cpu::tlb_flush`, `Kicker`; `kernel/exec` (`AT_HWCAP`); `kernel/signal` and
-  `kernel/ptrace` (FP registers, kicks, hardware debug slots); `kernel/procfs` (`/proc/cpuinfo`,
-  MIDR); `kernel/boot` (`install_fault_guard`).
+  `kernel/ptrace` (FP registers, `fpcr_write_mask`, kicks, hardware debug slots); `kernel/procfs`
+  (`/proc/cpuinfo`, MIDR); `kernel/boot` (`install_fault_guard`).
 - Tests: `core/engine/tests/interp.rs`, `guard.rs` and `tests/lockstep` (random instruction
   sequences compared between hardware, Tier 0 and Tier 1; the whitelist check against `llvm-mc`,
   which runs only on Linux aarch64 and is skipped without `llvm-mc`).
@@ -220,6 +223,9 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   registered users of an address space, and by removing a thread from both before its `Cpu` is
   freed; `Cpu::reset` (execve) zeroes `pending`, and the kernel re-kicks afterwards if the task was
   interrupted. `engine/dbt`'s own flush kick may race a reset harmlessly.
+- The engine models ERET by clearing `excl_size` on architectural exception and interrupt exits.
+  Signal delivery, `rt_sigreturn` (including invalid frames), single-step traps and ptrace stops
+  also clear it. Ordinary instruction completion and code invalidation alone preserve the reservation.
 - Atomic instructions act directly on host memory reached through the page table, so threads and
   processes sharing a page get correct atomicity for free.
 - The `llvm-mc` whitelist check follows LLVM on should-be-one fields: exclusives and LDAR/STLR
@@ -227,18 +233,11 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- **The kernel drops page-zero invalidation from pure Tier 0:** its code-change path filters out
-  zero even for an explicit `InvalidateCode` exit. A single-stepped write and cache flush on
-  page zero can therefore leave stale code when execution returns to Tier 1 (`engine/dbt`'s own
-  dispatcher handles page zero directly).
-- **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
-  where Linux 6.1 delivers `SIGILL`.
+None.
 
 ## Open questions
 
-- Is it intended that FAULT, KICK and signal exits leave the exclusive monitor set (architecturally
-  an exception return clears it)? The compare-and-swap semantics make this mostly harmless.
-- Should FPCR written by sigreturn or ptrace be masked like `msr fpcr` in Tier 0?
+None.
 
 ## To verify
 

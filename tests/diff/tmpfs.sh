@@ -130,9 +130,118 @@ echo "left: $(show | wc -l)"
 # part can be written, it writes until full), and once inodes run out, creating files, mkdir,
 # link and symlink are all ENOSPC; deleting and truncating free space again, and so does closing
 # a deleted file written after its last name went, again and again. Remounting can
+mkdir -p /tmp/quota
+# Demand allocation, aliases, ordinary writes and hole punching share the page budget.
+mount -t tmpfs -o size=4k mapped-quota /tmp/quota
+python3 - <<'PYTHON'
+import ctypes, mmap, os, signal, time
+fallocate = ctypes.CDLL(None).fallocate
+KEEP_SIZE = 1
+PUNCH_HOLE = 2
+fd = os.open('/tmp/quota/sparse', os.O_CREAT | os.O_RDWR, 0o600)
+os.ftruncate(fd, 8192)
+shared = mmap.mmap(fd, 8192)
+alias = mmap.mmap(fd, 8192)
+ro = os.open('/tmp/quota/sparse', os.O_RDONLY)
+reader = mmap.mmap(ro, 8192, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+private = mmap.mmap(ro, 8192, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ)
+def touch(mapping, index, write=False):
+    pid = os.fork()
+    if not pid:
+        signal.signal(signal.SIGBUS, signal.SIG_DFL)
+        if write:
+            mapping[index] = 67
+        else:
+            _ = mapping[index]
+        os._exit(0)
+    _, st = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(st)
+def times(st):
+    return (st.st_mtime_ns, st.st_ctime_ns)
+def seek_data(fd, off):
+    try:
+        return os.lseek(fd, off, os.SEEK_DATA)
+    except OSError as e:
+        return -e.errno
+os.utime(fd, ns=(1000000000, 2000000000))
+before = times(os.fstat(fd))
+time.sleep(0.03)
+print("sparse read", reader[0], touch(shared, 4096, True), touch(private, 4096))
+print("sparse read times", times(os.fstat(fd)) == before,
+      times(os.stat('/tmp/quota/sparse')) == before, os.fstat(fd).st_blocks, seek_data(fd, 0))
+try:
+    reader.madvise(22, 4096, 4096)  # MADV_POPULATE_READ
+    print("populate at quota", 0)
+except OSError as e:
+    print("populate at quota", e.errno)
+shared[0] = 65
+after = times(os.fstat(fd))
+print("shared write times", after[0] != before[0], after[1] != before[1])
+copy = mmap.mmap(fd, 8192, flags=mmap.MAP_PRIVATE)
+assert copy[0] == 65
+copy[0] = 88
+print("existing alias", alias[0])
+try:
+    os.pwrite(fd, b'B', 4096)
+except OSError as e:
+    print("write at quota", e.errno)
+assert fallocate(fd, KEEP_SIZE | PUNCH_HOLE, 0, 4096) == 0
+print("reuse punched space", os.pwrite(fd, b'B', 4096), touch(alias, 0, True))
+print("private copy after punch", copy[0], touch(copy, 0, True), copy[0], touch(private, 0))
+copy.madvise(mmap.MADV_DONTNEED, 0, 4096)
+print("discarded private copy", touch(copy, 0))
+shared.madvise(mmap.MADV_REMOVE, 4096, 4096)
+print("reuse removed space", touch(shared, 0, True), alias[0], touch(reader, 4096))
+# Only the preallocated page fits. An unrelated hole must not consume its reservation.
+os.ftruncate(fd, 0)
+os.ftruncate(fd, 8192)
+os.posix_fallocate(fd, 4096, 4096)
+print("reserved page", os.statvfs('/tmp/quota').f_bfree, os.fstat(fd).st_blocks,
+      seek_data(fd, 0), touch(reader, 0), touch(reader, 4096), seek_data(fd, 0))
+print("reserved fd writes", os.pwrite(fd, b'R', 4096), reader[4096])
+try:
+    os.pwrite(fd, b'X', 0)
+except OSError as e:
+    print("hole beside reservation", e.errno)
+# An instantiated sparse page remains data after every mapping closes and after unlink.
+for m in (shared, alias, reader, private, copy):
+    m.close()
+os.ftruncate(fd, 0)
+os.ftruncate(fd, 8192)
+m = mmap.mmap(fd, 8192, flags=mmap.MAP_PRIVATE)
+os.utime(fd, ns=(1000000000, 2000000000))
+before = times(os.fstat(fd))
+time.sleep(0.03)
+m[4096] = 99
+m.close()
+preserved = times(os.fstat(fd)) == before
+pathfd = os.open('/tmp/quota/sparse', os.O_PATH)
+os.unlink('/tmp/quota/sparse')
+print("unmapped private write", preserved, os.pread(fd, 1, 4096),
+      os.fstat(fd).st_blocks, os.statvfs('/tmp/quota').f_bfree,
+      seek_data(fd, 0), os.lseek(fd, 4096, os.SEEK_HOLE))
+os.close(ro)
+os.close(fd)
+os.sync()
+print("only O_PATH", os.fstat(pathfd).st_blocks, os.statvfs('/tmp/quota').f_bfree)
+os.close(pathfd)
+print("last close", os.statvfs('/tmp/quota').f_bfree)
+# KEEP_SIZE reserves beyond EOF, survives growth and releases the pages on shrink.
+fd = os.open('/tmp/quota/keep', os.O_CREAT | os.O_RDWR)
+assert fallocate(fd, KEEP_SIZE, 4096, 4096) == 0
+print("keep size", os.fstat(fd).st_size, os.fstat(fd).st_blocks)
+assert fallocate(fd, KEEP_SIZE | PUNCH_HOLE, 4096, 4096) == 0
+print("punch beyond EOF", os.fstat(fd).st_blocks, os.statvfs('/tmp/quota').f_bfree)
+assert fallocate(fd, KEEP_SIZE, 4096, 4096) == 0
+os.ftruncate(fd, 8192)
+m = mmap.mmap(fd, 8192)
+print("grow into reservation", touch(m, 0), touch(m, 4096), seek_data(fd, 0))
+os.ftruncate(fd, 4096)
+print("shrink releases reservation", os.fstat(fd).st_blocks, os.statvfs('/tmp/quota').f_bfree)
+PYTHON
+umount /tmp/quota
 # change size= and nr_inodes=: a value smaller than what is already used, or a limit on what was
 # unlimited, is EINVAL, and mode= and the like stay unchanged
-mkdir -p /tmp/quota
 mount -t tmpfs -o size=64k,nr_inodes=8,mode=700 quota /tmp/quota
 python3 - <<'PY'
 import errno, os

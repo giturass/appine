@@ -365,7 +365,8 @@ int main(void)
     get(s, "detached", 2 * LEN);
     close(s);
 
-    /* TCP, which a host with Linux 5d39580f68e6 refuses to the app (Appine keeps the program) */
+    /* Use a full accept verdict for the TCP read-back and inheritance checks on restricted hosts. */
+    prog[LEN - 1].k = 0xffffffff;
     int t = socket(AF_INET, SOCK_STREAM, 0);
     printf("tcp attach: %d\n", setsockopt(t, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof fp));
     get(t, "tcp count", 0);

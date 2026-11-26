@@ -3,252 +3,329 @@
 > Static understanding snapshot, not a decision history.
 > See `.agents/decisions/kernel/unix.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
+> Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 10 confirmed and 2 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: timeouts; reads of nothing; shutdowns; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, options; datagram queue length; resets, typed abstract names, sender addresses; EINTR on timed waits last)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: receive-time sender addresses, cross-netns pending embryos in `/proc/net/unix`, `truesize` accounting for `SIOCOUTQ`/datagrams/seqpacket, and Linux-verified `SOCK_SEQPACKET` `EPIPE` without `SIGPIPE`)
 
 ## Responsibilities
 
-`kernel/unix` emulates AF_UNIX sockets entirely inside the kernel layer, never touching host
+`kernel/unix` emulates `AF_UNIX` sockets entirely inside the kernel layer, never touching host
 sockets:
 
 - stream, datagram and seqpacket sockets and `socketpair`;
-- pathname names (socket nodes in the store), abstract names and autobind;
-- connection lifecycle: listen, connect, accept, shutdown, close;
-- data transfer with Linux's merge and boundary rules, `SCM_RIGHTS` with guest open files,
-  `SCM_CREDENTIALS` and `SO_PEERCRED` with guest ids;
-- readiness for poll/epoll, `FIONREAD`, and `/proc/net/unix`;
-- a `unix_gc`-style collector for sockets reachable only through in-flight messages.
+- pathname names (`S_IFSOCK` nodes in the store/overlay), abstract names and autobind;
+- connection lifecycle: `listen`, `connect`, `accept`, `shutdown`, `close`/`Drop`;
+- data transfer with merge/boundary rules, `SCM_RIGHTS` with guest open files, `SCM_CREDENTIALS`
+  and `SO_PEERCRED` with guest ids;
+- socket options, poll/epoll readiness, wake objects, edge-triggered arrivals, `FIONREAD`/`SIOCOUTQ`, and
+  `/proc/net/unix` enumeration;
+- a `unix_gc`-style collector breaking `Rc` cycles through in-flight `SCM_RIGHTS` messages, plus
+  in-flight snapshots for `/proc/net/unix`, unmount, detached mount collection, read-only remounts
+  and host-unshare rehoming.
 
-Root: `core/kernel/src/unix.rs`, `syscall/unix.rs`.
+Root: `core/kernel/src/unix.rs`, `core/kernel/src/syscall/unix.rs`.
 
-Outside the module: the generic socket syscalls that dispatch here (`kernel/net`); creating socket
-nodes and path resolution (`kernel/vfs`, `kernel/store`); fd tables (`kernel/files`); poll/epoll
-mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting (`kernel/process`).
+Outside the module: the generic socket syscalls, address/msghdr marshaling and `SockOpts` that
+dispatch here (`kernel/net`); creating socket nodes and path resolution (`kernel/vfs`,
+`kernel/store`, `kernel/overlay`); fd tables (`kernel/files`); poll/epoll mechanics
+(`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting (`kernel/process`).
 
 ## Key types
 
-- `UnixSocket` — type, bound address bytes, `link`, the datagram receive queue `rx`, `peer_cred`,
-  `passcred`, `rcvtimeo`/`sndtimeo`, `shut_wr`, `embryo` (a server end not accepted yet), the
-  namespace it was created in, and the generic options it only records (`SockOpts`,
-  `kernel/net`).
+- `UnixSocket` — socket type (`ty`), shared bound address cell `addr: AddrRef` (`Rc<RefCell<Vec<u8>>>`), `link: Link`, datagram/listener-wait
+  channel `rx: ChannelRef`, `peer_cred: Option<Ucred>`, `rcvtimeo`/`sndtimeo`,
+  `shut_wr`, `connections` arrival counter, `embryo` flag (unaccepted server end), `net:
+  Option<Rc<NetNs>>` (`Some` only for non-initial netns), recorded generic `SockOpts`
+  (`kernel/net`), and `outq: Rc<SenderState>` (sharing the live `addr: AddrRef` and `SIOCOUTQ`
+  `truesize` counter with outgoing packets).
 - `Link` — `None`, `Listening { backlog, pending, cred }`, `Stream { rx, tx, peer_addr }`,
-  `Dgram { tx: Weak, peer_addr }`.
-- `Channel` (`ChannelRef`) — one direction: a queue of `Packet`s, byte count (capacity 212992),
-  `eof`, `closed`, `arrivals`/`taken` counters, and for a datagram socket's queue `max_qlen` and
-  `peer` (the queue of the socket it is connected to, set by `set_dgram_link`), and `reset` (the
-  receiver's pending `ECONNRESET`); `Packet` — data, read offset, passed `FileRef`s, sender `Ucred`,
-  sender address; `Received` — one read's result (`len` may exceed the copied data).
-- `Ucred` — pid (global tgid), uid, gid (kernel ids).
-- `Name` — `Path(Ino)` or `Abstract(namespace id, socket type, bytes)`; `Names` — the kernel-wide
-  table of weak socket references plus the autobind counter.
-- `Kernel::unix_inflight` — weak references to channels that have queued files.
+  `Dgram { tx: Weak<RefCell<Channel>>, peer_addr }`, where `peer_addr: AddrRef` shares the peer's
+  address cell so post-connect `bind()` is visible to `accept()` and `getpeername()`.
+- `Channel` (`ChannelRef = Rc<RefCell<Channel>>`) — one direction: `packets: VecDeque<Packet>`,
+  the receiving socket's `passcred`, `bytes` (payload bytes for `FIONREAD` and stream `CAPACITY =
+  212_992`), `truesize` (queued packet `truesize` sum for `has_packet_room()` and `writable()`),
+  `eof`, `closed`, `arrivals`/`taken`, `max_qlen`
+  (datagram queue cap, default `10`), `peer: Option<Weak<RefCell<Channel>>>` (set by
+  `set_dgram_link`; `None` unconnected, `Some` connected so `may_receive_from` distinguishes
+  unconnected from connected to a dead third socket), `established` (Linux's datagram
+  `TCP_ESTABLISHED` state for `/proc/net/unix`), and `reset` (one-shot pending `ECONNRESET`).
+  `Packet` holds `data`, `off`, `fds: Vec<FileRef>`, `cred: Ucred`, fallback `from: Vec<u8>`, and
+  `outq: Option<Rc<SenderState>>` (resolving `addr` at receive time and uncharging
+  `packet_truesize(data.len())` (>= 768 B) when popped/dropped).
+  `Received` holds `data`, untruncated `len`, `fds`, `cred` and `from`.
+- `Ucred` — kernel-space `(pid, uid, gid)` (global tgid, kuid, kgid) with 12-byte LE encoding.
+- `Name` — `Path(Ino)` or `Abstract(net_id, ty, bytes)`; `Names` (`Kernel::unix`) maps `Name` to
+  `Weak<RefCell<Socket>>`, holds the kernel-wide `next_auto` counter, and tracks pending
+  unaccepted server `embryos: Vec<Weak<RefCell<Socket>>>` so `inflight_sockets` surfaces them to
+  `/proc/net/unix` under each embryo's own network namespace without borrowing any socket `RefCell`.
+- `Kernel::unix_sending` holds weak references to `SendingRights`. A send with SCM_RIGHTS owns its
+  files from control-message validation until the first packet takes them or the send fails.
+- `Kernel::unix_inflight` — `Vec<Weak<RefCell<Channel>>>` of channels carrying `SCM_RIGHTS` fds.
+- `Kernel::unix_receiving` holds weak references to `PendingRights` deliveries. Each delivery owns
+  its files and reserved descriptor numbers until recvmsg finishes its output copies.
 
 ## Public entry points
 
-- `syscall::unix::{socket, pair, bind, listen, accept, connect, connect_dgram, send, send_dgram,
-  recv, setsockopt, getsockopt, sockname, shutdown}`, reached from `kernel/net`'s socket syscalls
-  and read/write.
-- `UnixSocket::{readiness, wake_objects, arrivals, unread}` for poll, epoll and `FIONREAD`.
-- `unix::released` (from close, close_range, dup3 over an fd, close-on-exec, seccomp addfd) and
-  `unix::collect` (also at a group's last thread exit); `unix::proc_listing`,
-  `unix::inflight_sockets`.
+- `syscall::unix::{socket, pair, max_dgram_qlen, bind, listen, accept, connect, send, recv,
+  recv_into, setsockopt, getsockopt, sockname, shutdown}`, dispatched from
+  `kernel/net`'s socket syscalls and socket read/write/splice paths.
+- `UnixSocket::{readiness, wake_objects, arrivals, unread, outq}` for `kernel/poll`, `FIONREAD`
+  and `SIOCOUTQ`.
+- `unix::released` (from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`,
+  `execve`/`execveat`, `deliver` `MSG_CTRUNC`/`EMFILE`, AIO `io_cancel`/`released`),
+  `unix::defer_collect`/`take_deferred`/`collect_deferred`/`is_unix_file` (`UnixSocket::drop`,
+  AIO `complete_polls`/`check_polls`, syscall dispatch end), `unix::collect` (also at `task::exit`
+  when `last || fds_gone || take_deferred()`), `unix::proc_listing`, `unix::inflight_sockets`
+  (`/proc/net/unix`) and `unix::inflight_files` (`sb_busy` remount checks and `opens_of`
+  host-unshare rehoming). Mount accounting uses `try_inflight_files` so teardown can retry if a
+  channel is borrowed.
 
 ## Data flow / lifecycle
 
-### Creating sockets
+### Creating sockets and naming
 
-- `socket`: protocol 0 or 1 (else `EPROTONOSUPPORT`); stream, datagram, seqpacket (`SOCK_RAW`
-  becomes datagram; others `ESOCKTNOSUPPORT`); the socket records a new network namespace if the
-  creator is in one.
-- `socketpair` (any of the three types) builds two connected stream channels or two datagram links
-  pointing at each other; both ends record the creator's credentials as peer credentials.
+- `socket` / `socketpair`: protocol must be 0 or `AF_UNIX` (1), else `EPROTONOSUPPORT`; types are
+  `SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_SEQPACKET` (`SOCK_RAW` maps to `SOCK_DGRAM`; others
+  `ESOCKTNOSUPPORT`). Non-initial network namespaces are recorded on `u.net`, and `max_qlen` is
+  initialized from the caller's `net.unix.max_dgram_qlen` sysctl (default 10). `socketpair`
+  connects both ends (using `set_dgram_link` for datagrams so `rx.peer` exempts the peer from
+  `max_qlen`) and stamps both with `cx.ucred()` (`tgid`, `euid`, `egid`).
+- Addresses: generic `read_addr` caps at 128 bytes (`EINVAL`); `parse` requires `2..=110` bytes
+  and `AF_UNIX`. Length 2 is unnamed; leading NUL in `sun_path` is abstract (all bytes kept);
+  otherwise a pathname cut at the first NUL.
+- `bind`: already bound -> `EINVAL`.
+  - Unnamed: `Names::autobind` tries up to `2^20` sequential `\0%05x` names (starting at `\000001`)
+    per `(net_id, ty)`, returning `ENOSPC` when exhausted.
+  - Abstract: inserts `Name::Abstract(net_id, ty, bytes)` (`EADDRINUSE` while a live socket of
+    the same namespace and type holds it).
+  - Pathname: calls `reject_trailing_slash` (`ENOENT` if missing, `EADDRINUSE` if existing),
+    resolves parent via `create_parent_at` (copying up overlay parent if needed), rejects
+    `.`/`..` (`EADDRINUSE`), runs `may_create` (`MAY_EXEC`, `!exists_in` -> `EADDRINUSE`, `!ro` ->
+    `EROFS`, `MAY_WRITE|MAY_EXEC`), limits mode 0777 by the parent default ACL or umask with setgid-directory rules, reserves
+    tmpfs room (`ENOSPC`), creates an `S_IFSOCK` inode, emits `IN_CREATE` (including on overlay
+    dir), and inserts `Name::Path(ino)`.
+- With `SO_PASSCRED` enabled, an unnamed socket autobinds on connect to a valid peer address.
+  Datagram sends and connected seqpacket sends also autobind, so a receiver can reply to the
+  sender's abstract address. Enabling the option alone leaves the socket unnamed.
+- Path names key strictly by store `Ino` (shared across network namespaces, surviving hard links,
+  bind mounts and renames; inode stays on disk after socket drop); abstract/autobind names scope by
+  `(net_id, ty)` and expire with their `Weak` reference.
 
-### Names
+### Connections, shutdown and close
 
-- Addresses: over 128 bytes `EINVAL` (generic layer), then 2..110 bytes and `AF_UNIX`; an empty
-  path is unnamed, a leading NUL abstract (all bytes kept), otherwise a path cut at the first NUL.
-- bind: already bound `EINVAL`. Unnamed: autobind to a sequential `\0%05x` name free in the
-  socket's namespace for its type (`EADDRINUSE` when exhausted). Abstract: inserted in the table
-  under the namespace and the socket type (`EADDRINUSE` while a live socket of that type holds
-  it), as Linux's `unix_abstract_hash` mixes the type in. Path: the parent is resolved; `.`/`..` as the last name `EADDRINUSE`;
-  creation checks (search, `EEXIST` → `EADDRINUSE`, `EROFS`, write+search), owner and mode
-  `0o777 & ~umask` with setgid-directory rules, tmpfs room (`ENOSPC`), then an `S_IFSOCK` node in
-  the store, an inotify `IN_CREATE`, and the name `Path(ino)`.
-- Path names are keyed by inode only, so hard links, bind mounts and renames reach the same socket
-  and path names are shared by all network namespaces; abstract names and autobind are per
-  namespace (the socket's creation namespace) and socket type. Names die with their socket (pruned lazily); path
-  nodes stay in the store.
+- `listen`: datagram -> `EOPNOTSUPP`; unbound or connected -> `EINVAL`; backlog clamped to 4096
+  (negative -> 4096). Records `cx.ucred()` on every call; re-listening with a larger backlog wakes
+  blocked connectors on `u.rx`.
+- `connect` (stream/seqpacket): listening -> `EINVAL`, already connected -> `EISCONN`. Resolves
+  target by abstract `(net_id, ty, bytes)` or by pathname (following symlinks; checks `MAY_WRITE`
+  `EACCES` before `S_IFSOCK` `ECONNREFUSED`; wrong Unix type -> `EPROTOTYPE`;
+  self or not listening -> `ECONNREFUSED`). When `pending.len() <= backlog` (capacity `backlog +
+  1`), creates a server embryo (`embryo = true`, inheriting the *client's* `net`, listener's
+  `addr`, and exchanging `cx.ucred()`/`server_cred`), pushes it onto `pending`, bumps
+  `server.connections` and wakes both `server.rx` and `client.rx`. Full backlog blocks via `block`
+  bounded by `SO_SNDTIMEO`.
+- `accept`: non-listening -> `EINVAL`; pops front embryo, clears `embryo`, inherits listener's
+  `SO_PASSCRED` (not timeouts or `SockOpts`), wakes `u.rx`, and returns peer name (2-byte
+  `unnamed()` when client unbound). Waits bounded by `SO_RCVTIMEO`.
+- Datagram connect is non-blocking. `connect` handles `AF_UNSPEC` before autobind and
+  disconnects via `set_dgram_link(Link::None)`. Otherwise `connect_dgram` resolves the target (`EPROTOTYPE` if not
+  datagram; self-connect allowed), checks `unix_may_send` (target connected to another socket ->
+  `EPERM`), and installs `Link::Dgram` (does not set `peer_cred`). `set_dgram_link` marks both
+  ends `established = true` on connect; when leaving a different previous peer (disconnect,
+  reconnect to another peer, or dead-peer disconnect on send), it purges `self.rx` (returning any
+  `SCM_RIGHTS` fds to release after borrows end and waking writers), clears the previous peer's
+  `established` if that peer is unconnected, and if `self.rx` had unread messages and the previous
+  peer is still connected back to this socket, sets `reset = true` (`ECONNRESET`) and wakes it
+  (Linux's `unix_dgram_disconnected`).
+- `shutdown`: `how` outside `0..=2` -> `EINVAL`; succeeds on any state. On `Link::Stream`,
+  `SHUT_RD` sets `rx.eof = true` and `rx.closed = true` (peer writes get `EPIPE`), `SHUT_WR` sets
+  `tx.eof = true` (peer reads EOF and polls `POLLIN|POLLRDHUP`, plus `POLLHUP` once both sides are
+  shut); on unconnected/listening/datagram sockets, `SHUT_RD` sets `self.rx.eof` and `SHUT_WR`
+  sets local `self.shut_wr`.
+- `close` / `Drop`: wakes waiters; on `Link::Stream`, sets `tx.eof = true`, sets `tx.reset |=
+  self.embryo || !rx.packets.is_empty()`, and discards `rx` (dropping queued packets *after*
+  releasing all `RefCell` borrows). Dropping a listener drops all pending embryos (each setting
+  `reset = true` on its client). Peer observes `reset` once as `ECONNRESET` on `recv` (before
+  queued data on `SOCK_SEQPACKET` and `SOCK_DGRAM`, after draining on `SOCK_STREAM`) or
+  `SO_ERROR`, and `POLLERR` until consumed. Closing a datagram socket never resets a connected
+  peer (next send disconnects it with `ECONNREFUSED` and purges its own queue, then `ENOTCONN`).
 
-### Connections
+### Sending, receiving and ancillary data
 
-- listen: datagram `EOPNOTSUPP`; unbound `EINVAL`; backlog clamped to 4096 (negative → 4096);
-  records the listener's credentials, again at every re-listen, which also wakes connectors
-  blocked on a full backlog when the backlog grows.
-- connect (stream/seqpacket): listening `EINVAL`, connected `EISCONN`; the target is found by
-  path (following symlinks; a store socket node needs write permission; anything else
-  `ECONNREFUSED`) or by abstract name among the caller's namespace's sockets of its type (none
-  `ECONNREFUSED`, so another type's socket of that name is never found); self or not listening
-  `ECONNREFUSED`; a path socket of another type `EPROTOTYPE`. With room (backlog + 1 pending)
-  a server end is created in the client's namespace and queued; credentials are exchanged (client
-  gets the listener's listen-time credentials). A full queue blocks (`EAGAIN` nonblocking or after
-  `SO_SNDTIMEO`, interrupted by signals as below) until an accept or the listener closing.
-- accept: not listening `EINVAL`; pops a pending end, turns on its `SO_PASSCRED` when the
-  listener has it (`unix_sock_inherit_flags`), wakes blocked connectors, returns the peer name
-  (2 bytes for unnamed clients); waits bounded by `SO_RCVTIMEO`.
-- Datagram connect: `AF_UNSPEC` disconnects; otherwise the target must be a datagram socket
-  (`EPROTOTYPE`) not connected to another socket (`EPERM`, `unix_may_send`).
-- shutdown: `how` outside 0..2 `EINVAL`; on unconnected and listening sockets the flags are only
-  recorded (Linux 6.1 returns 0 there too); `SHUT_RD` closes the own receive channel (the peer's writes get `EPIPE`), `SHUT_WR` marks the
-  send channel EOF (the peer reads EOF and polls `POLLIN|POLLRDHUP`, `POLLHUP` once both are shut);
-  on datagram sockets the flags are local.
-- close: wakes waiters; the peer's receive side gets EOF and the own receive queue (with its
-  files) is discarded, so the peer's writes get `EPIPE`; a listener's pending ends are dropped (their
-  clients see EOF/`EPIPE`). A stream or seqpacket end closed with anything left in its own receive
-  queue, or as a pending end never accepted, resets the connection (6.1's `unix_release_sock`):
-  the peer's `reset` is reported once as `ECONNRESET` by its next read (a stream one once its own
-  queue is empty, a seqpacket one before anything queued) or `SO_ERROR`, and polls `POLLERR`
-  until then.
+- Control messages on send (`rights`): 16-byte headers, 8-byte alignment, front-end cap 4096 B
+  (data capped at `MSG_MAX = 1 MiB` per call); trailing 1..15 bytes ignored; invalid header lengths
+  (`len < 16 || len > remaining`) -> `EINVAL`; non-`SOL_SOCKET` control messages are skipped after
+  length validation (matching Linux's `__scm_send`); unknown `SOL_SOCKET` types -> `EINVAL`.
+  `SCM_RIGHTS`: at most `253` fds total (`EINVAL`/`EBADF`).
+  `SCM_CREDENTIALS`: exact length 28; validates `uid_in`/`gid_in` (`EINVAL`), pid/uid/gid match or
+  `CAP_SYS_ADMIN` (over `pid_ns.owner`)/`CAP_SETUID`/`CAP_SETGID` (`EPERM`), and live task
+  existence (`ESRCH`). Explicit credentials are recorded on the packet. Otherwise each enqueue
+  records the sender's tgid and real uid/gid if either endpoint has `SO_PASSCRED` enabled or the
+  receiving connection is awaiting accept. Other packets carry `Ucred::UNSTAMPED`.
+- Send paths (each packet shares the sender's `AddrRef`, so `recvfrom`/`recvmsg` read the
+  sender's current bound address at receive time even if bound after send or closed before receive):
+  - `SOCK_STREAM`: destination address -> `EISCONN` (connected) or `EOPNOTSUPP` (unconnected);
+    peer gone -> `epipe` (`EPIPE` + `SIGPIPE` unless `MSG_NOSIGNAL`) or partial count; loops pushing
+    available space (files attached to first chunk; a zero-byte send carrying files requires
+    `c.space() > 0` and, when `c.bytes == 0`, `c.has_packet_room()`, waiting or returning `EAGAIN`
+    when full) and blocking on `tx`.
+  - `SOCK_SEQPACKET` (never raises `SIGPIPE`, matching Linux's `unix_seqpacket_sendmsg` ->
+    `unix_dgram_sendmsg`): ignores destination address; peer gone / `SHUT_WR` -> `EPIPE` without
+    `SIGPIPE`; `len > DGRAM_MAX_LEN (212_960)` -> `EMSGSIZE`; waits until `c.has_packet_room()`
+    (`c.truesize < CAPACITY`).
+  - `SOCK_DGRAM` (never raises `SIGPIPE`): local `shut_wr` -> `EPIPE`; dead connected peer
+    disconnects (`ECONNREFUSED`, then `ENOTCONN`); both addressed and connected unaddressed sends
+    check `unix_may_send` (`c.may_receive_from(&own_rx)`, `EPERM`);
+    target `c.eof` (`SHUT_RD`) -> `EPIPE`; `len > DGRAM_MAX_LEN (212_960)` -> `EMSGSIZE`; waits
+    until `c.has_packet_room()` (`c.truesize < CAPACITY`) and `!c.holds_back(&own_rx)` (holding
+    more than `max_qlen` packets unless target is connected back to sender, so `max_qlen + 1` queue
+    and the next waits).
+- Receive paths:
+  - `SOCK_STREAM` (`unix::recv_into`, used by `recvmsg`, `recvfrom`, `read` and `readv`): peeks from
+    `Channel` and copies into guest iovecs via `net::scatter_partial` *before* consuming, consuming
+    only the copied byte count on partial copy fault (leaving unread bytes intact) or `EFAULT` when
+    nothing was copied. `MSG_TRUNC` is ignored on `SOCK_STREAM` (matching Linux's
+    `unix_stream_read_generic`, unlike TCP). `MSG_WAITALL` loops until full (capped at 1 MiB), receipt of files,
+    a credential change once the read has taken credentials, reset (left pending on a partial read),
+    EOF or error/timeout. A waiting read can start taking credentials when the option is enabled.
+    Once taken, they delimit the rest of that read even if the option is then disabled.
+  - `Channel::read_stream` merges packets in order, taking `from` from the first packet, stopping
+    after a packet with `fds`. When the receiver has `SO_PASSCRED` enabled, it also stops before
+    a packet whose `cred` differs. Zero-length non-`MSG_PEEK` `recv*` on a non-empty queue returns 0
+    immediately while taking the head packet's `fds` (whereas zero-length `read` short-circuits in
+    `net::rw` and zero-length `readv` short-circuits earlier in `fs::vectored`). `MSG_PEEK` clones
+    `fds` without consuming or waking writers.
+  - `SOCK_DGRAM` / `SOCK_SEQPACKET` (`Channel::read_packet`): peeks/copies into user iovecs, setting
+    `MSG_TRUNC` when truncated and returning full `m.len` when input `flags & MSG_TRUNC != 0`; on
+    `EFAULT` consumes and drops the packet (releasing any `fds` via `unix::released`), while
+    `FUSE_RETRY` leaves it queued for retry.
+- Ancillary delivery (`deliver` / `put_cmsg`): `SCM_CREDENTIALS` first when `passcred` is set
+  (translated via `pid_out`, `uid_out`/`gid_out` with overflow 65534; truncated with `MSG_CTRUNC`
+  if buffer is 16..27 B), then `SCM_RIGHTS` reserving as many descriptor numbers as fit.
+  Enabling `SO_PASSCRED` after enqueue reports pid 0 and overflow uid/gid for unstamped packets.
+  A NULL control buffer supplies zero room. Buffer and fd limits set `MSG_CTRUNC` and excess
+  files are released. Reserved numbers remain unavailable to other threads during a FUSE fill.
+  After the control and header copies succeed, recvmsg installs each file with the requested
+  `MSG_CMSG_CLOEXEC`. An unwritable control buffer drops the reservations and returns the data
+  with `MSG_CTRUNC` and zero control length. A failing header copy also releases the reservations.
+- `block()` interruption: timed waits (`SO_RCVTIMEO`/`SO_SNDTIMEO`) interrupted by a signal return
+  `EINTR`; untimed waits return `ERESTARTSYS` (partial stream sends and `MSG_WAITALL` reads return
+  moved bytes instead).
 
-### Sending and receiving
+### Options, readiness and `/proc/net/unix`
 
-- Control messages on send: 16-byte headers, 8-byte alignment, at most 253 fds in total; other
-  levels or types `EINVAL`; `SCM_CREDENTIALS` must match the sender (pid/uid/gid) unless
-  privileged (`EINVAL`, `EPERM`, `ESRCH`); default credentials are tgid, real uid and real gid.
-- Stream send: a destination address is `EISCONN` (`EOPNOTSUPP` unconnected; seqpacket ignores
-  it); peer gone → `EPIPE` + `SIGPIPE` (unless `MSG_NOSIGNAL`) or the partial count; otherwise
-  pushes what fits (files with the first chunk) and blocks for the rest. Seqpacket: over the
-  capacity `EMSGSIZE`, otherwise waits until the whole packet fits. Datagram (never `SIGPIPE`):
-  after `SHUT_WR` `EPIPE`; dead or closed target `ECONNREFUSED`, and a dead connected peer also
-  disconnects the socket (then `ENOTCONN`); a target connected to another socket `EPERM`; a target shut down for reading
-  `EPIPE`; over the capacity `EMSGSIZE`; blocks for room: bytes, and unless the target is connected
-  back to the sender, the target holding more datagrams than its `max_qlen` (6.1's
-  `unix_recvq_full`; `net.unix.max_dgram_qlen` of the namespace the target was created in, 10 by
-  default), so 11 queue and the 12th waits.
-- Stream and seqpacket sends record the sender's bound name (none when unbound), which recvfrom
-  returns: a stream read the first message's, as `unix_stream_read_generic` copies it.
-- Stream receive merges packets in order, stopping after the first packet with files and before a
-  packet whose credentials differ (even without `SO_PASSCRED`); a read of nothing returns 0 at
-  once when something is queued, taking the first message's files (blocking or `EAGAIN` on an
-  empty queue, as on Linux); `MSG_PEEK` clones files;
-  `MSG_WAITALL` loops until full, files, EOF or an error/timeout. Packet receive pops one packet and
-  truncates (`MSG_TRUNC` set; with the `MSG_TRUNC` flag the full length is returned).
-- Delivery, as Linux's `scm_recv`: `SCM_CREDENTIALS` first when `SO_PASSCRED` is set (pid and ids
-  translated into the receiver's namespaces; with less room than the message, the header and what
-  fits, `cmsg_len` cut, `MSG_CTRUNC`), then as many files as fit after a header installed into the
-  receiver's fd table (`MSG_CMSG_CLOEXEC`); when the control buffer or the fd limit runs out,
-  `MSG_CTRUNC` is set and the remaining files are dropped (closed). A NULL control buffer holds
-  nothing whatever its length; one that cannot be written loses its messages but not the data
-  (the installed files are closed again, `MSG_CTRUNC`, `msg_controllen` 0). recvmsg first checks
-  that the part of the iovecs the data already queued would fill lies in writable mappings
-  (`EFAULT`, leaving the data queued). Control
-  buffers are capped at 4096 bytes, data at 1 MiB per call.
-- Waits interrupted by a signal return `EINTR` when `SO_RCVTIMEO`/`SO_SNDTIMEO` gave them a
-  timeout and `ERESTARTSYS` otherwise (Linux's `sock_intr_errno`), so `SA_RESTART` never restarts
-  a timed wait with its whole timeout; a stream send or `MSG_WAITALL` read that already moved data
-  returns the count instead.
+- `setsockopt` / `getsockopt`: non-`SOL_SOCKET` -> `EOPNOTSUPP`. Handles `SO_PASSCRED`,
+  `SO_RCVTIMEO`/`SO_SNDTIMEO` (plus `*_NEW` folded in `kernel/net`, shared `net::timeval`),
+  `SO_TYPE`, `SO_DOMAIN` (1), `SO_PROTOCOL` (0), `SO_ERROR` (consumes pending `ECONNRESET` once
+  via `receive_queue()` for stream, seqpacket and datagram sockets), `SO_ACCEPTCONN`,
+  `SO_PEERCRED` (listener's `listen`-time creds or `u.peer_cred` set by
+  `socketpair`/`connect_stream` and never cleared or updated by `connect_dgram`, translated into
+  caller namespaces; `(0, -1, -1)` when `None`, such as unconnected or `connect_dgram`-connected
+  `socket()`-created datagrams, while `socketpair(SOCK_DGRAM)` sockets keep their original creds
+  across `AF_UNSPEC` disconnect or reconnection), and recorded generic `SockOpts` (buffer sizes,
+  `SO_RCVLOWAT`, linger, keepalive, priority, etc., with no runtime effect). `setsockopt` rejects
+  read-only `SO_SNDLOWAT`, `SO_ACCEPTCONN` and `SO_PEERCRED` (as well as `SO_TYPE`, `SO_ERROR`,
+  `SO_PROTOCOL`, `SO_DOMAIN` via `SockOpts`) with `EINVAL` for `< 4` bytes and `ENOPROTOOPT`
+  otherwise; other unknown `SOL_SOCKET` names are silently ignored by `setsockopt` and return
+  `ENOPROTOOPT` from `getsockopt`. `getsockname`/`getpeername` return `u.name()`/`peer_name()`
+  (reading the live shared `AddrRef`; `ENOTCONN` if unconnected/listening).
+- Readiness: `POLLIN|POLLRDNORM` on queued data, EOF or pending accepts; `POLLOUT|POLLWRNORM` when
+  `truesize * 2 <= CAPACITY` for datagram/seqpacket (`packet_budget`) or `bytes * 4 <= CAPACITY`
+  (plus `truesize * 2 <= CAPACITY` when `bytes == 0`) for stream (or `tx.closed`, or unconnected
+  stream with `POLLHUP`), and for connected datagrams when peer is neither full nor `holds_back`
+  (ignoring peer `SHUT_RD`, matching Linux's `unix_dgram_poll`); `POLLRDHUP`/`POLLHUP` from shutdown
+  state;
+  `POLLERR` while `rx.reset` is set (on stream, seqpacket and datagram sockets). `wake_objects`
+  registers `self.rx` plus `Stream`'s `rx`/`tx` or live `Dgram` `tx`; `arrivals` exposes
+  `[connections, 0]` for listeners and `[rx.arrivals, tx.taken]` for channels. `FIONREAD` uses
+  `unread()` (`rx.bytes` payload bytes for stream/seqpacket, head packet length for datagram,
+  `EINVAL` for listener); `SIOCOUTQ` (`TIOCOUTQ`) uses `outq()` (queued packet `truesize` bytes
+  sent by this socket still in peer buffers, >= 768 B per packet; 0 on listeners).
+- `/proc/net/unix`: collects sockets from all tasks' fd tables plus `unix::inflight_sockets` (which
+  includes both `SCM_RIGHTS` in-flight sockets and tracked pending server embryos from
+  `Names::embryos`), filtered by target task's netns, sorted by `socket_ino`. State 1 for
+  unconnected/listening (`Flags = 0x10000` on listeners), 3 for connected streams and datagram
+  sockets with `rx.established`, and state 2 (`Inode = 0`, listener address) for `u.embryo` rows in
+  each embryo's own (connector's) network namespace; abstract names printed with `@` (interior NULs
+  as `@`).
 
-### Options, readiness, listing
+### Garbage collection (`unix::collect`)
 
-- setsockopt: `SO_PASSCRED` (an int, `EINVAL`), `SO_RCVTIMEO`/`SO_SNDTIMEO` (parsed as for inet
-  sockets: negative times and times of at least `KTIME_MAX` mean none), the generic options
-  `SockOpts` records (buffer sizes, linger, keepalive, rcvlowat, priority and the like, by
-  Linux's rules); other `SOL_SOCKET` names are accepted and ignored; other levels `EOPNOTSUPP`.
-  getsockopt: `SO_TYPE`, `SO_DOMAIN` 1, `SO_PROTOCOL` 0, `SO_ERROR` (a pending reset's
-  `ECONNRESET` once, else 0), `SO_PASSCRED`,
-  `SO_ACCEPTCONN`, timeouts, `SO_PEERCRED` (pid, euid, egid recorded at pair/connect time, or a
-  listener's own from its last listen, translated into the caller's pid and user namespaces; pid 0
-  and uid/gid -1 without either), the recorded generic options; others `ENOPROTOOPT`.
-- Readiness: `POLLIN` when data or EOF is readable, `POLLOUT` when the queue is under a quarter of
-  the capacity (or the peer is gone, so writers get `EPIPE`) and, for a connected datagram socket,
-  its peer does not hold back its datagrams (`unix_dgram_poll`), `POLLRDHUP`/`POLLHUP` from shutdown
-  state (a datagram socket's `POLLHUP` once both directions are shut), `POLLERR` while a reset is
-  pending; listeners are readable with pending connections. `FIONREAD` (`unix_inq_len`):
-  every byte queued on a stream or seqpacket connection, the next datagram's length, `EINVAL` on
-  a listener; `SIOCOUTQ` is not implemented.
-- `/proc/net/unix`: sockets from fd tables plus in-flight ones, filtered by the reader's namespace;
-  state 1 (unconnected/listening), 3 (connected), pending connections as state 2; abstract names
-  printed with `@`.
-
-### Garbage collection
-
-- Channels that queue files are recorded. `released` drops closed files and, if any was a unix
-  socket, runs `collect`: candidates are unix-socket files all of whose references are in-flight
-  (plus the collector's own); references from candidates' own inboxes (including pending
-  connections) are subtracted; candidates still referenced are reachable, and so is everything
-  reachable through their inboxes; the rest have their inboxes emptied, breaking the cycles.
-  `collect` also runs at a group's last thread exit.
-- Conservative: any extra strong reference (a blocked thread) keeps a socket out of the candidates;
-  epoll holds weak references and does not. Files dropped by `MSG_CTRUNC` or by a socket's own
-  drop do not trigger it.
+- Channels carrying `SCM_RIGHTS` register weak refs in `Kernel::unix_inflight` via `note_inflight`.
+  File and socket snapshots include pending sends, queued packets and pending recvmsg deliveries.
+  Pending sends and deliveries hold external references for cycle collection. A failed send that
+  still owns files, or a cancelled delivery holding a Unix socket, schedules deferred collection.
+- `unix::released` drops closed files and runs `unix::collect` when any was an AF_UNIX socket
+  (called from `close`, `close_range`, `dup3`, `close_replaced`/seccomp `addfd`, `exec`, AIO
+  `io_cancel`/`released`, `deliver` truncation, datagram `EFAULT` drop). `UnixSocket::drop` (when
+  dropping packets carrying `fds` or pending embryos) and AIO `complete_polls` set a thread-local
+  `DEFERRED_COLLECT` flag (`defer_collect`), drained via `collect_deferred` at the end of syscall
+  dispatch (covering `accept4` address-write failures and socket drops) and in AIO `check_polls`;
+  `task::exit` runs `collect` whenever `(last || fds_gone || take_deferred()) && !unix_inflight.is_empty()`
+  (covering non-last thread exit after `unshare(CLONE_FILES)`), and `collect` loops while
+  `take_deferred()` handles cascading drops.
+- Algorithm: prunes dead/fd-free channels; counts in-flight references per `FileRef`; selects
+  AF_UNIX candidates where `Rc::strong_count(f) == inflight_count + 1`; subtracts references from
+  candidates' own `inboxes` (`u.rx`, `Stream::rx`, and pending embryos' `Stream::rx`); marks
+  candidates with remaining external refs and all transitively reachable candidates; empties
+  unreachable candidates' inboxes into a local `garbage: Vec<Packet>` and drops `inflight` then
+  `garbage` after releasing all borrows.
+- Epoll `Interest`/`ExGate`/`Fasync`, OFD locks and inotify `doomed` hold `Weak<RefCell<OpenFile>>`
+  so they never pin cycles; `socket_of` (all socket syscalls), `read_file`/`write_file`/
+  `splice_read`, `ppoll`/`pselect6`, `epoll` `EPOLLEXCLUSIVE` waits, `sendmsg` passed `files` and
+  AIO `PendingPoll` hold strong `FileRef`s.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/net` (socket syscalls, read/write, ioctl, readiness, `accept4` installing the fd);
-  `kernel/files` close paths (`released`); `kernel/exec` (execve close-on-exec), `kernel/process`
-  (last-thread exit); seccomp addfd; `kernel/procfs` (`/proc/net/unix`).
+- `kernel/net`: socket syscalls, `Socket::Unix`, `rw`, ioctl (`FIONREAD`), readiness/wake/arrivals,
+  `accept4` fd reservation and `recvmsg` installation of pending rights.
+- `kernel/files` (`close`, `close_range`, `dup3`, `close_replaced`, `OpenFile::drop`, `splice_read`,
+  `opens_of` -> `inflight_files`), `kernel/exec` (`exec` cloexec), `kernel/process` (last-thread
+  `task::exit`), `kernel/cred` (seccomp `addfd`), `kernel/mount` (busy checks and collection),
+  `kernel/procfs` (`/proc/net/unix`).
 
 ### Outbound
 
-- `kernel/vfs` and `kernel/store` (path lookup, creation checks, `mknod` with its inotify
-  `IN_CREATE`, tmpfs accounting); fd tables (`get`, `install`; `kernel/files`); credentials and
-  namespaces (`permission`, `new_owner`, `uid_out`/`gid_out`, `pid_in`/`pid_out`, `ns_capable`); the
-  kernel's waits and wake objects; signals (`SIGPIPE`).
+- `kernel/vfs`, `kernel/store`, `kernel/overlay`, `kernel/inotify`: `create_parent_at`,
+  `lookup_at`, `may_create`, `create_in`, `tmpfs_reserve`/`tmpfs_created`, `created_events`,
+  `mknod`.
+- `kernel/net`: `SockOpts`, `Message`, `put_cmsg`, `epipe`, `timeval`, `netconf::sysctl_read`.
+- `kernel/files`, `kernel/cred`, `kernel/ns`, `kernel/process`, `kernel/signal`, `kernel/procfs`:
+  `FdTable`, `Cred`, `PidNs`/`NetNs`, `Cx::wait_objects`/`interrupted`, `request_wake_object`,
+  `pseudo::socket_ino`.
 
 ## Invariants and gotchas
 
-- Sockets reference each other through `Rc` channels; any cycle through in-flight files must be
-  broken by the collector.
-- Drop must release borrows before dropping queued files, since dropping files can recurse into
-  other sockets.
-- Credentials are kernel ids and are translated only when shown to a reader.
+- All `Rc`/`RefCell` counts, `unix_inflight` mutations and `collect` runs assume the single-threaded
+  BKL. `UnixSocket::drop` and `unix::collect` must drop queued `Packet`s only after all `RefCell`
+  borrows end to avoid double-borrow panics when `SCM_RIGHTS` files drop sibling sockets.
+- `OpenFile::drop` skips `wake::of(s)` for `Socket::Unix` because `UnixSocket::drop` wakes its own
+  channels.
+- `Ucred` always stores global `pid` and kernel `uid`/`gid`, translating into the reader's pid and
+  user namespaces only at delivery (`SCM_CREDENTIALS`, `SO_PEERCRED`).
+- Accepted sockets inherit the *connector's* `NetNs`, not the listener's. Pathname sockets cross
+  network namespaces; abstract/autobind names isolate by `(net_id, ty)`.
+- Zero-length `read` short-circuits in `net::rw` and zero-length `readv` short-circuits earlier in
+  `fs::vectored` without detaching head `SCM_RIGHTS` fds, whereas zero-length non-`MSG_PEEK`
+  `recv`/`recvfrom`/`recvmsg` detaches them.
+- `unix::collect` emptying an unreachable stream socket's inbox before `UnixSocket::drop` suppresses
+  `ECONNRESET` to an open peer (the peer sees EOF instead).
 
 ## Confirmed bugs / technical debt
 
-- **Connected datagram sends skip the may-send check:** a send without an address to a peer that
-  has since connected to a third socket goes through, where Linux's `unix_may_send` makes it
-  `EPERM` (connect and addressed sends do check).
-- **Stream reads split and merge at the wrong places:** reads stop at a change of sender
-  credentials even without `SO_PASSCRED` (Linux merges), while `MSG_WAITALL` joins data from
-  different writers across iterations and reports the first one's credentials even with
-  `SO_PASSCRED`. A zero-byte stream send carrying files still queues the files.
-- **Error order on connect:** a non-socket path is `ECONNREFUSED` before the write-permission
-  check (Linux: `EACCES` first).
-- **Delayed collection:** files dropped by `MSG_CTRUNC` or with a dropped socket's queue do not
-  trigger the collector, so their cycles wait for the next unix close or exit (and stay listed in
-  `/proc/net/unix` meanwhile).
-- **Smaller deviations:** no `SIOCOUTQ`; a datagram queue counts payload bytes, not Linux's
-  per-message `truesize` against the sender's buffer; non-`SOL_SOCKET`
-  control messages are rejected instead of skipped; `/proc/net/unix` shows connected datagram sockets
-  as state 3; buffer sizes are only recorded: the capacity stays 212992, so a small send buffer
-  does not make writes block and a larger one does not unblock them, and `SO_RCVLOWAT` does not
-  change when stream reads return.
-- **Credentials are attached to messages sent without `SO_PASSCRED`:** every message records the
-  sender's pid, uid and gid, so a receiver that turns `SO_PASSCRED` on later gets real credentials
-  for data sent earlier, where Linux delivers pid 0 and uid/gid 65534 for them (Linux attaches
-  credentials only while the sender or receiver has the option). The same stamping causes the read
-  splits of **Stream reads split and merge at the wrong places**.
-- **recvmsg copy faults can still lose data:** the iovecs are checked only against the data queued
-  when recvmsg starts, so data that arrives while it waits, or a buffer that is mapped but faults
-  anyway (past the end of a file mapping), is taken off the queue and lost when the copy fails
-  (Linux keeps a stream message queued); a datagram whose copy would fault is kept, where Linux
-  drops it.
-- **Sender addresses are taken when sent:** recvfrom gives the sender's name as it was bound when
-  it sent, where Linux reads the sending socket's name at receive time, so a sender bound between
-  its send and the receive shows no name here.
-- **Connected datagram sockets are never reset:** Linux's `unix_dgram_disconnected` gives a datagram
-  socket `ECONNRESET` when the peer it is connected to disconnects or reconnects with this
-  socket's datagrams still queued; here none is reported.
+- **Smaller Linux divergences:** `SO_SNDBUF`/`SO_RCVBUF` and `SO_RCVLOWAT` are recorded only (the
+  channel capacity stays `CAPACITY = 212_992`); `packet_truesize` approximates Linux's slab/page
+  buckets rather than exact kernel `sk_buff` allocations for payloads above 4 KiB, and `SOCK_STREAM`
+  write room still caps by payload `CAPACITY` rather than `truesize`.
 
 ## Open questions
 
-- Should `SO_PASSCRED` autobind on connect and send?
-- Should the seqpacket send path raise `SIGPIPE` (Linux routes seqpacket through the datagram
-  send path)?
+None currently recorded.
 
 ## To verify
 
-- Linux 6.1 comparisons above come from knowledge of `af_unix.c`, `scm.c` and `sock.c`, not a
-  source checkout; the differential tests cover the common paths natively.
+- Linux 6.1 comparisons above for receive-time sender addresses, `SOCK_SEQPACKET` `SIGPIPE`,
+  `SIOCOUTQ`/`truesize` and `DGRAM_MAX_LEN` were verified empirically against Linux; differential
+  tests cover common paths natively.

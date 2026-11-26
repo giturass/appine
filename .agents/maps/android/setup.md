@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-15 (full mapping: 4 research concerns; 12 claims checked by an independent verifier — 8 confirmed and 4 qualified below)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: bash startup-file seeding and extracted settings ownership while preserving offline OpenRC setup)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's preserved `ENV=/etc/profile.d/appine.ashrc` across Alpine `doas -s` rules and ash command-title fallback alongside the retained bash startup-file seeding and offline OpenRC setup)
 
 ## Responsibilities
 
@@ -17,8 +17,8 @@
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
   terminal's shell integration), one-time OpenRC setup on Alpine, the osclock script run before boot and the boot log's failed services;
-- package mirrors: built-in lists, one speed probe after an import, writing the fastest into
-  sources nobody has changed;
+- package mirrors: built-in lists, concurrent throughput probes during import and one sources write in the
+  temporary store;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup, installing the bundled bash, procps-ng and bubblewrap, and the NOPASSWD rules;
 - the store lock shared by the kernel start, store deletion and the Files provider.
@@ -45,8 +45,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - `DEBIAN`: "Debian 13"; one pinned GitHub URL (debuerreotype's `debian:trixie`) with fixed
     length and sha256; mirrors are host names (deb.debian.org, Tsinghua, USTC, Aliyun), probed at
     `debian/dists/trixie/InRelease` over https.
-  - The first mirror of each list is the official one: the import writes it, and probing falls
-    back to it.
+  - The first mirror of each list is the official one: the importer uses it when no successful probe is ready.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings` file is `android/service`'s
   `Settings`, displayed and edited through `android/settings`.
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -58,28 +57,38 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - `ashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.ashrc` (not `.sh`, so
   `/etc/profile` does not read it): ash's prompt marks, read through `ENV`.
 - `bashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.bashrc`: bash's prompt
-  marks, read by the profile and, on Alpine, by `/etc/bash/appine.sh` (`BASH_HOOK`, a line sourcing
-  it).
+  marks (including `k=c` continuation marks on multi-line `PS1` and scalar/array `PROMPT_COMMAND`
+  handling), read by the profile, by `/etc/bash/appine.sh` (`BASH_HOOK`) on Alpine, and via
+  `DEBIAN_BASH_HOOK` appended once to `/etc/bash.bashrc` on Debian.
 - `zshrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.zshrc`, read by the
-  profile only in zsh. Its anonymous function registers the hooks in local zsh emulation,
-  preserving the caller's options. `Rootfs.writeProfile(context, store, distro)` writes all three
-  companion files and then the profile.
+  profile (on Alpine via `/etc/zsh/zprofile`, on Debian via `/etc/appine/zsh/.zshenv` written from
+  `ZSHENV` and selected by `login.sh` via `ZDOTDIR`), and by `/etc/zsh/zshrc` (`ZSH_RC_HOOK`,
+  installed once after `zsh` is present) for nested interactive zsh. Its anonymous function
+  registers the hooks in local zsh emulation, preserving the caller's options, and wraps `PS1`
+  (with `k=c` continuation marks on multi-line prompts), `PS2`, non-empty `RPROMPT` (`k=r` on
+  single-line `PS1`, `k=c` on multi-line `PS1`) and `RPS2` (`k=s`), restoring clean prompts before
+  commands and respecting `nopromptpercent`. `Rootfs.writeProfile(context, store, distro)` writes
+  the three companion files, `/etc/appine/zsh/.zshenv`, Alpine's `/etc/bash/appine.sh`, and then
+  the profile, and runs `ensureShellRcHooks`.
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`,
-  `sudo-installed` and `bash-startup-done` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
-  (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`,
-  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed), and `/run/appine-install.lock`.
+  `sudo-installed`, `bash-startup-done`, `debian-bashrc-hook-done` and `zsh-rc-hook-done`
+  (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules (`/etc/doas.d/30-appine.conf` or
+  `/etc/sudoers.d/appine`), `/etc/appine/zsh/.zshenv`, `/var/cache/appine/doas.apk`,
+  `/var/cache/appine/{bash,procps,bubblewrap,openrc}/` (packages until installed),
+  `/run/appine-install.lock` and `/run/appine-rules.lock`.
 
 ## Public entry points
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
-  `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
+  `fetch`, `tarball`, `deleteTarball`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
   `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser`, `updateProfile`; around boot:
   `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
-- Mirrors: `chooseMirror`, `useMirror`.
-- Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
+- Mirrors: the service supplies `probeMirrors` to `prepare`. The default imports offline with official sources when the tarball is local.
+- Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
   packages into `target/rootfs` by default; prints each package's path, then the tarball's last).
+  `--assets` lists their pinned filenames, SHA-256 digests and APK destinations offline.
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
   directory; or `--refresh-rules`.
 
@@ -93,10 +102,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   the ncurses dependencies; also bubblewrap and libcap2, openrc, openrc-user, ifupdown-ng and bridge; apk checks signatures at install) and, unless a copy with the
   pinned sha256 is already there, the minirootfs: its GPG signature is
   checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
-  gpg a warning), then its pinned sha256. Gradle bundles the newest fetched files by version
-  (`BuildConfig.ALPINE_BRANCH` is taken from the name, `edge` without one) as `rootfs.tgz`,
-  `doas.apk`, `{bash,procps,bubblewrap,openrc}/<file name>` without checking them again, and fails without them; `prepare`
-  copies the tarball asset to the cache.
+  gpg a warning), then its pinned sha256. Gradle verifies the inputs named by `--assets` and bundles
+  them as `rootfs.tgz`, `doas.apk` and `{bash,procps,bubblewrap,openrc}/<file name>`.
+  `BuildConfig.ALPINE_BRANCH` comes from the pinned tarball name. `prepare` copies the tarball asset to the cache.
 - Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
   reused; else `fetch` tries the sources in order (probed by speed when there are several; Debian
   has one), checking for cancellation before each, moving to the next on any error but a cancel,
@@ -121,7 +129,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   2. delete `<store>.tmp`;
   3. get the tarball into the cache: Alpine's asset copied over it, unchecked; others through
      `download`;
-  4. import into `<store>.tmp` (`Native.importRootfs`) and `configure` it;
+  4. start the supplied mirror probes, import into `<store>.tmp` (`Native.importRootfs`),
+     `configure` it and write package sources from the results available then;
   5. sync the store (`syncfs`), rename it to the real store, fsync `files/` (a failure only
      logged) and only then delete the tarball.
 - `installed` is the recorded distro of a ready store (Alpine when there is no record); while
@@ -130,8 +139,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   the store under the write lock and leaves the preferences and the cache alone.
 - `configure` writes, with mode 0644 for new files (an overwritten file keeps its mode, and an
   existing entry that is not a regular file fails the import):
-  - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
-    http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
+  - always: `hostname` (`localhost`), `motd`, and
     `/etc/profile.d/appine.ashrc`, `/etc/profile.d/appine.bashrc`, `/etc/profile.d/appine.zshrc`, on Alpine
     `/etc/bash/appine.sh`, and then `/etc/profile.d/appine.sh` (the assets' `ashrc.sh`,
     `bashrc.sh`, `zshrc.sh` and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, the browser default below,
@@ -168,12 +176,14 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   shells such as fish and Debian's zsh need their own login configuration.
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
-- On the start thread, after an import and the start of its mirror probe when there is one, in
+- On the start thread, after any import, in
   this order, before the kernel starts under the write lock: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`, rewritten at every start; on Alpine, `ensureBashStartup`
+  `doas.apk` into `/var/cache/appine/`, rewritten at every start, and unmodified stock
+  `/etc/doas.d/20-wheel.conf` (`permit persist :wheel`) upgraded to preserve
+  `ENV=/etc/profile.d/appine.ashrc`; on Alpine, `ensureBashStartup`
   once per store (gated by `/var/lib/appine/bash-startup-done`): writes `/etc/skel/.bash_profile`
   and `/etc/skel/.bashrc` when missing and, for root and pre-existing regular accounts (UID
   1000–65533) whose `/etc/passwd` shell is `/bin/bash` and whose non-root home directory already
@@ -209,8 +219,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - Integrated bash, ash and zsh set OSC 2 to the full current `$PWD` at each primary prompt, with
   control characters replaced by `?`. Before execution, bash and zsh set OSC 2 to the submitted
-  command line, also sanitized, once for the whole pipeline or compound command. This is input
-  text, not tracking of the foreground executable or its children. Programs can replace it with
+  command line, also sanitized, once for the whole pipeline or compound command; for busybox ash
+  (which has no preexec hook) and unmarked shells, `android/vtcore` falls back to the console's
+  foreground process command line when a command sets no OSC 0/2 title. Programs can replace it with
   OSC 0/2 between prompts; the next primary prompt restores the directory.
   Bash sends the directory from `__appine_prompt`, zsh from precmd,
   and ash after the visible PS1 and B mark. Secondary prompts do not replace the title.
@@ -225,46 +236,65 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - For the terminal's shell integration (android/vtcore) the profile has login shells mark their
   prompts with OSC 133:
   - bash: the profile sets the coloured PS1 and reads `appine.bashrc`, whose `__appine_prompt`
-    function, put first in `PROMPT_COMMAND` (once, however often the file is read), prints, before
-    each prompt, the last command's end with its status (D) and the prompt's start on a fresh line
-    (A, `redraw=last;cl=line`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2
-    (`k=s`), and appends the output's start (C) to PS0, each again whenever it is missing, so a PS1
-    that `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later plain
-    assignment to `PROMPT_COMMAND` drops the function and with it every mark. On Alpine,
+    function, put first in `PROMPT_COMMAND` (scalar or bash 5.1+ array, once, however often the
+    file is read), prints, before each prompt, the last command's end with its status (D) and the
+    prompt's start on a fresh line (A, `redraw=last;cl=line`), wraps PS1 (P with `k=i`, `k=c`
+    after `\n` escapes and command-substitution-free literal newlines, … B, the input starting)
+    and PS2 (`k=s`), and appends the output's start (C) to PS0, each again whenever it is missing,
+    so a PS1 that `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later
+    plain assignment to `PROMPT_COMMAND` drops the function and with it every mark. On Alpine,
     `/etc/bash/bashrc` reads `/etc/bash/appine.sh`, hence `appine.bashrc`, in every interactive
-    bash (a login one first, through `/etc/profile.d/00-bashrc.sh`), so a nested bash (`bash`, `su`
-    without `-l`) marks its own prompt, Alpine's `\h:\w\$ `;
+    bash; on Debian, `ensureShellRcHooks` appends `DEBIAN_BASH_HOOK` once to `/etc/bash.bashrc`
+    (gated by `/var/lib/appine/debian-bashrc-hook-done`), so a nested bash (`bash`, `su` without
+    `-l`) marks its own prompt on both distros;
   - busybox ash, which has no hook before a command or a prompt (1.37 has no `PROMPT_COMMAND`):
-    PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, and
-    after the prompt B (the input starts); PS2 is P with `k=s` and B. ash marks no output start
+    PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, `P;k=c`
+    with `appine_lf=output` after `\n` escapes in multi-line prompts, and after the prompt B (the
+    input starts); PS2 is P with `k=s` and B. ash marks no output start
     and breaks a command longer than the screen's width into rows itself, so A and P also carry
     `appine_lf=output`, the app's own option, asking the terminal to read ash's line feeds
     (android/vtcore): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
-    wraps whatever PS1 and PS2 are when they have no marks, and only in busybox ash: the profile
-    sources it after setting its coloured PS1, and every interactive ash reads it again through
+    calls `__appine_ash_path` to show the physical directory in the stock visible prompt
+    (abbreviated under `HOME`) and the full logical `PWD` in the title. Both replace controls with
+    `?` and double backslashes before BusyBox interprets the prompt escapes. Custom prompt text
+    keeps its own path formatting. The script wraps unmarked PS1 and PS2 only in busybox ash.
+    The profile sources it after setting its coloured PS1, and every interactive ash reads it through
     `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
     marked; one set later (typed, or by a file the user's own `ENV` names) goes without.
-  - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. Its `__appine_precmd`,
-    appended to `precmd_functions`, prints D with the status before each
-    prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
-    marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
-    theme's own hook sets is wrapped (a theme setting PS1 before each prompt gets its first prompt
-    unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C)
-    and the command title. Reloading the profile or companion file deduplicates both hook
-    registrations while preserving other hooks, including when sourced in sh emulation.
-    A and B are in PS1, so every redraw by zle sends them again; D is sent once per prompt.
+  - zsh: the profile sets the coloured PS1 and reads `appine.zshrc`. On Debian (where
+    `/etc/zsh/zprofile` does not read `/etc/profile`), `login.sh` starts login `zsh` with
+    `ZDOTDIR=/etc/appine/zsh` when `ZDOTDIR` is unset; `/etc/appine/zsh/.zshenv` unsets `ZDOTDIR`
+    immediately, sources `~/.zshenv`, and for interactive login shells on non-Alpine systems
+    sources `/etc/profile.d/appine.sh` in sh emulation (with `__appine_profile_seen` guarding
+    `cat /etc/motd` against double display if `~/.zprofile` also sources it). Once `zsh` is
+    installed, `ensureShellRcHooks` appends `ZSH_RC_HOOK` to `/etc/zsh/zshrc` (Debian) or writes
+    `/etc/zsh/zshrc` beside Alpine's `/etc/zsh/zprofile` once (gated by
+    `/var/lib/appine/zsh-rc-hook-done`), so nested interactive `zsh` (`zsh`, `su` without `-l`)
+    also loads `appine.zshrc`. `__appine_precmd`, appended to `precmd_functions`, prints D with
+    the status before each prompt, restores saved clean prompts, wraps PS1 (A with `cl=line`,
+    `k=c` after `$'\n'` on multi-line prompts, … B), PS2 (`k=s`, `k=c` after `$'\n'`, … B),
+    non-empty `RPROMPT` (`k=r` on single-line PS1, `k=c` on multi-line PS1 so it keeps the
+    continuation row mark, … B so right-prompt cells are prompt rather than input) and non-empty
+    `RPS2` (`k=s` … B) in `%{ %}` (doubling a trailing bare `%`, or emitting `A;cl=line` directly
+    when `prompt_percent` is unset), and moves itself last in `precmd_functions`;
+    `__appine_preexec`, appended to `preexec_functions`, restores the clean prompts before
+    commands and prints the output's start (C) and the command title. Reloading the profile or
+    companion file deduplicates both hook registrations while preserving other hooks, including
+    when sourced in sh emulation. A and B are in PS1, so every redraw by zle sends them again; D
+    is sent once per prompt.
   - `cl=line` tells the terminal that the three line editors move the cursor with the left and
     right arrows, so a tap on the typed command moves the cursor there.
-- Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
-  for others) when the shell reads `/etc/profile`: zsh does only where its `/etc/zsh/zprofile`
-  sources it (Alpine's does, in sh emulation; Debian trixie's does not, so zsh there has no marks
-  unless the user's `~/.zprofile` sources `/etc/profile.d/appine.sh`). `ENV` is exported from every
-  shell that reads the profile, so a nested interactive ash that inherits it (`ash`, `sh` on
-  Alpine, `su` without `-l`, also under bash or zsh) marks its own prompt, the distro's; one
-  started through `doas -s`, which resets the environment, does not. Other nested non-login shells
-  (but bash on Alpine, above; a nested bash on Debian has none) and
-  other shells get no marks from it (fish and nushell send their own, android/vtcore), and shells that
-  do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
+- Every login shell of a tab reads the profile (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
+  for others), including login `zsh` on Debian through `/etc/appine/zsh/.zshenv`. `ENV` is
+  exported from every shell that reads the profile (and from `appine.ashrc` when unset), so a
+  nested interactive ash that inherits it (`ash`, `sh` on Alpine, `su` without `-l`, also under
+  bash or zsh) marks its own prompt, the distro's; on Alpine, Appine's `doas.d` rules
+  (`20-wheel.conf` and `30-appine.conf`) pin `setenv { ENV=/etc/profile.d/appine.ashrc }` so
+  `doas -s` / `doas sh` keeps ash's prompt marks too. Nested non-login `bash` (both distros) and
+  `zsh` (once `ensureShellRcHooks` runs after `zsh` is installed) also get prompt marks. Other
+  shells get no marks from it (fish and nushell send their own, and `android/vtcore` falls back to
+  foreground-process detection for unmarked shells and overwritten ash `PS1`), and shells that do
+  not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
   environment (android/vt), but show no motd.
 - The shared profile contains no zsh array syntax; only zsh sources `appine.zshrc`. The companion
   uses an anonymous function with `emulate -L zsh` for registration, so Alpine's sh emulation
@@ -273,19 +303,16 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ### Mirrors
 
-- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After every import, and
-  only then, on the `appine-mirrors` thread, `chooseMirror` probes every mirror at once (one
-  thread each, checking 512 KiB and 5 s thresholds between reads, waiting at most 10 s for each result) and takes the
-  highest throughput (ties to the earlier mirror); if every probe failed it does nothing. A read
-  can overshoot either probe threshold; these are not hard byte or elapsed-time caps.
-- Writing (`useMirror`): only while the distro's sources file (`/etc/apk/repositories` or
-  `debian.sources`) is byte for byte what the import wrote, with the official mirror, it is
-  written again from the same template with the winner (nothing is written when the official
-  mirror won). A file that differs in any way (already switched, edited by the user) or is
-  missing is left alone, so the mirror is switched at most once per import and the sources are
-  the user's from then on. It does not take the store lock; a failed write is only logged.
-- Nothing records the mirror in use and nothing in the app shows or changes it later: the user
-  edits the sources in the guest.
+- After obtaining the tarball, `prepare` starts the service's `probeMirrors` measurements in
+  distro list order, one task per mirror. Each measures throughput, checking the 512 KiB and
+  5 s thresholds between reads. The import proceeds while these tasks run.
+- After local configuration, the importer chooses the highest completed successful speed, breaking
+  ties in distro list order and falling back to the official mirror if no speed is available.
+  It writes Alpine's `main` and `community` to `/etc/apk/repositories`, or Debian's deb822
+  HTTP sources for trixie, updates and security to `/etc/apt/sources.list.d/debian.sources`.
+- The importer requests cancellation of outstanding probes before syncing and renaming the
+  temporary store. Probe tasks only measure throughput. A ready store skips the entire import,
+  so users can edit or remove sources in the guest.
 
 ### Accounts and login
 
@@ -293,8 +320,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   `nologin` or `false`) with the lowest UID, else root; `root`; or a named passwd entry, falling
   back to root. `regularAccounts` lists the same accounts for `android/settings`. `login.sh` picks
   the account by the same rules, except that it does not require a numeric GID or all seven fields.
-- `login.sh` traps SIGINT, so Ctrl-C does not end the login but still interrupts the command
-  running (normally apk or apt, skipping the install until the next login), chooses wheel, doas and
+- `login.sh` ignores `SIGINT` (`trap '' INT`) by default so Ctrl-C cannot disrupt short setup
+  commands (passwd lookup, group checks, shadow reads, rules publication, or the `su --help`
+  probe), temporarily catches `SIGINT` (`trap 'interrupted=1' INT`, restoring default disposition
+  in child processes) only around cancellable package-lock waits (`flock 9` in `locked`, `apk add
+  --wait 3600`) and Debian `apt-get` update/sleep/install calls, and restores `trap - INT` right
+  before `exec` into the user shell or `su`. It chooses wheel, doas and
   `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), else sudo, sudo and
   `/etc/sudoers.d/appine`, picks the account, and:
   - every login, root's included: rewrite the NOPASSWD rules for recorded admins still in the
@@ -303,11 +334,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     do a missing shadow entry and an unreadable `/etc/shadow`. The file is written beside it,
     made 0440 and renamed into place; with nobody qualifying, or without the rules' directory
     (on Debian, until sudo is installed), it is deleted;
-  - `--refresh-rules` as the first argument only rewrites the rules: `Rootfs.dirsChanged` runs
-    it as root, without a console and without waiting, when the service's poll finds `/etc`
-    itself among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
-    `/etc/shadow`; group changes replace `/etc/group`), so a password set in a running session
-    makes escalating ask for it within about one poll (2 s);
+  - the first service poll for each machine runs `--refresh-rules` as root without a console.
+    Later polls compare the inode, size, mtime and ctime of `/etc`, `/etc/passwd`, `/etc/group`,
+    `/etc/shadow` and `/var/lib/appine/admins`. A changed or unavailable sample triggers
+    another refresh. The worker starts the process and a separate thread waits for its exit.
+    Only a successful exit acknowledges the sample. Changes during a refresh are checked at
+    the next poll after it finishes;
   - before choosing the account: install procps-ng, then bubblewrap offline when their cache directories
     exist, under the install lock, testing `apk info -e <package>` (BusyBox already provides ps/top/free),
     re-add each by name for upgrades, and delete its cache under the lock only on success. Failure
@@ -322,8 +354,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - root: `cd` to the directory (else root's home, else `/`) and `exec` root's passwd shell (or
     `/bin/sh` when it is not executable) as a login shell;
   - a regular account not yet in `/var/lib/appine/admins` (matched literally): add it to wheel
-    (Alpine, with `permit persist :wheel` in `20-wheel.conf`) or sudo (Debian) and record it once
-    it really is in the group (otherwise say so and retry at the next login);
+    (Alpine, with `permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel` in
+    `20-wheel.conf`, also upgrading an unmodified stock `permit persist :wheel` file on
+    `refresh_rules` and `Rootfs.ensureLoginTools`/`updateProfile`) or sudo (Debian) and record it
+    once it really is in the group (otherwise say so and retry at the next login);
   - a regular account, while the tool's marker is missing and the tool is not on PATH (whether or
     not the account was just made an admin): install doas from the bundled package and re-add it
     by name under the install lock, or sudo from the network showing apt's progress (Ctrl-C skips
@@ -333,7 +367,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     `DPkg::Lock::Timeout`, which apt shows on the terminal), and touch the marker once the tool is
     there;
   - the install lock: a `flock` on `/run/appine-install.lock` held around each install of a bundled
-    package (`locked`), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
+    package (`locked` runs `flock 9 && "$@"` so commands never run if acquiring the lock fails), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another, each first
     checking whether an earlier holder installed it already; each `apk add` (`apk_add`) that fails
     on apk's own lock, held by an apk the user runs, prints that another apk is running and is
     retried with `--wait 3600`, so the login waits until that apk ends; Ctrl-C stops the wait and
@@ -348,34 +382,34 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 ### Inbound
 
 - `TerminalService` (`android/service`: start, import, switch, reset, the mirror probe, per-start
-  files, boot, the poll's `dirsChanged`, login accounts), `SettingsFragment` (`android/settings`:
+  files, boot, the poll's `LoginRules`, login accounts), `SettingsFragment` (`android/settings`:
   `Distro`, `installed`, `regularAccounts`, `loginAccount`), `Documents` (`android/documents`:
   `loginAccount`, `installed`, `isReady`, `access`), `ConsolePty` (`android/vt`: runs `login.sh`),
-  the instrumentation tests (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`,
+  the instrumentation tests (`fetch`, `prepare` into another store with supplied probe results, `updateProfile`,
   `PREFER_OSCLOCK`).
 
 ### Outbound
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
-  symlinks), `readFile` (null when missing), `spawn` and `waitFor` (`android/native`);
+  symlinks), `readFile` (null when missing), `loginRuleInputs`, `spawn` and `waitFor` (`android/native`);
   `HttpURLConnection` (system proxy); `BuildConfig` (Alpine branch); the bundled assets
   (`android/build`).
 
 ## Invariants and gotchas
 
+- Reset advances the in-process rootfs generation (`Rootfs.generation`) under the write lock.
+  Upstream's terminal imports check it before publishing a staged file; with `android/file-import`
+  retired here, nothing reads it.
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
-  mirror write, the import (on `rootfs.tmp`) and the per-start files run without it.
-- The probe starts as the import ends, so it can write the sources while the kernel opens the
-  store (a distro switch's `replace` joins the mirror thread before deleting the store). The write
-  opens its own store connection: at worst the kernel then skips one boot
-  cleanup (the store's leftovers under `/dev/shm` and `/run`, hidden by the tmpfs mounts, and
-  orphaned objects reclaimed later), with no corruption.
+  import (including package sources in the temporary store) and the per-start files run without it.
 - A store becomes ready only when the synced import is renamed into place, so a half-imported
   `rootfs.tmp` never counts and is deleted by the next `prepare` or `reset`.
 - An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
   distro on the next launch, from the verified tarball still in the cache or by downloading it
-  again with the usual progress; if that fails, the service falls back to Alpine with its notice.
+  again with the usual progress; if that fails and the service falls back to Alpine,
+  `Rootfs.deleteTarball` deletes the abandoned cached tarball (and any `.part` file) before
+  starting the Alpine fallback import.
 - The distro record is committed before the import starts, so an existing store always has it;
   only the app's own store writes it, but an import into another store (only the
   instrumentation tests make one) still overwrites (Alpine) and deletes the shared cached tarball.
@@ -396,37 +430,24 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   fresh `scripts/fetch-rootfs` fail until it is pinned anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; `android/vtcore`): bash, busybox ash and zsh do.
-- The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
-  trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
-- `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
-  lands during another command than an install (the passwd lookup, the group check, the shadow
-  read, the `su --help` probe) can log a named account in as root, leave an admin out of the
-  NOPASSWD rules until the next refresh, or make Debian fall back to `su -c`. The window is short.
+- Every rule writer takes the root-only rules lock before reading the accounts and holds it
+  through publication or removal. A failed publication attempts to remove stale grants.
+  Reading account files and publishing in the rules subdirectory do not change the sampled
+  inputs. The service polls every 2 s independently of the Files app's directory notifications.
+- `login.sh` runs without job control (its children share its process group), so `SIGINT` stays
+  ignored except inside `cancellable` waits/installs (`locked` uses a braced group rather than a
+  subshell so `interrupted=1` propagates while fd 9 still closes on exit) and is reset with
+  `trap - INT` immediately before every `exec`.
 
 ## Confirmed bugs / technical debt
 
-- Mirror template comparison and replacement are separate operations: a guest edit between
-  them can be overwritten.
-- `locked` runs the install command even when `flock 9` fails. The unchecked return is confirmed;
-  consequences under lock errors or interruption have not been reproduced.
-- Busybox ash can emit literal path controls through the visible prompt's `\w`. The directory
-  title is sanitized and restored after that prompt, but other terminal effects in visible
-  prompt text are not sanitized.
-- Automatic command titles cover bash and zsh only. Busybox ash has no preexec hook; it still
-  needs terminal-side or foreground-process detection to report commands that set no title.
-- **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
-  (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
-  than 256 changed directories between two polls stops recording the rest, and changes before the
-  service's first poll are not recorded, so such a change waits for the next login; while the app
-  is not running there is nothing to refresh.
+(None currently; busybox ash automatic command titles and unmarked-shell busy/completion fallback are now covered by foreground-process detection in `android/vtcore`, and Alpine `doas -s` preserves `ENV=/etc/profile.d/appine.ashrc`.)
 
 ## Open questions
 
 - Should a failed optional per-start write (the network, containers, doas package or profile file,
   for example through a directory the user replaced with a symlink, which `writeFile` refuses) fail
   the whole start rather than be logged?
-- Should a Debian tarball left in the cache after its import failed and fell back to Alpine be
-  deleted?
 
 ## To verify
 
@@ -441,9 +462,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
   temporary rules files rely on it).
-- The profile's bash marks in the app on Debian (tried only in a container with Ubuntu 26.04's
-  bash 5.3) and with a `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
-- The profile's zsh marks in the app (tried only in a container with Alpine's zsh 5.9) and with a
-  right prompt (its cells follow B, so they count as input), a multiline PS1 (rows after the first
-  are not marked as continuation rows), `prompt_percent` unset or a prompt framework (oh-my-zsh,
-  powerlevel10k).
+- The profile's bash marks in the app on Debian (verified in Debian trixie container for nested
+  bash and on Pixel 4a API 34 emulator for Alpine multi-line PS1/hook installation) and with a
+  prompt tool that rewrites PS1 after it each time.
+- The profile's zsh marks in the app (verified in macOS zsh 5.9 PTY, Alpine/Debian trixie
+  containers, and `VtShellIntegrationTest` on Pixel 4a API 34 emulator for right prompts,
+  multi-line PS1 continuations, `nopromptpercent` and Debian `ZDOTDIR`/rc hooks) with third-party
+  prompt frameworks (oh-my-zsh, powerlevel10k).

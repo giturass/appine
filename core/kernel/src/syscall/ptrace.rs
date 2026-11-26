@@ -1,22 +1,25 @@
 //! The tracer side of ptrace(2), plus process_vm_readv and process_vm_writev (the kernel/ptrace
 //! map). The tracee side is in [`crate::ptrace`].
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use appine_engine::PAGE_SIZE;
 
 use super::proc::may_ptrace;
 use super::{SysResult, get, put};
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};
+use crate::mm::Mm;
 use crate::process::Signal;
 use crate::ptrace::{
     BRK_SLOTS, EVENTMSG_SYSCALL_ENTRY, EVENTMSG_SYSCALL_EXIT, HwDebug, Mode, Regs, Stop, Trace,
     WATCH_SLOTS, event, opt,
 };
 use crate::signal::{self, SigInfo};
-use crate::task::Task;
+use crate::task::{Task, TaskSync};
 use crate::uaccess::UserSlice;
 
 const TRACEME: i64 = 0;
@@ -69,23 +72,22 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
     // the thread must also be in a ptrace-stop (Linux's ptrace_check_attach)
     {
         let t = task.trace.borrow();
-        if t.tracer != Some(cx.tgid()) || !(matches!(request, KILL | INTERRUPT) || t.stopped()) {
+        if t.tracer != Some(cx.tgid())
+            || !(matches!(request, KILL | INTERRUPT) || (t.stopped() && !task.killed.get()))
+        {
             return Err(Errno::ESRCH);
         }
     }
     match request {
-        PEEKTEXT | PEEKDATA => peek(cx, &task, addr, data),
+        PEEKTEXT | PEEKDATA => {
+            let expected = Rc::downgrade(&task);
+            drop(task);
+            peek(cx, pid, &expected, addr, data)
+        }
         POKETEXT | POKEDATA => {
-            if !may_access_vm(cx, &task) {
-                return Err(Errno::EIO);
-            }
-            // As with Linux's FOLL_FORCE, private mappings without write permission can be
-            // written: setting breakpoints
-            let mm = task.res.borrow().mm.clone();
-            mm.borrow_mut()
-                .write_force(addr, &data.to_le_bytes(), &cx.task.sync)
-                .map_err(|_| Errno::EIO)?;
-            Ok(0)
+            let expected = Rc::downgrade(&task);
+            drop(task);
+            poke(cx, pid, &expected, addr, data)
         }
         CONT => resume(&task, Mode::Cont, data),
         SYSCALL => resume(&task, Mode::Syscall, data),
@@ -293,16 +295,80 @@ fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
 }
 
 /// PTRACE_PEEKTEXT, PTRACE_PEEKDATA: reads one word of the tracee and writes it to `data`.
-fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
-    if !may_access_vm(cx, task) {
+fn peek(cx: &mut Cx<'_>, pid: i32, expected: &Weak<Task>, addr: u64, data: u64) -> SysResult {
+    let mut word = [0u8; 8];
+    access_tracee_vm(cx, pid, expected, |mm, _| mm.read_force(addr, &mut word))?;
+    put(cx, data, word).map(|()| 0)
+}
+
+/// PTRACE_POKETEXT, PTRACE_POKEDATA: writes one word to the tracee (Linux's `FOLL_FORCE`:
+/// private mappings without write permission can be written, e.g. setting breakpoints).
+fn poke(cx: &mut Cx<'_>, pid: i32, expected: &Weak<Task>, addr: u64, data: u64) -> SysResult {
+    let word = data.to_le_bytes();
+    access_tracee_vm(cx, pid, expected, |mm, current| {
+        mm.write_force(addr, &word, current)
+    })?;
+    Ok(0)
+}
+
+/// Re-validates that `pid` is still the same live thread (`expected`), traced by the current
+/// process, in a ptrace-stop (Linux's `ptrace_check_attach`), and that its memory may be
+/// accessed (`may_access_vm`), returning its current address space.
+fn tracee_vm(cx: &Cx<'_>, pid: i32, expected: &Weak<Task>) -> Result<Rc<RefCell<Mm>>, Errno> {
+    let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
+    if !expected
+        .upgrade()
+        .is_some_and(|orig| Rc::ptr_eq(&task, &orig))
+    {
+        return Err(Errno::ESRCH);
+    }
+    {
+        let t = task.trace.borrow();
+        if t.tracer != Some(cx.tgid()) || !t.stopped() || task.killed.get() {
+            return Err(Errno::ESRCH);
+        }
+    }
+    if !may_access_vm(cx, &task) {
         return Err(Errno::EIO);
     }
-    let mm = task.res.borrow().mm.clone();
-    let mut word = [0u8; 8];
-    mm.borrow()
-        .read(UserSlice::new(addr, 8), &mut word)
-        .map_err(|_| Errno::EIO)?;
-    put(cx, data, word).map(|()| 0)
+    Ok(task.res.borrow().mm.clone())
+}
+
+/// Runs a forced memory access against tracee `pid`, filling any cold FUSE pages (`Fill`) with
+/// the BKL released and re-validating ptrace attachment, stop state and `may_access_vm` after
+/// every wait so a detached, resumed, killed or exited tracee is never accessed.
+fn access_tracee_vm(
+    cx: &mut Cx<'_>,
+    pid: i32,
+    expected: &Weak<Task>,
+    mut op: impl FnMut(&mut Mm, &Arc<TaskSync>) -> Result<(), Errno>,
+) -> Result<(), Errno> {
+    let current = cx.task.sync.clone();
+    for _ in 0..=super::FUSE_RETRIES {
+        let mm = tracee_vm(cx, pid, expected)?;
+        let result = {
+            let mut mm = mm.borrow_mut();
+            op(&mut mm, &current)
+        };
+        drop(mm);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(Errno::FUSE_RETRY) => {
+                let page = crate::mm::take_wanted().ok_or(Errno::EIO)?;
+                if let Err(e) = super::fuse::fill(cx, page) {
+                    if e == Errno::EINTR {
+                        return Err(Errno::ERESTARTSYS);
+                    }
+                    return match tracee_vm(cx, pid, expected) {
+                        Err(Errno::ESRCH) => Err(Errno::ESRCH),
+                        _ => Err(Errno::EIO),
+                    };
+                }
+            }
+            Err(_) => return Err(Errno::EIO),
+        }
+    }
+    Err(Errno::EIO)
 }
 
 /// Whether the tracer may read and write the tracee's memory with `PTRACE_PEEK*`/`POKE*` (Linux's
@@ -568,23 +634,30 @@ pub(super) fn process_vm(
     write: bool,
 ) -> SysResult {
     const IOV_MAX: u64 = 1024;
-    if flags != 0 || local_count > IOV_MAX || remote_count > IOV_MAX {
+    if flags != 0 || local_count > IOV_MAX {
         return Err(Errno::EINVAL);
     }
     let local = iovecs(cx, local, local_count)?;
     if local.iter().all(|&(_, len)| len == 0) {
         return Ok(0);
     }
+    if remote_count > IOV_MAX {
+        return Err(Errno::EINVAL);
+    }
     let remote = iovecs(cx, remote, remote_count)?;
+    if remote.iter().all(|&(_, len)| len == 0) {
+        return Ok(0);
+    }
     let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
     if !may_ptrace(cx, task.tid.get()) {
         return Err(Errno::EPERM);
     }
     let target: Rc<_> = task.res.borrow().mm.clone();
+    drop(task);
     let mut local = local.into_iter().filter(|&(_, len)| len > 0);
     let mut cur = (0, 0);
     let mut total = 0u64;
-    let mut faulted = false;
+    let mut faulted = None;
     let mut buf = Vec::new();
     'remote: for (base, len) in remote {
         let mut done = 0;
@@ -596,20 +669,32 @@ pub(super) fn process_vm(
                 }
             }
             let addr = base + done;
-            let n = (len - done).min(cur.1).min(PAGE_SIZE - addr % PAGE_SIZE) as usize;
+            let n = (len - done)
+                .min(cur.1)
+                .min(PAGE_SIZE - addr % PAGE_SIZE)
+                .min(PAGE_SIZE - cur.0 % PAGE_SIZE) as usize;
             buf.resize(n, 0);
-            let ok = if write {
-                cx.mm().read(UserSlice::new(cur.0, n), &mut buf).is_ok()
-                    && target.borrow().write(UserSlice::new(addr, n), &buf).is_ok()
+            let step = if write {
+                super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+                    cx.mm().read(UserSlice::new(cur.0, n), &mut buf)
+                })
+                .and_then(|()| {
+                    super::retry_user_pages(cx, Errno::ERESTARTSYS, |_| {
+                        target.borrow().write(UserSlice::new(addr, n), &buf)
+                    })
+                })
             } else {
-                target
-                    .borrow()
-                    .read(UserSlice::new(addr, n), &mut buf)
-                    .is_ok()
-                    && cx.mm().write(UserSlice::new(cur.0, n), &buf).is_ok()
+                super::retry_user_pages(cx, Errno::ERESTARTSYS, |_| {
+                    target.borrow().read(UserSlice::new(addr, n), &mut buf)
+                })
+                .and_then(|()| {
+                    super::retry_user_pages(cx, Errno::ERESTARTSYS, |cx| {
+                        cx.mm().write(UserSlice::new(cur.0, n), &buf)
+                    })
+                })
             };
-            if !ok {
-                faulted = true;
+            if let Err(e) = step {
+                faulted = Some(e);
                 break 'remote;
             }
             done += n as u64;
@@ -617,14 +702,23 @@ pub(super) fn process_vm(
             cur = (cur.0 + n as u64, cur.1 - n as u64);
         }
     }
-    if faulted && total == 0 {
-        return Err(Errno::EFAULT);
+    if total == 0
+        && let Some(e) = faulted
+    {
+        return Err(if e == Errno::ERESTARTSYS {
+            Errno::ERESTARTSYS
+        } else {
+            Errno::EFAULT
+        });
     }
     Ok(total)
 }
 
 /// Reads `count` iovecs.
 fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut b = vec![0u8; count as usize * 16];
     cx.mm().read(UserSlice::new(addr, b.len()), &mut b)?;
     let mut total = 0u64;

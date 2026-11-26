@@ -3,6 +3,7 @@ biometric = "1.1.0"
 browser = "1.10.0"
 core = "1.19.1"
 junit = "1.3.0"
+junit4 = "4.13.2"
 material = "1.14.0"
 preference = "1.2.1"
 recyclerview = "1.2.1"
@@ -18,4 +19,5 @@ androidx-preference = { group = "androidx.preference", name = "preference", vers
 androidx-recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
 androidx-runner = { group = "androidx.test", name = "runner", version.ref = "runner" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "webkit" }
+junit4 = { group = "junit", name = "junit", version.ref = "junit4" }
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }

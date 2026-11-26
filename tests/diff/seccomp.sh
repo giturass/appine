@@ -528,6 +528,10 @@ static void *sibling(void *arg)
     write(sibling_done[1], "r", 1);
     char c;
     while (read(sibling_go[0], &c, 1) == 1 && c != 'q') {
+        if (c == 'n') {
+            result("  sibling no_new_privs", prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+            status_lines("sibling", gettid());
+        }
         if (c == 'f')
             install(SYS_getsid, RET_ERRNO | 2, 0);
         if (c == 'c') {
@@ -539,6 +543,17 @@ static void *sibling(void *arg)
         write(sibling_done[1], "d", 1);
     }
     return arg;
+}
+
+static pthread_t start_sibling(void)
+{
+    pipe(sibling_go);
+    pipe(sibling_done);
+    pthread_t t;
+    pthread_create(&t, NULL, sibling, NULL);
+    char ready;
+    read(sibling_done[0], &ready, 1);
+    return t;
 }
 
 static void sibling_do(char c)
@@ -676,6 +691,26 @@ static void fast_path(void)
     wait_for(pid);
 }
 
+static void no_new_privs(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t = start_sibling();
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        sibling_do('n');
+        pid_t child = fork();
+        if (child == 0)
+            _exit(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 ? 0 : 1);
+        printf("  fork inherited no_new_privs: %s\n", describe(wait_for(child)));
+        result("  synchronize no_new_privs", install(SYS_getppid, RET_ALLOW, FLAG_TSYNC));
+        sibling_do('n');
+        sibling_do('q');
+        pthread_join(t, NULL);
+        _exit(0);
+    }
+    printf("no_new_privs: %s\n", describe(wait_for(pid)));
+}
+
 static void inherit(void)
 {
     printf("== inheritance and tsync\n");
@@ -695,12 +730,7 @@ static void inherit(void)
     printf("fork and exec: %s\n", describe(wait_for(pid)));
     pid = fork();
     if (pid == 0) {
-        pipe(sibling_go);
-        pipe(sibling_done);
-        pthread_t t;
-        pthread_create(&t, NULL, sibling, NULL);
-        char c;
-        read(sibling_done[0], &c, 1);
+        pthread_t t = start_sibling();
         /* A sibling thread without seccomp can be synchronized */
         result("tsync", install(SYS_getppid, RET_ERRNO | EPERM, FLAG_TSYNC));
         sibling_do('c');
@@ -1296,6 +1326,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     alarm(60);
     drop_sys_admin();
+    no_new_privs();
     basics();
     strict();
     checks();

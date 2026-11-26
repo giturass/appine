@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: upstream sharded CI and Appine 1.1.0 signed releases with GPU inputs and updated JNI checks)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's CI shard and reproduction-note updates alongside the retained Appine 1.1.0 signed-release workflow)
 
 ## Responsibilities
 
@@ -109,8 +109,8 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
   `--ulimit nice=40:40`, the Docker daemon's proxy settings, `-it` only when stdin and stdout are
   terminals, docker's default seccomp, and only `APPINE_DBT_REGS` forwarded (when set).
 - `ci.yml`, on every push and pull request that changes more than `docs/`, `.agents/`, Markdown
-  or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs
-  and `cargo test --workspace` with the require switches.
+  or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy (`-D warnings`), fetch the rootfs,
+  open `ping_group_range` and `cargo test --workspace` with the require switches.
 - `android.yml`, on pushes and pull requests that change `core/`, `hosts/android/`, `android/`,
   the Cargo files or the rootfs, Ghostty and virglrenderer fetch scripts (or on demand), on x86_64 (`ubuntu-24.04`,
   for aapt2): NDK 29.0.14206865, SDK CMake 3.22.1, Java 21, cargo-ndk (unpinned), the rootfs, Zig 0.17.0 (from
@@ -147,8 +147,9 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
     `appine-run` artifact (`retention-days: 7`, `overwrite: true`).
   - `checks`: runs in parallel with `build` and `difftest` — the network test, a 200,000-iteration
     lockstep run, and the engine/lockstep tests built with clang.
-  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): five independent single-lane
-    shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) that partition
+  - `difftest` (`needs: [changed, build]`, `fail-fast: false`): ten independent single-lane
+    shards (`gvisor-process`, `gvisor`, `gvisor-fs-devices`, `gvisor-inet`, `gvisor-unix-address`, `gvisor-unix-pairs`,
+    `gvisor-slow`, `starnix`, `core-1`, `core-2`) that partition
     `tests/diff/*.sh` deterministically without installing Rust. Each shard downloads and
     `chmod +x`s `appine-run`, restores `target/rootfs` and (if needed) its suite cache with the
     builder script as fallback, opens `ping_group_range`, runs `scripts/difftest -R` on its slice
@@ -204,7 +205,7 @@ Android builds `android/build`, rootfs fetching `android/setup`, kernel run/cons
 
 - On Pixel 11 Pro, Alpine llama.cpp b9564 selects incompatible matrix-multiply and Flash Attention tiles for the PowerVR GPU's 128-lane subgroups. Full offload with `-fa off -ub 16` passed both surveyed Qwen2.5 prompts. The native driver also signals zero-batch submission fences early. The [device survey](../../docs/mobile-gpu.md#powervr-correctness) records the independent controls.
 - On Galaxy S23 firmware `S9110ZCS8FZJ1`, llama.cpp b9564 reproduces the Adreno 740 shader link failure during warm-up in both Alpine and native Android. Native runs identify `quantize_q8_1_x4` for both surveyed Qwen2.5 models. The guest logs do not name the shader. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
-- On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, Alpine llama.cpp b9564 completes full Vulkan offload on Adreno 830 but produces incorrect text for both surveyed Qwen2.5 prompts. The cause remains open. The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
+- On Galaxy S25 Ultra firmware `S9380ZCS8BZA1`, llama.cpp b9564 reproduces both Adreno 830 failures in Alpine and native Android independently of Appine and Venus: full Vulkan offload completes with incorrect text for both surveyed Qwen2.5 prompts, and `-fa off -ub 16` aborts with a shader link failure on `mul_mat_vec_q4_0_q8_1_f32` (named in native logs). The [device survey](../../docs/mobile-gpu.md#llamacpp-on-alpine-324) records the CPU controls and alternative Vulkan settings.
 
 ## Open questions
 

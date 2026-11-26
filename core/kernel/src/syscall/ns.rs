@@ -25,12 +25,12 @@ use crate::vfs::{MntNs, MountId, Node, Vfs, new_ns_id};
 /// (ENOSPC; older kernels give EUSERS for the level), a chrooted process may not (EPERM), and the
 /// creator's effective user ID and group ID must be mapped in the old namespace (EPERM).
 /// `chrooted` means the root directory is not the mount namespace's root.
-pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
+pub(super) fn new_user_ns(cx: &mut Cx<'_>, cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
     let parent = cred.user_ns.clone();
     if parent.level > MAX_USER_NS_LEVEL {
         return Err(Errno::ENOSPC);
     }
-    check_counts(k, &[Counted::User], &parent, cred.euid)?;
+    check_counts(cx.k(), &[Counted::User], &parent, cred.euid)?;
     if chrooted {
         return Err(Errno::EPERM);
     }
@@ -41,7 +41,10 @@ pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Re
     }
     let setfcap = cred.cap_effective & 1 << cap::SETFCAP != 0;
     let ns = UserNs::child(&parent, cred.euid, setfcap);
-    k.ucounts
+    ns.mq_max
+        .set(cx.t.group.borrow().rlimits[crate::process::RLIMIT_MSGQUEUE as usize].0);
+    cx.k()
+        .ucounts
         .add(Counted::User, &parent, cred.euid, ns.clone(), Some(ns.id));
     cred.enter_user_ns(ns);
     Ok(())
@@ -401,26 +404,49 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
 /// be changed (Linux's `timens_commit`).
 fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     if let Some(ns) = set.user {
-        let mut cred = cx.cred();
+        let old = cx.cred();
+        let mut cred = old.clone();
         cred.enter_user_ns(ns);
+        // Linux's commit_creds sets dumpable to fs.suid_dumpable and clears pdeathsig when
+        // entering a user namespace not owned by the caller's euid (!cred_cap_issubset(old, new))
+        if !cred.caps_subset_of(&old) {
+            let mode = crate::coredump::suid_dumpable(cx.kr());
+            cx.t.group.borrow_mut().set_dumpable_mode(mode);
+            cx.task.pdeathsig.set(0);
+        }
         cx.set_cred(cred);
     }
     if let (Some(ns), Some(root)) = (set.mnt, root) {
-        let mut fs = cx.t.fs.borrow_mut();
-        fs.set_root(root.clone());
-        fs.set_cwd(root);
-        fs.mnt_ns = ns;
-        drop(fs);
+        // When a pidfd setns combines CLONE_NEWNS with other namespace types while the fs context
+        // is shared (Linux's prepare_nsset copies fs_struct), switch only the caller's own copy
+        // rather than mutating the shared FsContext seen by other tasks
+        if Rc::strong_count(&cx.t.fs) > 2 {
+            let umask = cx.t.fs.borrow().umask;
+            let copy = FsContext {
+                root: root.clone(),
+                cwd: root,
+                umask,
+                mnt_ns: ns,
+            };
+            cx.set_fs(Rc::new(crate::cell::RefCell::new(copy)));
+        } else {
+            let mut fs = cx.t.fs.borrow_mut();
+            fs.set_root(root.clone());
+            fs.set_cwd(root);
+            fs.mnt_ns = ns;
+        }
         cx.shared.fast_changed();
     }
     if set.ipc.is_some() {
-        let tgid = cx.tgid();
-        cx.ipc_mut().exit(tgid);
+        crate::ipc::leave_undo(cx);
     }
     {
         let mut p = cx.task.ns.borrow_mut();
         if let Some(ns) = set.uts {
             p.uts = ns;
+        }
+        if let Some(ns) = set.ipc {
+            p.ipc = ns;
         }
         if let Some(ns) = set.cgroup {
             p.cgroup = ns;
@@ -428,10 +454,6 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         if let Some(ns) = set.net {
             p.net = ns;
         }
-    }
-    if let Some(ns) = set.ipc {
-        cx.task.ns.borrow_mut().ipc = ns;
-        cx.k().collect_ipc();
     }
     if let Some(ns) = set.pid {
         *cx.task.pid_ns_children.borrow_mut() = Some(ns);
@@ -519,7 +541,7 @@ pub(super) fn ioctl(
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),
     );
-    cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
+    cx.install_fd(file, true).map(|fd| fd as u64)
 }
 
 /// The owner of namespace `ns`, which must be the caller's user namespace or below it (Linux's

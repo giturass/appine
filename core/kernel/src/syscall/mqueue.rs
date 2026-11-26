@@ -14,13 +14,13 @@
 //! then gets the cookie marked removed, which ends musl's helper thread. Limits follow
 //! `/proc/sys/fs/mqueue/*`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{SysResult, get, put, read_timespec};
 use crate::cell::RefCell;
-use crate::cred::{Cred, MAY_READ, MAY_WRITE, cap};
+use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
@@ -93,31 +93,78 @@ impl Default for Limits {
     }
 }
 
+/// The process holding an `mq_notify` registration (Linux holds its `struct pid`): pinning the
+/// `ThreadGroup` weakly ensures an exited registrant whose fd table lives on via `CLONE_FILES`
+/// cannot match a new process that later reuses the same tgid.
+struct Registrant {
+    tgid: Tid,
+    group: Weak<RefCell<crate::process::ThreadGroup>>,
+}
+
+impl Registrant {
+    fn of(group: &Rc<RefCell<crate::process::ThreadGroup>>) -> Registrant {
+        Registrant {
+            tgid: group.borrow().tgid,
+            group: Rc::downgrade(group),
+        }
+    }
+
+    fn is_group(&self, group: &Rc<RefCell<crate::process::ThreadGroup>>) -> bool {
+        self.group.upgrade().is_some_and(|g| Rc::ptr_eq(&g, group))
+    }
+
+    fn live_group(
+        &self,
+        k: &crate::kernel::Kernel,
+    ) -> Option<Rc<RefCell<crate::process::ThreadGroup>>> {
+        let g = self.group.upgrade()?;
+        k.groups
+            .get(&self.tgid)
+            .filter(|cur| Rc::ptr_eq(cur, &g) && g.borrow().zombie.is_none())
+            .map(|_| g)
+    }
+
+    fn is_live(&self, k: &crate::kernel::Kernel) -> bool {
+        self.live_group(k).is_some()
+    }
+
+    /// The registrant's tgid while it is still alive (not exited or reaped), else 0 for status.
+    fn live_tgid(&self) -> Tid {
+        if self
+            .group
+            .upgrade()
+            .is_some_and(|g| g.borrow().zombie.is_none())
+        {
+            self.tgid
+        } else {
+            0
+        }
+    }
+}
+
 /// An mq_notify registration.
 enum Notify {
     Signal {
-        tgid: Tid,
+        owner: Registrant,
         sig: Signal,
         value: u64,
     },
     /// Does nothing, only holding the notification (`SIGEV_NONE`).
-    None {
-        tgid: Tid,
-    },
+    None { owner: Registrant },
     /// Delivers the cookie to a netlink socket (`SIGEV_THREAD`).
     Socket {
-        tgid: Tid,
+        owner: Registrant,
         sock: Weak<RefCell<Socket>>,
         cookie: [u8; 32],
     },
 }
 
 impl Notify {
-    fn tgid(&self) -> Tid {
+    fn owner(&self) -> &Registrant {
         match self {
-            Notify::Signal { tgid, .. } | Notify::None { tgid } | Notify::Socket { tgid, .. } => {
-                *tgid
-            }
+            Notify::Signal { owner, .. }
+            | Notify::None { owner }
+            | Notify::Socket { owner, .. } => owner,
         }
     }
 }
@@ -169,6 +216,7 @@ impl MqDir {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             blocks: None,
+            ..Stat::default()
         }
     }
 
@@ -184,8 +232,81 @@ impl Default for MqDir {
     }
 }
 
+/// Charged capacity per (user namespace, real kernel uid), shared across IPC namespaces.
+pub(crate) type MqUsage = Rc<std::cell::RefCell<BTreeMap<(u64, u32), u64>>>;
+
+struct QueueCharge {
+    usage: MqUsage,
+    owners: Vec<(u64, u32)>,
+    bytes: u64,
+}
+
+impl QueueCharge {
+    fn reserve(
+        usage: &MqUsage,
+        cred: &Cred,
+        mut limit: u64,
+        maxmsg: u64,
+        msgsize: u64,
+    ) -> Result<Self, Errno> {
+        // arm64 Linux accounts a 48-byte msg_msg per slot and a 48-byte priority tree node
+        // per possible priority, in addition to the maximum payload.
+        let overhead = maxmsg
+            .checked_mul(48)
+            .and_then(|n| n.checked_add(maxmsg.min(MQ_PRIO_MAX.into()) * 48));
+        let bytes = maxmsg
+            .checked_mul(msgsize)
+            .zip(overhead)
+            .and_then(|(data, overhead)| data.checked_add(overhead))
+            .ok_or(Errno::EOVERFLOW)?;
+        let mut owners = Vec::new();
+        let mut ns = &cred.user_ns;
+        let mut uid = cred.ruid;
+        let mut totals = usage.borrow_mut();
+        loop {
+            let owner = (ns.id, uid);
+            if totals
+                .get(&owner)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(bytes)
+                .is_none_or(|n| n > limit.min(i64::MAX as u64))
+            {
+                return Err(Errno::EMFILE);
+            }
+            owners.push(owner);
+            let Some(parent) = &ns.parent else { break };
+            limit = ns.mq_max.get();
+            uid = ns.owner;
+            ns = parent;
+        }
+        for owner in &owners {
+            *totals.entry(*owner).or_default() += bytes;
+        }
+        Ok(Self {
+            usage: usage.clone(),
+            owners,
+            bytes,
+        })
+    }
+}
+
+impl Drop for QueueCharge {
+    fn drop(&mut self) {
+        let mut totals = self.usage.borrow_mut();
+        for owner in &self.owners {
+            let total = totals.get_mut(owner).expect("missing message queue charge");
+            *total -= self.bytes;
+            if *total == 0 {
+                totals.remove(owner);
+            }
+        }
+    }
+}
+
 /// A message queue.
 pub struct MessageQueue {
+    _charge: QueueCharge,
     /// Inode number: nodes in the mqueue filesystem find their queue by it.
     pub ino: u64,
     /// The number of the IPC namespace it is in (fstat's device number follows it).
@@ -234,9 +355,11 @@ impl MessageQueue {
     pub fn status(&self) -> Vec<u8> {
         let qsize: usize = self.messages.iter().map(|(_, m)| m.len()).sum();
         let (notify, signo, pid) = match &self.notify {
-            Some(Notify::Signal { tgid, sig, .. }) => (SIGEV_SIGNAL, sig.number(), *tgid),
-            Some(Notify::None { tgid }) => (SIGEV_NONE, 0, *tgid),
-            Some(Notify::Socket { tgid, .. }) => (SIGEV_THREAD, 0, *tgid),
+            Some(Notify::Signal { owner, sig, .. }) => {
+                (SIGEV_SIGNAL, sig.number(), owner.live_tgid())
+            }
+            Some(Notify::None { owner }) => (SIGEV_NONE, 0, owner.live_tgid()),
+            Some(Notify::Socket { owner, .. }) => (SIGEV_THREAD, 0, owner.live_tgid()),
             None => (0, 0, 0),
         };
         format!("QSIZE:{qsize:<10} NOTIFY:{notify:<5} SIGNO:{signo:<5} NOTIFY_PID:{pid:<6}\n")
@@ -257,6 +380,7 @@ impl MessageQueue {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             blocks: None,
+            ..Stat::default()
         }
     }
 
@@ -309,6 +433,9 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
+    let dir_st = cx.ipc().mq_dir.borrow().stat(cx.ipc().mqueues.len());
+    // Lookup in the internal mqueue root directory requires search permission (do_mq_open)
+    cred.permission(&dir_st, MAY_EXEC)?;
     let existing = cx.ipc().mqueues.get(&name).cloned();
     let queue = match existing {
         Some(_)
@@ -328,6 +455,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         }
         None if flags & oflags::O_CREAT == 0 => return Err(Errno::ENOENT),
         None => {
+            cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
             let privileged = cred.capable(cap::SYS_RESOURCE);
             let mut size = None;
             if attr != 0 {
@@ -346,7 +474,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
                 size = Some((m as u64, s as u64));
             }
             let ns = cx.ns().ipc.id;
-            new_queue(cx.ipc(), ns, &cred, perm & !cx.umask(), size)?
+            new_queue(cx, ns, &cred, perm & !cx.umask(), size)?
         }
     };
     let path: Rc<[u8]> = Rc::from([b"/".as_slice(), &name].concat());
@@ -355,8 +483,11 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         accmode | (flags & oflags::O_NONBLOCK),
         Some(path),
     );
+    // Opened via mq_open on the IPC namespace's internal mqueue instance (Linux's alloc_file_pseudo),
+    // not through a user-visible mqueue mount.
+    file.borrow_mut().pseudo = true;
     // Always close-on-exec, as on Linux; when out of fds (EMFILE) the new queue is not left behind
-    let fd = cx.fds_mut().install(file, true, 0)?;
+    let fd = cx.install_fd(file, true)?;
     insert_queue(cx.ipc_mut(), name, queue);
     Ok(fd as u64)
 }
@@ -369,12 +500,13 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
 /// installing the fd). The defaults are capped by `msg_max` and `msgsize_max`
 /// (`mqueue_get_inode`).
 pub(crate) fn new_queue(
-    ipc: &crate::ipc::Ipc,
+    cx: &Cx<'_>,
     ns: u64,
     cred: &Cred,
     perm: u32,
     size: Option<(u64, u64)>,
 ) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
+    let ipc = cx.kr().ipc(ns);
     let limits = &ipc.mq_limits;
     if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
         return Err(Errno::ENOSPC);
@@ -383,8 +515,22 @@ pub(crate) fn new_queue(
         limits.msg_default.min(limits.msg_max),
         limits.msgsize_default.min(limits.msgsize_max),
     ));
+    let limit = cx.t.group.borrow().rlimits[crate::process::RLIMIT_MSGQUEUE as usize].0;
+    create_queue(&cx.kr().mq_usage, ns, cred, limit, perm, (maxmsg, msgsize))
+}
+
+fn create_queue(
+    usage: &MqUsage,
+    ns: u64,
+    cred: &Cred,
+    limit: u64,
+    perm: u32,
+    (maxmsg, msgsize): (u64, u64),
+) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
     let now = crate::tty::wall_ns();
+    let charge = QueueCharge::reserve(usage, cred, limit, maxmsg, msgsize)?;
     Ok(Rc::new(RefCell::new(MessageQueue {
+        _charge: charge,
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         ns,
         uid: cred.fsuid,
@@ -417,18 +563,24 @@ pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
 }
 
 /// Removes queue `name` (mq_unlink, and unlink in the mqueue filesystem, both Linux's
-/// `vfs_unlink`): the root directory has the sticky bit, so the caller must own the queue or the
-/// root directory, or have `CAP_FOWNER` over the queue; otherwise EPERM (libc's mq_unlink turns
-/// that into EACCES).
+/// `vfs_unlink`): checks search and write permission on the mqueue root directory, and enforces
+/// the sticky-bit owner rule only when the root directory has `S_ISVTX` set (libc's mq_unlink
+/// turns `EPERM` into `EACCES`).
 pub(crate) fn remove_queue(
     ipc: &mut crate::ipc::Ipc,
     cred: &Cred,
     name: &[u8],
 ) -> Result<(), Errno> {
+    let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+    cred.permission(&dir_st, MAY_EXEC)?;
     let q = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
     let st = q.borrow().stat();
-    let dir_uid = ipc.mq_dir.borrow().uid;
-    if cred.fsuid != st.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&st, cap::FOWNER) {
+    if dir_st.mode & mode::S_ISVTX != 0
+        && cred.fsuid != st.uid
+        && cred.fsuid != dir_st.uid
+        && !cred.capable_wrt(&st, cap::FOWNER)
+    {
         return Err(Errno::EPERM);
     }
     ipc.mqueues.remove(name);
@@ -517,28 +669,29 @@ pub(super) fn mq_timedsend(
         }
     };
     match notify {
-        Some(Notify::Signal { tgid, sig, value }) => {
-            // si_pid and si_uid are as the registering process sees them (Linux's __do_notify
-            // uses the user namespace at registration; here its current one is used), and after
-            // that, like any other signal, they are translated once more as sent by the sender
-            let cred = cx.cred();
-            let uid = cx
-                .kr()
-                .groups
-                .get(&tgid)
-                .map_or(cred.ruid, |g| g.borrow().cred.uid_out(cred.ruid));
-            let info = SigInfo {
-                code: SI_MESGQ,
-                fields: InfoFields::Queue {
-                    pid: cx.kr().pid_seen_by(tgid, cx.tgid()),
-                    uid,
-                    value,
-                },
-                sender: cx.tgid(),
-                ..SigInfo::default()
+        Some(Notify::Signal { owner, sig, value }) => {
+            // Only signal if the registering ThreadGroup itself is still live (not a new process
+            // that later reused the same tgid after the registrant exited with shared CLONE_FILES)
+            if let Some(group) = owner.live_group(cx.kr()) {
+                let tgid = owner.tgid;
+                // si_pid and si_uid are as the registering process sees them (Linux's __do_notify
+                // uses the user namespace at registration; here its current one is used), and after
+                // that, like any other signal, they are translated once more as sent by the sender
+                let cred = cx.cred();
+                let uid = group.borrow().cred.uid_out(cred.ruid);
+                let info = SigInfo {
+                    code: SI_MESGQ,
+                    fields: InfoFields::Queue {
+                        pid: cx.kr().pid_seen_by(tgid, cx.tgid()),
+                        uid,
+                        value,
+                    },
+                    sender: cx.tgid(),
+                    ..SigInfo::default()
+                }
+                .sent_by(&cred);
+                signal::send_to_group(cx.kr(), tgid, sig, info);
             }
-            .sent_by(&cred);
-            signal::send_to_group(cx.kr(), tgid, sig, info);
         }
         Some(Notify::Socket { sock, cookie, .. }) => send_cookie(&sock, cookie, NOTIFY_WOKENUP),
         _ => {}
@@ -596,9 +749,11 @@ pub(super) fn mq_timedreceive(
         r?;
     };
     request_wake_object(wake::of(&q));
-    cx.mm().write(UserSlice::new(msg, data.len()), &data)?;
+    super::copy_result(cx, |cx| {
+        cx.mm().write(UserSlice::new(msg, data.len()), &data)
+    })?;
     if prio != 0 {
-        put(cx, prio, p.to_le_bytes())?;
+        super::copy_result(cx, |cx| put(cx, prio, p.to_le_bytes()))?;
     }
     Ok(data.len() as u64)
 }
@@ -629,23 +784,26 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         None
     };
     let (q, _) = queue_of(cx, fd)?;
-    let tgid = cx.tgid();
     let Some(b) = sev else {
         // Cancel one's own registration
         let mut q = q.borrow_mut();
-        if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
+        if q.notify
+            .as_ref()
+            .is_some_and(|n| n.owner().is_group(&cx.t.group))
+        {
             remove_notification(&mut q);
             q.touch_read();
         }
         return Ok(0);
     };
+    let owner = Registrant::of(&cx.t.group);
     let value = u64::from_le_bytes(b[..8].try_into().unwrap());
     let signo = i32::from_le_bytes(b[8..12].try_into().unwrap());
     let how = i32::from_le_bytes(b[12..16].try_into().unwrap());
     let notify = match how {
-        SIGEV_NONE => Notify::None { tgid },
+        SIGEV_NONE => Notify::None { owner },
         SIGEV_SIGNAL => Notify::Signal {
-            tgid,
+            owner,
             sig: Signal::new(signo).ok_or(Errno::EINVAL)?,
             value,
         },
@@ -660,18 +818,19 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
                 _ => return Err(Errno::ENOTSOCK),
             };
             let cookie: [u8; 32] = get(cx, value)?;
-            Notify::Socket { tgid, sock, cookie }
+            Notify::Socket {
+                owner,
+                sock,
+                cookie,
+            }
         }
         _ => return Err(Errno::EINVAL),
     };
     let mut q = q.borrow_mut();
     // A queue can have only one registered process; a registrant that has exited does not count
+    // (even if a new process has since reused its tgid)
     if let Some(n) = &q.notify
-        && cx
-            .kr()
-            .groups
-            .get(&n.tgid())
-            .is_some_and(|g| g.borrow().zombie.is_none())
+        && n.owner().is_live(cx.kr())
     {
         return Err(Errno::EBUSY);
     }
@@ -681,14 +840,17 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     Ok(0)
 }
 
-/// Files that process `tgid` closed (close, dup3 over a descriptor, close_range, close-on-exec,
+/// Files that process `group` closed (close, dup3 over a descriptor, close_range, close-on-exec,
 /// its last thread's exit): its registrations on their queues end, whatever other descriptors
 /// remain (Linux's `mqueue_flush_file`).
-pub(crate) fn closed(tgid: Tid, files: &[crate::fd::FileRef]) {
+pub(crate) fn closed(
+    group: &Rc<RefCell<crate::process::ThreadGroup>>,
+    files: &[crate::fd::FileRef],
+) {
     for f in files {
         if let FileKind::MessageQueue(q) = &f.borrow().kind {
             let mut q = q.borrow_mut();
-            if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
+            if q.notify.as_ref().is_some_and(|n| n.owner().is_group(group)) {
                 remove_notification(&mut q);
             }
         }
@@ -710,8 +872,7 @@ fn send_cookie(sock: &Weak<RefCell<Socket>>, mut cookie: [u8; 32], code: u8) {
         && let Socket::Netlink(n) = &mut *sock.borrow_mut()
     {
         cookie[31] = code;
-        n.queue.push_back((cookie.to_vec(), 0));
-        n.arrivals += 1;
+        n.enqueue(cookie.to_vec(), 0);
         request_wake_object(wake::of(&sock));
     }
 }
@@ -771,4 +932,65 @@ pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCel
         .iter()
         .find(|(_, q)| q.borrow().ino == ino)
         .map(|(n, q)| (n.as_slice(), q))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_user_namespace_charges_its_creator() {
+        let mut parent = Cred::root();
+        parent.ruid = 42;
+        let usage = MqUsage::default();
+        let first = QueueCharge::reserve(&usage, &parent, 100, 1, 4).unwrap();
+        let child_ns = crate::cred::UserNs::child(&parent.user_ns, parent.ruid, false);
+        child_ns.mq_max.set(199);
+        let mut child = parent.clone();
+        child.enter_user_ns(child_ns);
+        child.ruid = 1234;
+        assert!(matches!(
+            QueueCharge::reserve(&usage, &child, 100, 1, 4),
+            Err(Errno::EMFILE)
+        ));
+        assert_eq!(usage.borrow().len(), 1);
+        drop(first);
+        let second = QueueCharge::reserve(&usage, &child, 100, 1, 4).unwrap();
+        assert_eq!(usage.borrow().len(), 2);
+        drop(second);
+        assert!(usage.borrow().is_empty());
+    }
+
+    /// Reaping a dead IPC namespace when its last nsfs fd closes also drops its named POSIX
+    /// message queues and releases their `RLIMIT_MSGQUEUE` (`Kernel::mq_usage`) quota immediately.
+    #[test]
+    fn reaping_pinned_ipc_namespace_releases_mqueue_quota() {
+        let shared = crate::kernel::Shared::new(crate::kernel::Kernel::new(
+            crate::process::Tier::Interpreter,
+        ));
+        let ns_id = {
+            let mut k = shared.lock();
+            let cred = Cred::root();
+            let ns = k.new_ipc_ns(cred.user_ns.clone(), (0, 0));
+            let ns_id = ns.id;
+            let q = create_queue(&k.mq_usage, ns_id, &cred, 819200, 0o600, (10, 8192)).unwrap();
+            let weak_q = Rc::downgrade(&q);
+            insert_queue(k.ipc_mut(ns_id), b"q1".to_vec(), q);
+            assert!(!k.mq_usage.borrow().is_empty());
+
+            let nsfs = crate::kernel::tests::nsfs_ipc_file(ns);
+            k.collect_ipc();
+            assert!(weak_q.upgrade().is_some());
+            assert!(!k.mq_usage.borrow().is_empty());
+
+            drop(nsfs);
+            k.collect_ipc();
+            assert!(weak_q.upgrade().is_none());
+            assert!(k.mq_usage.borrow().is_empty());
+            ns_id
+        };
+        let k = shared.lock();
+        assert!(!k.ipcs.contains_key(&ns_id));
+        assert!(k.mq_usage.borrow().is_empty());
+    }
 }

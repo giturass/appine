@@ -31,6 +31,7 @@ const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
+const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 /// The type of the build ID note written by Go's linker (`.note.go.buildid`), with name "Go".
 const NT_GO_BUILDID: u32 = 4;
 /// The most bytes of `PT_NOTE` read when looking for the Go note (Go programs have only about a
@@ -142,9 +143,12 @@ pub struct Args<'a> {
     /// A privileged exec (setuid, setgid, file capabilities, [`crate::cred::Cred::exec`]): sets
     /// `AT_SECURE`.
     pub secure: bool,
-    /// The stack size limit (the soft limit of `RLIMIT_STACK`): decides the address-space layout,
-    /// how much the arguments may take, and how large the initial stack mapping is.
+    /// The stack size limit (the soft limit of `RLIMIT_STACK`, already clamped to [`STACK_SIZE`]
+    /// for a secure exec): decides the address-space layout and initial stack mapping.
     pub stack_limit: u64,
+    /// Maximum stack space for argv/envp strings and pointers (`bprm_stack_limits`), computed
+    /// before clamping `RLIMIT_STACK` for a secure exec (so a secure exec still allows up to 6 MB).
+    pub arg_limit: usize,
 }
 
 /// The load result: pc and sp when the guest starts running, and the address ranges of the program
@@ -373,7 +377,7 @@ struct Elf<'a> {
 impl<'a> Elf<'a> {
     /// Parses the headers in 6.1's order. `interpreter`: the file is a program's interpreter,
     /// whose own `PT_INTERP` is ignored and whose type is checked only when it is loaded.
-    fn parse(exe: &'a Executable, interpreter: bool) -> Result<Self, LoadError> {
+    fn parse(exe: &'a Executable, interpreter: bool, reads: &mut usize) -> Result<Self, LoadError> {
         let file = exe.head();
         if file.len() < 64 || &file[..4] != b"\x7fELF" {
             return Err(LoadError::NotElf);
@@ -414,10 +418,14 @@ impl<'a> Elf<'a> {
         if phoff.checked_add(phnum * PHDR_SIZE).is_none() {
             return Err(LoadError::Malformed("program header out of range"));
         }
+        // Count guest-visible positive reads even when the executable header is cached.
+        // A short read before EOF still reports access.
+        *reads += usize::from(phoff < exe.len as u64);
         let table = exe
             .read(phoff, phnum * PHDR_SIZE)
             .map_err(LoadError::Read)?
             .ok_or(LoadError::Malformed("truncated"))?;
+        let mut property_read = false;
         for ph in (0..phnum as usize).map(|i| i * PHDR_SIZE as usize) {
             let p_type = u32_at(&table, ph)?;
             let flags = u32_at(&table, ph + 4)?;
@@ -432,6 +440,7 @@ impl<'a> Elf<'a> {
                     if !(2..=MAX_INTERP_PATH).contains(&filesz) {
                         return Err(LoadError::Malformed("bad interpreter path"));
                     }
+                    *reads += usize::from(offset < exe.len as u64);
                     let range = exe
                         .read(offset, filesz)
                         .map_err(LoadError::Read)?
@@ -441,6 +450,10 @@ impl<'a> Elf<'a> {
                     }
                     let end = range.iter().position(|&b| b == 0).unwrap_or(range.len());
                     elf.interp = Some(range[..end].to_vec());
+                }
+                PT_GNU_PROPERTY => {
+                    // parse_elf_properties reads the selected image's last property header.
+                    property_read = (1..=1024).contains(&filesz) && offset < exe.len as u64;
                 }
                 // Only selects Tier 1's register allocation (load_prepared); if it cannot be read,
                 // treat the program as not Go
@@ -480,6 +493,7 @@ impl<'a> Elf<'a> {
                 _ => {}
             }
         }
+        *reads += usize::from(property_read && elf.interp.is_none());
         // An interpreter with nothing to map (load_elf_interp's total_size of 0)
         if interpreter && elf.segments.is_empty() {
             elf.doomed = true;
@@ -614,7 +628,11 @@ pub fn load(
     args: &Args<'_>,
     read_interp: &mut ReadInterp<'_>,
 ) -> Result<Image, LoadError> {
-    load_prepared(mm, &prepare(file, read_interp)?, args)
+    load_prepared(
+        mm,
+        &prepare(file, &mut |path, _| read_interp(path), &mut 0)?,
+        args,
+    )
 }
 
 /// A program and its interpreter, already opened and format-checked ([`prepare`]), needing only
@@ -628,11 +646,14 @@ pub struct Prepared<'a> {
 /// `read_interp`. Opening the interpreter resolves a guest path, so the caller holds the BKL; the
 /// second half, [`load_prepared`], touches only the new address space, and execve runs it with
 /// the BKL released.
+/// `header_reads` counts positive ELF reads on the current file, including reads before an
+/// error. Switching to the interpreter passes the program's count to the callback and resets it.
 pub fn prepare<'a>(
     file: &'a Executable,
-    read_interp: &mut ReadInterp<'_>,
+    read_interp: &mut impl FnMut(&[u8], usize) -> Result<Executable, Errno>,
+    header_reads: &mut usize,
 ) -> Result<Prepared<'a>, LoadError> {
-    let exe = Elf::parse(file, false)?;
+    let exe = Elf::parse(file, false, header_reads)?;
     let interp = match &exe.interp {
         Some(path) => {
             // An empty path opens the working directory, which is not a regular file (6.1's
@@ -640,10 +661,12 @@ pub fn prepare<'a>(
             if path.is_empty() {
                 return Err(LoadError::Interpreter(path.clone(), Errno::EACCES));
             }
-            let data = read_interp(path).map_err(|e| LoadError::Interpreter(path.clone(), e))?;
+            let data = read_interp(path, std::mem::take(header_reads))
+                .map_err(|e| LoadError::Interpreter(path.clone(), e))?;
             // Its headers are checked before the point of no return: not an aarch64 ELF, or
             // program headers that cannot be read, is ELIBBAD
-            Elf::parse(&data, true).map_err(|_| LoadError::BadInterpreter("not an aarch64 ELF"))?;
+            Elf::parse(&data, true, header_reads)
+                .map_err(|_| LoadError::BadInterpreter("not an aarch64 ELF"))?;
             Some((path.clone(), data))
         }
         None => None,
@@ -755,7 +778,7 @@ fn map_programs(mm: &mut Mm, prepared: &Prepared<'_>, execfn: &[u8]) -> Option<M
     let mut entry = main.entry;
     if let Some((path, data)) = &prepared.interp {
         // Checked by prepare; what remains is load_elf_interp's, after the point of no return
-        let interp = Elf::parse(data, true).ok()?;
+        let interp = Elf::parse(data, true, &mut 0).ok()?;
         if interp.doomed {
             return None;
         }
@@ -831,7 +854,7 @@ fn build_stack(
         + extra.iter().map(|s| s.len() + 1).sum::<usize>()
         + random.len();
     let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * (auxv.len() + 1);
-    if strings + words * 8 > arg_limit(args.stack_limit) {
+    if strings + words * 8 > args.arg_limit {
         return Err(LoadError::ArgumentsTooLong);
     }
 
@@ -1430,6 +1453,7 @@ mod tests {
                 ids: [0; 4],
                 secure: false,
                 stack_limit: STACK_SIZE,
+                arg_limit: arg_limit(STACK_SIZE),
             };
             load(&mut mm, &exe(&elf), &args, &mut no_interp).unwrap();
             mm.dbt_regs
@@ -1458,6 +1482,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let image = load(
             &mut mm,
@@ -1545,6 +1570,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let image = load(&mut mm, &exe(&main), &args, &mut read_interp).unwrap();
         assert_eq!(requested, b"/lib/ld.so");
@@ -1598,10 +1624,11 @@ mod tests {
                 ids: [0; 4],
                 secure: false,
                 stack_limit: STACK_SIZE,
+                arg_limit: arg_limit(STACK_SIZE),
             };
             let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
-            assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
-            assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
+            mm.write(UserSlice::new(0x41ffe8, 1), b"x").unwrap();
+            mm.write(UserSlice::new(0x423fe0, 1), b"x").unwrap();
             assert_eq!(read_u64(&mm, 0x420000), 0);
             let mut insn = [0u8; 4];
             mm.read(UserSlice::new(image.entry, 4), &mut insn).unwrap();
@@ -1621,6 +1648,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         assert_eq!(
             load(&mut mm, &exe(b"#!/bin/sh\n"), &args, &mut no_interp),
@@ -1645,6 +1673,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let load_one = |f: &[u8]| load(&mut Mm::new(), &exe(f), &args, &mut no_interp);
         let ph = 64;
@@ -1846,6 +1875,7 @@ mod tests {
             ids: [0; 4],
             secure: false,
             stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(STACK_SIZE),
         };
         let mut mm = Mm::new();
         let image = load(&mut mm, &exe(&img), &args, &mut no_interp).unwrap();
@@ -1923,5 +1953,36 @@ mod tests {
         for &(input, expected) in vectors {
             assert_eq!(sha256(input), expected);
         }
+    }
+
+    #[test]
+    fn secure_exec_keeps_preclamp_arg_limit_up_to_six_mb() {
+        let elf = tiny_elf(ET_EXEC, &[0; 4]);
+        // 3 MiB exceeds arg_limit(STACK_SIZE = 8 MiB) == 2 MiB, but fits within arg_limit(32 MiB) == 6 MiB.
+        let arg_chunk = vec![b'x'; 64 * 1024];
+        let argv_3m: Vec<Vec<u8>> = (0..48).map(|_| arg_chunk.clone()).collect();
+        let args_ok = Args {
+            argv: &argv_3m,
+            envp: &[],
+            execfn: b"/bin/suid",
+            ids: [1000, 0, 1000, 0],
+            secure: true,
+            stack_limit: STACK_SIZE,
+            arg_limit: arg_limit(32 << 20),
+        };
+        let mut mm = Mm::new();
+        let image = load(&mut mm, &exe(&elf), &args_ok, &mut no_interp).unwrap();
+        assert_eq!(auxv(&mm, image.sp)[&AT_SECURE], 1);
+
+        // Over 6 MiB still fails with ArgumentsTooLong.
+        let argv_7m: Vec<Vec<u8>> = (0..112).map(|_| arg_chunk.clone()).collect();
+        let args_too_big = Args {
+            argv: &argv_7m,
+            ..args_ok
+        };
+        assert_eq!(
+            load(&mut Mm::new(), &exe(&elf), &args_too_big, &mut no_interp),
+            Err(LoadError::ArgumentsTooLong)
+        );
     }
 }

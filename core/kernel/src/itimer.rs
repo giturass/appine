@@ -345,7 +345,18 @@ impl PosixTimer {
             },
             Clock::Thread { tid, serial } => match k.tasks.get(&tid) {
                 Some(t) if t.serial == serial => Target::Cpu(t.cpu_ns(), true),
-                _ => Target::Gone,
+                _ => match k.groups.get(&tid) {
+                    Some(g) => {
+                        let g = g.borrow();
+                        match (g.leader_serial, g.leader_exit) {
+                            (Some(s), Some((_, cpu))) if s == serial => {
+                                Target::Cpu(cpu.total_ns, false)
+                            }
+                            _ => Target::Gone,
+                        }
+                    }
+                    None => Target::Gone,
+                },
             },
         }
     }
@@ -533,5 +544,62 @@ mod tests {
             interval: Duration::ZERO,
         };
         assert_eq!(once.next(start), None);
+    }
+
+    #[test]
+    fn zombie_leader_thread_clock_stays_stopped_until_reaped() {
+        use crate::process::{CpuTime, Tier};
+        use crate::signal::SigHandlers;
+        use std::rc::Rc;
+
+        let mut k = Kernel::new(Tier::Interpreter);
+        let group = Rc::new(RefCell::new(ThreadGroup::new(
+            42,
+            1,
+            Rc::new(RefCell::new(SigHandlers::default())),
+        )));
+        group.borrow_mut().leader_exit = Some((
+            [0; 16],
+            CpuTime {
+                total_ns: 123_456_789,
+                sys_ns: 0,
+            },
+        ));
+        group.borrow_mut().leader_serial = Some(777);
+        k.groups.insert(42, group.clone());
+
+        let mut timer = PosixTimer {
+            clock: Clock::Thread {
+                tid: 42,
+                serial: 777,
+            },
+            signal: None,
+            value: 0,
+            deadline: None,
+            interval: Duration::from_millis(50),
+            overrun: 0,
+        };
+        assert!(!timer.gone(&k));
+        assert!(!timer.ticking(&k));
+        timer.arm(&k, Duration::from_nanos(1_000_000), None, false);
+        assert_eq!(timer.remaining(&k), Some(Duration::from_nanos(1_000_000)));
+        // Stopped clock must not fire even if armed with an already-passed absolute deadline.
+        timer.arm(&k, Duration::from_nanos(100), None, true);
+        assert_eq!(timer.fire(&k), None);
+
+        // Wrong serial (e.g. a reused pid) is treated as gone.
+        let wrong = PosixTimer {
+            clock: Clock::Thread {
+                tid: 42,
+                serial: 999,
+            },
+            ..timer.clone()
+        };
+        assert!(wrong.gone(&k));
+
+        // Once the process is reaped, the zombie leader's timer is gone.
+        k.groups.remove(&42);
+        assert!(timer.gone(&k));
+        assert_eq!(timer.remaining(&k), None);
     }
 }

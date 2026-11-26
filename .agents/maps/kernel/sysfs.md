@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/sysfs.md` for the paired decision history (not yet created; decisions from before the split are D14, D29, D42 and the sysfs parts of D2, D3, D9, D25 and D31 in `.agents/decisions/kernel/procfs.md`).
 >
 > Verified: 2026-11-22 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: loop-device number links under `/sys/dev/block/` and block `uevent` attributes)
 
 ## Responsibilities
 
@@ -11,30 +13,30 @@
 
 - CPU topology and host-copied `cache/` and `cpufreq/` attributes under `/sys/devices/system/cpu/`;
 - `/sys/class/net/<if>/` network interface, bridge (`bridge/`, `brif/`) and port (`brport/`) views;
-- `/sys/block/loop<n>/` loop-device attributes;
+- `/sys/block/loop<n>/` loop-device attributes and their device-number links under `/sys/dev/block/`;
 - `/sys/module/overlay/parameters/` defaults, the `/sys/fs/cgroup/` mount point, and the
   conditional platform DRM render-node discovery hierarchy (`SYS_GPU`).
 
-Root: in `core/kernel/src/pseudo.rs`, `SYS_GPU`, `SYS_STATIC`, `SYS_NET_DIR`, `SYS_BLOCK_DIR`,
+Root: in `core/kernel/src/pseudo.rs`, `SYS_GPU`, `SYS_STATIC`, `SYS_NET_DIR`, `SYS_BLOCK_DIR`, `SYS_DEV_BLOCK_DIR`,
 `BLOCK_FILES`, `NET_FILES`, `BRIDGE_FILES`, `PORT_FILES`, `SYS_CPU_DIR`, `CPU_FILES`,
-`HOST_CPU_FILES`, `CGROUP_POINT`, `PseudoNode::{SysRoot, Sys, SysCpu, SysNet, SysBrif, SysBlock}`,
+`HOST_CPU_FILES`, `CGROUP_POINT`, `PseudoNode::{SysRoot, Sys, SysCpu, SysNet, SysBrif, SysBlock, SysDevBlock}`,
 the `sysfs` section (`net_file`, `cpu_file`, `cpu_list`, `cpu_mask`, `host_cpu_file`,
 `parse_cpu_list`, `parse_cpu_mask`, `cpu_list_of`, `cpu_mask_of`, `host_cpu_has`, `host_cpu`), and
 the sysfs arms of `View`, `stat`, `fs_of`, `readdir`, `node_ino`, `ino_of`, `open_unwritable`,
 `pollable` and `content`.
 
 Outside the module: the shared `Pseudo` / `View` / `FileKind::Proc` snapshot and poll-event
-machinery (`kernel/procfs`); sysfs mounting and single-instance rules (`kernel/mount`); open/read
-dispatch (`kernel/files`); loop-device values (`kernel/loop`); network interface views and counters
+machinery (`kernel/procfs`); sysfs mounting and single-instance rules (`kernel/mount`); open
+dispatch (`kernel/files`) and read dispatch (`kernel/fileio`); loop-device values (`kernel/loop`); network interface views and counters
 (`kernel/net`, `kernel/netns`); the cgroup2 tree mounted on `fs/cgroup/` (`kernel/cgroup`); host
 CPU and `tx_queue_len` helpers (`hal`).
 
 ## Key types
 
 - `PseudoNode` variants: `SysRoot`, `Sys(path)`, `SysCpu(cpu, path)`, `SysNet(ifindex, path)`,
-  `SysBrif(bridge, port)`, `SysBlock(loop_n, path)`; `CGROUP_POINT` (`Sys(b"fs/cgroup/")`).
-- Tables: `SYS_STATIC` (23 fixed paths), `SYS_GPU` (conditional platform DRM render-node paths),
-  `BLOCK_FILES` (22), `NET_FILES` (36), `BRIDGE_FILES` (10), `PORT_FILES` (4), `CPU_FILES` (19) and
+  `SysBrif(bridge, port)`, `SysBlock(loop_n, path)`, `SysDevBlock(loop_n)` and `CGROUP_POINT` (`Sys(b"fs/cgroup/")`).
+- Tables: `SYS_STATIC` (25 fixed paths), `SYS_GPU` (conditional platform DRM render-node paths),
+  `BLOCK_FILES` (23), `NET_FILES` (36), `BRIDGE_FILES` (10), `PORT_FILES` (4), `CPU_FILES` (19) and
   `HOST_CPU_FILES` (68).
 
 ## Public entry points
@@ -47,21 +49,23 @@ CPU and `tx_queue_len` helpers (`hal`).
 
 ### Tree layout and read-only rules
 
-- Tree: `block/`, `class/net/`, `devices/system/cpu/`, the empty `fs/cgroup/` mount point, and
-  `module/overlay/parameters/` with Linux 6.1's Kconfig defaults, which match what `kernel/overlay`
-  does (`redirect_always_follow` Y, `redirect_max` 256, `check_copy_up`, `index`, `metacopy`,
-  `nfs_export`, `redirect_dir`, `xino_auto` N; containerd adds `index=off` and BuildKit
-  `redirect_dir=off` because the files exist).
+- Tree: `block/`, `class/net/`, `dev/block/`, `devices/system/cpu/`, the empty `fs/cgroup/` mount point, and
+  `module/overlay/parameters/` matching what `kernel/overlay` does (`redirect_max` 256,
+  `redirect_always_follow`, `check_copy_up`, `index`, `metacopy`, `nfs_export`, `redirect_dir`,
+  `xino_auto` N; containerd adds `index=off` and BuildKit `redirect_dir=off` because the files
+  exist).
 - `SYS_GPU` supplies the platform bus and `dev/char/226:128/device` paths on renderer-enabled
   kernels: `libdrm` enumerates `drm/renderD128`, reads the `subsystem` link to `/sys/bus/platform`,
   and reads the device-tree name and compatible string from `uevent`.
-- Absent: `kernel/`, other modules, `dev/` (outside `SYS_GPU`), `bus/` (outside `SYS_GPU`),
-  `firmware/`, `power/`, NUMA nodes, other classes or block `uevent` files.
+- Absent: `kernel/`, other modules, `dev/char/` and `bus/` on kernels without a renderer,
+  `firmware/`, `power/`, NUMA nodes and other classes.
 - Modes and metadata: directories are 0755, files 0444 with reported size 4096 and `st_blksize`
   4096, owned by root, root inode 1.
 - sysfs is read-only (write opens `EACCES`, chmod/chown `EACCES`; like `kernfs_fop_open`, it
-  refuses only a write access mode so `O_TRUNC` alone opens); one instance, so new mounts share the
-  boot device and stacking on its root is `EBUSY`; mounting it needs `CAP_SYS_ADMIN` over the owner
+  refuses only a write access mode so `O_TRUNC` alone opens); one instance per network namespace
+  (the boot device in the initial namespace and a per-namespace device otherwise, `Vfs::sys_dev`),
+  so stacking a sysfs mount of the same network namespace on its own root is `EBUSY` while mounting
+  sysfs in a different network namespace succeeds; mounting it needs `CAP_SYS_ADMIN` over the owner
   of the caller's network namespace (`kernel/mount`).
 - Every sysfs file is pollable (`pseudo::pollable`): always readable and writable, plus
   `POLLERR|POLLPRI` before its first read from offset 0 (`fd::ProcEvent`).
@@ -78,16 +82,23 @@ CPU and `tx_queue_len` helpers (`hal`).
 - The guest CPU count is a snapshot of the host process's affinity at kernel creation (capped at
   64); the same count drives sysfs, `/proc/cpuinfo`, `/proc/stat`, `status`, `sched_getaffinity`
   and cgroup `cpuset`; guest CPU `i` is host CPU `host_cpus()[i]`.
-- `/sys/class/net/<if>/` follows the reader thread's network namespace; interfaces are directories
+- `/sys/class/net/<if>/` follows the sysfs mount's network namespace (`View::sys_net_ns`, tagged at
+  mount time via `Vfs::sys_net_ns`, falling back to the initial network namespace for the boot
+  mount); interfaces are directories
   (Linux uses symlinks into `/sys/devices`); bridges have `bridge/` and `brif/` (symlinks to the
-  ports' `brport/`), ports `brport/`; only byte and packet counters of host interfaces and `lo` are
-  real; `carrier` of a down interface is `EINVAL`, a removed interface `ENODEV`.
+  ports' `brport/`), ports `brport/`; byte and packet counters from `k.traffic` and host
+  `tx_queue_len` are read only in the initial network namespace (`ns.host_net.is_none()`), while new
+  network namespaces report zero statistics and `tx_queue_len` 1000; `carrier` of a down interface
+  is `EINVAL`, a removed interface `ENODEV`.
 - `/sys/block/loop<n>/` exists for every loop device (`kernel/loop`): `dev`, `removable`, `ro`,
   `size` (sectors), `queue/` (logical, physical, minimum and hardware sector sizes, optimal I/O 0,
   `dma_alignment` 511, `rotational`, `read_ahead_kb`, `max_sectors_kb`, `rq_affinity`), and while
   the device is bound `loop/` (`backing_file` as the backing open file's display path, `offset`,
-  `sizelimit`, `autoclear`, `partscan`, `dio`). Values come from `Loops::sysfs_read`; device
+  `sizelimit`, `autoclear`, `partscan`, `dio`). These values come from `Loops::sysfs_read`. Device
   directories are directories rather than symlinks into `/sys/devices/virtual/block`.
+- `/sys/dev/block/7:<n>` links to `../../block/loop<n>` for each existing loop device, bound or
+  unbound. Both paths reach the same `uevent` file. Its four lines give `MAJOR=7`, `MINOR=<n>`,
+  `DEVNAME=loop<n>` and `DEVTYPE=disk`. Lookup, readlink and uevent generation check device existence.
 
 ## Dependencies (inbound / outbound)
 
@@ -96,7 +107,7 @@ CPU and `tx_queue_len` helpers (`hal`).
 - `kernel/procfs`: dispatches sysfs lookup, stat, readdir, open-writability, pollability and
   content generation inside `pseudo.rs`.
 - `kernel/mount`: mounts `/sys` and `/sys/fs/cgroup` (using `CGROUP_POINT`).
-- `kernel/files`: opens and reads sysfs files through `open_pseudo`.
+- `kernel/files` and `kernel/fileio`: opens (`open_pseudo`) and reads sysfs files.
 
 ### Outbound
 
@@ -112,22 +123,17 @@ CPU and `tx_queue_len` helpers (`hal`).
   `sched_getaffinity` and cgroup `cpuset`.
 - Device numbers advertised by `SYS_GPU` (`226:128`) must match `/dev/dri/renderD128` (`kernel/vfs`
   and `kernel/files`).
-- Dynamic sysfs directories (`brif/`, interfaces, loop devices, `cpu<n>`) must stay excluded in
+- `SYS_STATIC` supplies the shared `dev/` parent. `SYS_GPU` adds `dev/char/` when a renderer is present.
+- Dynamic sysfs directories (`brif/`, interfaces, loop devices, `dev/block/`, `cpu<n>`) must stay excluded in
   `missing_path` (`kernel/procfs`), or each absent entry becomes a counted unimplemented path.
 
 ## Confirmed bugs / technical debt
 
-- **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
-  (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
-  filesystem has no block device behind it at all.
-- **`/sys/class/net/<if>/statistics` leaks the initial namespace's counters:** host-interface and
-  `lo` counters are read by name from the kernel-wide traffic table without a namespace check, so a
-  new namespace's `lo` shows the initial loopback's counts, while `/proc/net/dev` and netlink show
-  zeros there.
-- **Fidelity gaps:** `/sys/class/net` follows the reader rather than the mounter's network
-  namespace; interfaces and loop devices are directories rather than symlinks into `/sys/devices`;
-  `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.
+- **Root filesystem backing device:** the inode store reports device `8:1` but has no backing
+  block device. Probes for `/sys/dev/block/8:1` return `ENOENT`.
+- **Fidelity gaps:** interfaces and loop devices are directories rather than symlinks into
+  `/sys/devices`; `kernel/`, other modules, `firmware/`, `power/` and NUMA nodes are absent.
 
 ## Open questions
 
-- Should `/sys/class/net` follow the mounter's network namespace, as Linux tags sysfs mounts?
+- None.

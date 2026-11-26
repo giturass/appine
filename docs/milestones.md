@@ -247,6 +247,23 @@ When the LTP syscall tests run in full in parallel (`scripts/ltp -j 8`), the fol
 
 In the differential tests (`scripts/difftest`), the native side of `loop` uses the development VM's own loop devices: on 2026-11-07 it failed once with `control remove 4000: Resource busy` (the VM probing the device just created) and then once with `control remove missing: 0` (the device left behind by that failed run), and passed on the next runs. Rerun it on its own: the failed run's leftover device is removed by the next run, which then passes.
 
+On arm64 Linux 6.8.0-117, the native side of `gvisor-devices` failed
+`SocketInetLoopbackIsolatedTest.TCPPassiveCloseNoTimeWaitTest/ListenV4MappedLoopback_ConnectV4Any`
+once during the full gVisor run on 2026-11-24. The same parameter passed 20 consecutive native
+repetitions on its own and the whole 994-case group passed on rerun. Tier 1 later failed
+`ListenV6Loopback_ConnectV6Any` in the same test. Its 22 parameters now run in
+`gvisor-inet-ports`. The native TCP variant of `V4EphemeralPortReservedReuseAddr` also
+failed once in the mixed group. The new group runs all six ephemeral-bind variants before
+any passive-close tests can leave connections in TIME_WAIT. All 28 parameters passed three
+successive runs on each of native Linux, Tier 0 and Tier 1 with the port checks first. Upstream's `SetupTimeWaitClose`
+waits one second for the passive socket to finish closing before the test tries to rebind the port.
+
+In `gvisor-syscalls`, `MembarrierTest.Global` and `MembarrierTest.GlobalExpedited` passed
+natively and failed on Appine Tier 1. The whole group passed on its automatic retry.
+The child synchronized only its own address space, so the parent could miss the barrier.
+Appine now synchronizes all guest address spaces for `GLOBAL` and all registered ones for
+`GLOBAL_EXPEDITED`. [Original CI failure](https://github.com/mthli/appine/actions/runs/45278336950/job/138056601002).
+
 In `gvisor-process`, Appine's side of `ExecTest.ExecuteOnlySpecialFiles` fails intermittently when the whole group runs: on 2026-11-08 it failed 2 of 5 runs with the binary under test and 3 of 3 with the previous commit's, while 30 runs of the test alone passed. The test calls setresuid on a thread (until 2026-11-09 Appine changed the whole process's credentials; since then each thread has its own, and on that day the group passed 6 of 6 runs, but the previous binary also passed 3 of 3, so the change cannot be credited) and execs a FIFO, a socket and a device node under a 10 s alarm each. A failed run that is killed by the 60 s timeout leaves `/tmp/exec-only-*.<pid>` in the lane's store, and later runs whose test gets that pid failed at once on `EEXIST`; since 2026-11-08 `tests/diff/gtest/run.sh` deletes those files before running, so only the first failure is intermittent. The cause was not investigated.
 
 In `gvisor-fs`, the native side of `PtyTest.TCFLSHWakesReplicaPolloutAfterMasterInputFlush` failed once on 2026-11-08 while four groups ran in parallel (`-j 4`), and passed when the group was rerun alone; it waits for a replica's `POLLOUT` after the master flushes its input, and was presumably slowed by the load. The cause was not investigated.

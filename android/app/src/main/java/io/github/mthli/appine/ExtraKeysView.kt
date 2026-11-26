@@ -71,7 +71,7 @@ import kotlin.math.roundToInt
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : FrameLayout(context) {
 
-    /** Where the keys go: the terminal view of the tab shown. */
+    /** Where the keys go: the activity routes them to the focused search bar or terminal view. */
     interface Target {
         /** A special key (Esc, Tab, arrows); the one-shot modifiers are still to be read. */
         fun key(keyCode: Int)
@@ -567,6 +567,11 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
     val shift get() = shiftKey.on && !waits(shiftKey)
+
+    /** Cancels any active touch highlight or held-key repeat, leaving modifiers and page intact. */
+    fun cancelPresses() {
+        presses.forEach { it.cancel() }
+    }
 
     /**
      * The next key or character took the one-shot modifiers; locked ones stay on, and so does

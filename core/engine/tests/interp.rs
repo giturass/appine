@@ -315,6 +315,63 @@ fn exclusive_store_succeeds_only_after_a_matching_load() {
 }
 
 #[test]
+fn exceptions_clear_exclusive_reservations() {
+    let mut g = Guest::new();
+    g.set_x(1, DATA);
+    g.set_x(3, 9);
+    g.set_x(5, 10);
+    g.set_x(6, DATA + 1);
+    g.set_x(7, DATA + 16);
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(DATA + 16, DATA + 24, appine_engine::WATCH_LOAD)]);
+    for (load, store) in [
+        (0xc85f_7c20, 0xc802_7c23), // ldxr x0, [x1]; stxr w2, x3, [x1]
+        (0xc87f_1020, 0xc822_1423), // ldxp x0, x4, [x1]; stxp w2, x3, x5, [x1]
+    ] {
+        g.put_u64(DATA, 5);
+        g.put_u64(DATA + 8, 6);
+        let fault = |addr, kind| Exit::Fault {
+            addr,
+            access: Access::Read,
+            kind,
+        };
+        for (insn, expected) in [
+            (0xf940_03e0, fault(0, FaultKind::Page)), // ldr x0, [sp]
+            (0xc85f_7cc0, fault(DATA + 1, FaultKind::Alignment)), // ldxr x0, [x6]
+            (0xf940_00e0, fault(DATA + 16, FaultKind::Watchpoint)), // ldr x0, [x7]
+            (0, Exit::Undefined { insn: 0 }),
+            (0xd420_0020, Exit::Breakpoint { imm: 1 }),
+            (0xd400_0001, Exit::Svc { imm: 0 }),
+        ] {
+            g.step(load);
+            assert_eq!(g.x(0), 5);
+            assert_eq!(g.cpu.exec_insn(insn), Some(expected));
+            g.step(store);
+            assert_eq!(
+                (g.x(2), g.get_u64(DATA), g.get_u64(DATA + 8)),
+                (1, 5, 6),
+                "{expected:?}"
+            );
+        }
+
+        g.step(load);
+        unsafe { g.cpu.kicker().kick() };
+        assert_eq!(g.cpu.run(), Exit::Kick);
+        g.step(store);
+        assert_eq!((g.x(2), g.get_u64(DATA), g.get_u64(DATA + 8)), (1, 5, 6));
+
+        g.step(load);
+        assert_eq!(
+            g.cpu.exec_insn(0xd50b_7521), // ic ivau, x1
+            Some(Exit::InvalidateCode { addr: DATA })
+        );
+        g.step(store);
+        assert_eq!((g.x(2), g.get_u64(DATA)), (0, 9));
+    }
+}
+
+#[test]
 fn simd_and_fp_round_trip() {
     if !has_simd() {
         return;
@@ -466,6 +523,65 @@ fn id_registers_match_hwcap() {
     }
     assert_eq!(caps & hwcap::FPHP != 0, caps & hwcap::ASIMDHP != 0);
     assert_eq!(caps & hwcap::DIT != 0, (g.x(0) >> 48) & 0xf == 1);
+}
+
+#[test]
+fn unallocated_id_registers_are_undefined() {
+    let mut g = Guest::new();
+    let mrs_id = |crm: u32, op2: u32| 0xd538_0000u32 | (crm << 8) | (op2 << 5);
+    // CRm=0: only MIDR_EL1 (op2=0), MPIDR_EL1 (op2=5), and REVIDR_EL1 (op2=6) are emulated.
+    g.step(mrs_id(0, 0));
+    assert_eq!(g.x(0), appine_engine::guest_midr());
+    g.step(mrs_id(0, 5));
+    assert_eq!(g.x(0), 1u64 << 31);
+    g.cpu.state_mut().x[0] = 0xdead_beef;
+    g.step(mrs_id(0, 6));
+    assert_eq!(g.x(0), 0);
+
+    for op2 in [1, 2, 3, 4, 7] {
+        let insn = mrs_id(0, op2);
+        let pc = g.pc();
+        g.cpu.state_mut().x[0] = 0x1234;
+        assert_eq!(
+            g.cpu.exec_insn(insn),
+            Some(Exit::Undefined { insn }),
+            "CRm=0 op2={op2} should be undefined"
+        );
+        assert_eq!(g.pc(), pc);
+        assert_eq!(g.x(0), 0x1234);
+    }
+
+    // CRm=1: all op2 values are unallocated for EL0 on Linux 6.1 arm64 and must fault with SIGILL.
+    for op2 in 0..8 {
+        let insn = mrs_id(1, op2);
+        let pc = g.pc();
+        g.cpu.state_mut().x[0] = 0x5678;
+        assert_eq!(
+            g.cpu.exec_insn(insn),
+            Some(Exit::Undefined { insn }),
+            "CRm=1 op2={op2} should be undefined"
+        );
+        assert_eq!(g.pc(), pc);
+        assert_eq!(g.x(0), 0x5678);
+    }
+
+    // CRm=2..=7: emulated by Linux 6.1 (feature values or RAZ).
+    for crm in 2..=7 {
+        for op2 in 0..8 {
+            let insn = mrs_id(crm, op2);
+            assert_eq!(
+                g.cpu.exec_insn(insn),
+                None,
+                "CRm={crm} op2={op2} should succeed"
+            );
+        }
+    }
+
+    // CRm=8..=15: undefined.
+    for crm in 8..=15 {
+        let insn = mrs_id(crm, 0);
+        assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+    }
 }
 
 #[test]

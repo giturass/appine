@@ -435,7 +435,8 @@ table ip t {
   }
 }
 N
-# Outer namespace: 2290 from the bridge is REDIRECTed to the proxy at 1083; for 2292 only what is
+# Leave traffic to B:2290 for B's own REDIRECT, whether the native kernel runs bridge hooks
+# or not. Other traffic to 2290 from the bridge is REDIRECTed to the proxy at 1083; for 2292 only what is
 # sent to a local address goes to 1083 (docker's and podman's rules for published ports restrict
 # it this way), the rest to 1084; 2293 and 2294 are DNATed to B, and FORWARD rejects B's 1085 (B
 # listens there); UDP port 53 is hijacked to 1053. A and B are in the same subnet, so what is
@@ -446,7 +447,7 @@ nft -f - <<'N'
 table ip t {
   chain pre {
     type nat hook prerouting priority -100
-    iif br0 tcp dport 2290 redirect to :1083
+    iif br0 ip daddr != 10.50.0.3 tcp dport 2290 redirect to :1083
     fib daddr type local tcp dport 2292 redirect to :1083
     iif br0 tcp dport 2292 redirect to :1084
     iif br0 tcp dport 2293 dnat to 10.50.0.3:1082

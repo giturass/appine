@@ -1,3 +1,5 @@
+import java.security.MessageDigest
+import java.util.HexFormat
 import java.util.Properties
 
 plugins {
@@ -17,56 +19,16 @@ val zigExecutable = providers.fileContents(rootProject.layout.projectDirectory.f
     .orElse(providers.environmentVariable("ZIG"))
     .orElse("zig")
 
-/** Orders file names by the numbers in them, so that 3.10 comes after 3.9 and r10 after r9. */
-val byVersion: Comparator<File> = Comparator { a, b ->
-    val numbers = { f: File -> Regex("""\d+""").findAll(f.name).map { it.value.toLong() }.toList() }
-    val (x, y) = numbers(a) to numbers(b)
-    x.zip(y).map { (p, q) -> p.compareTo(q) }.firstOrNull { it != 0 } ?: x.size.compareTo(y.size)
+/** The fetcher's pinned inventory is shared with release-sources. Listing it works offline. */
+val rootfsAssets = providers.exec {
+    commandLine(repoRoot.file("scripts/fetch-rootfs").asFile, "--assets")
+}.standardOutput.asText.map { it.trim().lines() }
+
+val alpineBranch = rootfsAssets.map { inventory ->
+    val tarball = inventory.last().substringBefore(' ')
+    val version = tarball.removePrefix("alpine-minirootfs-").substringBefore("-aarch64.")
+    "v${version.substringBeforeLast('.')}"
 }
-
-/** The newest of the files `scripts/fetch-rootfs` downloaded and verified whose name matches. */
-fun newestFetched(name: Regex): File? = repoRoot.dir("target/rootfs").asFile
-    .listFiles { f -> f.name.matches(name) }
-    ?.maxWithOrNull(byVersion)
-
-/** The newest package for each name, or null when any package is missing. */
-fun fetchedPackages(vararg names: String): List<File>? = names
-    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
-    .takeIf { null !in it }
-    ?.filterNotNull()
-
-/** Alpine minirootfs tarball. */
-val rootfsTarball: File? = newestFetched(Regex("""alpine-minirootfs-.*-aarch64\.tar\.gz"""))
-
-/**
- * The doas package bundled with the app, installed offline when a regular user first becomes the
- * login account.
- */
-val doasPackage: File? = newestFetched(Regex("""doas-.*\.apk"""))
-
-/**
- * bash and the libraries it needs that the minirootfs lacks, bundled with the app and installed
- * offline at the first login of a system the app imported, whose login shell bash is; null when
- * any of them is missing.
- */
-val bashPackages: List<File>? = fetchedPackages("bash", "readline", "libncursesw", "ncurses-terminfo-base")
-
-/** procps-ng and its missing libraries, installed offline on the first login of a new Alpine system. */
-val procpsPackages: List<File>? = fetchedPackages(
-    "procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs", "libncursesw", "ncurses-terminfo-base",
-)
-
-/** bubblewrap and libcap, installed offline independently of the login shell. */
-val bubblewrapPackages: List<File>? = fetchedPackages("bubblewrap", "libcap2")
-
-/** The remaining OpenRC packages. The first boot also uses libcap2 from the bubblewrap bundle. */
-val openrcPackages: List<File>? = fetchedPackages("openrc", "openrc-user", "ifupdown-ng", "bridge")
-
-/** For example 3.24.3 → v3.24, written into apk's repository URLs. */
-val alpineBranch: String = rootfsTarball
-    ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
-    ?.let { "v${it.groupValues[1]}.${it.groupValues[2]}" }
-    ?: "edge"
 
 android {
     namespace = "io.github.mthli.appine"
@@ -81,7 +43,7 @@ android {
         versionCode = 3
         versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "ALPINE_BRANCH", "\"$alpineBranch\"")
+        buildConfigField("String", "ALPINE_BRANCH", "\"${alpineBranch.get()}\"")
     }
 
     buildFeatures {
@@ -144,17 +106,15 @@ dependencies {
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.webkit)
     implementation(libs.material)
+    testImplementation(libs.junit4)
     androidTestImplementation(libs.androidx.runner)
     androidTestImplementation(libs.androidx.junit)
 }
 
 val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
-    rootfsTarball?.let { tarball.set(it) }
-    doasPackage?.let { doas.set(it) }
-    bashPackages?.let { bash.from(it) }
-    procpsPackages?.let { procps.from(it) }
-    bubblewrapPackages?.let { bubblewrap.from(it) }
-    openrcPackages?.let { openrc.from(it) }
+    inventory.set(rootfsAssets)
+    val cache = repoRoot.dir("target/rootfs")
+    sources.from(rootfsAssets.map { rows -> rows.map { cache.file(it.substringBefore(' ')) } })
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -276,48 +236,44 @@ abstract class CargoNdkTask : DefaultTask() {
  * bubblewrap with libcap under `bubblewrap/`, and the first-boot packages under `openrc/`.
  */
 abstract class RootfsAssetTask : DefaultTask() {
-    @get:InputFile
-    @get:Optional
-    abstract val tarball: RegularFileProperty
-
-    @get:InputFile
-    @get:Optional
-    abstract val doas: RegularFileProperty
+    @get:Input
+    abstract val inventory: ListProperty<String>
 
     @get:InputFiles
-    abstract val bash: ConfigurableFileCollection
-
-    @get:InputFiles
-    abstract val procps: ConfigurableFileCollection
-
-    @get:InputFiles
-    abstract val bubblewrap: ConfigurableFileCollection
-
-    @get:InputFiles
-    abstract val openrc: ConfigurableFileCollection
+    abstract val sources: ConfigurableFileCollection
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
+    private fun verifiedBytes(source: File, expectedSha256: String): ByteArray {
+        if (!source.isFile) throw GradleException("Missing ${source.name}. Run scripts/fetch-rootfs first.")
+        val bytes = source.readBytes()
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        if (HexFormat.of().formatHex(digest) != expectedSha256) {
+            throw GradleException("Checksum mismatch for ${source.name}. Run scripts/fetch-rootfs.")
+        }
+        return bytes
+    }
+
     @TaskAction
     fun copy() {
-        val source = tarball.orNull?.asFile
-            ?: throw GradleException("Alpine minirootfs not found: run scripts/fetch-rootfs first")
+        val files = sources.files.associateBy { it.name }
+        val assets = mutableMapOf<String, ByteArray>()
+        for (entry in inventory.get()) {
+            val fields = entry.split(' ')
+            val (name, sha256) = fields
+            val bytes = verifiedBytes(files.getValue(name), sha256)
+            for (dest in fields.drop(2)) {
+                val path = if (dest.endsWith('/')) dest + name else dest
+                assets[path] = bytes
+            }
+        }
         val out = outputDir.get().asFile
         out.deleteRecursively()
-        out.mkdirs()
-        source.copyTo(File(out, "rootfs.tgz"))
-        val doasFile = doas.orNull?.asFile
-            ?: throw GradleException("doas package not found: run scripts/fetch-rootfs first")
-        doasFile.copyTo(File(out, "doas.apk"))
-
-        fun copyBundle(packages: FileCollection, directory: String, label: String = directory) {
-            if (packages.isEmpty) throw GradleException("$label packages not found: run scripts/fetch-rootfs first")
-            for (apk in packages) apk.copyTo(out.resolve(directory).resolve(apk.name))
+        for ((path, bytes) in assets) {
+            val target = out.resolve(path)
+            target.parentFile.mkdirs()
+            target.writeBytes(bytes)
         }
-        copyBundle(bash, "bash")
-        copyBundle(procps, "procps", "procps-ng")
-        copyBundle(bubblewrap, "bubblewrap")
-        copyBundle(openrc, "openrc", "OpenRC")
     }
 }

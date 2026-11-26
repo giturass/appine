@@ -5,6 +5,11 @@ fn main() {
         "src/c/atomic.c",
         "src/c/cpu.c",
         "src/c/dbt.c",
+        "src/c/dbt_cache.c",
+        "src/c/dbt_group.c",
+        "src/c/dbt_loop.c",
+        "src/c/dbt_routines.c",
+        "src/c/dbt_translate.c",
         "src/c/features.c",
         "src/c/guard.c",
         "src/c/interp.c",
@@ -13,6 +18,7 @@ fn main() {
         "src/c/simd.c",
     ];
     for path in sources.iter().chain(&[
+        "src/c/dbt_internal.h",
         "src/c/emit.h",
         "src/c/internal.h",
         "include/appine/engine.h",

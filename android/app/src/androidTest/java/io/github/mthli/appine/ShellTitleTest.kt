@@ -100,6 +100,12 @@ class ShellTitleTest {
                 send(". /etc/profile.d/appine.bashrc; . /etc/profile.d/appine.bashrc\n")
                 awaitTitle("/tmp")
                 commandTitle("read -r answer")
+            } else {
+                // Busybox ash has no preexec hook; foreground-process fallback reports running
+                // commands that set no title, then restores $PWD at the next prompt.
+                send("sleep 0.25\n")
+                awaitTitle("sleep 0.25")
+                awaitTitle("/tmp")
             }
             send("sh -c 'printf \"\\033]2;Building\\007\"; read -r answer'\n")
             awaitTitle("Building")

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-17 (full mapping: 3 research concerns, 14 claims checked by 2 independent verifiers)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint raw ICMP and sysfs references to kernel/rawicmp and kernel/sysfs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: fall back to `SIGIO` with `SI_KERNEL` when an `F_SETSIG` RT signal fails on `RLIMIT_SIGPENDING` overflow)
 
 ## Responsibilities
 
@@ -25,24 +25,33 @@ Outside the module: the wait mechanism, wake objects and the BKL (`kernel/proces
 the timer thread (`kernel/time`); per-kind readiness of sockets (`kernel/net`, `kernel/rawicmp`, `kernel/netlink`, `kernel/unix`),
 terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
 (`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
-entry points and the read paths (`kernel/files`); clock bases, `Expiry` and the wall-clock jump
+entry points (`kernel/files`) and the read paths (`kernel/fileio`); clock bases, `Expiry` and the wall-clock jump
 count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Key types
 
-- `Waits` — one blocking wait: host fds with events, in-process wake objects, pidfd/signalfd
-  flags (CHILD/SIGNAL channels), the earliest timerfd deadline, edge state, gated files.
+- `Waits` — one blocking wait: host fds with events, in-process wake objects, tracked epolls
+  joined on `Epoll::waiters`, pidfd/signalfd flags (CHILD/SIGNAL channels), the earliest timerfd
+  deadline, edge state, gated files.
 - `Interest` — one watched file of an epoll: weak open file, events, data, `armed` (ONESHOT),
-  `seen`/`drained`/`arrivals` snapshots for edge triggering, nested-generation share.
-- `Epoll` — interests (no ready list), round-robin `cursor`, `base` generation, sticky
-  `edge_watched`, waiters.
+  `seen`/`drained`/`arrivals` snapshots for edge triggering, nested-generation share, captured
+  `fdinfo_id` `(sdev, ino)`, `exclusive_order` (monotonic registration order for `EPOLLEXCLUSIVE`),
+  slot `epoch`, `WatchMode` (`WakeObjects` / `HostEpoll` / `Dynamic`), and cached scan host fd.
+- `Epoll` — slab of interests with O(1) `(fd, file_ptr)` index, event-driven `ready_queue`
+  (`VecDeque<usize>`), `dynamic` fallback list, lazy `appine_hal::HostEpoll` for host-backed
+  sockets/fences, round-robin `cursor` (for dynamic/untracked scans), `base` generation, sticky
+  `edge_watched`, weak `parents` (parent epolls watching this epoll, for top-down nesting checks),
+  `waiters`, and weak handle to `Kernel::epoll_watches`.
+- `EpollWatches` — per-kernel (`Kernel::epoll_watches`) wake-object, per-file (`drained` /
+  shared `HostEdges`), and edge-triggered pipe (`arrived`) subscription map marking matching
+  tracked epoll slots dirty and waking their `waiters` (and ancestors) in O(subscribers).
 - `HostPollBatch` — host poll slots paired with interest indices and guest-known bits for one scan.
 - `HostEdges` (on `OpenFile`) — a private edge-triggered host epoll on one host fd, accumulating
   read/write arrivals.
 - `OpenFile` fields used here: `drained` (per direction), `reads`, `exclusive_claim`, `owner`,
   `sig`, `host_edges`.
-- `ExGate` — per-file queue of sleeping exclusive waiters plus the last generation seen
-  (`Kernel::ex_gates`).
+- `ExGate` — per-file queue of sleeping exclusive `GateWaiter`s (`event`, `wanted` mask, `seen`
+  bits, and stable registration `order`) plus the last generation seen (`Kernel::ex_gates`).
 - `Fasync` — one `O_ASYNC` file: weak open file, fd, last events, counter snapshots
   (`Kernel::fasync`).
 - `EventFd` (in `fd.rs`) — counter, semaphore flag, `writes`/`reads` generations.
@@ -77,7 +86,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   Host stdio and ordinary inet sockets supply an fd. Queued DNS answers on an untapped UDP socket
   supply guest bits alone. A tapped UDP socket can supply both guest bits and its host fd. Other
   readiness sources include pipes (a write end `POLLOUT` with
-  `PIPE_BUF` free, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
+  a free page slot, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
   seccomp notify, kmsg, `/dev/fuse` (`kernel/fuse`: always writable, readable while a request or
@@ -98,23 +107,30 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ### Waiting
 
-- `Waits` collects host fds and wake objects (readiness is computed again per file) and calls the
-  kernel's wait: the BKL is dropped around one host poll of all host fds plus the thread's event
-  fd; the timeout is the earliest of the deadline and any timerfd deadline; pidfd and signalfd
-  waits also listen on the CHILD and SIGNAL channels. Spurious wakeups just rescan. The BKL is held
-  for every scan.
+- `Waits` reuses the host fds discovered during an empty `ppoll`/`pselect6` scan (`add_with_host`)
+  and `Interest::cached_host` on dynamic/untracked epoll slots rather than recomputing `readiness`
+  when building a blocking wait. For tracked epolls, `Waits::add_epoll_rc` joins `ep.waiters`
+  (woken directly by `EpollWatches` and `epoll_ctl`) and passes the single `host_epoll` fd for all
+  tracked host sockets instead of copying and sorting every idle interest's wake objects or host
+  fds. It calls the kernel's wait: the BKL is dropped around one host poll of all host fds plus
+  the thread's event fd; the timeout is the earliest of the deadline and any timerfd deadline;
+  pidfd and signalfd waits also listen on the CHILD and SIGNAL channels. Spurious wakeups just
+  rescan. The BKL is held for every scan.
 - AIO uses the same `Waits`: io_getevents waits on its pending polls' files plus the context's wake
   object (`wait_aio_polls`), and the timer thread takes each eventfd-signalling poll's host fds and
   timerfd expiration (`watch_aio_poll`), relying on its all-channel interest for the rest.
 
 ### ppoll and pselect6
 
+- `wait_ready` scans all items once, batching every host-backed fd into a single zero-timeout
+  `appine_hal::poll` (`poll_host_batch`, with per-fd fallback if the batch fails), and reuses the
+  discovered host fds when constructing `Waits` on an empty scan.
 - ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`) and, as
   in every timed wait here, saturated at `KTIME_MAX` (the `kernel/time` map); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted,
   also when the wait is interrupted (zeros, before the error is returned, as `do_sys_poll`).
-- pselect6: `nfds` negative `EINVAL`, otherwise clamped to Linux's fd table size computed from
-  the highest open fd (64, then `alloc_fdtable`'s 128 · 2^k), so bits above it are neither read
+- pselect6: `nfds` negative `EINVAL`, otherwise clamped to the fd table's retained capacity
+  (`FdTable::capacity`, including previously occupied slots), so bits above it are neither read
   nor written back; sets read in 64-bit words; read → `IN|RDNORM|HUP|ERR|NVAL`, write →
   `OUT|WRNORM|ERR|NVAL`, except → `PRI|NVAL` (an `O_PATH` fd is ready in every set); a set bit on a
   closed fd `EBADF`; results rebuilt per set (one count per bit). Only events in an fd's sets end
@@ -127,51 +143,69 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ### epoll
 
-- `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`).
+- `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`); attaches the epoll to `Kernel::epoll_watches`.
 - `epoll_ctl` checks in Linux 6.1's order: the event is copied first except for DEL (`EFAULT`);
   epfd, then the target (`EBADF`; `O_PATH` `EBADF`); a target that cannot be polled — regular
   files, directories, synthetic files without a Linux poll operation (`pseudo::pollable`),
   `/dev/null|zero|full`, loop devices and `/dev/loop-control` — `EPERM`; epfd not an epoll, or the target itself, `EINVAL`;
   `EPOLLEXCLUSIVE` only on ADD, not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`); on ADD
-  a cycle or excessive depth in the target's subtree gives `ELOOP`. Interests are keyed by (fd, open file);
+  a cycle or combined nesting depth (receiving epoll's `parents` ancestor depth plus the target's
+  subtree depth) exceeding `MAX_NESTS` (4) gives `ELOOP`, and adding/deleting a nested epoll
+  registers/removes one matching weak ref in the inner epoll's `parents`. Interests are keyed by
+  (fd, open file) in an O(1) index over a slab;
   ADD `EEXIST`, MOD replaces (re-arms; MOD of an exclusive interest `EINVAL`), DEL, missing
-  `ENOENT`. After initial validation, ctl prunes dead interests and signals waiters before
-  checking whether the requested entry exists.
+  `ENOENT`. After initial validation, ctl prunes any dead entry at the matching key (and amortizes
+  full slab pruning on growth), captures `(sdev, ino)` via `Vfs` for `Epoll::fdinfo` (matching
+  `stat` for tmpfs, overlay, FUSE, synthetic mounts, message queues, host fds and anonymous files,
+  encoded as Linux's internal `(major << 20) | minor`), registers/updates `EpollWatches` and
+  `HostEpoll`, and signals waiters.
 - Interests hold weak references: they live while any fd or fork copy holds the open file and are
-  skipped once it is gone (removed at the next `epoll_ctl`). Fork shares the epoll.
+  skipped once it is gone (pruned lazily when touched or on amortized slab growth). Fork shares
+  the epoll.
 - `epoll_pwait`/`epoll_pwait2`: `maxevents` ≤ 0 or too large `EINVAL`; an events buffer reaching
   past the user address space (2^48) `EFAULT` before epfd is looked at (`access_ok`; whether it
-  is mapped is seen only at the copy-out); scan from the cursor (O(n),
-  no ready list); return if anything is ready or past the deadline; interrupted → `EINTR` (never
-  restarted; the temporary mask is kept); otherwise wait. Reports are marked (ONESHOT disarmed,
-  exclusive claim taken) before the events are copied out.
-- With `maxevents > 1`, a scan collects level-triggered host fds without `EPOLLEXCLUSIVE` or
-  file-level `HostEdges` in a zero-timeout poll. Each interest keeps its own mask and guest-known
-  bits, including when registrations share a host fd. Pending entries are reported in cursor
-  order when they could fill the remaining output slots, before another event is appended, or
-  at scan end. A failed batch retries its fds individually. Single-event probes, including the
-  readiness check on an inner epoll, use the scalar path.
+  is mapped is seen only at the copy-out); tracked epolls pull ready host fds via one zero-timeout
+  `HostEpoll::wait_now`, drain only queued entries from `ready_queue` (re-queuing ready entries at
+  the tail until `reported` confirms copy-out for `EFAULT` safety and round-robin fairness), and
+  scan the `dynamic` list (timers, signalfds, pidfds, nested epolls, `EPOLLEXCLUSIVE`, host stdio,
+  `udp_tap` sockets, duplicate/non-epollable host fds, and unconnected or datagram AF_UNIX sockets); return if
+  anything is ready or past the deadline; interrupted → `EINTR` (never restarted; the temporary
+  mask is kept); otherwise wait. Each 16-byte `epoll_event` is copied out to guest memory before
+  `reported` marks it (ONESHOT disarmed, ET `seen` advanced, `HostEpoll` mask synced, exclusive
+  claim taken, mounts change consumed); on `EFAULT`, a partial count is returned if any event was
+  already written, else `EFAULT`, leaving unwritten events intact.
+- Dynamic and untracked scans with `maxevents > 1` batch eligible level-triggered host fds in a
+  zero-timeout poll (`HostPollBatch`), preserving per-interest masks and guest-known bits with
+  per-fd fallback on batch failure. When one epoll consumes a shared `HostEdges` event,
+  `EpollWatches::notify_file` marks other epolls watching that open file dirty so they still see
+  the incremented arrival count.
 - Edge triggering: each interest compares the file's per-direction drain counts and arrival
   generations with its snapshots; a direction that was drained or received new data clears its
   reported bits; an interest fires only for bits not yet reported. Host fds with edge-triggered
   or exclusive interests (or in an edge-watched epoll) get a private edge-triggered host epoll
   (`HostEdges`) so each host arrival counts. While waiting, reported-and-still-ready bits are left
-  out (avoiding busy loops); drains and pipe arrivals wake edge waiters. A pipe's read end counts
-  writes as arrivals and its write end the reads that made it writable again (`Pipe::room`, as
-  Linux's pipe_read wakes the writers of a full pipe). Drains are counted for
-  read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they return
-  `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector forms
-  never count; tee's write-side entry reads the length argument instead of `fd_out`).
+  out (and `HostEpoll` unarms `fd` once `POLLHUP`/`POLLERR` is seen, keeping `HostEdges` armed,
+  avoiding busy loops); drains (`EpollWatches::notify_file`) and non-empty pipe arrivals
+  (`EpollWatches::notify_et_pipes`) mark tracked interests dirty and wake waiters. A pipe's read
+  end counts writes as arrivals. Its write end counts reads that free a slot from a full pipe,
+  whole slots moved by pipe-to-pipe splice and successful resizes (`Pipe::room`). Drains are
+  counted for read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they
+  return `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector
+  forms never count; tee's write-side entry reads the length argument instead of `fd_out`).
 - Nested epolls: an inner epoll's generation is its `base` plus every interest's share. Only live,
   armed entries refresh their shares, and removal transfers the previous share to `base`. The
   generation counts on the read side only. Edge-watching an inner epoll propagates host
-  edge watching inward. An epoll fd reports `POLLIN|POLLRDNORM` (6.1's ep_eventpoll_poll).
+  edge watching inward (and registers inner `HostEdges` and `et_pipes`). An epoll fd reports
+  `POLLIN|POLLRDNORM` (6.1's ep_eventpoll_poll).
 - `EPOLLEXCLUSIVE`: an edge is the file's drain and arrival counts; each edge is claimed by one
   epoll (level-triggered exclusive interests keep reporting to the claiming epoll). Exclusive
-  waiters queue on the file's `ExGate`, and the timer thread (subscribed to
-  every kernel change while gates exist, to the host edges, and woken at the next expiry of a gated
-  timerfd) wakes only the first waiter when a new edge appears. Woken waiters requeue at the back.
-  A host fd for which edge tracking could not be installed uses the direct wait path.
+  waiters queue on the file's `ExGate` in ascending `exclusive_order` (assigned monotonically at
+  `EPOLL_CTL_ADD`, preserving Linux's stable wait-queue order instead of rotating woken waiters to
+  the back) with their `wanted` mask and `seen` bits, and the timer thread (subscribed to every
+  kernel change while gates exist, to the host edges, and woken at the next expiry of a gated
+  timerfd) wakes the first waiter whose requested ready bits are unmasked for the changed
+  read/write direction(s) when a new edge appears. A host fd for which edge tracking could not be
+  installed uses the direct wait path.
 
 ### eventfd
 
@@ -219,7 +253,9 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
   clears reported read/write bits when the counters moved (`drained`, `reads` — bumped by read-file
   syscalls only — and arrivals), computes new events, adds host fds' not-yet-ready bits to its
   host poll, and sends: `SIGIO` with kernel siginfo, or the `F_SETSIG` signal with `POLL_*` code,
-  band (Linux's band table) and fd. Owners are a thread, process or process group
+  band (Linux's band table) and fd (falling back to `SIGIO` with `SI_KERNEL` if an RT `F_SETSIG`
+  signal fails to queue on `RLIMIT_SIGPENDING` overflow, matching Linux 6.1's `send_sigio_to_task`).
+  Owners are a thread, process or process group
   (`send_to_owner`), stored as global ids with the setter's real and effective user IDs; a thread
   owner, or a process through its main thread's credentials (the process's once that thread is
   gone), gets the signal only when that effective ID is root or either ID is its real or saved user
@@ -230,7 +266,7 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 ### Inbound
 
 - The syscall dispatcher (also the drain hook after I/O syscalls; timerfd reads through
-  `kernel/files`' read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
+  `kernel/fileio`'s read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
   `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); lease breaks
   (`send_to_owner`); fdinfo and kcmp.
@@ -255,29 +291,11 @@ count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Confirmed bugs / technical debt
 
-- **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
-  sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
-  bit on a closed fd just above that can be ignored where Linux returns `EBADF`.
-- **Exclusive gates ignore direction and order:** gate wakeups ignore the interest's direction
-  (spurious wakeups, and with mixed masks a matching waiter can miss an edge consumed by another)
-  and rotate waiters instead of keeping Linux's order.
-- **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
-  claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
-  partial count.
-- **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
-  `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
-  buffers partly used, poll and epoll report a pipe writable earlier than Linux.
-- **Per-scan cost:** epoll still scans under the BKL without a ready list. ppoll, pselect6 and
-  epoll's scalar probes issue a separate poll per host-backed item. Building a blocking wait
-  recomputes readiness.
-- **Nesting limit can be bypassed by extending a leaf:** ADD checks the target's descendants
-  without counting the receiving epoll's ancestors. A chain built from the top down can extend
-  past the depth the readiness scan follows.
+- None.
 
 ## Open questions
 
-- Would batching the initial ppoll and pselect6 scans repay its cost on their workloads?
-- Should exclusive waiters keep Linux's stable queue order instead of rotating?
+- None.
 
 ## To verify
 

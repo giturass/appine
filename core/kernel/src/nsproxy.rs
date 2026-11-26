@@ -5,8 +5,8 @@
 //!
 //! A UTS namespace has its own host name and NIS domain name. An IPC namespace has its own System
 //! V IPC objects, POSIX message queues and their limits; the contents are stored by number in
-//! [`crate::kernel::Kernel::ipcs`] and dropped once no thread uses the namespace and no namespace
-//! file keeps it ([`NsRef`]). For network namespaces see [`NetNs`].
+//! [`crate::kernel::Kernel::ipcs`] and dropped once no thread, mount, namespace file ([`NsRef`]),
+//! or pinned IPC sysctl holds it. For network namespaces see [`NetNs`].
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -99,6 +99,11 @@ pub(crate) struct UtsNs {
     /// [`crate::kernel::UTS_LEN`] bytes.
     pub hostname: RefCell<Vec<u8>>,
     pub domainname: RefCell<Vec<u8>>,
+    /// Per-name change counters bumped by sysctl writes and `sethostname`/`setdomainname` so
+    /// pollers on `/proc/sys/kernel/{hostname,domainname}` wake with `POLLPRI|POLLERR` (Linux's
+    /// `uts_proc_notify`).
+    pub hostname_event: Rc<Cell<u64>>,
+    pub domainname_event: Rc<Cell<u64>>,
 }
 
 impl UtsNs {
@@ -109,7 +114,23 @@ impl UtsNs {
             owner,
             hostname: RefCell::new(self.hostname.borrow().clone()),
             domainname: RefCell::new(self.domainname.borrow().clone()),
+            hostname_event: Rc::new(Cell::new(1)),
+            domainname_event: Rc::new(Cell::new(1)),
         })
+    }
+
+    /// Updates `hostname` and wakes pollers on `/proc/sys/kernel/hostname`.
+    pub fn set_hostname(&self, value: Vec<u8>) {
+        *self.hostname.borrow_mut() = value;
+        self.hostname_event.set(self.hostname_event.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.hostname_event));
+    }
+
+    /// Updates `domainname` and wakes pollers on `/proc/sys/kernel/domainname`.
+    pub fn set_domainname(&self, value: Vec<u8>) {
+        *self.domainname.borrow_mut() = value;
+        self.domainname_event.set(self.domainname_event.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.domainname_event));
     }
 }
 
@@ -119,6 +140,15 @@ pub(crate) struct IpcNs {
     pub id: u64,
     /// The user namespace it was created in (for permission checks).
     pub owner: Rc<UserNs>,
+    /// Shared with [`crate::kernel::Kernel::ipc_dead`]; set on drop so the kernel reaps its
+    /// [`crate::ipc::Ipc`] entry regardless of which holder dropped the last reference.
+    pub dead: Rc<Cell<bool>>,
+}
+
+impl Drop for IpcNs {
+    fn drop(&mut self) {
+        self.dead.set(true);
+    }
 }
 
 /// A cgroup namespace: paths in `/proc/<pid>/cgroup` and the root of cgroup2 mounted inside are
@@ -150,28 +180,9 @@ pub(crate) struct NetNs {
     pub devs: RefCell<crate::netdev::Devices>,
     /// The nftables rule set ([`crate::nft`]).
     pub nft: RefCell<crate::nft::Nft>,
-    /// TCP sockets listening and UDP sockets bound in a new network namespace
-    /// ([`crate::netns::listening`]).
-    pub listeners: RefCell<Vec<Listener>>,
-}
-
-/// A TCP socket listening or a UDP socket bound in a new network namespace: on the host they are
-/// all on this namespace's loopback addresses, and incoming connections and datagrams are checked
-/// against these for whether anyone is there and whether the bound address matches (on Linux TCP
-/// gets ECONNREFUSED and UDP is dropped).
-#[derive(Debug, Clone)]
-pub(crate) struct Listener {
-    /// The number used to remove it ([`crate::net::InetSocket::listener`]).
-    pub id: u64,
-    /// The guest port.
-    pub port: u16,
-    /// The bound guest address (4 or 16 bytes); None is the wildcard address.
-    pub addr: Option<Vec<u8>>,
-    /// An AF_INET6 socket, and its `IPV6_V6ONLY`.
-    pub v6: bool,
-    pub v6only: bool,
-    /// UDP (bound), otherwise TCP (listening).
-    pub udp: bool,
+    /// Bound TCP and UDP sockets in a new network namespace (conflict checks, host-port
+    /// resolution and reverse lookup; [`crate::netns::Bindings`]).
+    pub listeners: RefCell<crate::netns::Bindings>,
 }
 
 /// The state of lo in a new network namespace: initially down and without addresses (Linux's
@@ -263,10 +274,13 @@ impl NsProxy {
                 owner: UserNs::init(),
                 hostname: RefCell::new(b"localhost".to_vec()),
                 domainname: RefCell::new(b"(none)".to_vec()),
+                hostname_event: Rc::new(Cell::new(1)),
+                domainname_event: Rc::new(Cell::new(1)),
             }),
             ipc: Rc::new(IpcNs {
                 id: INIT_IPC_NS,
                 owner: UserNs::init(),
+                dead: Rc::new(Cell::new(false)),
             }),
             net: Rc::new(NetNs {
                 id: INIT_NET_NS,

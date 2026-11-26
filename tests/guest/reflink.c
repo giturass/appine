@@ -44,8 +44,12 @@ struct file_clone_range {
     uint64_t dest_offset;
 };
 
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
 #define DIR "/tmp/reflink-test"
-#define SIZE (3 * 4096 + 100)
+#define SIZE (4 * 4096 + 100)
 
 static char data[SIZE];
 
@@ -224,11 +228,20 @@ static void mappings_follow(void)
     char *pa = mmap(NULL, SIZE, PROT_READ, MAP_SHARED, ra, 0);
     CHECK(pb != MAP_FAILED && pa != MAP_FAILED, "mmap");
     CHECK(memcmp(pb, data, SIZE) == 0, "mapped clone");
-    int w = open(DIR "/b", O_RDWR);
-    CHECK(w >= 0 && pwrite(w, "NEW", 3, 8192) == 3, "write the clone");
+    pid_t pid = fork();
+    CHECK(pid >= 0, "fork before unsharing");
+    if (pid == 0) {
+        int w = open(DIR "/b", O_RDWR);
+        CHECK(w >= 0 && pwrite(w, "NEW", 3, 8192) == 3, "write the clone");
+        CHECK(memcmp(pb + 8192, "NEW", 3) == 0, "child sees the write");
+        CHECK(memcmp(pa, data, SIZE) == 0, "child sees the original source");
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "child write: status %#x", status);
     CHECK(memcmp(pb + 8192, "NEW", 3) == 0, "the clone's mapping shows the write");
     CHECK(memcmp(pa, data, SIZE) == 0, "the source's mapping keeps its data");
-    close(w);
     munmap(pb, SIZE);
     munmap(pa, SIZE);
     close(ra);
@@ -239,21 +252,60 @@ static void mappings_follow(void)
     int rc = open(DIR "/c", O_RDONLY);
     char *pc = mmap(NULL, SIZE, PROT_READ, MAP_SHARED, rc, 0);
     CHECK(pc != MAP_FAILED && pc[8192] == data[8192], "mapped clone");
-    CHECK(truncate(DIR "/c", 4096) == 0, "truncate");
-    CHECK(memcmp(pc, data, 4096) == 0, "the kept part");
-    pid_t pid = fork();
+    pid = fork();
+    CHECK(pid >= 0, "fork before truncating");
+    if (pid == 0) {
+        CHECK(truncate(DIR "/c", 4096) == 0, "truncate");
+        CHECK(memcmp(pc, data, 4096) == 0, "the kept part");
+        volatile char x = pc[8192];
+        (void)x;
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
+          "past the end: status %#x", status);
+    CHECK(memcmp(pc, data, 4096) == 0, "parent sees the kept part");
+    pid = fork();
+    CHECK(pid >= 0, "fork after truncating");
     if (pid == 0) {
         volatile char x = pc[8192];
         (void)x;
         _exit(0);
     }
-    int status;
     CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS,
-          "past the end: status %#x", status);
+          "parent's mapping past the end: status %#x", status);
     munmap(pc, SIZE);
     close(rc);
     close(rb);
     ok("mappings_follow");
+}
+
+/* Only a privately dirtied page stops following writes to the cloned file. */
+static void private_mapping(void)
+{
+    source(DIR "/a");
+    int b = empty(DIR "/b");
+    CHECK(clone_into(b, DIR "/a") == 0, "clone before private mmap");
+    close(b);
+    int r = open(DIR "/b", O_RDONLY);
+    CHECK(r >= 0, "open clone read-only");
+    char *p = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, r, 0);
+    CHECK(p != MAP_FAILED && p[16384] == data[16384], "fault clean clone page");
+    close(r);
+    p[1] = 'P';
+    b = open(DIR "/b", O_WRONLY);
+    CHECK(b >= 0 && pwrite(b, "X", 1, 1) == 1 && pwrite(b, "Y", 1, 16384) == 1,
+          "write both clone pages");
+    CHECK(p[1] == 'P' && p[16384] == 'Y', "private and clean pages after write");
+    CHECK(holds(DIR "/a", data, SIZE), "original after clone write");
+    CHECK(unlink(DIR "/b") == 0, "unlink mapped clone");
+    char *moved = mremap(p, SIZE, SIZE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    CHECK(moved != MAP_FAILED && moved[1] == 'P' && p[1] == 'X',
+          "remap keeps dirty page and refills old address from unlinked file");
+    munmap(moved, SIZE);
+    CHECK(pwrite(b, "Z", 1, 16384) == 1 && p[16384] == 'Z', "refilled mapping follows file");
+    close(b);
+    munmap(p, SIZE);
+    ok("private_mapping");
 }
 
 /* A whole-file copy_file_range shares too, advancing both positions */
@@ -360,6 +412,7 @@ int main(void)
     truncation();
     shared_mapping();
     mappings_follow();
+    private_mapping();
     copy_whole();
     ranges();
     sources();

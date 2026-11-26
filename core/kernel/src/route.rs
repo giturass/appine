@@ -54,10 +54,13 @@ const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_PREFSRC: u16 = 7;
+const RTA_FLOW: u16 = 11;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
+const RTA_MARK: u16 = 16;
 const RTA_PREF: u16 = 20;
 const RTA_UID: u16 = 25;
+const RTA_SPORT: u16 = 30;
 /// rtm_flags: `ip route get`'s answer is an entry in the route cache; the matched route itself is
 /// what is asked for.
 const RTM_F_CLONED: u32 = 0x200;
@@ -343,9 +346,16 @@ pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
 /// after the rtmsg); `uid` is the user ID of the requesting process. Returns the answer's content
 /// (RTM_NEWROUTE) or an error number.
 ///
-/// When the longest prefix match in the main table is a route on a virtual device
-/// ([`crate::netdev`]), or this is not the boot namespace (`host_ok` is false), the choice follows
-/// this namespace's table: the output is that route's interface, and the source address
+/// When `RTA_IIF` is present (and nonzero), performs an input-route lookup (Linux's
+/// `inet_rtm_getroute` -> `ip_route_input_rcu` / `inet6_rtm_getroute` -> `ip6_route_input_lookup`):
+/// IPv4 validates source/destination martians, checks the input device is up with an IPv4 address
+/// (`EXDEV`), requires IPv4 forwarding (`ip_forward(iif)`) for non-local/non-broadcast routes
+/// (`EHOSTUNREACH`), and emits `RTA_IIF` without `RTA_PREFSRC`/`RTA_UID`; IPv6 rejects `::1` on
+/// non-loopback `iif` (`ENETUNREACH`) and emits `RTA_IIF` without `RTA_PREFSRC`.
+///
+/// For output lookups, when the longest prefix match in the main table is a route on a virtual
+/// device ([`crate::netdev`]), or this is not the boot namespace (`host_ok` is false), the choice
+/// follows this namespace's table: the output is that route's interface, and the source address
 /// is its preferred source, or when there is none an address on the output interface
 /// (`inet_select_addr`).
 pub(crate) fn get(
@@ -354,24 +364,58 @@ pub(crate) fn get(
     ifaces: &[Interface],
     uid: u32,
     host_ok: bool,
-) -> Result<Vec<u8>, i32> {
+    ip_forward: impl Fn(u32) -> bool,
+    route_localnet: impl Fn(u32) -> bool,
+) -> Result<Vec<u8>, (i32, Option<&'static str>)> {
     const EINVAL: i32 = 22;
+    const ERANGE: i32 = 34;
     const EOPNOTSUPP: i32 = 95;
     const ENETUNREACH: i32 = 101;
-    let family = *req.get(16).ok_or(EINVAL)? as i32;
-    let flags = u32::from_le_bytes(req.get(24..28).ok_or(EINVAL)?.try_into().unwrap());
+    const BAD_ATTR: (i32, Option<&'static str>) =
+        (ERANGE, Some("Attribute failed policy validation"));
+    let family = *req.get(16).ok_or((EINVAL, None))? as i32;
     let len = match family {
         AF_INET => 4,
         AF_INET6 => 16,
-        _ => return Err(EOPNOTSUPP),
+        _ => return Err((EOPNOTSUPP, None)),
     };
-    let (mut dst, mut src) = (vec![0u8; len], None);
+    let flags_bytes = req.get(24..28).ok_or((
+        EINVAL,
+        Some(if family == AF_INET {
+            "ipv4: Invalid header for route get request"
+        } else {
+            "ipv6: Invalid header for route get request"
+        }),
+    ))?;
+    let flags = u32::from_le_bytes(flags_bytes.try_into().unwrap());
+    let addr_err = if family == AF_INET {
+        BAD_ATTR
+    } else {
+        (EINVAL, None)
+    };
+    let (mut dst, mut src, mut iif) = (vec![0u8; len], None, None);
+    // Mirror Linux's rtm_ipv4_policy / rtm_ipv6_policy (leading bytes accepted on oversized
+    // RTA_DST/RTA_SRC; IPv4 short attrs and u32s return ERANGE, IPv6 short DST/SRC return EINVAL).
     for (ty, data) in attrs(&req[28..]) {
-        match ty {
-            RTA_DST if data.len() == len => dst = data.to_vec(),
-            RTA_SRC if data.len() == len => src = Some(data.to_vec()),
-            // Routing as for a received packet (`iif`) is not implemented
-            RTA_IIF => return Err(EOPNOTSUPP),
+        match (family, ty) {
+            (_, RTA_DST) => dst = data.get(..len).ok_or(addr_err)?.to_vec(),
+            (_, RTA_SRC) => src = Some(data.get(..len).ok_or(addr_err)?.to_vec()),
+            (_, RTA_IIF) => {
+                let b = data.get(..4).ok_or(BAD_ATTR)?;
+                let idx = i32::from_le_bytes(b.try_into().unwrap());
+                if idx != 0 {
+                    iif = Some(idx);
+                }
+            }
+            (_, RTA_OIF | RTA_PRIORITY | RTA_TABLE | RTA_MARK | RTA_UID) | (AF_INET, RTA_FLOW)
+                if data.len() < 4 =>
+            {
+                return Err(BAD_ATTR);
+            }
+            (_, RTA_GATEWAY | RTA_PREFSRC) if data.len() < len => return Err(BAD_ATTR),
+            (_, RTA_SPORT) if data.len() != 2 => {
+                return Err((EINVAL, Some("invalid attribute length")));
+            }
             _ => {}
         }
     }
@@ -379,6 +423,22 @@ pub(crate) fn get(
     let local_hit = longest_match(of_family().filter(|e| e.table == RT_TABLE_LOCAL), &dst)
         .filter(|e| e.ty != RTN_MULTICAST || family == AF_INET);
     let lo = ifaces.iter().find(|i| i.flags & IFF_LOOPBACK != 0);
+    if let Some(iif_idx) = iif {
+        return get_input(
+            family,
+            flags,
+            &dst,
+            src.as_deref(),
+            iif_idx,
+            entries,
+            ifaces,
+            local_hit,
+            lo,
+            ip_forward,
+            route_localnet,
+        )
+        .map_err(|e| (e, None));
+    }
     // The matched route, output interface, source address, and the cache entry's rt_flags
     let (route, oif, saddr, rt_flags) = match local_hit {
         Some(e) if e.ty == RTN_LOCAL => {
@@ -407,7 +467,7 @@ pub(crate) fn get(
                 .is_some_and(|e| !e.host) =>
         {
             let route = longest_match(of_family().filter(|e| e.table == RT_TABLE_MAIN), &dst)
-                .ok_or(ENETUNREACH)?
+                .ok_or((ENETUNREACH, None))?
                 .clone();
             let saddr = match &src {
                 Some(s) => s.clone(),
@@ -415,7 +475,7 @@ pub(crate) fn get(
                     .prefsrc
                     .clone()
                     .or_else(|| select_source(ifaces, &route, &dst))
-                    .ok_or(ENETUNREACH)?,
+                    .ok_or((ENETUNREACH, None))?,
             };
             let index = route.index;
             (route, index, Some(saddr), 0)
@@ -423,7 +483,7 @@ pub(crate) fn get(
         _ => {
             let saddr = match &src {
                 Some(s) => s.clone(),
-                None => appine_hal::net::source_for(&dst)?,
+                None => appine_hal::net::source_for(&dst).map_err(|e| (e, None))?,
             };
             let out = owner(ifaces, &saddr);
             let matched = longest_match(
@@ -457,7 +517,7 @@ pub(crate) fn get(
                     flags: 0,
                     host: true,
                 },
-                (None, None) => return Err(ENETUNREACH),
+                (None, None) => return Err((ENETUNREACH, None)),
             };
             // Multicast: this machine is always in the all-hosts group (224.0.0.1); for other
             // groups whether it joined cannot be told
@@ -536,8 +596,163 @@ pub(crate) fn get(
     Ok(p)
 }
 
+/// Input-route lookup (`ip route get ... iif <dev>`): Linux's `ip_route_input_rcu` /
+/// `ip6_route_input_lookup`.
+#[allow(clippy::too_many_arguments)]
+fn get_input(
+    family: i32,
+    flags: u32,
+    dst: &[u8],
+    src: Option<&[u8]>,
+    iif_idx: i32,
+    entries: &[Entry],
+    ifaces: &[Interface],
+    local_hit: Option<&Entry>,
+    lo: Option<&Interface>,
+    ip_forward: impl Fn(u32) -> bool,
+    route_localnet: impl Fn(u32) -> bool,
+) -> Result<Vec<u8>, i32> {
+    const EXDEV: i32 = 18;
+    const ENODEV: i32 = 19;
+    const EINVAL: i32 = 22;
+    const ENETUNREACH: i32 = 101;
+    const EHOSTUNREACH: i32 = 113;
+    let in_dev = ifaces
+        .iter()
+        .find(|i| i.index as i32 == iif_idx)
+        .ok_or(ENODEV)?;
+    let main_match = || {
+        longest_match(
+            entries
+                .iter()
+                .filter(|e| e.family == family && e.table == RT_TABLE_MAIN),
+            dst,
+        )
+    };
+    if family == AF_INET {
+        let s = src.ok_or(EINVAL)?;
+        let localnet = route_localnet(in_dev.index);
+        // Linux's ip_route_input_slow martian checks: reject 0/8, multicast, 255.255.255.255
+        // sources, 0/8 dst, and 127/8 src/dst unless route_localnet is enabled on iif.
+        if s[0] == 0
+            || s[0] & 0xf0 == 0xe0
+            || s == [255, 255, 255, 255]
+            || dst[0] == 0
+            || (!localnet && (s[0] == 127 || dst[0] == 127))
+        {
+            return Err(EINVAL);
+        }
+        if in_dev.flags & IFF_UP == 0 || !in_dev.addrs.iter().any(|(f, ..)| *f == AF_INET) {
+            return Err(EXDEV);
+        }
+        let (route, oif, rt_flags) = match local_hit {
+            Some(e) if e.ty == RTN_LOCAL => (e, lo.map_or(e.index, |i| i.index), RTCF_LOCAL),
+            Some(e) if e.ty == RTN_BROADCAST => (
+                e,
+                lo.map_or(e.index, |i| i.index),
+                RTCF_BROADCAST | RTCF_LOCAL,
+            ),
+            _ => {
+                if !ip_forward(in_dev.index) {
+                    return Err(EHOSTUNREACH);
+                }
+                let route = main_match().ok_or(ENETUNREACH)?;
+                (route, route.index, 0)
+            }
+        };
+        if flags & RTM_F_FIB_MATCH != 0 {
+            return Ok(route_message(route));
+        }
+        let ty = match rt_flags {
+            f if f & RTCF_BROADCAST != 0 => RTN_BROADCAST,
+            RTCF_LOCAL => RTN_LOCAL,
+            _ => RTN_UNICAST,
+        };
+        let mut p = rtmsg(
+            family,
+            32,
+            32,
+            RT_TABLE_MAIN,
+            0,
+            RT_SCOPE_UNIVERSE,
+            ty,
+            rt_flags | RTM_F_CLONED,
+        );
+        put(&mut p, RTA_TABLE, &u32::from(RT_TABLE_MAIN).to_le_bytes());
+        put(&mut p, RTA_DST, dst);
+        put(&mut p, RTA_SRC, s);
+        put(&mut p, RTA_OIF, &oif.to_le_bytes());
+        if let Some(gw) = route.gateway.as_ref().filter(|_| rt_flags == 0) {
+            put(&mut p, RTA_GATEWAY, gw);
+        }
+        put(&mut p, RTA_IIF, &in_dev.index.to_le_bytes());
+        put(&mut p, RTA_CACHEINFO, &cacheinfo(2));
+        return Ok(p);
+    }
+    // IPv6 input route lookup (Linux's inet6_rtm_getroute -> ip6_route_input_lookup)
+    if dst == std::net::Ipv6Addr::LOCALHOST.octets() && in_dev.flags & IFF_LOOPBACK == 0 {
+        return Err(ENETUNREACH);
+    }
+    let (route, oif) = match local_hit {
+        Some(e) if e.ty == RTN_LOCAL => (e, lo.map_or(e.index, |i| i.index)),
+        _ => {
+            let route = main_match().ok_or(ENETUNREACH)?;
+            (route, route.index)
+        }
+    };
+    let fib = flags & RTM_F_FIB_MATCH != 0;
+    let mut p = if fib {
+        rtmsg(
+            route.family,
+            route.prefix,
+            0,
+            route.table,
+            route.proto,
+            route.scope,
+            route.ty,
+            route.flags,
+        )
+    } else {
+        rtmsg(
+            family,
+            128,
+            128,
+            route.table,
+            route.proto,
+            RT_SCOPE_UNIVERSE,
+            route.ty,
+            0,
+        )
+    };
+    put(&mut p, RTA_TABLE, &u32::from(route.table).to_le_bytes());
+    if fib {
+        if route.prefix > 0 {
+            put(&mut p, RTA_DST, &route.dst);
+        }
+    } else {
+        put(&mut p, RTA_DST, dst);
+        put(&mut p, RTA_SRC, src.unwrap_or(&[0; 16]));
+    }
+    put(&mut p, RTA_IIF, &in_dev.index.to_le_bytes());
+    put(&mut p, RTA_PRIORITY, &route.metric.to_le_bytes());
+    if let Some(gw) = &route.gateway {
+        put(&mut p, RTA_GATEWAY, gw);
+    }
+    put(
+        &mut p,
+        RTA_OIF,
+        &if fib { route.index } else { oif }.to_le_bytes(),
+    );
+    put(&mut p, RTA_CACHEINFO, &cacheinfo(if fib { 0 } else { 2 }));
+    put(&mut p, RTA_PREF, &[0]);
+    Ok(p)
+}
+
+/// One parsed netlink attribute: `(type, payload)`.
+pub(crate) type Attr<'a> = (u16, &'a [u8]);
+
 /// The attributes in a message: (type, payload).
-pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
+pub(crate) fn attrs(mut b: &[u8]) -> Vec<Attr<'_>> {
     let mut out = Vec::new();
     while b.len() >= 4 {
         let len = u16::from_le_bytes([b[0], b[1]]) as usize;
@@ -548,6 +763,25 @@ pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
         b = &b[len.next_multiple_of(4).min(b.len())..];
     }
     out
+}
+
+/// Strictly parses netlink attributes (Linux's `nla_parse_deprecated_strict`): rejects malformed
+/// lengths and leftover trailing bytes with `EINVAL`.
+pub(crate) fn attrs_strict(mut b: &[u8]) -> Result<Vec<Attr<'_>>, (i32, &'static str)> {
+    const LEFTOVER: (i32, &str) = (22, "bytes leftover after parsing attributes");
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            return Err(LEFTOVER);
+        }
+        out.push((u16::from_le_bytes([b[2], b[3]]) & 0x3fff, &b[4..len]));
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    if !b.is_empty() {
+        return Err(LEFTOVER);
+    }
+    Ok(out)
 }
 
 /// The route in `entries` with the longest prefix containing `ip`; among equally long ones the
@@ -1000,9 +1234,20 @@ mod tests {
     fn answers_local_destinations_like_linux() {
         let ifaces = container();
         let t = tables(&ifaces, Some(host_routes()));
+        let no = |_: u32| false;
+        let yes = |_: u32| true;
         // A local address: the table is main (merged), type local, through lo, flags RTCF_LOCAL |
         // RTM_F_CLONED
-        let r = get(&request(AF_INET, &[172, 17, 0, 2], 0), &t, &ifaces, 0, true).unwrap();
+        let r = get(
+            &request(AF_INET, &[172, 17, 0, 2], 0),
+            &t,
+            &ifaces,
+            0,
+            true,
+            no,
+            no,
+        )
+        .unwrap();
         assert_eq!(r[..12], [2, 32, 0, 0, 254, 0, 0, 2, 0, 2, 0, 0x80]);
         let a: Vec<(u16, Vec<u8>)> = attrs(&r[12..])
             .iter()
@@ -1023,7 +1268,16 @@ mod tests {
         assert_eq!(a[2].1, 1u32.to_le_bytes());
         assert_eq!(a[3].1, [172, 17, 0, 2]);
         // Another address in the loopback subnet: the source address is the loopback one
-        let r = get(&request(AF_INET, &[127, 0, 0, 9], 0), &t, &ifaces, 0, true).unwrap();
+        let r = get(
+            &request(AF_INET, &[127, 0, 0, 9], 0),
+            &t,
+            &ifaces,
+            0,
+            true,
+            no,
+            no,
+        )
+        .unwrap();
         assert!(attrs(&r[12..]).contains(&(RTA_PREFSRC, &[127, 0, 0, 1][..])));
         // The subnet's broadcast
         let r = get(
@@ -1032,13 +1286,15 @@ mod tests {
             &ifaces,
             0,
             true,
+            no,
+            no,
         )
         .unwrap();
         assert_eq!(r[7], RTN_BROADCAST);
         // IPv6 ::1: the local table, with RTA_SRC ::, metric and priority
         let mut one = [0u8; 16];
         one[15] = 1;
-        let r = get(&request(AF_INET6, &one, 0), &t, &ifaces, 0, true).unwrap();
+        let r = get(&request(AF_INET6, &one, 0), &t, &ifaces, 0, true, no, no).unwrap();
         assert_eq!(r[..12], [10, 128, 128, 0, 255, 2, 0, 2, 0, 0, 0, 0]);
         let types: Vec<u16> = attrs(&r[12..]).iter().map(|(t, _)| *t).collect();
         assert_eq!(
@@ -1061,6 +1317,8 @@ mod tests {
             &ifaces,
             0,
             true,
+            no,
+            no,
         )
         .unwrap();
         assert_eq!(r, route_message(&t[5]));
@@ -1073,21 +1331,151 @@ mod tests {
         let n = req.len() as u32;
         req[..4].copy_from_slice(&n.to_le_bytes());
         let empty = tables(&ifaces, Some(Vec::new()));
-        let r = get(&req, &empty, &ifaces, 0, true).unwrap();
+        let r = get(&req, &empty, &ifaces, 0, true, no, no).unwrap();
         let a = attrs(&r[12..]);
         assert!(a.contains(&(RTA_OIF, &2u32.to_le_bytes()[..])));
         assert!(
             !a.iter()
                 .any(|(t, _)| *t == RTA_GATEWAY || *t == RTA_PREFSRC)
         );
-        // Routing as for a received packet is not implemented
-        let mut req = request(AF_INET, &[1, 1, 1, 1], 0);
-        let mut iif = Vec::new();
-        put(&mut iif, RTA_IIF, &2u32.to_le_bytes());
-        req.extend_from_slice(&iif);
-        let n = req.len() as u32;
-        req[..4].copy_from_slice(&n.to_le_bytes());
-        assert_eq!(get(&req, &t, &ifaces, 0, true), Err(95));
+        // Input-route lookup (`RTA_IIF`):
+        let iif_req = |fam: i32, dst: &[u8], src: Option<&[u8]>, iif: i32, flags: u32| {
+            let mut m = request(fam, dst, flags);
+            let mut extra = Vec::new();
+            if let Some(s) = src {
+                put(&mut extra, RTA_SRC, s);
+            }
+            put(&mut extra, RTA_IIF, &iif.to_le_bytes());
+            m.extend_from_slice(&extra);
+            let n = m.len() as u32;
+            m[..4].copy_from_slice(&n.to_le_bytes());
+            m
+        };
+        // Nonexistent iif -> ENODEV
+        assert_eq!(
+            get(
+                &iif_req(AF_INET, &[172, 17, 0, 2], Some(&[172, 17, 0, 5]), 99, 0),
+                &t,
+                &ifaces,
+                0,
+                true,
+                yes,
+                no,
+            )
+            .map_err(|(e, _)| e),
+            Err(19)
+        );
+        // IPv4 iif without RTA_SRC -> EINVAL
+        assert_eq!(
+            get(
+                &iif_req(AF_INET, &[172, 17, 0, 2], None, 2, 0),
+                &t,
+                &ifaces,
+                0,
+                true,
+                yes,
+                no,
+            )
+            .map_err(|(e, _)| e),
+            Err(22)
+        );
+        // IPv4 iif loopback without route_localnet -> EINVAL
+        assert_eq!(
+            get(
+                &iif_req(AF_INET, &[127, 0, 0, 1], Some(&[172, 17, 0, 5]), 2, 0),
+                &t,
+                &ifaces,
+                0,
+                true,
+                yes,
+                no,
+            )
+            .map_err(|(e, _)| e),
+            Err(22)
+        );
+        // IPv4 iif local destination succeeds even with ip_forward = 0, emits RTA_IIF without
+        // RTA_PREFSRC/RTA_UID
+        let r = get(
+            &iif_req(AF_INET, &[172, 17, 0, 2], Some(&[172, 17, 0, 5]), 2, 0),
+            &t,
+            &ifaces,
+            0,
+            true,
+            no,
+            no,
+        )
+        .unwrap();
+        assert_eq!(r[7], RTN_LOCAL);
+        let types: Vec<u16> = attrs(&r[12..]).iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            types,
+            [RTA_TABLE, RTA_DST, RTA_SRC, RTA_OIF, RTA_IIF, RTA_CACHEINFO]
+        );
+        assert!(attrs(&r[12..]).contains(&(RTA_IIF, &2u32.to_le_bytes()[..])));
+        assert!(attrs(&r[12..]).contains(&(RTA_OIF, &1u32.to_le_bytes()[..])));
+        // IPv4 iif forwarding: EHOSTUNREACH when ip_forward=0, unicast with gateway when 1
+        let fwd_req = iif_req(AF_INET, &[1, 1, 1, 1], Some(&[172, 17, 0, 5]), 2, 0);
+        assert_eq!(
+            get(&fwd_req, &t, &ifaces, 0, true, no, no).map_err(|(e, _)| e),
+            Err(113)
+        );
+        let r = get(&fwd_req, &t, &ifaces, 0, true, yes, no).unwrap();
+        assert_eq!(r[7], RTN_UNICAST);
+        let a = attrs(&r[12..]);
+        assert!(a.contains(&(RTA_GATEWAY, &[172, 17, 0, 1][..])));
+        assert!(a.contains(&(RTA_IIF, &2u32.to_le_bytes()[..])));
+        assert!(!a.iter().any(|(t, _)| *t == RTA_PREFSRC || *t == RTA_UID));
+        // IPv6 iif: ::1 on non-lo -> ENETUNREACH; on lo -> local with RTA_IIF; fibmatch keeps RTA_IIF
+        assert_eq!(
+            get(
+                &iif_req(AF_INET6, &one, None, 2, 0),
+                &t,
+                &ifaces,
+                0,
+                true,
+                no,
+                no,
+            )
+            .map_err(|(e, _)| e),
+            Err(101)
+        );
+        let r = get(
+            &iif_req(AF_INET6, &one, Some(&one), 1, 0),
+            &t,
+            &ifaces,
+            0,
+            true,
+            no,
+            no,
+        )
+        .unwrap();
+        let types: Vec<u16> = attrs(&r[12..]).iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            types,
+            [
+                RTA_TABLE,
+                RTA_DST,
+                RTA_SRC,
+                RTA_IIF,
+                RTA_PRIORITY,
+                RTA_OIF,
+                RTA_CACHEINFO,
+                RTA_PREF
+            ]
+        );
+        let ll_dst = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let r = get(
+            &iif_req(AF_INET6, &ll_dst, None, 2, RTM_F_FIB_MATCH),
+            &t,
+            &ifaces,
+            0,
+            true,
+            no,
+            no,
+        )
+        .unwrap();
+        assert_eq!(r[1], 64);
+        assert!(attrs(&r[12..]).contains(&(RTA_IIF, &2u32.to_le_bytes()[..])));
     }
 
     #[test]

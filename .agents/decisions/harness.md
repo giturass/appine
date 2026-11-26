@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
@@ -89,11 +89,11 @@
 - **Source**: 248d79f
 
 ### D24: CI is split into quick checks, the Android build and nightly full tests
-- **What**: ci.yml runs fmt, clippy and cargo test on every push and pull request that touches more than docs, `.agents`, Markdown or `android/`; android.yml runs when `core/`, `hosts/android/`, `android/`, the Cargo files or the rootfs and Ghostty scripts change, or by hand; full.yml runs the network test, extended lockstep, the Starnix and gVisor builds, the differential tests (`scripts/difftest -R`, D38, after building the release `appine-run` in a step of its own) and the clang engine tests nightly at 02:00 China time when develop has a commit from the last 25 hours, on pushes to master and by hand; the quick workflows cancel a run a newer push supersedes, and the performance probe is dropped.
-- **Why**: Each of the frequent pushes waited 16 minutes (30 or more with the Starnix and gVisor cases) for suites that rarely change their verdict between two pushes.
-- **Tradeoffs**: Regressions only the differential tests catch show up the next morning, so risky changes need a local difftest or a manual full run; the nightly run uses master's copy of full.yml; a rust-cache miss adds the release build to full.yml; Tier 1's overhead on Neoverse N2 is no longer recorded in CI logs.
-- **Watch out**: GitHub runs scheduled workflows only from the default branch, so the nightly run picks up a change to full.yml only once master has it (without 48dce39's build step the differential tests never ran from 0202f1e on), while a `workflow_dispatch` started with `--ref <branch>` runs that branch's copy; CI's newer native kernel answers some cases otherwise than colima's 6.8 (D36); and a new Android build input outside the path filters goes unbuilt until a run that matches.
-- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch); 36083476; 20137e4c; d053be24; 39e55b4b
+- **What**: ci.yml runs fmt, clippy and cargo test on pushes/PRs outside docs, `.agents`, Markdown or `android/`; android.yml runs on Android/core/script changes or manually; full.yml runs nightly at 02:00 China time (when develop had a commit in 25 hours), on pushes to master and manually, split into `build` (builds release `appine-run` as a 7-day `overwrite: true` artifact and populates Starnix/gVisor caches), parallel `checks` (network, extended lockstep, clang engine/lockstep) and five `fail-fast: false` single-lane `difftest` matrix shards (`gvisor-process`, `gvisor`, `starnix`, `core-1`, `core-2`) running `scripts/difftest -R` (D38); quick workflows cancel superseded runs and the performance probe is dropped.
+- **Why**: Frequent pushes waited 16–30+ minutes for rarely changing suites, and running all 97 differential groups plus checks serially in one full.yml job took ~35 minutes and forced full re-runs on a single intermittent failure.
+- **Tradeoffs**: Differential regressions surface nightly unless run locally/manually, sharding uses more total runner minutes (each shard initializes its own Alpine store in ~20 s) and passes `appine-run` via a 7-day artifact, nightly runs use master's copy of full.yml, and Tier 1's Neoverse N2 overhead is no longer logged in CI.
+- **Watch out**: Scheduled runs read `master`'s `full.yml` until merged (`workflow_dispatch --ref <branch>` uses the branch copy), `Re-run failed jobs` fails after the 7-day `appine-run` artifact expires, unbalanced `core-1`/`core-2` slices can skew shard time, CI's newer kernel differs from colima 6.8 (D36), and Android build inputs outside path filters go unbuilt.
+- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch); 36083476; 20137e4c; d053be24; 39e55b4b; 2e6c1894
 
 ### D25: Signals to appine-run go through the guest, so shutdown still runs
 - **What**: `appine-run` catches SIGINT, SIGTERM and SIGHUP with `appine_hal::stop_notifier` (hal D14) and hands them to the kernel's run through `RunOptions::stop` (kernel/process D30): the first is sent on to the program, one at least a second later ends every guest process, and the run then ends as usual.
@@ -180,11 +180,11 @@
 - **Source**: ba6200f
 
 ### D37: CI saves the suite caches by themselves and uploads the differential tests' diagnostics
-- **What**: full.yml restores each suite build's cache before it and saves it as soon as a missed build finishes (actions/cache/restore and save), samples vmstat every 10 s during the differential tests (stopped by a trap however the step ends), and uploads every case's `.appine.err`, the failed cases' outputs and the samples as the `difftest` artifact whatever the result, removing the store in a later step.
-- **Why**: actions/cache saved only when the whole job succeeded, so the Starnix and gVisor builds ran on every failing run, and stalls seen only on CI cost 23–35 minutes a run with nothing kept to show why.
-- **Tradeoffs**: Every run uploads an artifact, and parallel lanes stay off on CI, since four lanes made timing-sensitive cases flaky on the development VM.
-- **Watch out**: A stall that holds no BKL leaves no watchdog report, only vmstat's view of the runner.
-- **Source**: 4b5f458
+- **What**: full.yml restores and saves each suite cache right around its build in `build`, restores only the needed suite cache per `difftest` shard, samples `vmstat` every 10 s during differential tests (stopped by a trap), and uploads `*.appine.err`, `failed/` outputs and `vmstat.log` as `difftest-<shard>-attempt-<run_attempt>` regardless of outcome before removing the store (having removed the temporary `sy-sample.log` and `strace`/`gdb` probes after the CI livelock fix in 23e3b01e).
+- **Why**: Whole-job caching lost Starnix/gVisor builds on failing runs, CI stalls needed low-overhead host diagnostics, and keeping the temporary `strace`/`gdb` install and 30 s sampler added ~15 s per shard after the livelock was fixed.
+- **Tradeoffs**: Every shard uploads an artifact, multi-lane `-j` stays off on CI to avoid VM timing flakes, and future non-watchdog host stalls would require re-adding thread-level `strace`/`gdb` probes on demand.
+- **Watch out**: Without the temporary probes, a non-BKL host stall leaves only `vmstat.log`'s host `sy`/`cs` anomalies and no per-thread stack dump.
+- **Source**: 4b5f458, 2e6c1894, 45495baf, 6e80c7a0, f5220571
 
 ### D38: `difftest -R` reruns failed groups once and passes those that pass as flaky
 - **What**: `-R` collects the failed groups (from the single-lane loop, the lanes' report lines and lanes that never reported) and reruns each once, alone on the main store after all the others; one that passes prints `flaky <name>`, counted in the summary and not failed, one that fails again prints its second report too, the first failure's outputs stay in `target/difftest/failed/` for full.yml's upload (D37), and full.yml runs `scripts/difftest -R`.
@@ -253,3 +253,5 @@
 - ~~Manual full.yml runs also use master's copy (D24's watch-out, 0202f1e, 48dce39)~~ → replaced by **D24** in 4083007 (2026-11-11)
 - ~~The native side's forgets must arrive within the 1 s the case sleeps after `drop_caches` (D34's watch-out, 3957a03)~~ → replaced by **D34** in 8f50f11 (2026-11-11)
 - ~~D9 combined ownership of the newly extracted child modules~~ → replaced by **D9** in 60790c14 (2026-11-15; scope only, inherited implementation decisions remain here)
+- ~~Single-job serial `full.yml` execution in D24 (0202f1e, 48dce39)~~ → replaced by **D24** in 2e6c1894 (2026-11-22, implicit refinement)
+- ~~Temporary 30 s `sy-sample.log` sampler (45495baf) and `strace`/`gdb` deep probes (6e80c7a0) in `full.yml`~~ → removed under **D37** in f5220571 (2026-11-22)

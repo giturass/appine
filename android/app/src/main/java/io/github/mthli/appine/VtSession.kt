@@ -3,7 +3,6 @@ package io.github.mthli.appine
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
 import android.util.Log
 import io.github.mthli.appine.VtSession.Companion.MAX_STATUS_RECORDS
 import io.github.mthli.appine.VtSession.Companion.PROGRESS_TIMEOUT_MS
@@ -13,6 +12,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.math.abs
 
 /**
  * A terminal tab (the android/vt map), owned by [TerminalService]: a login shell on a kernel
@@ -92,6 +92,19 @@ internal class VtSession(
     /** The console is open: started and not closed yet. */
     val consoleOpen: Boolean get() = pty.console >= 0 && !hungUp.get()
 
+    /**
+     * Whether this tab owned [console] when kill reports were taken at [epoch]: each tracked
+     * console lifetime has a disjoint `[openedEpoch, closedEpoch]` interval (`closedEpoch == 0`
+     * while open).
+     */
+    fun ownedConsoleAt(console: Int, epoch: Long): Boolean {
+        if (console < 0 || pty.console != console) return false
+        val opened = pty.openedEpoch
+        if (opened <= 0L || epoch < opened) return false
+        val closed = pty.closedEpoch
+        return closed == 0L || epoch <= closed
+    }
+
     /** The login account setting the tab was opened with ([ConsolePty.login]). */
     val login: String get() = pty.login
 
@@ -155,7 +168,11 @@ internal class VtSession(
      */
     private var lastTranscript: String? = null
 
-    /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
+    /**
+     * The title a program set (OSC 0/2), or the console's foreground command while one runs under
+     * busybox ash or an unmarked shell without setting a title; null when none (the tab bar then
+     * shows `sh`).
+     */
     val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
 
     /**
@@ -170,16 +187,16 @@ internal class VtSession(
 
     /**
      * Closing the tab would end something the user may be waiting for: the shell runs and is not
-     * at its prompt, as its prompt marks (OSC 133, sent from `/etc/profile.d/appine.sh`) tell, so a
-     * command runs; always so for a shell without the marks. A shell not started yet (a restored
-     * tab never shown) has nothing to end.
+     * at its prompt, as OSC 133 prompt marks tell (falling back to foreground-process detection
+     * for unmarked shells and busybox ash whose PS1 lost its marks). A shell not started yet (a
+     * restored tab never shown) has nothing to end.
      */
-    val busy: Boolean get() = isRunning && tab != 0L && !VtNative.atPrompt(tab)
+    val busy: Boolean get() = isRunning && tab != 0L && VtNative.busy(tab)
 
     /**
      * The last progress report (OSC 9;4); null when there is none, it was removed, none came for
      * [PROGRESS_TIMEOUT_MS] (as Ghostty drops it, against programs that never remove it), the
-     * program gave the terminal back ([onForeground]) or the shell exited.
+     * command ended, the shell started a primary prompt, the foreground group changed, or the shell exited.
      */
     var progress: Progress? = null
         private set
@@ -204,7 +221,11 @@ internal class VtSession(
      * Clipboard reads (OSC 52) waiting for the user's answer: the clipboard each named, `c`, `p`
      * or `s`, which the answer names too.
      */
-    private val clipboardReads = ArrayList<Char>()
+    val clipboardReads = ClipboardReads(
+        schedule = { timeout, delay -> main.postDelayed(timeout, delay) },
+        cancelTimeout = main::removeCallbacks,
+        reply = ::write,
+    )
 
     private val dropProgress = Runnable { setProgress(null) }
 
@@ -380,34 +401,29 @@ internal class VtSession(
         main.post { if (!released) events.onNotification(this, title, body) }
     }
 
-    /**
-     * From vt.rs, on the pump thread: programs asked to read the clipboard (OSC 52 "?") [count]
-     * times, the last naming clipboard [kind] (`c`, `p` or `s`). They wait for the answer: the
-     * service has the user asked, or answers with an empty clipboard ([answerClipboardRead]).
-     */
+    /** Invalidate queued replies on the pump thread before the main thread dismisses the preview. */
     @Suppress("unused")
-    fun onClipboardRead(kind: Int, count: Int) {
-        main.post {
-            if (released) return@post
-            val first = clipboardReads.isEmpty()
-            repeat(count) { clipboardReads.add(kind.toChar()) }
-            if (first) events.onClipboardRead(this)
-        }
+    fun onClipboardReset(generation: Long) {
+        clipboardReads.observeNativeGeneration(generation)
+        main.post { if (!released) clipboardReads.resetTo(generation) }
     }
 
     /**
-     * Answers the clipboard reads that wait with [text], or, denied, with an empty clipboard
-     * (as libghostty-vt answers a read it refuses), so programs do not wait for a timeout. The
-     * answer names the clipboard asked for, ends with ST and carries the text in base64, as
-     * Ghostty's does.
+     * From vt.rs, on the pump thread: programs asked to read the clipboard (OSC 52 "?") [count]
+     * times, the last naming clipboard [kind]. Only the first waiting read needs a UI callback.
      */
-    fun answerClipboardRead(text: String?) {
-        if (clipboardReads.isEmpty()) return
-        val data = Base64.encodeToString(text.orEmpty().toByteArray(), Base64.NO_WRAP)
-        val answer = clipboardReads.joinToString("") { "\u001b]52;$it;$data\u001b\\" }
-        clipboardReads.clear()
-        write(answer.toByteArray())
+    @Suppress("unused")
+    fun onClipboardRead(kind: Int, count: Int, generation: Long) {
+        if (clipboardReads.isStale(generation)) return
+        main.post {
+            if (released || !isRunning) return@post
+            if (clipboardReads.enqueue(kind.toChar(), count, generation)) events.onClipboardRead(this)
+        }
     }
+
+    fun onClipboardRead(kind: Int, count: Int) = onClipboardRead(kind, count, clipboardReads.currentNativeGeneration)
+
+    fun answerClipboardRead(text: String?) = clipboardReads.answer(text)
 
     /**
      * From vt.rs, on the pump thread: a program reported its progress (OSC 9;4), [state] being
@@ -453,6 +469,10 @@ internal class VtSession(
         val taken = synchronized(reports) { reports.toList().also { reports.clear() } }
         if (released || !isRunning) return
         for (r in taken) {
+            if (r.state == STATUS_EXPIRE_TRANSIENT) {
+                records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }
+                continue
+            }
             if (r.state == STATUS_CLEAR) {
                 if (r.id.isEmpty()) records.clear() else records.keys.removeAll { it == r.id || it.startsWith(r.id + "/") }
                 continue
@@ -492,11 +512,8 @@ internal class VtSession(
      */
     @Suppress("unused")
     fun onForeground() {
-        main.post {
-            if (released) return@post
-            setProgress(null)
-            if (records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }) updateStatus()
-        }
+        onProgress(PROGRESS_REMOVE, -1)
+        onStatus(STATUS_EXPIRE_TRANSIENT, 0, -1, "", "", "")
     }
 
     /**
@@ -536,14 +553,20 @@ internal class VtSession(
     }
 
     /** Input for the program, written on the tab's writer thread; dropped once the shell exited. */
-    fun write(data: ByteArray) {
+    fun write(data: ByteArray) = write(data, null)
+
+    private fun write(data: ByteArray, clipboardToken: ClipboardReads.Token?) {
         val w = writer ?: return
-        if (!isRunning) return
+        if (!isRunning || hungUp.get()) return
         val console = pty.console
+        if (console < 0) return
         try {
-            w.execute { Native.write(machine, console, data, 0, data.size) }
+            w.execute {
+                if (clipboardToken != null && !clipboardReads.isCurrent(clipboardToken)) return@execute
+                if (!hungUp.get()) Native.write(machine, console, data, 0, data.size)
+            }
         } catch (_: RejectedExecutionException) {
-            // Released meanwhile
+            // Released or hung up meanwhile
         }
     }
 
@@ -563,30 +586,44 @@ internal class VtSession(
 
     /**
      * Resets the terminal as Ghostty's reset does (⋮); a shell at its prompt gets a form feed (^L)
-     * to draw the prompt again on the empty screen.
+     * to draw the prompt again on the empty screen. Also drops progress and program-status state,
+     * matching a program's RIS.
      */
     fun reset() {
-        if (tab == 0L) return
-        if (VtNative.reset(tab)) write(FORM_FEED)
+        clipboardReads.clear() // Invalidate queued replies before waiting for the terminal lock.
+        if (tab == 0L || released) return
+        val reset = VtNative.reset(tab)
+        clipboardReads.resetTo(abs(reset))
+        if (reset > 0L) write(FORM_FEED)
+        clearStatus()
         view?.invalidate()
         // The title a program set is gone
         events.onTitleChanged(this)
     }
 
+    /** Drops progress, its timeout and all status records; notifies the service when any were shown. */
+    private fun clearStatus() {
+        main.removeCallbacks(dropProgress)
+        synchronized(reports) { reports.clear() }
+        val had = progress != null || status != null
+        progress = null
+        records.clear()
+        status = null
+        if (had) events.onStatusChanged(this)
+    }
+
     private fun exited(code: Int) {
         if (exit != null) return
         exit = code
+        clipboardReads.clear()
         hangUp()
-        writer?.shutdown()
-        main.removeCallbacks(dropProgress)
-        if (released) return
-        // Nothing runs any more to work, wait or have finished: an ended tab shows none of it
-        if (progress != null || status != null) {
-            progress = null
-            records.clear()
-            status = null
-            events.onStatusChanged(this)
+        writer?.shutdownNow()
+        if (released) {
+            main.removeCallbacks(dropProgress)
+            return
         }
+        // Nothing runs any more to work, wait or have finished: an ended tab shows none of it
+        clearStatus()
         if (tab != 0L) {
             val reason = when {
                 code > 0 -> " (code $code)"
@@ -603,8 +640,9 @@ internal class VtSession(
     fun release() {
         if (released) return
         released = true
+        clipboardReads.clear()
         finishIfRunning()
-        writer?.shutdown()
+        writer?.shutdownNow()
         main.removeCallbacks(dropProgress)
         // A running pump keeps the terminal until it returns
         if (tab != 0L) VtNative.destroy(tab)
@@ -617,7 +655,12 @@ internal class VtSession(
 
     /** Closes the console once, so a later close cannot hang up a tab that reused its number. */
     private fun hangUp() {
-        if (hungUp.compareAndSet(false, true)) pty.close()
+        if (hungUp.compareAndSet(false, true)) {
+            // Cancel queued writes before closing so draining tasks cannot write into a newly
+            // opened tab if the kernel immediately reuses the console number.
+            writer?.shutdownNow()
+            pty.close()
+        }
     }
 
     companion object {
@@ -637,6 +680,8 @@ internal class VtSession(
         const val STATUS_BLOCKED = 3
         const val STATUS_ERROR = 4
         const val STATUS_CLEAR = 5
+        // Internal queue entry shared with vt.c. Later reports can be in the same batch.
+        private const val STATUS_EXPIRE_TRANSIENT = 255
 
         // libghostty-vt's GhosttyProgramStatusKind: what a blocked program needs
         const val KIND_NONE = 0

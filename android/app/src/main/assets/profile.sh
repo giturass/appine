@@ -8,13 +8,20 @@
 # in a command's output offers to select all of it, and a tap on the command being typed moves the
 # cursor there (cl=line: the terminal sends left and right arrows). bash and zsh put the marks back
 # around whatever PS1 is before each prompt: bash from /etc/profile.d/appine.bashrc, which this file
-# reads, and on Alpine every interactive bash too (/etc/bash/appine.sh), so nested ones are marked;
+# reads (and interactive bash through /etc/bash/appine.sh on Alpine or /etc/bash.bashrc on Debian);
 # ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
-# ~/.profile and in nested shells; zsh gets them from /etc/profile.d/appine.zshrc, read here.
+# ~/.profile and in nested shells (including doas -s on Alpine); zsh gets them from
+# /etc/profile.d/appine.zshrc, read here (and via /etc/appine/zsh/.zshenv for login zsh on Debian
+# and /etc/zsh/zshrc for nested zsh).
 # Before each primary prompt the title returns to the current directory. bash and zsh report the
-# submitted command before execution; ash has no preexec hook. A program can replace the title
-# with OSC 0/2 until the next prompt. Control characters in paths and commands are replaced by ?.
-cat /etc/motd 2>/dev/null
+# submitted command before execution; for ash (which has no preexec hook) and unmarked shells, the
+# terminal falls back to the console's foreground command when a program sets no title. A program
+# can replace the title with OSC 0/2 until the next prompt. Control characters in paths and
+# commands are replaced by ?.
+if [ -z "${__appine_profile_seen-}" ]; then
+    __appine_profile_seen=1
+    cat /etc/motd 2>/dev/null
+fi
 export TERM=xterm-256color
 export LANG=C.UTF-8
 export NMAP_UNPRIVILEGED=1
@@ -34,11 +41,13 @@ if [ -n "${BASH_VERSION-}" ]; then
 elif [ -n "${BB_ASH_VERSION-}" ]; then
     # ash runs nothing before a command or a prompt, so its marks are in PS1 and PS2 themselves:
     # appine.ashrc puts them there, now and again when ash reads ENV
-    PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-    if [ -r /etc/profile.d/appine.ashrc ]; then . /etc/profile.d/appine.ashrc; fi
+    if [ -r /etc/profile.d/appine.ashrc ]; then
+        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]$(__appine_ash_path prompt)\[\e[0m\]\$ '
+        . /etc/profile.d/appine.ashrc
+    fi
 elif [ -n "${ZSH_VERSION-}" ]; then
-    # zsh reads this file where its /etc/zsh/zprofile sources /etc/profile (Alpine's does, in sh
-    # emulation; Debian's does not). Its hooks come from appine.zshrc
+    # zsh reads this file through Alpine's /etc/zsh/zprofile (in sh emulation) or Appine's
+    # /etc/appine/zsh/.zshenv on Debian. Its hooks come from appine.zshrc
     PS1='%B%F{green}%n@%m%f%b:%B%F{blue}%~%f%b%(!.#.$) '
     if [ -r /etc/profile.d/appine.zshrc ]; then . /etc/profile.d/appine.zshrc; fi
 fi

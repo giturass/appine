@@ -27,7 +27,9 @@
 //! same rules as Linux 6.1 (no internal processes, controllers in use cannot be disabled). Limits
 //! are checked in Linux's format and recorded, and read back as written: `pids.max` stops fork
 //! and thread creation ([`pids_charge`]), `memory.max` is checked periodically by the OOM killer
-//! ([`crate::oom`]), and the others (`memory.high`, `cpu.max`, `cpuset.cpus`...) have no effect;
+//! ([`crate::oom`]), `memory.high` records `high` events and triggers DBT pool/code-view reclaim
+//! without killing, `cpuset.cpus` enforces hierarchical effective CPU masks on task scheduling and
+//! affinity, and `cpu.max`/`cpu.weight`/`memory.low`/`memory.min` are stored without enforcement;
 //! `cgroup.freeze` freezes the processes in the subtree (threads stop before returning to the
 //! guest, and waiting syscalls return as if interrupted by a signal and restart after thaw);
 //! `cgroup.kill` kills the processes in the whole subtree. The files Linux notifies of changes
@@ -46,6 +48,7 @@ use crate::cell::RefCell;
 use crate::kernel::{Cx, INIT, Kernel, Tid};
 use crate::oom::Events;
 use crate::process::ThreadGroup;
+use crate::vfs::store::{Stat, mode};
 
 /// The root cgroup's id (also its inode number, 1 as on Linux).
 pub(crate) const ROOT: u64 = 1;
@@ -65,8 +68,9 @@ const CONTROLLERS: [(&str, bool); 8] = [
 ];
 
 /// The controllers Appine has (bits in [`CONTROLLERS`]).
-const AVAILABLE: u32 = 1 | 1 << 1 | 1 << MEMORY | 1 << PIDS;
-/// The positions of the memory and pids controllers in [`CONTROLLERS`].
+const AVAILABLE: u32 = 1 << CPUSET | 1 << 1 | 1 << MEMORY | 1 << PIDS;
+/// The positions of the cpuset, memory and pids controllers in [`CONTROLLERS`].
+const CPUSET: usize = 0;
 const MEMORY: usize = 3;
 const PIDS: usize = 5;
 
@@ -114,6 +118,11 @@ pub(crate) const FILES: [(&[u8], u32, Option<usize>); 39] = [
     (b"pids.max", 0o644, Some(5)),
 ];
 
+/// The index of interface file `name` in [`FILES`]; None when it is not a cgroup file.
+fn file_index(name: &[u8]) -> Option<usize> {
+    FILES.iter().position(|f| f.0 == name)
+}
+
 /// The permission bits of file `name`; None when it is not a cgroup file.
 pub(crate) fn file_mode(name: &[u8]) -> Option<u32> {
     FILES.iter().find(|f| f.0 == name).map(|f| f.1)
@@ -131,12 +140,16 @@ pub(crate) struct Cgroup {
     /// `cgroup.subtree_control`: the controllers enabled for child cgroups (bits in
     /// [`CONTROLLERS`]).
     pub subtree_control: u32,
-    /// Owner of the directory and its files (the fsuid and fsgid of the process that created it,
-    /// Linux's `cgroup_kn_set_ugid`).
-    pub uid: u32,
-    pub gid: u32,
-    /// The directory's permission bits, as mkdir gave them (the umask applied); the root's 0755.
-    pub mode: u32,
+    /// Generation of the controller files exposed in children. A removed node stays dead.
+    generations: [u64; CONTROLLERS.len()],
+    /// Default kernfs attributes at mkdir. An attribute change affects only the named node.
+    creator: (u32, u32),
+    dir_mode: u32,
+    created_ns: i64,
+    attrs: BTreeMap<&'static [u8], Stat>,
+    /// Bitmask of interface files (indexed by [`FILES`]) that have been looked up or opened
+    /// (emulating Linux dcache dentry instantiation for directory-watch `kernfs_notify`).
+    instantiated: Cell<u64>,
     /// Values of the interface files written (the limits), in the format Linux shows; files not
     /// written show their defaults.
     pub values: BTreeMap<&'static [u8], String>,
@@ -152,6 +165,8 @@ pub(crate) struct Cgroup {
     /// `memory.peak`: the largest subtree usage measured (bytes). The root's is measured by the
     /// OOM killer.
     pub mem_peak: Cell<u64>,
+    /// Usage at the last `high` event, reset to zero when usage returns to or below `memory.high`.
+    mem_high_last: Cell<u64>,
     /// `cgroup.freeze`: this cgroup itself asks to be frozen (an ancestor's also freezes it,
     /// [`Cgroups::freezing`]).
     pub freeze: bool,
@@ -169,17 +184,78 @@ impl Cgroup {
             parent,
             children: BTreeMap::new(),
             subtree_control: 0,
-            uid,
-            gid,
-            mode,
+            generations: [0; CONTROLLERS.len()],
+            creator: (uid, gid),
+            dir_mode: mode,
+            created_ns: crate::tty::wall_ns(),
+            attrs: BTreeMap::new(),
+            instantiated: Cell::new(0),
             values: BTreeMap::new(),
             pids_events: 0,
             mem_events: Events::default(),
             mem_events_local: Events::default(),
             mem_peak: Cell::new(0),
+            mem_high_last: Cell::new(0),
             freeze: false,
             device_progs: Vec::new(),
             device_flags: 0,
+        }
+    }
+
+    pub(crate) fn mark_instantiated(&self, name: &[u8]) {
+        if let Some(i) = file_index(name) {
+            self.instantiated.set(self.instantiated.get() | (1u64 << i));
+        }
+    }
+
+    pub(crate) fn is_instantiated(&self, name: &[u8]) -> bool {
+        file_index(name).is_some_and(|i| self.instantiated.get() & (1u64 << i) != 0)
+    }
+
+    fn initial_attrs(&self, name: &[u8]) -> Result<Stat, Errno> {
+        let mode = if name.is_empty() {
+            mode::S_IFDIR | self.dir_mode
+        } else {
+            mode::S_IFREG | file_mode(name).ok_or(Errno::ENOENT)?
+        };
+        Ok(self.node_attrs(mode, self.creator))
+    }
+
+    fn node_attrs(&self, mode: u32, (uid, gid): (u32, u32)) -> Stat {
+        let dir = mode & mode::S_IFMT == mode::S_IFDIR;
+        Stat {
+            mode,
+            uid,
+            gid,
+            nlink: if dir { 2 } else { 1 },
+            size: if dir { 0 } else { 4096 },
+            atime_ns: self.created_ns,
+            mtime_ns: self.created_ns,
+            ctime_ns: self.created_ns,
+            ..Stat::default()
+        }
+    }
+
+    /// Remove a disabled controller's files and create newly enabled files as the writer.
+    fn update_controller_files(&mut self, enable: u32, disable: u32, owner: (u32, u32)) {
+        for (idx, (name, perm, ctl)) in FILES.iter().copied().enumerate() {
+            let Some(ctl) = ctl else { continue };
+            if disable & (1 << ctl) != 0 {
+                self.attrs.remove(name);
+                self.values.remove(name);
+                self.instantiated
+                    .set(self.instantiated.get() & !(1u64 << idx));
+            } else if enable & (1 << ctl) != 0 && self.creator != owner {
+                self.attrs
+                    .insert(name, self.node_attrs(mode::S_IFREG | perm, owner));
+            }
+        }
+    }
+
+    pub(crate) fn attrs(&self, name: &[u8]) -> Result<Stat, Errno> {
+        match self.attrs.get(name) {
+            Some(st) => Ok(st.clone()),
+            None => self.initial_attrs(name),
         }
     }
 }
@@ -195,11 +271,13 @@ pub(crate) struct Cgroups {
     pending: Cell<bool>,
 }
 
-/// A notifying cgroup file being watched: what it showed when last looked at, and the counter its
-/// changes bump ([`crate::fd::ProcEvent`]).
+/// A notifying cgroup file being watched: what it showed at the last mutation, whether any
+/// transition happened since the last checkpoint (preserving transient 0 -> 1 -> 0 changes), and
+/// the counter its changes bump ([`crate::fd::ProcEvent`]).
 struct Observed {
     dirty: Cell<bool>,
-    content: Option<String>,
+    changed: Cell<bool>,
+    content: RefCell<Option<String>>,
     counter: Rc<Cell<u64>>,
 }
 
@@ -226,8 +304,8 @@ impl Default for Cgroups {
     }
 }
 
-/// The files whose changes Linux notifies (`cgroup_file_notify`: populated and frozen, memory
-/// events, pids events).
+/// The files whose changes Linux 6.1 notifies (`cgroup_file_notify`: populated and frozen, memory
+/// events, pids events). Linux 6.1 does not notify `cgroup.stat`.
 const NOTIFYING: [&[u8]; 4] = [
     b"cgroup.events",
     b"memory.events",
@@ -248,10 +326,15 @@ pub(crate) const fn is_key(key: u64) -> bool {
     key >> 62 == 1
 }
 
-/// The change counter of file `name` of cgroup `id` for an open file or an inotify watch to
-/// follow; None for a file Linux never notifies. A new one starts from the file's current
-/// contents, so only later changes count.
+/// The change counter of file `name` of cgroup `id` for an open file or a direct inotify watch to
+/// follow; None for a file Linux never notifies. Marks the file instantiated (looked up/opened)
+/// and starts from the file's current contents so only later changes count.
 pub(crate) fn observe(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc<Cell<u64>>> {
+    k.cgroups.file_looked_up(id, name);
+    observe_inner(k, id, name)
+}
+
+fn observe_inner(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc<Cell<u64>>> {
     if !NOTIFYING.contains(&name) {
         return None;
     }
@@ -260,33 +343,81 @@ pub(crate) fn observe(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc
     {
         return Some(observed.counter.clone());
     }
-    let content = file(k, id, name, &|t| t);
+    let content = file(k, id, name, &|t| t).ok();
     let counter = Rc::new(Cell::new(1));
     k.cgroups.observed.insert(
         (id, name),
         Observed {
             dirty: Cell::new(false),
-            content,
+            changed: Cell::new(false),
+            content: RefCell::new(content),
             counter: counter.clone(),
         },
     );
     Some(counter)
 }
 
-/// Every notifying file of cgroup `id`, for a watch on its directory ([`observe`]).
+/// Registers every notifying file of cgroup `id` for a watch on its directory without marking
+/// un-looked-up child files instantiated (matching Linux's dcache-gated directory `kernfs_notify`).
 pub(crate) fn observe_all(k: &mut Kernel, id: u64) {
     let names: Vec<&'static [u8]> = k
         .cgroups
         .files(id)
-        .filter(|f| NOTIFYING.contains(f))
+        .filter_map(|(name, _)| NOTIFYING.contains(&name).then_some(name))
         .collect();
     for name in names {
-        observe(k, id, name);
+        observe_inner(k, id, name);
+    }
+}
+
+/// Records an exact-point transition for an observed notifying file `(id, name)`: updates its
+/// stored snapshot immediately so transient changes that revert before the next checkpoint
+/// (e.g. `populated` or `frozen` 0 -> 1 -> 0) are never missed.
+fn record_change(k: &Kernel, id: u64, name: &'static [u8]) {
+    let Some(observed) = k.cgroups.observed.get(&(id, name)) else {
+        return;
+    };
+    let current = file(k, id, name, &|tid| tid).ok();
+    let mut prev = observed.content.borrow_mut();
+    if *prev != current {
+        *prev = current;
+        if prev.is_some() {
+            observed.changed.set(true);
+        } else {
+            observed.dirty.set(true);
+        }
+        k.cgroups.pending.set(true);
+    } else if prev.is_none() {
+        observed.dirty.set(true);
+        k.cgroups.pending.set(true);
+    }
+}
+
+/// A member arrived, left, migrated or changed its freezer participation. Evaluates `cgroup.events`
+/// immediately on observed ancestors so transient transitions between checkpoints are preserved.
+/// Callers must not hold a mutable borrow on any `ThreadGroup`.
+pub(crate) fn task_changed(k: &Kernel, id: u64) {
+    if !k.cgroups.observed.is_empty() {
+        for ancestor in k.cgroups.ancestors(id) {
+            record_change(k, ancestor, b"cgroup.events");
+        }
+    }
+}
+
+/// A cgroup's `cgroup.freeze` changed: re-evaluates `cgroup.events` on observed cgroups in its
+/// subtree immediately so transient freeze/thaw toggles between checkpoints are preserved.
+fn freeze_changed(k: &Kernel, id: u64) {
+    for &(child, name) in k.cgroups.observed.keys() {
+        if name == b"cgroup.events" && k.cgroups.is_within(child, id) {
+            record_change(k, child, name);
+        }
     }
 }
 
 /// Processes pending changes at the existing syscall, exit, freezer and timer checkpoints.
-/// Several changes to the same file before a checkpoint produce at most one notification.
+/// Transitions were already captured at their exact mutation points, so transient 0 -> 1 -> 0
+/// changes still produce a notification here; several changes before a checkpoint coalesce into
+/// one poll-counter bump and one inotify event.
 #[inline]
 pub(crate) fn notify_changes(k: &mut Kernel) {
     if k.cgroups.pending.get() {
@@ -299,30 +430,46 @@ fn flush_changes(k: &mut Kernel) {
         .cgroups
         .observed
         .iter()
-        .filter_map(|(&key, observed)| observed.dirty.get().then_some(key))
+        .filter_map(|(&key, observed)| {
+            (observed.changed.get() || observed.dirty.get()).then_some(key)
+        })
         .collect();
     files.retain(|&(id, name)| refresh_observed(k, id, name));
     // If reading a file panics, the next checkpoint retries the remaining files.
     k.cgroups.pending.set(false);
 
     // Deliver after refreshing all counters, since delivery can consume a one-shot watch.
+    // Directory watches only receive IN_MODIFY for child files whose dentry has been instantiated,
+    // matching native Linux kernfs_notify.
     for (id, name) in files {
-        crate::syscall::kernfs_modified(k, key(id, name), key(id, b""), name);
+        let dir = k
+            .cgroups
+            .get(id)
+            .is_some_and(|g| g.is_instantiated(name))
+            .then_some((key(id, b""), name));
+        crate::syscall::kernfs_modified(k, key(id, name), dir);
     }
 }
 
-/// Refreshes a dirty file's poll counter and reports whether to send IN_MODIFY.
+/// Refreshes a dirty/changed file's poll counter and reports whether to send IN_MODIFY.
 fn refresh_observed(k: &mut Kernel, id: u64, name: &'static [u8]) -> bool {
     let key = (id, name);
     if k.cgroups.observed[&key].is_watched(k, id, name)
-        && let Some(content) = file(k, id, name, &|tid| tid)
+        && let Ok(content) = file(k, id, name, &|tid| tid)
     {
         let observed = k.cgroups.observed.get_mut(&key).unwrap();
-        observed.dirty.set(false);
-        if observed.content.as_ref() == Some(&content) {
+        let was_dirty = observed.dirty.replace(false);
+        let mut changed = observed.changed.replace(false);
+        if was_dirty {
+            let mut prev = observed.content.borrow_mut();
+            if prev.as_ref() != Some(&content) {
+                *prev = Some(content);
+                changed = true;
+            }
+        }
+        if !changed {
             return false;
         }
-        observed.content = Some(content);
         observed.counter.set(observed.counter.get() + 1);
         crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*observed.counter));
         return true;
@@ -339,13 +486,11 @@ impl Cgroups {
         }
     }
 
-    /// A member arrived, left or changed whether it counts as frozen. Its ancestors
-    /// include the same task in their populated and frozen values.
-    pub(crate) fn task_changed(&self, id: u64) {
-        if !self.observed.is_empty() {
-            for ancestor in self.ancestors(id) {
-                self.mark_dirty(ancestor, b"cgroup.events");
-            }
+    /// Marks interface file `name` of cgroup `id` as looked up (dentry instantiated), so a watch
+    /// on the cgroup directory will receive `IN_MODIFY` notifications for later changes to it.
+    pub(crate) fn file_looked_up(&self, id: u64, name: &[u8]) {
+        if let Some(g) = self.map.get(&id) {
+            g.mark_instantiated(name);
         }
     }
 
@@ -361,7 +506,7 @@ impl Cgroups {
         mode: u32,
     ) -> Result<u64, Errno> {
         let p = self.map.get(&parent).ok_or(Errno::ENOENT)?;
-        if p.children.contains_key(name) || self.files(parent).any(|f| f == name) {
+        if p.children.contains_key(name) || self.has_file(parent, name) {
             return Err(Errno::EEXIST);
         }
         if name.contains(&b'\n') {
@@ -396,13 +541,34 @@ impl Cgroups {
         Ok(id)
     }
 
-    /// The files in cgroup `id`'s directory: the core files plus those of the enabled controllers.
-    pub fn files(&self, id: u64) -> impl Iterator<Item = &'static [u8]> + '_ {
-        let on = self.controllers(id);
-        FILES
-            .iter()
-            .filter(move |f| f.2.is_none_or(|c| on & 1 << c != 0))
-            .map(|f| f.0)
+    /// Visible interface files and their generations. A lookup captures both so an open fd
+    /// cannot act on a controller file recreated under the same name.
+    pub fn files(&self, id: u64) -> impl Iterator<Item = (&'static [u8], u64)> + '_ {
+        let group = self.get(id);
+        let parent = group.and_then(|g| self.get(g.parent?));
+        FILES.iter().filter_map(move |&(name, _, controller)| {
+            group?;
+            let generation = match (parent, controller) {
+                (Some(p), Some(ctl)) if p.subtree_control & (1 << ctl) != 0 => p.generations[ctl],
+                (Some(_), Some(_)) => return None,
+                _ => 0,
+            };
+            Some((name, generation))
+        })
+    }
+
+    pub(crate) fn attrs_mut(&mut self, id: u64, name: &'static [u8]) -> Result<&mut Stat, Errno> {
+        if !name.is_empty() && !self.has_file(id, name) {
+            return Err(Errno::ENOENT);
+        }
+        let group = self.map.get_mut(&id).ok_or(Errno::ENOENT)?;
+        let initial = group.initial_attrs(name)?;
+        Ok(group.attrs.entry(name).or_insert(initial))
+    }
+
+    /// Whether cgroup `id` exposes an interface file with this name.
+    pub(crate) fn has_file(&self, id: u64, name: &[u8]) -> bool {
+        self.files(id).any(|(f, _)| f == name)
     }
 
     /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
@@ -519,19 +685,20 @@ pub(crate) fn proc_cgroups(k: &Kernel) -> String {
     s
 }
 
-/// The contents of `<name>` in cgroup `id`; None when it is not one of its files. `vnr` turns a
-/// global id into the reader's (0 for one its pid namespace cannot see, as Linux's task_pid_vnr
-/// prints in `cgroup.procs` and `cgroup.threads`).
+/// The contents of `<name>` in cgroup `id`; `ENODEV` when the cgroup has been removed or its
+/// controller has been disabled (Linux's `kernfs_get_active`), and `EINVAL` for a write-only file
+/// (`cgroup.kill`). `vnr` turns a global id into the reader's (0 for one its pid namespace cannot
+/// see, as Linux's `task_pid_vnr` prints in `cgroup.procs` and `cgroup.threads`).
 pub(crate) fn file(
     k: &Kernel,
     id: u64,
     name: &[u8],
     vnr: &dyn Fn(crate::kernel::Tid) -> crate::kernel::Tid,
-) -> Option<String> {
-    let g = k.cgroups.get(id)?;
-    if !k.cgroups.files(id).any(|f| f == name) {
-        return None;
+) -> Result<String, Errno> {
+    if !k.cgroups.has_file(id, name) {
+        return Err(Errno::ENODEV);
     }
+    let g = &k.cgroups.map[&id];
     let root = g.parent.is_none();
     let max = |v: u64| {
         if v == u64::MAX {
@@ -540,7 +707,6 @@ pub(crate) fn file(
             v.to_string()
         }
     };
-    let cpus = appine_hal::host_cpus().len();
     // Processes and threads in the subtree
     let in_tree = |c: u64| k.cgroups.is_within(c, id);
     let procs = || members(k).filter(|&(_, c)| c == id).map(|(t, _)| t);
@@ -550,13 +716,13 @@ pub(crate) fn file(
             .filter(move |(_, t)| t.tgid != INIT && group_cgroup(k, t.tgid).is_some_and(in_tree))
     };
     if let Some(v) = g.values.get(name) {
-        return Some(format!("{v}\n"));
+        return Ok(format!("{v}\n"));
     }
     let s = match name {
         b"cgroup.controllers" => names(k.cgroups.controllers(id)),
         // A controller list ends with a newline only when it lists names (Linux's
         // cgroup_print_ss_mask)
-        b"cgroup.subtree_control" if g.subtree_control == 0 => return Some(String::new()),
+        b"cgroup.subtree_control" if g.subtree_control == 0 => return Ok(String::new()),
         b"cgroup.subtree_control" => names(g.subtree_control),
         b"cgroup.type" => "domain".to_owned(),
         b"cgroup.procs" => list(procs().map(vnr)),
@@ -602,8 +768,8 @@ pub(crate) fn file(
             )
         }
         b"cpuset.cpus" | b"cpuset.mems" => String::new(),
-        b"cpuset.cpus.effective" if cpus > 1 => format!("0-{}", cpus - 1),
-        b"cpuset.cpus.effective" | b"cpuset.mems.effective" => "0".to_owned(),
+        b"cpuset.cpus.effective" => format_cpu_list(effective_cpus(k, id)),
+        b"cpuset.mems.effective" => "0".to_owned(),
         b"cpuset.cpus.partition" => "member".to_owned(),
         // The root's memory is the whole app's, measured by the OOM killer; a child cgroup's is
         // the sum of its processes' resident memory
@@ -627,15 +793,15 @@ pub(crate) fn file(
         b"memory.max" | b"memory.swap.max" => "max".to_owned(),
         b"memory.events" => events(&g.mem_events),
         b"memory.events.local" => events(&g.mem_events_local),
-        b"memory.stat" if root => memory_stat(),
-        b"memory.stat" => child_memory_stat(subtree_rss(k, id)),
+        b"memory.stat" if root => memory_stat(k),
+        b"memory.stat" => child_memory_stat(k, id),
         b"memory.swap.events" => "high 0\nmax 0\nfail 0".to_owned(),
         b"pids.current" => pids_current(k, id).to_string(),
         b"pids.events" => format!("max {}", g.pids_events),
         // Write-only ones (cgroup.kill)
-        _ => return None,
+        _ => return Err(Errno::EINVAL),
     };
-    Some(s + "\n")
+    Ok(s + "\n")
 }
 
 /// Lists the names in a controller bitmask in [`CONTROLLERS`] order, separated by spaces.
@@ -672,15 +838,16 @@ fn frozen(k: &Kernel, id: u64) -> bool {
 /// Freezer stops and vfork waits both contribute to the subtree's frozen state.
 pub(crate) fn enter_frozen(cx: &Cx<'_>) {
     if !cx.task.frozen.replace(true) {
-        cx.kr().cgroups.task_changed(cx.t.group.borrow().cgroup);
+        let cg = cx.t.group.borrow().cgroup;
+        task_changed(cx.kr(), cg);
     }
 }
 
-/// The contents of `memory.events` (low and high are always 0: there is no reclaim).
+/// The contents of `memory.events` (`low` is always 0: there is no memory.low protection).
 fn events(e: &Events) -> String {
     format!(
-        "low 0\nhigh 0\nmax {}\noom {}\noom_kill {}\noom_group_kill {}",
-        e.max, e.oom, e.oom_kill, e.oom_group_kill
+        "low 0\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill {}",
+        e.high, e.max, e.oom, e.oom_kill, e.oom_group_kill
     )
 }
 
@@ -690,34 +857,35 @@ fn events(e: &Events) -> String {
 /// as shmem (Linux's file includes shmem), all in active_anon; there is no reclaimable page cache,
 /// so inactive_file is 0. .NET's GC computes usage as `memory.current` minus inactive_file, and
 /// without this file looks only at its own process's RSS.
-fn memory_stat() -> String {
+fn memory_stat(k: &Kernel) -> String {
     let u = crate::oom::app_memory().unwrap_or_default();
-    memory_stat_with(u.anon + u.swap, u.shmem)
+    memory_stat_with(u.anon + u.swap, u.shmem, subtree_pgtables(k, ROOT))
 }
 
-/// A child cgroup's `memory.stat`: only resident memory is known, and all of it counts as
-/// anonymous memory.
-fn child_memory_stat(rss: u64) -> String {
-    memory_stat_with(rss, 0)
+/// A child cgroup's `memory.stat`: resident memory counts as anonymous memory, plus allocated
+/// soft-MMU page tables for the subtree.
+fn child_memory_stat(k: &Kernel, id: u64) -> String {
+    memory_stat_with(subtree_rss(k, id), 0, subtree_pgtables(k, id))
 }
 
-/// The format of [`memory_stat`]: anonymous memory `anon` and shared memory `shmem` (bytes).
-fn memory_stat_with(anon: u64, shmem: u64) -> String {
+/// The format of [`memory_stat`]: anonymous memory `anon`, shared memory `shmem` and soft-MMU
+/// `pagetables` (bytes).
+fn memory_stat_with(anon: u64, shmem: u64, pagetables: u64) -> String {
     let mut s = String::new();
     let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();
     for (name, v) in [("anon", anon), ("file", shmem)] {
         put(name, v);
     }
-    for name in [
-        "kernel",
-        "kernel_stack",
-        "pagetables",
-        "sec_pagetables",
-        "percpu",
-        "sock",
-        "vmalloc",
+    for (name, v) in [
+        ("kernel", 0),
+        ("kernel_stack", 0),
+        ("pagetables", pagetables),
+        ("sec_pagetables", 0),
+        ("percpu", 0),
+        ("sock", 0),
+        ("vmalloc", 0),
     ] {
-        put(name, 0);
+        put(name, v);
     }
     put("shmem", shmem);
     for name in [
@@ -779,6 +947,7 @@ pub(crate) struct Writer<'a> {
     pub pid_ns: &'a crate::pidns::PidNs,
     pub ns_root: u64,
     pub opener: &'a Cred,
+    pub cred: &'a Cred,
 }
 
 /// Writes `<name>` in cgroup `id` (Linux 6.1's `cgroup_file_write` and each cftype's `write`).
@@ -788,9 +957,9 @@ pub(crate) fn write(
     (id, name): (u64, &[u8]),
     data: &[u8],
 ) -> Result<(), Errno> {
-    // A file of a removed cgroup still open: every write is ENODEV (kernfs_get_active fails),
-    // which container managers take as "cgroup gone"
-    if k.cgroups.get(id).is_none() {
+    // A file of a removed cgroup or a disabled controller still open: every write is ENODEV
+    // (kernfs_get_active fails), which container managers take as "cgroup/file gone"
+    if !k.cgroups.has_file(id, name) {
         return Err(Errno::ENODEV);
     }
     // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be
@@ -821,7 +990,7 @@ pub(crate) fn write(
             };
             migrate(k, (tid, w.opener), (id, w.ns_root), name == b"cgroup.procs")
         }
-        b"cgroup.subtree_control" => subtree_control(k, id, text),
+        b"cgroup.subtree_control" => subtree_control(k, id, text, (w.cred.fsuid, w.cred.fsgid)),
         // An integer; anything other than 1 is ERANGE (Linux's cgroup_kill_write)
         b"cgroup.kill" => match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
             1 => {
@@ -838,12 +1007,6 @@ pub(crate) fn write(
                 _ => return Err(Errno::ERANGE),
             };
             k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?.freeze = freeze;
-            // Descendants inherit the request, including empty cgroups with observers.
-            for &(child, name) in k.cgroups.observed.keys() {
-                if name == b"cgroup.events" && k.cgroups.is_within(child, id) {
-                    k.cgroups.mark_dirty(child, name);
-                }
-            }
             let groups: Vec<_> = k
                 .groups
                 .iter()
@@ -853,6 +1016,8 @@ pub(crate) fn write(
             for g in groups {
                 refreeze(k, &g);
             }
+            // Record exact transitions for observed descendants, including empty cgroups.
+            freeze_changed(k, id);
             Ok(())
         }
         b"cgroup.type" => match word {
@@ -860,22 +1025,41 @@ pub(crate) fn write(
             _ => Err(Errno::EINVAL),
         },
         _ => {
-            let old = k.cgroups.get(id).and_then(|g| g.values.get(name).cloned());
-            let value = parse_value(name, word, old.as_deref())?;
             let g = k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?;
+            let value = parse_value(name, word, g.values.get(name).map(String::as_str))?;
             let key = FILES.iter().find(|f| f.0 == name).ok_or(Errno::EINVAL)?.0;
             g.values.insert(key, value);
-            // Lowering memory.max: when usage is already over it, kill a process at once (Linux's
-            // memory_max_write OOMs when it cannot reclaim, without recording a max event)
-            if let Some(max) = g.values[key]
-                .parse::<u64>()
-                .ok()
-                .filter(|_| key == b"memory.max")
-            {
-                let used = measure_memory(k, id);
-                if used > max {
-                    crate::oom::out_of_memory(k, (id, used, max));
+            match key {
+                // Lowering memory.max: when usage is already over it, kill a process at once
+                // (Linux's memory_max_write OOMs when it cannot reclaim, without recording a max
+                // event).
+                b"memory.max" => {
+                    k.oom.recheck();
+                    if let Ok(max) = g.values[key].parse::<u64>() {
+                        let used = measure_memory(k, id);
+                        if used > max {
+                            crate::oom::out_of_memory(k, (id, used, max));
+                        }
+                    }
                 }
+                // Writing memory.high: recheck periodically, and if usage already exceeds a newly
+                // lowered threshold, record a high event and reclaim immediately without killing.
+                b"memory.high" => {
+                    k.oom.recheck();
+                    match g.values[key].parse::<u64>() {
+                        Ok(high) => {
+                            let used = measure_memory(k, id);
+                            if note_memory_high_state(k, id, used, high) {
+                                crate::oom::handle_memory_high(k, id);
+                            }
+                        }
+                        Err(_) => g.mem_high_last.set(0),
+                    }
+                }
+                b"cpuset.cpus" => {
+                    apply_cpuset_subtree(k, id);
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -918,11 +1102,13 @@ fn migrate(
         return Err(Errno::EBUSY);
     }
     g.borrow_mut().cgroup = dst;
-    k.cgroups.task_changed(src);
-    k.cgroups.task_changed(dst);
+    // Clamp the migrated process's affinity to the destination cgroup's effective cpuset.
+    apply_cpuset_group(k, &g.borrow());
     // Migrating into a frozen cgroup stops the process, and migrating out lets it run on (Linux's
     // cgroup_freezer_migrate_task)
     refreeze(k, &g);
+    task_changed(k, src);
+    task_changed(k, dst);
     Ok(())
 }
 
@@ -930,7 +1116,7 @@ fn migrate(
 /// separated by whitespace. An unknown controller or a missing `+`/`-` is EINVAL; enabling one not
 /// in `cgroup.controllers` is ENOENT; controllers cannot be enabled in a non-root cgroup that has
 /// processes (EBUSY); one a child cgroup still has enabled cannot be disabled (EBUSY).
-fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
+fn subtree_control(k: &mut Kernel, id: u64, text: &str, owner: (u32, u32)) -> Result<(), Errno> {
     let (mut enable, mut disable) = (0u32, 0u32);
     for tok in text.split_ascii_whitespace() {
         let (on, name) = match tok.split_at_checked(1) {
@@ -973,8 +1159,15 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     }
     let g = k.cgroups.map.get_mut(&id).unwrap();
     g.subtree_control = (g.subtree_control | enable) & !disable;
+    for (ctl, generation) in g.generations.iter_mut().enumerate() {
+        if enable & (1 << ctl) != 0 {
+            *generation += 1;
+        }
+    }
     let adds_event_files = enable & ((1 << MEMORY) | (1 << PIDS)) != 0;
     for child_id in children {
+        let child = k.cgroups.map.get_mut(&child_id).unwrap();
+        child.update_controller_files(enable, disable, owner);
         if adds_event_files && k.inotify.borrow().watches(key(child_id, b"")) {
             observe_all(k, child_id);
         }
@@ -992,13 +1185,6 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
         let Some(child) = k.cgroups.map.get_mut(&child_id) else {
             continue;
         };
-        child.values.retain(|name, _| {
-            FILES
-                .iter()
-                .find(|f| f.0 == *name)
-                .and_then(|f| f.2)
-                .is_none_or(|ctl| disable & 1 << ctl == 0)
-        });
         if disable & 1 << PIDS != 0 {
             child.pids_events = 0;
         }
@@ -1006,6 +1192,10 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
             child.mem_events = Events::default();
             child.mem_events_local = Events::default();
             child.mem_peak.set(0);
+            child.mem_high_last.set(0);
+        }
+        if disable & 1 << CPUSET != 0 {
+            apply_cpuset_subtree(k, child_id);
         }
     }
     Ok(())
@@ -1190,12 +1380,7 @@ pub(crate) fn may_enter(
 /// an open for writing would be (Linux's `cgroup_may_write`).
 fn may_write_procs(k: &Kernel, cred: &Cred, id: u64) -> Result<(), Errno> {
     let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
-    let st = crate::vfs::store::Stat {
-        mode: crate::vfs::store::mode::S_IFREG | file_mode(b"cgroup.procs").unwrap_or(0o644),
-        uid: g.uid,
-        gid: g.gid,
-        ..Default::default()
-    };
+    let st = g.attrs(b"cgroup.procs")?;
     cred.permission(&st, crate::cred::MAY_WRITE)
 }
 
@@ -1227,8 +1412,130 @@ pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
             format_args!("cgroup: fork rejected by pids controller in {path}"),
         );
     }
-    k.cgroups.mark_dirty(css, b"pids.events");
+    record_change(k, css, b"pids.events");
     Err(Errno::EAGAIN)
+}
+
+// ---- Cpuset ----
+
+/// Online CPU bitmask matching the guest's host CPUs (1..=64).
+pub(crate) fn online_cpus() -> u64 {
+    let cpus = appine_hal::host_cpus().len().clamp(1, 64);
+    if cpus == 64 {
+        u64::MAX
+    } else {
+        (1u64 << cpus) - 1
+    }
+}
+
+/// Parses a validated Linux CPU range list (e.g. `"0,2-3"`) into a 64-bit mask.
+fn parse_cpu_mask(spec: &str) -> u64 {
+    let mut mask = 0u64;
+    for part in spec.split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) else {
+            continue;
+        };
+        if a > b || a >= 64 {
+            continue;
+        }
+        for cpu in a..=b.min(63) {
+            mask |= 1u64 << cpu;
+        }
+    }
+    mask
+}
+
+/// Formats a non-zero CPU bitmask in canonical Linux range-list form (e.g. `"0-3"`, `"0,2-3"`).
+fn format_cpu_list(mask: u64) -> String {
+    let mut out = String::new();
+    let mut i = 0u32;
+    while i < 64 {
+        if (mask >> i) & 1 == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i + 1 < 64 && (mask >> (i + 1)) & 1 != 0 {
+            i += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == i {
+            write!(out, "{start}").unwrap();
+        } else {
+            write!(out, "{start}-{i}").unwrap();
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Effective `cpuset.cpus` mask for cgroup `id` (Linux 6.1's `compute_effective_cpumask`):
+/// starts from online CPUs at the root and intersects with each descendant's configured
+/// `cpuset.cpus` where the `cpuset` controller is enabled, falling back to the parent's effective
+/// mask whenever a child's `cpuset.cpus` is empty or disjoint from its parent.
+pub(crate) fn effective_cpus(k: &Kernel, id: u64) -> u64 {
+    effective_cpus_within(k, id, online_cpus())
+}
+
+fn effective_cpus_within(k: &Kernel, id: u64, online: u64) -> u64 {
+    let mut chain: Vec<u64> = k.cgroups.ancestors(id).collect();
+    chain.reverse();
+    let mut eff = online;
+    for c in chain {
+        if c == ROOT || k.cgroups.controllers(c) & (1 << CPUSET) == 0 {
+            continue;
+        }
+        if let Some(spec) = k
+            .cgroups
+            .get(c)
+            .and_then(|g| g.values.get(&b"cpuset.cpus"[..]))
+        {
+            let req = parse_cpu_mask(spec) & eff;
+            if req != 0 {
+                eff = req;
+            }
+        }
+    }
+    eff
+}
+
+/// Clamps thread affinity `mask` to cgroup `cgroup`'s effective `cpuset.cpus`, falling back to
+/// the effective cpuset when the intersection is empty (matching Linux `set_cpus_allowed_ptr`).
+pub(crate) fn clamp_affinity(k: &Kernel, cgroup: u64, mask: u64) -> u64 {
+    let eff = effective_cpus(k, cgroup);
+    let clamped = mask & eff;
+    if clamped != 0 { clamped } else { eff }
+}
+
+/// Applies the effective `cpuset.cpus` mask to every live thread in the group.
+fn apply_cpuset_group(k: &Kernel, g: &ThreadGroup) {
+    let cg = g.cgroup;
+    for tid in &g.threads {
+        if let Some(t) = k.tasks.get(tid) {
+            let clamped = clamp_affinity(k, cg, t.affinity.get());
+            t.affinity.set(clamped);
+            if t.host_tid.get() != 0 {
+                appine_hal::set_thread_affinity(t.host_tid.get(), clamped);
+            }
+        }
+    }
+}
+
+/// Re-clamps affinity of every live process in cgroup `id`'s subtree after a `cpuset.cpus` change
+/// or `cpuset` controller disable.
+fn apply_cpuset_subtree(k: &Kernel, id: u64) {
+    for (&tgid, group) in &k.groups {
+        if tgid == INIT {
+            continue;
+        }
+        let g = group.borrow();
+        if k.cgroups.is_within(g.cgroup, id) {
+            apply_cpuset_group(k, &g);
+        }
+    }
 }
 
 // ---- OOM killer ----
@@ -1242,6 +1549,35 @@ pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
         .filter(|&(&id, _)| id != ROOT && k.cgroups.controllers(id) & 1 << MEMORY != 0)
         .filter_map(|(&id, g)| Some((id, g.values.get(&b"memory.max"[..])?.parse().ok()?)))
         .collect()
+}
+
+/// The cgroups with numeric `memory.high` set (and the memory controller enabled) and their
+/// thresholds (bytes).
+pub(crate) fn memory_high_limits(k: &Kernel) -> Vec<(u64, u64)> {
+    k.cgroups
+        .map
+        .iter()
+        .filter(|&(&id, _)| id != ROOT && k.cgroups.controllers(id) & 1 << MEMORY != 0)
+        .filter_map(|(&id, g)| Some((id, g.values.get(&b"memory.high"[..])?.parse().ok()?)))
+        .collect()
+}
+
+/// Tracks whether cgroup `id` crossed above `memory.high` (or grew further while above it).
+/// Returns `true` when a `high` event and reclaim pass should be triggered, and resets state once
+/// usage returns at or below `high`.
+pub(crate) fn note_memory_high_state(k: &Kernel, id: u64, used: u64, high: u64) -> bool {
+    let Some(g) = k.cgroups.get(id) else {
+        return false;
+    };
+    if used <= high {
+        g.mem_high_last.set(0);
+        false
+    } else if used > g.mem_high_last.get() {
+        g.mem_high_last.set(used);
+        true
+    } else {
+        false
+    }
 }
 
 /// Measures cgroup `id`'s memory usage (bytes), recording the peak on the way.
@@ -1262,10 +1598,12 @@ pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
             f(&mut g.mem_events);
             if c == id {
                 f(&mut g.mem_events_local);
-                k.cgroups.mark_dirty(c, b"memory.events.local");
             }
-            k.cgroups.mark_dirty(c, b"memory.events");
         }
+        if c == id {
+            record_change(k, c, b"memory.events.local");
+        }
+        record_change(k, c, b"memory.events");
     }
 }
 
@@ -1361,6 +1699,26 @@ fn subtree_rss(k: &Kernel, id: u64) -> u64 {
     usage.pages() * 4096
 }
 
+/// Allocated soft-MMU page-table bytes across unique address spaces in cgroup `id`'s subtree.
+fn subtree_pgtables(k: &Kernel, id: u64) -> u64 {
+    let mut total = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    for (tgid, _) in members(k).filter(|&(_, c)| k.cgroups.is_within(c, id)) {
+        let Some(g) = k.groups.get(&tgid) else {
+            continue;
+        };
+        let g = g.borrow();
+        let Some(task) = g.threads.first().and_then(|t| k.tasks.get(t)) else {
+            continue;
+        };
+        let mm = task.res.borrow().mm.clone();
+        if seen.insert(std::rc::Rc::as_ptr(&mm)) {
+            total = total.saturating_add(mm.borrow().pgtables_bytes());
+        }
+    }
+    total
+}
+
 /// The number of tasks in cgroup `id`'s subtree (`pids.current`): as on Linux, tasks count until
 /// they are reaped: a process's live threads, plus 1 when its main thread has exited (zombie
 /// processes, processes whose main thread exited first).
@@ -1391,7 +1749,7 @@ mod tests {
         let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
         let mut k = shared.lock();
         let child = k.cgroups.mkdir(ROOT, b"t", &Cred::root(), 0o755).unwrap();
-        subtree_control(&mut k, ROOT, "+memory +pids").unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids", (0, 0)).unwrap();
         let root_events = observe(&mut k, ROOT, b"memory.events").unwrap();
         let root_local = observe(&mut k, ROOT, b"memory.events.local").unwrap();
         let local = observe(&mut k, child, b"memory.events.local").unwrap();
@@ -1416,9 +1774,9 @@ mod tests {
         notify_changes(&mut k);
         assert_eq!(pids.get(), 2);
 
-        subtree_control(&mut k, ROOT, "-memory").unwrap();
+        subtree_control(&mut k, ROOT, "-memory", (0, 0)).unwrap();
         notify_changes(&mut k);
-        subtree_control(&mut k, ROOT, "+memory").unwrap();
+        subtree_control(&mut k, ROOT, "+memory", (0, 0)).unwrap();
         let reopened = observe(&mut k, child, b"memory.events.local").unwrap();
         memory_event(&mut k, child, |e| e.max += 1);
         notify_changes(&mut k);
@@ -1440,11 +1798,11 @@ mod tests {
         );
         assert_eq!(c.mkdir(ROOT, b"a\nb", &cred, 0o755), Err(Errno::EINVAL));
         // t has no memory enabled, so a child cgroup named memory.max can be created
-        assert!(!c.files(t).any(|f| f == b"memory.max"));
+        assert!(!c.has_file(t, b"memory.max"));
         assert!(c.mkdir(t, b"memory.max", &cred, 0o755).is_ok());
         c.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
-        assert!(c.files(t).any(|f| f == b"memory.max"));
-        assert!(!c.files(t).any(|f| f == b"pids.max"));
+        assert!(c.has_file(t, b"memory.max"));
+        assert!(!c.has_file(t, b"pids.max"));
         let a = c.mkdir(t, b"a", &cred, 0o755).unwrap();
         let b = c.mkdir(t, b"b", &cred, 0o755).unwrap();
         assert_eq!(c.path(a, ROOT), "/t/a");
@@ -1518,5 +1876,265 @@ mod tests {
             parse_value(b"memory.current", "1", None),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn disabled_controller_and_removed_cgroup_return_enodev() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = Cred::root();
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: ROOT,
+            opener: &cred,
+            cred: &cred,
+        };
+        let child = k.cgroups.mkdir(ROOT, b"c", &cred, 0o755).unwrap();
+        subtree_control(&mut k, ROOT, "+memory +pids", (0, 0)).unwrap();
+        assert!(file(&k, child, b"memory.max", &|t| t).is_ok());
+        assert_eq!(
+            file(&k, child, b"cgroup.kill", &|t| t),
+            Err(Errno::EINVAL),
+            "write-only cgroup file stays EINVAL"
+        );
+
+        // Disabling a controller rejects writes and reads on held fds with ENODEV and stores nothing.
+        subtree_control(&mut k, ROOT, "-memory", (0, 0)).unwrap();
+        assert_eq!(
+            write(&mut k, &writer, (child, b"memory.max"), b"4096\n"),
+            Err(Errno::ENODEV)
+        );
+        assert_eq!(file(&k, child, b"memory.max", &|t| t), Err(Errno::ENODEV));
+        assert!(
+            !k.cgroups
+                .get(child)
+                .unwrap()
+                .values
+                .contains_key(&b"memory.max"[..])
+        );
+
+        // Removing the cgroup causes reads/writes on existing files to return ENODEV.
+        rmdir(&mut k, child).unwrap();
+        assert_eq!(file(&k, child, b"pids.max", &|t| t), Err(Errno::ENODEV));
+        assert_eq!(
+            write(&mut k, &writer, (child, b"pids.max"), b"10\n"),
+            Err(Errno::ENODEV)
+        );
+    }
+
+    fn add_test_task(
+        k: &mut Kernel,
+        tgid: i32,
+        cgroup: u64,
+    ) -> (
+        Rc<RefCell<ThreadGroup>>,
+        Rc<crate::task::Task>,
+        appine_engine::Cpu,
+    ) {
+        use crate::fd::FdTable;
+        use crate::mm::Mm;
+        use crate::nsproxy::NsProxy;
+        use crate::signal::{AltStack, SigHandlers};
+        use crate::task::{FsContext, Task, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let mm = Mm::new().into_shared();
+        let sighand = Rc::new(RefCell::new(SigHandlers::default()));
+        let mut tg = ThreadGroup::new(tgid, INIT, sighand);
+        tg.cgroup = cgroup;
+        tg.threads.push(tgid);
+        let group = Rc::new(RefCell::new(tg));
+        let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+        let state = TaskState {
+            mm,
+            fds: Rc::new(RefCell::new(FdTable::new())),
+            fs: Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: Rc::new(MntNs {
+                    id: INIT_MNT_NS,
+                    owner: crate::cred::UserNs::init(),
+                    anon: false,
+                }),
+            })),
+            group: group.clone(),
+            vfs: None,
+            altstack: AltStack::default(),
+            clear_child_tid: 0,
+            vfork_done: None,
+            restart: None,
+            fast_sleep: None,
+            sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+        };
+        let task = Task::new(
+            tgid,
+            tgid,
+            &cpu,
+            state,
+            NsProxy::init(),
+            0,
+            *b"cg-test\0\0\0\0\0\0\0\0\0",
+        )
+        .unwrap();
+        k.groups.insert(tgid, group.clone());
+        k.tasks.insert(tgid, task.clone());
+        (group, task, cpu)
+    }
+
+    #[test]
+    fn transient_populated_and_frozen_transitions_are_not_missed() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = Cred::root();
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: ROOT,
+            opener: &cred,
+            cred: &cred,
+        };
+        let cg = k.cgroups.mkdir(ROOT, b"transient", &cred, 0o755).unwrap();
+        let events = observe(&mut k, cg, b"cgroup.events").unwrap();
+        assert_eq!(events.get(), 1);
+
+        // 1. Transient populated 0 -> 1 -> 0 before notify_changes must still trigger a notification.
+        let (group, _task, _cpu) = add_test_task(&mut k, 100, cg);
+        task_changed(&k, cg);
+        group.borrow_mut().threads.clear();
+        k.tasks.remove(&100);
+        task_changed(&k, cg);
+        notify_changes(&mut k);
+        assert_eq!(
+            events.get(),
+            2,
+            "transient populated 0 -> 1 -> 0 must not be lost before checkpoint"
+        );
+
+        // 2. Transient frozen 0 -> 1 -> 0 on an empty cgroup before notify_changes must still notify.
+        write(&mut k, &writer, (cg, b"cgroup.freeze"), b"1\n").unwrap();
+        write(&mut k, &writer, (cg, b"cgroup.freeze"), b"0\n").unwrap();
+        notify_changes(&mut k);
+        assert_eq!(
+            events.get(),
+            3,
+            "transient frozen 0 -> 1 -> 0 must not be lost before checkpoint"
+        );
+    }
+
+    #[test]
+    fn cpuset_effective_inheritance_and_task_clamping() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = Cred::root();
+        let parent = k.cgroups.mkdir(ROOT, b"p", &cred, 0o755).unwrap();
+        let child = k.cgroups.mkdir(parent, b"c", &cred, 0o755).unwrap();
+        subtree_control(&mut k, ROOT, "+cpuset", (0, 0)).unwrap();
+        subtree_control(&mut k, parent, "+cpuset", (0, 0)).unwrap();
+
+        // Test hierarchical intersection and fallback against a synthetic 4-CPU online mask.
+        let four_cpus = 0b1111u64;
+        assert_eq!(effective_cpus_within(&k, parent, four_cpus), 0b1111);
+        assert_eq!(format_cpu_list(0b1111), "0-3");
+        assert_eq!(format_cpu_list(0b1101), "0,2-3");
+
+        k.cgroups
+            .map
+            .get_mut(&parent)
+            .unwrap()
+            .values
+            .insert(b"cpuset.cpus", "1-3".to_owned());
+        assert_eq!(effective_cpus_within(&k, parent, four_cpus), 0b1110);
+        // Empty child inherits parent effective mask.
+        assert_eq!(effective_cpus_within(&k, child, four_cpus), 0b1110);
+
+        // Child intersection narrows effective mask.
+        k.cgroups
+            .map
+            .get_mut(&child)
+            .unwrap()
+            .values
+            .insert(b"cpuset.cpus", "0,2".to_owned());
+        assert_eq!(effective_cpus_within(&k, child, four_cpus), 0b0100);
+
+        // Disjoint child falls back to parent effective mask (never empty).
+        k.cgroups
+            .map
+            .get_mut(&child)
+            .unwrap()
+            .values
+            .insert(b"cpuset.cpus", "0".to_owned());
+        assert_eq!(effective_cpus_within(&k, child, four_cpus), 0b1110);
+
+        // Real write on CPU 0 (valid on every host >= 1 CPU) updates cpuset.cpus.effective and
+        // clamps live tasks in the subtree.
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: ROOT,
+            opener: &cred,
+            cred: &cred,
+        };
+        let (_g, task, _cpu) = add_test_task(&mut k, 200, child);
+        task.affinity.set(online_cpus());
+        write(&mut k, &writer, (parent, b"cpuset.cpus"), b"0\n").unwrap();
+        assert_eq!(
+            file(&k, parent, b"cpuset.cpus.effective", &|t| t).unwrap(),
+            "0\n"
+        );
+        assert_eq!(
+            file(&k, child, b"cpuset.cpus.effective", &|t| t).unwrap(),
+            "0\n"
+        );
+        assert_eq!(task.affinity.get(), 1);
+    }
+
+    #[test]
+    fn memory_high_write_records_event_without_killing() {
+        let shared = crate::kernel::Shared::new(Kernel::new(crate::process::Tier::Interpreter));
+        let mut k = shared.lock();
+        let cred = Cred::root();
+        let pid_ns = crate::pidns::PidNs::init();
+        let writer = Writer {
+            tid: 0,
+            pid_ns: &pid_ns,
+            ns_root: ROOT,
+            opener: &cred,
+            cred: &cred,
+        };
+        let cg = k.cgroups.mkdir(ROOT, b"mh", &cred, 0o755).unwrap();
+        subtree_control(&mut k, ROOT, "+memory", (0, 0)).unwrap();
+
+        let (group, task, _cpu) = add_test_task(&mut k, 210, cg);
+        let mm = task.res.borrow().mm.clone();
+        let addr = mm
+            .borrow_mut()
+            .mmap(
+                0,
+                32 * 4096,
+                appine_engine::prot::READ | appine_engine::prot::WRITE,
+                crate::mm::flags::MAP_PRIVATE | crate::mm::flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.borrow_mut()
+            .write_kernel(addr, &vec![0x7au8; 32 * 4096])
+            .unwrap();
+
+        write(&mut k, &writer, (cg, b"memory.high"), b"16384\n").unwrap();
+        assert!(group.borrow().exiting.is_none());
+        let ev = file(&k, cg, b"memory.events", &|t| t).unwrap();
+        assert!(ev.contains("high 1\n"), "expected high 1 in:\n{ev}");
+        let local = file(&k, cg, b"memory.events.local", &|t| t).unwrap();
+        assert!(local.contains("high 1\n"), "expected high 1 in:\n{local}");
+
+        // Removing the threshold re-arms the event even if usage stays the same.
+        write(&mut k, &writer, (cg, b"memory.high"), b"max").unwrap();
+        write(&mut k, &writer, (cg, b"memory.high"), b"0").unwrap();
+        assert_eq!(k.cgroups.get(cg).unwrap().mem_events_local.high, 2);
     }
 }

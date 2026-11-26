@@ -51,13 +51,13 @@ static unsigned short cksum(const void *p, int n)
     return htons(~fold(add(0, p, n)) & 0xffff);
 }
 
-static void echo(int s, int seq, int len)
+static void echo(int s, int id, int seq, int len)
 {
     struct sockaddr_in to = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     unsigned char pkt[256] = {0};
     struct icmphdr *h = (void *)pkt;
     h->type = ICMP_ECHO;
-    h->un.echo.id = htons(0x1234);
+    h->un.echo.id = htons(id);
     h->un.echo.sequence = htons(seq);
     for (int i = 8; i < len; i++)
         pkt[i] = i;
@@ -126,10 +126,19 @@ static void v4(void)
     unsigned char buf[512];
     struct sockaddr_in from;
     l = sizeof from;
-    echo(s, 1, 64);
+    echo(s, 0x1234, 1, 64);
     int n = recvfrom(s, buf, sizeof buf, 0, (void *)&from, &l);
     printf("recvfrom %d from %s\n", n, inet_ntoa(from.sin_addr));
     show(buf, n);
+
+    /* Outstanding requests can use the same sequence with different IDs. */
+    echo(s, 0x1111, 19, 64);
+    echo(s, 0x2222, 19, 64);
+    echo(s, 0, 0, 8);
+    for (int i = 0; i < 3; i++) {
+        n = recv(s, buf, sizeof buf, 0);
+        show(buf, n);
+    }
 
     /* Control messages: PKTINFO comes before TTL; both fit, only the first fits, only part of the
      * second fits */
@@ -147,7 +156,7 @@ static void v4(void)
         struct iovec iov = {buf, sizeof buf};
         struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = &cbuf,
                            .msg_controllen = rooms[i]};
-        echo(s, 2 + i, 64);
+        echo(s, 0x1234, 2 + i, 64);
         n = recvmsg(s, &m, 0);
         printf("recvmsg %d with %zu bytes of control\n", n, rooms[i]);
         control(&m);
@@ -158,7 +167,7 @@ static void v4(void)
 
     /* Truncation: MSG_TRUNC asks for the full length, and what is received is the start of the IP
      * header */
-    echo(s, 6, 200);
+    echo(s, 0x1234, 6, 200);
     struct iovec iov = {buf, 10};
     struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1};
     n = recvmsg(s, &m, MSG_TRUNC);
@@ -168,7 +177,7 @@ static void v4(void)
     filt = ~0u;
     setsockopt(s, SOL_RAW, ICMP_FILTER, &filt, sizeof filt);
     for (int peek = 0; peek < 2; peek++) {
-        echo(s, 7 + peek, 64);
+        echo(s, 0x1234, 7 + peek, 64);
         usleep(200000);
         n = recv(s, buf, sizeof buf, MSG_DONTWAIT | (peek ? MSG_PEEK : 0));
         printf("all blocked%s: %d %s\n", peek ? " (peek)" : "", n, n < 0 ? strerror(errno) : "");
@@ -177,7 +186,7 @@ static void v4(void)
     setsockopt(s, SOL_RAW, ICMP_FILTER, &filt, sizeof filt);
     n = recv(s, buf, sizeof buf, MSG_DONTWAIT);
     printf("after unblocking: %d %s\n", n, n < 0 ? strerror(errno) : "");
-    echo(s, 9, 64);
+    echo(s, 0x1234, 9, 64);
     n = recv(s, buf, sizeof buf, 0);
     printf("next reply:\n");
     show(buf, n);
@@ -218,26 +227,30 @@ static void v6(void)
     unsigned char pkt[64] = {0}, buf[256];
     struct icmp6_hdr *h = (void *)pkt;
     h->icmp6_type = ICMP6_ECHO_REQUEST;
-    h->icmp6_id = htons(0x4321);
     h->icmp6_seq = htons(1);
     for (int i = 8; i < 64; i++)
         pkt[i] = i;
-    if (sendto(s, pkt, 64, 0, (void *)&to, sizeof to) != 64)
-        printf("sendto: %s\n", strerror(errno));
-    struct sockaddr_in6 from;
-    l = sizeof from;
-    int n = recvfrom(s, buf, sizeof buf, 0, (void *)&from, &l);
-    char a[64];
-    printf("recvfrom %d from %s\n", n, inet_ntop(AF_INET6, &from.sin6_addr, a, sizeof a));
-    /* Pseudo-header: source and destination addresses, length, next header */
-    unsigned char pseudo[40] = {0};
-    memcpy(pseudo, &from.sin6_addr, 16);
-    memcpy(pseudo + 16, &to.sin6_addr, 16);
-    pseudo[35] = n;
-    pseudo[39] = IPPROTO_ICMPV6;
-    h = (void *)buf;
-    printf("  icmp6 type %d id %#x seq %d checksum %s\n", h->icmp6_type, ntohs(h->icmp6_id),
-           ntohs(h->icmp6_seq), fold(add(add(0, pseudo, 40), buf, n)) == 0xffff ? "ok" : "bad");
+    for (int i = 0; i < 2; i++) {
+        h->icmp6_id = htons(0x4321 + i);
+        if (sendto(s, pkt, 64, 0, (void *)&to, sizeof to) != 64)
+            printf("sendto: %s\n", strerror(errno));
+    }
+    for (int i = 0; i < 2; i++) {
+        struct sockaddr_in6 from;
+        l = sizeof from;
+        int n = recvfrom(s, buf, sizeof buf, 0, (void *)&from, &l);
+        char a[64];
+        printf("recvfrom %d from %s\n", n, inet_ntop(AF_INET6, &from.sin6_addr, a, sizeof a));
+        /* Pseudo-header: source and destination addresses, length, next header */
+        unsigned char pseudo[40] = {0};
+        memcpy(pseudo, &from.sin6_addr, 16);
+        memcpy(pseudo + 16, &to.sin6_addr, 16);
+        pseudo[35] = n;
+        pseudo[39] = IPPROTO_ICMPV6;
+        h = (void *)buf;
+        printf("  icmp6 type %d id %#x seq %d checksum %s\n", h->icmp6_type, ntohs(h->icmp6_id),
+               ntohs(h->icmp6_seq), fold(add(add(0, pseudo, 40), buf, n)) == 0xffff ? "ok" : "bad");
+    }
     close(s);
 }
 

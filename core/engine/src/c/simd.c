@@ -810,12 +810,6 @@ static void write_base(struct appine_cpu *c, unsigned rn, uint64_t v)
         c->x[rn] = v;
 }
 
-static enum appine_exit undef(struct appine_cpu *c, uint32_t insn)
-{
-    c->exit_info = insn;
-    return APPINE_EXIT_UNDEF;
-}
-
 /* Confirms that every page of [va, va + len) can be accessed as access, and that no hardware
  * watchpoint is hit */
 static bool probe(struct appine_cpu *c, uint64_t va, uint64_t len, uint32_t access)

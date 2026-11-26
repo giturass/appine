@@ -7,10 +7,7 @@
  * each way the kernel layer reports, and each report read back from /dev/kmsg must be the line
  * Linux 6.1 writes (comm[pid], exception class and ESR, what happened, the file mapped at or above
  * the pc) followed by the registers. Children with a handler or a tracer are not reported, and
- * after 10 reports within 5 seconds the next is dropped. The ESRs are those Appine synthesizes:
- * Linux reports the translation-table level the walk stopped at (often 2 for an address with no
- * page tables), and a never-touched page as a translation fault even when its mapping forbids
- * the access.
+ * after 10 reports within 5 seconds the next is dropped.
  *
  * Each item that passes prints "ok <name>"; a failure prints the reason and exits with 1; when all
  * pass it prints "all ok" at the end.
@@ -119,6 +116,7 @@ static void crash(enum crash what)
         break;
     case WRITE_READONLY: {
         volatile char *m = mmap(0, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        (void)m[0]; /* Populate the read-only page before the denied write. */
         m[0] = 1;
         break;
     }
@@ -133,7 +131,10 @@ static void crash(enum crash what)
         break;
     case PAST_EOF: {
         int fd = open("/tmp/crashlog-empty", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        volatile char *m = mmap(0, 8192, PROT_READ, MAP_SHARED, fd, 0);
+        /* An empty file in its own 512 GiB slot leaves even the level 0 entry absent. */
+        void *addr = (void *)(1ULL << 39);
+        volatile char *m = mmap(addr, 8192, PROT_READ, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+        CHECK(m == addr, "map empty file");
         (void)m[0];
         break;
     }
@@ -263,8 +264,9 @@ int main(void)
     write_trace("1\n");
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* Low addresses share a 1 GiB slot with this static executable at 0x400000. */
     reported("write-unmapped", WRITE_UNMAPPED, SIGSEGV,
-             "DABT (lower EL), ESR 0x0000000092000047, level 3 translation fault", 1, 0);
+             "DABT (lower EL), ESR 0x0000000092000046, level 2 translation fault", 1, 0);
     reported("write-readonly", WRITE_READONLY, SIGSEGV,
              "DABT (lower EL), ESR 0x000000009200004f, level 3 permission fault", 1, 0);
     reported("undefined", UNDEFINED, SIGILL, "undefined instruction", 1, 0);
@@ -273,11 +275,11 @@ int main(void)
     reported("pc-alignment", PC_ALIGNMENT, SIGBUS,
              "PC Alignment, ESR 0x000000008a000000, SP/PC alignment exception", 1, 0x1002);
     reported("past-eof", PAST_EOF, SIGBUS,
-             "DABT (lower EL), ESR 0x0000000092000007, level 3 translation fault", 1, 0);
+             "DABT (lower EL), ESR 0x0000000092000004, level 0 translation fault", 1, 0);
     reported("exec-unmapped", EXEC_UNMAPPED, SIGSEGV,
-             "IABT (lower EL), ESR 0x0000000082000007, level 3 translation fault", 1, 0x10000);
+             "IABT (lower EL), ESR 0x0000000082000006, level 2 translation fault", 1, 0x10000);
     reported("ignored", IGNORED, SIGSEGV,
-             "DABT (lower EL), ESR 0x0000000092000047, level 3 translation fault", 1, 0);
+             "DABT (lower EL), ESR 0x0000000092000046, level 2 translation fault", 1, 0);
     reported("sp-alignment", SP_ALIGNMENT, SIGBUS,
              "SP Alignment, ESR 0x000000009a000000, SP/PC alignment exception", 1, 0);
     /* Appine checks the frame before restoring anything, so the registers are the caller's */

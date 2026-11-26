@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/ptrace.md` for the paired decision history (not yet created; pre-split decisions D5, D6, D12, the ptrace half of D14, D17, D20 and D26 stay in `.agents/decisions/kernel/signal.md`).
 >
 > Verified: 2026-11-15 (split out of the kernel/signal full mapping of 2026-11-03; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: `process_vm_readv`/`writev` validates local iovecs and returns 0 on zero local bytes before checking remote iovec count or pointers, matching Linux 6.1)
 
 ## Responsibilities
 
@@ -45,7 +47,7 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 - Attaching: `ATTACH` sends `SIGSTOP`; `SEIZE` takes options and never stops. Requests other than
   `KILL` and `INTERRUPT` need the tracee in a ptrace stop (else `ESRCH`); unknown requests are `EIO`.
 - Every ptrace stop saves a copy of the registers; the tracer reads and writes the copy and it is
-  written back on resume. Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
+  written back on resume (masking `fpcr` with `appine_engine::fpcr_write_mask`). Stopping notifies the tracer (`CLD_STOPPED` or `CLD_TRAPPED`, `SIGCHLD`
   unless suppressed) and waits until resumed, detached or killed.
 - Signal-delivery stops: resuming with 0 suppresses the signal, another number replaces it (as
   `SI_USER` unless `SETSIGINFO` was used); blocked replacements are re-queued.
@@ -60,7 +62,8 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   vfork-done, seccomp. `CLONE_PTRACE` forces and `CLONE_UNTRACED` prevents tracing of children.
   A non-seized tracee exec without `TRACEEXEC` gets `SIGTRAP`.
 - Single-step: the interpreter executes one instruction (`Cpu::step`) and the tracee reports
-  `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` reports after the syscall.
+  `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` (including `rt_sigreturn`, `execve`, and skipped `-1`
+  syscalls) reports at syscall return.
 - Register sets: `NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`,
   `NT_ARM_HW_BREAK` (6 slots), `NT_ARM_HW_WATCH` (4 slots); nothing for SVE, PAC, MTE, SME. Debug
   slots are handed to the engine (`set_hw_debug`) when the tracee resumes: breakpoints force Tier
@@ -69,13 +72,24 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
   set during the last stop) and a later attach finds them; only execve clears them.
 - Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
   `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
-  `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
-  non-writable mappings, translation invalidation; written mappings stop being trusted translation
-  sources). `process_vm_writev` uses plain writes.
+  `PEEKTEXT`/`PEEKDATA` and `/proc/<pid>/mem` can read protected pages, including CoW loans,
+  through forced reads. `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes
+  (private copies of non-writable mappings, translation invalidation; written mappings stop being
+  trusted translation sources). Both `PEEK*` and `POKE*` retry cold FUSE (`Fill`) pages locally
+  via `fuse::fill` with the BKL released, dropping all borrows and the tracee `Mm` reference
+  across the wait and re-validating tracee identity, ptrace attachment, stop state (not resumed or
+  killed) and `may_access_vm` afterwards (`ESRCH` if detached, resumed, killed or exited; `EIO` on
+  fill or access error). `process_vm_readv` and `process_vm_writev` still require ordinary read or
+  write permissions and also fill cold FUSE pages locally on both local and remote sides per page
+  chunk.
 - wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
-  traced leader's zombie is hidden from its parent until the tracer reaps it. When the tracer
+  traced leader's zombie is hidden from its separate parent until the tracer reaps it. If the
+  tracer becomes the parent first, the pending exit is taken once through the ordinary child wait. When the tracer
   process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
-  stopped group returns it to the group stop.
+  stopped group returns it to the group stop silently without dequeuing attach-time `SIGSTOP` or
+  re-notifying the parent. `process_vm_readv`/`writev` check `flags` and `liovcnt`, copy/sum local
+  iovecs and return 0 on zero local bytes before checking `riovcnt` (`> 1024`) or reading remote
+  iovecs (also returning 0 on zero remote bytes before PID lookup and access checks).
 
 ## Dependencies (inbound / outbound)
 
@@ -90,37 +104,25 @@ Procfs memory-file handling stays `kernel/procfs`, core writing `kernel/signal`.
 
 - `kernel/signal` supplies siginfo, signals and delivery on resume; `kernel/process` supplies
   task/group tables, wakes and waits. `kernel/ns` translates visible IDs.
-- `kernel/cred` checks access; `kernel/mm` performs reads/plain and forced writes, with
-  `kernel/mmu` code invalidation; `engine` provides Cpu state, stepping and hardware-debug slots.
+- `kernel/cred` checks access; `kernel/mm` performs ordinary and forced reads and writes, with
+  `kernel/mmu` code invalidation; `kernel/fuse` (`fill`) serves cold FUSE pages for `PEEK*`/`POKE*`
+  and `process_vm_readv`/`writev`; `engine` provides Cpu state, stepping and hardware-debug slots.
 - `kernel/vdso` identifies clock stubs that bypass ptrace stops.
 
 ## Invariants and gotchas
 
 - The tracer works on the saved register copy; changes made directly to the CPU state during a
   stop would be overwritten on resume.
-- Only threads calling `exit`/`exit_group` or taking the fatal signal report
-  `PTRACE_EVENT_EXIT`.
+- Every traced thread exiting normally (including `exit_group` siblings, fatal-signal siblings,
+  and threads killed by a non-leader's `execve`, which waits for them) reports `PTRACE_EVENT_EXIT`
+  before teardown (skipped only during machine shutdown).
 
 - Signal-delivery and fatal-exit ordering crosses `kernel/signal`; changing stops requires
   reading both maps. Immutable signal actions bypass signal-delivery stops.
 
 ## Confirmed bugs / technical debt
 
-- **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
-  skipped syscall (number -1), the step is not reported at syscall return.
-- **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
-  pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
-- **Threads ended by another thread report no `PTRACE_EVENT_EXIT`:** only threads calling
-  `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
-  `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1
-  gives them (there the execve waits for it); a tracer that collects state at exit misses them.
-- **Detaching at an attach-time group stop reports the stop again:** after `PTRACE_ATTACH` to a
-  stopped process and a detach during its group-stop report, the thread takes the `SIGSTOP` that
-  ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
-  where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
-  gdb or strace sees a duplicate stop.
-- `process_vm_readv`/`writev` with a non-empty local vector but no remote bytes look up the pid and
-  check access (`ESRCH`, `EPERM`) where Linux 6.1 returns 0 first.
+- `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 
 ## Open questions
 

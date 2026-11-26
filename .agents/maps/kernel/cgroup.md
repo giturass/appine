@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint unprivileged_bpf_disabled sysctl and sysfs mount-point references to kernel/sysctl and kernel/sysfs)
+> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: exact mutation-point cgroup notifications, dentry-instantiated dir watches, `memory.high` events/reclaim, and `cpuset.cpus` enforcement)
 
 ## Responsibilities
 
@@ -27,12 +27,11 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Key types
 
-- `Cgroup` (name, parent, children, `subtree_control`, owner, mode, written `values`, pids and
+- `Cgroup` (name, parent, children, `subtree_control`, creator, directory mode, per-node attribute overrides, written `values`, pids and
   memory events, memory peak, `freeze`, attached device programs and their flags) and `Cgroups`
   (the tree; ids never reused, root 1; `observed` notifying files); `CONTROLLERS` (8 in Linux's
   order, of which cpuset, cpu, memory and pids are available), `FILES` (39 interface files with
-  modes and controllers), `Writer` (writing thread, pid namespace, cgroup-namespace root, opener's
-  credentials); `CgroupNs` (in nsproxy).
+  modes and controllers), `Writer` (writing thread, pid namespace, cgroup-namespace root, writer and opener credentials); `CgroupNs` (in nsproxy).
 - `bpf::Prog` (id, instructions, name, tag, gpl, load time, loader's uid), `bpf::Registry` (weak,
   by id, ids never reused), `FileKind::Bpf`.
 - `PseudoNode::Cgroup(id, name)` is the `kernel/procfs` adapter (empty name for a directory).
@@ -41,9 +40,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 ## Public entry points
 
 - cgroup: `file`, `write`, `Cgroups::mkdir`, `rmdir`, `proc_cgroup`, `proc_cgroups`, `may_enter`,
-  `pids_charge`, `memory_limits`, `measure_memory`, `memory_event`, `oom_group`,
+  `pids_charge`, `memory_limits`, `memory_high_limits`, `note_memory_high_state`,
+  `measure_memory`, `memory_event`, `oom_group`, `effective_cpus`, `clamp_affinity`,
   `effective_device_progs`, `hierarchy_allows_attach`, `file_mode`, `observe`, `observe_all`,
-  `notify_changes`, `key`.
+  `task_changed`, `Cgroups::file_looked_up`, `notify_changes`, `key`.
 - bpf(2) (`syscall::bpf::bpf`) and `check_device`.
 
 ## Data flow / lifecycle
@@ -59,10 +59,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - mkdir: `EROFS` on ro mounts; `EEXIST` for `.`, `..`, existing names and interface-file names;
   write and search on the parent; newline in the name `EINVAL`; ancestors' `cgroup.max.depth` /
   `max.descendants` `EAGAIN`; the new cgroup and its files belong to the creator's fsuid/fsgid,
-  which is the only way to own one (path chown/chmod `EACCES`, or `EROFS` on ro mounts; fd-based
-  `EBADF`), and the directory has the mode mkdir gave (umask applied, `S_IRWXUGO|S_ISVTX`), which
-  path lookups through it, chdir and chroot check for search, as kernfs does. So only privileged
-  processes create top-level cgroups. rmdir: write and search on the parent; children or live
+  and chmod/chown change each node independently. The directory starts with the mode from mkdir
+  (umask applied, `S_IRWXUGO|S_ISVTX`), which
+  path lookups through it, chdir and chroot check for search, as kernfs does. The default root permissions restrict
+  top-level creation to privileged processes. rmdir: write and search on the parent; children or live
   processes `EBUSY` (zombies do not count); the root `EBUSY`; removal is immediate, with no dying
   state. Creating plain files is `EACCES`, renaming `EPERM`.
 - Membership: every process starts in the root; fork places the child in the parent's cgroup or a
@@ -85,9 +85,10 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   0 for ones it cannot see (Linux's task_pid_vnr). `cgroup.threads` only accepts moves within the
   same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain` (`threaded` is
   `EOPNOTSUPP`).
-- Writes, in order: a removed cgroup `ENODEV`; on the root and on the writer's namespace root only
-  `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable (`EPERM`); a
-  read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
+- Writes, in order: a removed cgroup or a file whose controller is no longer enabled on that
+  cgroup `ENODEV` (`Cgroups::has_file`); on the root and on the writer's
+  namespace root only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable
+  (`EPERM`); a read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
   including a token starting with a multi-byte character, `EINVAL`); enabling a
   controller not in `cgroup.controllers` `ENOENT`; enabling while the cgroup has processes `EBUSY`
   (except at the real root); disabling one a child still delegates `EBUSY`; disabling clears the
@@ -97,15 +98,21 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   default, `cpu.weight`, `cpuset.cpus` against the guest CPUs, and so on) and read back
   as stored; a stored value always wins over the computed default.
 - Enforced: `pids.max` (fork and thread creation; `pids.current` counts live threads plus one for
-  a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and measurement; a child's
-  usage is its members' resident memory with what they share counted once (`kernel/oom`'s
-  `Usage`), checked periodically by the OOM killer and immediately when a lower limit is written;
-  `memory.oom.group` widens the kill), `cgroup.freeze` (threads stop before returning to guest
-  code, waits return and restart after thaw; `cgroup.events` reports frozen once every task has
-  stopped or is a vfork parent waiting for its child, as Linux counts that wait), `cgroup.kill`
-  (SIGKILL to every live process in the subtree), `cgroup.max.depth`/`max.descendants` (at
-  mkdir), the device programs. Everything else (`memory.high`, `cpu.max`, `cpuset.cpus`, …) is
-  format-checked and stored.
+  a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and
+  measurement; a child's usage is its members' resident memory with what they share counted once
+  (`kernel/oom`'s `Usage`), checked periodically by the OOM killer and immediately when a lower
+  limit is written; `memory.oom.group` widens the kill), `memory.high` (checked on writes and
+  periodically by `oom::check`; exceeding it records `high` in `memory.events` and
+  `memory.events.local` and reclaims unused Tier 1 pool translations and writable code views
+  without killing processes), `cpuset.cpus` (hierarchical `cpuset.cpus.effective` intersecting
+  with parent effective CPUs and falling back to parent when empty or disjoint; enforced on
+  `sched_getaffinity`, `sched_setaffinity`, new host threads, `/proc/<pid>/status` `Cpus_allowed`,
+  migrations, and `cpuset.cpus` writes/controller disables), `cgroup.freeze` (threads stop before
+  returning to guest code, waits return and restart after thaw; `cgroup.events` reports frozen once
+  every task has stopped or is a vfork parent waiting for its child, as Linux counts that wait),
+  `cgroup.kill` (SIGKILL to every live process in the subtree), `cgroup.max.depth`/`max.descendants`
+  (at mkdir), the device programs. Everything else (`cpu.max`, `cpu.weight`, `memory.low`,
+  `memory.min`, …) is format-checked and stored.
 - `/proc/<pid>/cgroup` is `0::<path>` relative to the reader's cgroup-namespace root;
   `/proc/cgroups` reports hierarchy 0 for the v1 controller names.
 
@@ -126,8 +133,8 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   pointer); pointer arithmetic is limited to constant offsets; R0 must be 0 or 1 at exit; seven
   helpers. The interpreter treats any out-of-range access as returning 0 (deny).
 - Programs live while an fd or a cgroup holds them (rmdir drops a cgroup's). At device open
-  (except rdev 0), devpts terminal and `ptmx` opens by path and mknod (after `CAP_MKNOD`,
-  whiteouts exempt), the effective programs of the caller's cgroup run with its real uid and gid:
+  (except rdev 0), devpts terminal and `ptmx` opens by path and mknod (including FUSE mknod, after
+  `CAP_MKNOD`; only character 0:0 whiteouts are exempt), the effective programs of the caller's cgroup run with its real uid and gid:
   walking up from the cgroup, the first programs found (its own, or else the nearest ancestor's,
   whatever its flags), then those of further ancestors that attached with `MULTI` (Linux's
   `compute_effective_progs`); every one must return 1, else `EPERM`. `TIOCGPTPEER` runs none, as
@@ -136,14 +143,17 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 ### Synthetic node and open-file boundary
 
 - `kernel/procfs` maps cgroup directories and files to `PseudoNode::Cgroup`, gets their names
-  from `Cgroups::files`, modes from the cgroup or `file_mode`, and owners from the creator.
-  File sizes are 4096 and times are "now"; the node adapter has no store inode.
+  from `Cgroups::files` and attributes from `Cgroup::attrs`. Interface files report size 4096.
+  Enabling a controller creates its files with the writer's fsuid and fsgid. Lookups retain the controller
+  generation. Disabling it retires the open node and discards its attribute overrides.
 - The file syscalls check mount flags and DAC. Read-only cgroup files can still open for root
   in a write mode, with writes failing `EINVAL`; write-only files cannot be read (`EINVAL`).
 - The shared synthetic-file path generates content at open (empty for write-only files). The
-  first read from offset 0 keeps that fresh snapshot unless the change counter moved; later
-  reads from offset 0 regenerate with the opener's credentials and the current reader's
-  namespaces and cgroup root. Other reads use the snapshot. `pseudo::content` delegates to
+  first read from offset 0 keeps that fresh snapshot unless the change counter moved or
+  `pseudo::gone` reports the cgroup or controller file gone; later reads from offset 0 regenerate
+  with the opener's credentials and the current reader's namespaces and cgroup root, with `file`
+  returning `ENODEV` when the cgroup or controller file is gone and `EINVAL` for write-only files.
+  Other reads use the snapshot. `pseudo::content` delegates to
   `file`, `proc_cgroup` and `proc_cgroups`; `pseudo::write` delegates to `write`, supplying the writer's pid namespace
   and cgroup root plus the opener's credentials for migration. Writes apply each buffer
   separately, do not advance the position and mark the snapshot stale.
@@ -154,17 +164,23 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
   from the start and, for `cgroup.events`, `memory.events`, `memory.events.local` and
   `pids.events`, after a content change until read again. `kernel/files` attaches the counter
   returned by `observe` to `fd::ProcEvent`; `kernel/poll` consumes its readiness state.
-- A task starting, exiting, migrating or changing its freezer participation marks
-  `cgroup.events` in the affected groups and their ancestors. Freeze requests also mark
-  observed descendants. Pids and memory events mark the files whose counters they change;
-  controller disable and rmdir mark observations whose files disappear. Enabling pids or
-  memory registers the newly visible files for existing watches on the child directories.
+- A task starting, exiting, migrating or changing its freezer participation calls
+  `cgroup::task_changed` immediately after updating membership/state (outside any `ThreadGroup`
+  borrow), evaluating `cgroup.events` on observed ancestors right at the mutation point and
+  recording `Observed::changed` so transient transitions that revert before the next checkpoint
+  (e.g. `populated` or `frozen` 0 -> 1 -> 0) are never lost. `cgroup.freeze` writes, `pids_charge`,
+  and `memory_event` record transitions on their observed files immediately too; controller disable
+  and rmdir mark observations dirty so disappearing files are pruned. Enabling pids or memory
+  registers the newly visible files for existing watches on the child directories without marking
+  them instantiated.
 - A per-kernel flag lets `notify_changes` skip the observation table when clean. Otherwise it
-  compares only marked files, after BKL syscalls, thread exits,
-  freezer stops and timer-thread checks. Multiple changes to a file between checks yield at
-  most one counter increase. A change wakes pollers and reports `IN_MODIFY` to watches
-  on the file and its directory. A write to any cgroup2 file reports `IN_MODIFY` too,
-  from the file-syscall adapter.
+  flushes recorded changes at BKL syscall, thread exit, freezer stop and timer-thread checkpoints.
+  Multiple changes to a file before a checkpoint coalesce into one poll-counter bump and one
+  `IN_MODIFY` delivery. Directory watches receive `IN_MODIFY` only for child event files whose
+  dentry has been instantiated (`Cgroup::instantiated`, set on lookup in `pseudo::View::lookup`,
+  open, or direct watch, and cleared when a controller is disabled), matching native Linux
+  `kernfs_notify`. A write to any cgroup2 file reports `IN_MODIFY` too, from the file-syscall
+  adapter. Linux 6.1 does not notify `cgroup.stat`, so it stays outside `NOTIFYING`.
 - `key` gives cgroup2 files and directories inotify keys with top bits 01; store inodes, overlay
   keys (10) and FUSE keys (11) do not collide with them. Removed or no-longer-observed files
   are forgotten at the next check of that file. Until then a closed file may retain a snapshot;
@@ -176,8 +192,8 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 - `kernel/procfs`: synthetic node lookup, metadata and listing; cgroup interface content and
   writes; `/proc/<pid>/cgroup` and `/proc/cgroups`.
-- `kernel/vfs`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
-  opens (including devpts), file-change observation and write notifications.
+- `kernel/vfs` and `kernel/fuse`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
+  opens (including devpts) and file-change observation; `kernel/fileio`: write notifications.
 - `kernel/process`: clone/clone3 placement, pids charge, inherited freezer state, change checks
   after BKL syscalls and at thread exit; `kernel/time`: change checks on the timer thread;
   `kernel/signal`: freezer stops.
@@ -218,23 +234,12 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 
 ## Confirmed bugs / technical debt
 
-- **Change notifications are partial:** a cgroup2 change is noticed when the next syscall,
-  thread exit, freezer stop or timer-thread pass looks, and changes that come and go between
-  two looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
-  watched. A directory watch can also receive an inherited freeze notification for a child
-  event file never looked up, where the native 6.8 VM reported it only with the child dentry
-  instantiated.
-- **Delegation and controller gaps:** cgroup directories cannot be chmod'ed or chown'ed;
-  threaded cgroups are unavailable; limits such as `cpu.max`, `cpu.weight`, `cpuset.cpus` and
-  `memory.high` are stored without enforcement.
-- **cgroup write and read edge cases differ from kernfs:** writes are checked against
-  the global file table, not the cgroup's current files, so a descriptor opened before a
-  controller was disabled still stores a value (which returns when the controller is re-enabled;
-  a `memory.max` one runs the OOM check) where Linux gives `ENODEV`; a regenerating read of a
-  removed cgroup's file is `EINVAL` (Linux `ENODEV`).
-- **mknod on FUSE skips the device programs:** it returns to `kernel/fuse` before the cgroup device
-  check, which checks `CAP_MKNOD` itself but exempts every device 0:0, block ones included (Linux
-  exempts only the character whiteout).
+- **Controller gaps:** threaded cgroups are unavailable; `cpu.max` quota throttling, `cpu.weight`,
+  `memory.low` and `memory.min` are stored without enforcement (`cpu.max` throttling on CPU-bound
+  guest loops running outside the BKL would require periodic 1 ms-class timer accounting plus
+  run-loop kick/throttle stops without host CFS privileges, risking timer/BKL churn). `memory.high`
+  records `high` events and reclaims Tier 1 pool/code-view memory, but cannot force host kernel
+  reclaim or allocation-stall throttling of guest-managed anonymous pages.
 
 ## Open questions
 

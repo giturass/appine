@@ -39,14 +39,18 @@ internal object VtNative {
      * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
      * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
      * `onClipboard`, `onNotification`, `onProgress`, `onStatus` and `onClipboardRead` for what
-     * programs asked of the app, `onCommandFinished` when the shell's prompt marks saw a command
-     * finish, `onTmuxDetached()` when tmux's control mode, which vt.c detached, ended, and
+     * programs asked of the app, `onClipboardReset` before any reads following a RIS in the same
+     * batch, `onCommandFinished` when the shell's prompt marks saw a command finish,
+     * `onTmuxDetached()` when tmux's control mode, which vt.c detached, ended, and
      * `onForeground()` once the process group in the foreground when progress or a status was last
      * reported has given the terminal back.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
 
-    /** The title a program set (OSC 0/2); null when none. */
+    /**
+     * The title a program set (OSC 0/2), or the foreground-process fallback title while a command
+     * runs without setting one under busybox ash or an unmarked shell; null when none.
+     */
     @JvmStatic external fun title(tab: Long): String?
 
     /**
@@ -55,6 +59,13 @@ internal object VtNative {
      * without them and on the alternate screen.
      */
     @JvmStatic external fun atPrompt(tab: Long): Boolean
+
+    /**
+     * Whether closing the tab would interrupt a running command: false at an OSC 133 prompt, or
+     * (for unmarked shells and busybox ash whose PS1 lost its marks) when the primary screen's
+     * foreground process is an interactive shell waiting for input.
+     */
+    @JvmStatic external fun busy(tab: Long): Boolean
 
     /**
      * The rows that changed since the last frame, all of them with [full] (the frame format is in
@@ -263,10 +274,11 @@ internal object VtNative {
     @JvmStatic external fun clear(tab: Long): Int
 
     /**
-     * Resets the terminal (a full reset, RIS: screens, scrollback, modes, title, images); true when
-     * the shell was at its prompt, which then gets a form feed to draw it again.
+     * Resets the terminal and returns its new clipboard generation. A positive value means the
+     * shell was at its prompt and needs a form feed to redraw. Otherwise the value is negative.
+     * Returns zero if the tab is gone.
      */
-    @JvmStatic external fun reset(tab: Long): Boolean
+    @JvmStatic external fun reset(tab: Long): Long
 
     /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the
@@ -304,7 +316,7 @@ internal object VtNative {
 
     /**
      * Deletes [tab]'s oldest Kitty images, with their placements, until each screen's take at
-     * most 4 MiB (memory trimming under pressure, for a tab not shown).
+     * most 4 MiB (memory trimming for a background tab not shown).
      */
     @JvmStatic external fun dropImages(tab: Long)
 

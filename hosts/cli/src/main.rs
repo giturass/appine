@@ -177,10 +177,11 @@ fn main() -> ExitCode {
     };
 
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let on_tty = appine_hal::isatty(0) && appine_hal::isatty(1);
+    let input_tty = appine_hal::isatty(0);
+    let output_tty = appine_hal::isatty(1);
     let mut raw = None;
-    if pty.unwrap_or(on_tty) {
-        if on_tty {
+    if pty.unwrap_or(input_tty && output_tty) {
+        if input_tty {
             match appine_hal::RawMode::enter(0) {
                 Ok(r) => raw = Some(r),
                 Err(e) => {
@@ -188,13 +189,12 @@ fn main() -> ExitCode {
                 }
             }
         }
+        let size = output_tty.then_some(1).or(input_tty.then_some(0));
         options.terminal = Some(Terminal {
             input: 0,
             output: 1,
-            size: on_tty.then_some(1),
-            resize: on_tty
-                .then(appine_hal::sigwinch_notifier)
-                .and_then(Result::ok),
+            size,
+            resize: size.and_then(|_| appine_hal::sigwinch_notifier().ok()),
         });
     }
     // Without the pipe the signals keep their default action
@@ -355,4 +355,5 @@ fn print_stats(s: &DbtStats) {
     eprintln!("  code cache flushes  {:>12}", s.flushes);
     eprintln!("  blocks invalidated  {:>12}", s.invalidated);
     eprintln!("  groups undone       {:>12}", s.ungrouped);
+    eprintln!("  fast loops          {:>12}", s.fast_loops);
 }

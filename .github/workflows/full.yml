@@ -178,9 +178,8 @@ jobs:
         run: cargo test -p appine-engine -p appine-lockstep
 
   # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
-  # Alpine in docker. Split across independent runners so each shard stays single-lane (avoiding
-  # multi-lane timing flakiness and store-clone duplication on ext4) while cutting wall time from
-  # ~28 min to ~9 min. Each shard creates its store afresh and installs only the suite it needs.
+  # Alpine in Docker. Each runner uses one lane and installs the suite its shard needs.
+  # The gVisor filesystem and device groups run together, in parallel with the remaining groups.
   difftest:
     name: Differential tests (${{ matrix.shard }})
     needs: [changed, build]
@@ -193,6 +192,16 @@ jobs:
           - shard: gvisor-process
             suite: gvisor
           - shard: gvisor
+            suite: gvisor
+          - shard: gvisor-fs-devices
+            suite: gvisor
+          - shard: gvisor-inet
+            suite: gvisor
+          - shard: gvisor-unix-address
+            suite: gvisor
+          - shard: gvisor-unix-pairs
+            suite: gvisor
+          - shard: gvisor-slow
             suite: gvisor
           - shard: starnix
             suite: starnix
@@ -256,8 +265,18 @@ jobs:
           idx=0
           for name in "${all_cases[@]}"; do
             case "$name" in
-              gvisor-process)
-                if [ "${{ matrix.shard }}" = "gvisor-process" ]; then
+              gvisor-process|gvisor-inet|gvisor-unix-address|gvisor-unix-pairs)
+                if [ "${{ matrix.shard }}" = "$name" ]; then
+                  cases+=("$name")
+                fi
+                ;;
+              gvisor-slow|gvisor-slow-process)
+                if [ "${{ matrix.shard }}" = "gvisor-slow" ]; then
+                  cases+=("$name")
+                fi
+                ;;
+              gvisor-devices|gvisor-fs)
+                if [ "${{ matrix.shard }}" = "gvisor-fs-devices" ]; then
                   cases+=("$name")
                 fi
                 ;;

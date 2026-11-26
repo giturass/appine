@@ -542,6 +542,16 @@ for a, m in [(UTIME_NOW, UTIME_OMIT), (UTIME_OMIT, UTIME_NOW), (UTIME_NOW, UTIME
         print("utimensat", hex(struct.unpack_from("iIII", ev)[1]))
     except BlockingIOError:
         print("utimensat no event")
+
+# A non-owner with write permission may update both timestamps to now.
+path = b"/tmp/holes/r/f"
+os.chmod(path, 0o666)
+os.setgid(65534)
+os.setuid(65534)
+for a, m in [(UTIME_NOW, UTIME_OMIT), (UTIME_OMIT, UTIME_NOW), (UTIME_NOW, UTIME_NOW), (UTIME_OMIT, UTIME_OMIT)]:
+    t = (ts * 2)(ts(0, a), ts(0, m))
+    r = libc.utimensat(-100, path, t, 0)
+    print("non-owner utimensat", a, m, errno.errorcode[ctypes.get_errno()] if r else "ok")
 PY
 umount /tmp/holes/t
 rm -rf /tmp/holes

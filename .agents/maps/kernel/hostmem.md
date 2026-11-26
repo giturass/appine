@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-22 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification: HostRegion used-range tracking for oversized stack/heap reservations and recycled's `< 2 MB` `MAX_DISCARD` cap)
+> Maintained: 2026-11-25 (targeted verification: `WRITABLY_SHARED` cleanup via `forget_writably_shared` on host object unlink and `st_nlink == 0` rejection in `content::version`)
 
 ## Responsibilities
 
@@ -54,9 +54,11 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   commit-accounted).
 - `FileMaps` — kernel-wide LRU cache (at most 128 `FileMap` entries) of read-only private file
   mappings, shared by all address spaces, keyed by `(device, inode, offset, length, ctime, size)`.
-- `content` / `WRITABLY_SHARED` — process-wide set of `(dev, ino)` pairs that have ever been
-  mapped shared from a writably opened descriptor (never cleared), plus `content_version` checking
-  ctime stability.
+- `content` / `WRITABLY_SHARED` — process-wide set of linked host `(dev, ino)` pairs that have had
+  a writable shared mapping, re-checking `fstat(fd).st_nlink` under the lock against concurrent
+  unlinks and cleared by `forget_writably_shared` when `kernel/store`'s `remove_object` unlinks the
+  host object; `content_version` rejects `st_nlink == 0` (memfds and deleted objects), recent
+  ctimes, and tracked `(dev, ino)` entries.
 - `recycled` — process-wide reuse pool of private anonymous host ranges keyed by `(len, reserve)`:
   at most 256 MB in total and 32 ranges per key; on return (`recycled::put`), discards only the
   host-page-aligned `[used_start, used_end)` sub-range (skipping `MADV_DONTNEED` if nothing was
@@ -77,8 +79,8 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   `spare::refill` when it is released.
 - **Machine** (`kernel/boot`, `android/service`): `FileMaps::clear` from `Machine::trim_memory`.
 - **SysV shm** (`kernel/ipc`): `SharedMemory::new`, `SharedMemory::len`.
-- **Code groups and files** (`kernel/mm`, `kernel/mmu`): `content_version`,
-  `FileMaps::get`/`insert`, `UNMAPPING` (read by `kernel/oom`).
+- **Code groups and files** (`kernel/mm`, `kernel/mmu`, `kernel/store`): `content_version`,
+  `forget_writably_shared`, `FileMaps::get`/`insert`, `UNMAPPING` (read by `kernel/oom`).
 - **Internal mm / cow primitives**: `HostRegion::reserved`, `spare::anonymous` /
   `spare::anonymous_reserved`, `recycled::take`/`put`, `discard_host`, `discard_file_host`,
   `remove_host`, `copy_nonzero_pages`, `Mm::mmap_gpu`.
@@ -105,9 +107,11 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
   - a GPU mapping (`Mm::mmap_gpu`) → a shared, non-executable guest VMA over a page-aligned host
     mapping whose `HostRegion` retains the `gpu::Mapping` through fork, VMA splits, GEM close and
     TLB shootdown (growth and hole punching refused).
-- A file has no trusted content version while its ctime is within the last 2 s, or once it has
-  been mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, never cleared, recorded
-  even when the mmap then fails; sealed memfds count as not writable).
+- A file has no trusted content version when unlinked (`st_nlink == 0`, including memfds and
+  deleted store objects), while its ctime is within the last 2 s, or once a linked host object has
+  been mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, recorded after VMA
+  insertion succeeds and cleared by `forget_writably_shared` while `kernel/store` holds an `O_PATH`
+  pin across a successful `unlink_at`; sealed memfds count as not writable).
 - Shared file mappings map the same host object file with host `MAP_SHARED`, so they stay coherent
   with `read`/`write`, which go to that file through the host page cache.
 - On a 16 KB-page host, a file mapping covers the 16 KB-aligned host range around the target and
@@ -158,6 +162,7 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 - `kernel/ipc`: `SharedMemory::new` / `len`.
 - `kernel/boot` / `Machine`: initial `FileMaps`, `FileMaps::clear` in `Machine::trim_memory`.
 - `kernel/mmu`: `Mmu` dropped via `Unmapped::mmus` when `Mm` drops under the BKL.
+- `kernel/store`: calls `forget_writably_shared` from `remove_object` after unlinking a host object.
 
 ### Outbound
 
@@ -196,7 +201,7 @@ mmap/munmap/madvise wrappers (`hal`); GPU renderer mappings (`kernel/files`, `an
 
 ## Open questions
 
-- Should `WRITABLY_SHARED` ever be cleared (for example when the inode is deleted)?
+None.
 
 ## To verify
 

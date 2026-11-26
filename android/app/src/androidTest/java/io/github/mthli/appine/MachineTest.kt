@@ -1,5 +1,7 @@
 package io.github.mthli.appine
 
+import android.content.Context
+import android.database.ContentObserver
 import android.net.ConnectivityManager
 import android.provider.DocumentsContract
 import android.system.Os
@@ -19,13 +21,20 @@ import org.junit.runner.RunWith
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.AccessDeniedException
+import java.nio.file.FileAlreadyExistsException
 import java.security.MessageDigest
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -52,15 +61,19 @@ class MachineTest {
 
     private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier, false).also { machines.add(it) }
 
-    private fun withAlpineStore(name: String, test: (String) -> Unit) {
+    private fun withTempStore(name: String, test: (File) -> Unit) {
         val store = File(context.cacheDir, name)
         store.deleteRecursively()
         try {
-            Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
-            test(store.path)
+            test(store)
         } finally {
             store.deleteRecursively()
         }
+    }
+
+    private fun withAlpineStore(name: String, test: (String) -> Unit) = withTempStore(name) { store ->
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        test(store.path)
     }
 
     private fun <T> withMachine(store: String, test: (Long) -> T): T {
@@ -141,9 +154,12 @@ class MachineTest {
      * step by step: each step waits up to two minutes for `wait` to appear in the output (after the
      * point the previous step waited for), then types `send`. Returns all the output.
      */
-    private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String {
+    private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String =
+        loginSteps(machine, ConsolePty.LOGIN_AUTO, *steps)
+
+    private fun loginSteps(machine: Long, account: String, vararg steps: Pair<String, String>): String {
         val console = Native.openConsole(machine, 24, 200)
-        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_AUTO, null)
+        val argv = ConsolePty.argv(ConsolePty.script(context), account, null)
         val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
         val bytes = ByteArrayOutputStream()
         val text = { synchronized(bytes) { bytes.toString("UTF-8") } }
@@ -397,6 +413,19 @@ class MachineTest {
             assertTrue(out, out.contains("\u001b]133;P;k=s;appine_lf=output\u0007> \u001b]133;B\u0007"))
             // The loop's status, after its continuation line
             assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))
+            // Check the visible path and the title in the raw PTY output. BusyBox expands
+            // prompt backslashes after ash has substituted the directory name.
+            val prefix = "ash-${System.nanoTime()}"
+            val leaf = "$prefix?\\w"
+            val command = """d=$(printf '$prefix\t\\w'); mkdir "/root/${'$'}d" && cd "/root/${'$'}d"; false"""
+            val path = login(machine,
+                "$command\nash\nexit\ncd /root; ln -s \"\$d\" $prefix-link; cd $prefix-link\n" +
+                    "cd /root; rm $prefix-link; rmdir \"\$d\"\nexit\n", ConsolePty.LOGIN_ROOT)
+            assertTrue("visible ash path", path.contains("\u001b[1;34m~/$leaf\u001b[0m"))
+            assertTrue("nested ash path", path.contains("appine_lf=output\u0007~/$leaf # "))
+            assertTrue("ash directory title", path.contains("\u001b]2;/root/$leaf\u0007"))
+            assertTrue("physical prompt and logical title", path.contains(
+                "~/$leaf\u001b[0m# \u001b]133;B\u0007\u001b]2;/root/$prefix-link\u0007"))
             // A prompt that ~/.profile sets gets the marks when ash reads ENV after it, and so does
             // a nested ash, which reads no profile
             try {
@@ -898,39 +927,155 @@ class MachineTest {
         }
     }
 
-    /**
-     * A password set while the session runs (the android/setup map): until then alice escalates
-     * without one; chpasswd replaces `/etc/shadow`, the changed `/etc` (what the service takes with
-     * [Native.takeChangedDirs]) makes [Rootfs.dirsChanged] rewrite the rules, and from then on doas
-     * asks for the password without a new login. A change elsewhere refreshes nothing.
-     */
+    /** Account changes reach doas without opening another login or depending on a directory event. */
     @Test
-    fun rulesFollowAPasswordSetLater() {
-        Rootfs.ensureLoginTools(context)
-        val machine = start(1)
-        val escalate = "su alice -c 'doas -n id -un' 2>&1"
-        try {
-            assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
+    fun rulesFollowAPasswordSetLater() = withAlpineStore("login-rules") { store ->
+        context.assets.open("doas.apk").use {
+            Native.writeFile(store, "/var/cache/appine/doas.apk", it.readBytes(), 420, true)
+        }
+        withMachine(store) { machine ->
+            val rules = Rootfs.LoginRules(machine)
+            val escalate = "su alice -c 'doas -n id -un' 2>&1"
+
+            fun assertPasswordless() {
+                val output = checkedShell(machine, escalate)
+                assertTrue(output, output.lineSequence().any { it.trim() == "root" })
+            }
+
+            fun assertPasswordRequired() {
+                val (output, status) = sh(machine, escalate)
+                assertTrue(output, status != 0 && output.contains("doas: Authentication required"))
+            }
+
+            fun refresh() {
+                val task = requireNotNull(rules.poll(context)) { "expected a login rule refresh" }
+                task.join(10_000)
+                assertFalse("login rule refresh still running", task.isAlive)
+            }
+
+            checkedShell(machine, "adduser -D -s /bin/sh alice")
             val first = login(machine, "id -un; id -nG; doas -n id -un; exit\n")
             assertTrue(first, becameAdmin(first, "wheel"))
-            Native.takeChangedDirs(machine)
-            assertEquals(-1, Rootfs.dirsChanged(context, machine, arrayOf("/home/alice")))
-            assertEquals(0, sh(machine, "echo alice:secret | chpasswd").second)
-            val before = sh(machine, escalate).first
-            assertTrue(before, before.lines().any { it.trim() == "root" })
-            val dirs = Native.takeChangedDirs(machine) ?: emptyArray()
-            assertTrue(dirs.joinToString(), "/etc" in dirs)
-            val pid = Rootfs.dirsChanged(context, machine, dirs)
-            assertTrue(pid > 0)
-            Native.waitFor(machine, pid)
-            val after = sh(machine, escalate).first
-            assertTrue(after, after.contains("doas: Authentication required"))
-        } finally {
-            sh(
+
+            // The first poll must reconcile an earlier change, even if no event was collected.
+            checkedShell(machine, "cp /etc/shadow /root/passwordless-shadow && echo alice:secret | chpasswd")
+            assertPasswordless()
+            refresh()
+            assertPasswordRequired()
+
+            // Restore the passwordless entry without replacing the inode or changing /etc.
+            checkedShell(machine, "cp /etc/shadow /root/protected-shadow && cat /root/passwordless-shadow > /etc/shadow")
+            refresh()
+            assertPasswordless()
+
+            // A failed refresh must retry the same sample after the lock becomes available.
+            checkedShell(machine, "cat /root/protected-shadow > /etc/shadow && " +
+                "rm /run/appine-rules.lock && mkdir /run/appine-rules.lock")
+            refresh()
+            checkedShell(machine, "rmdir /run/appine-rules.lock")
+            refresh()
+            assertPasswordRequired()
+            checkedShell(machine, "cat /root/passwordless-shadow > /etc/shadow")
+            refresh()
+            assertPasswordless()
+
+            // Rewrite the group in place, with all temporary files outside /etc.
+            checkedShell(machine, "sed '/^wheel:/s/alice//' /etc/group > /root/updated-group && " +
+                "cat /root/updated-group > /etc/group")
+            refresh()
+            assertTrue(sh(machine, escalate).second != 0)
+            checkedShell(machine, "touch /home/alice/unrelated")
+            assertTrue("unrelated change refreshed the rules", rules.poll(context) == null)
+        }
+    }
+
+    /**
+     * Ctrl-C during `login.sh` must not disrupt short setup commands (passwd lookup, group check,
+     * shadow read) or log a named user in as root, while still interrupting cancellable `apk`
+     * lock waits and working normally once the user's shell starts.
+     */
+    @Test
+    fun loginProtectsSetupFromCtrlCAndRestoresItForInstallAndShell() = withAlpineStore("login-sigint") { store ->
+        context.assets.open("doas.apk").use {
+            Native.writeFile(store, "/var/cache/appine/doas.apk", it.readBytes(), 420, true)
+        }
+        withMachine(store) { machine ->
+            checkedShell(machine, "adduser -D -s /bin/sh alice")
+            // First login installs doas and records alice in /var/lib/appine/admins.
+            val first = login(machine, "id -un; id -nG; doas -n id -un; exit\n", "alice")
+            assertTrue(first, becameAdmin(first, "wheel"))
+
+            // Slow down awk during passwd/shadow lookups; Ctrl-C arriving then must be ignored so
+            // alice is not logged in as root and NOPASSWD rules stay intact, while Ctrl-C inside
+            // the launched shell still interrupts foreground commands.
+            checkedShell(
                 machine,
-                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
-                    "rm -rf /var/lib/appine /etc/doas.d",
+                "mkdir -p /usr/local/bin && printf '#!/bin/sh\\necho READY_AWK >&2\\nsleep 1\\nexec /usr/bin/awk \"\$@\"\\n' > /usr/local/bin/awk && chmod +x /usr/local/bin/awk",
             )
+            val protectedOut = plain(loginSteps(
+                machine, "alice",
+                "READY_AWK" to "\u0003",
+                "$ " to "id -un; doas -n id -un; echo sl''eeping; sleep 30\n",
+                "sleeping" to "\u0003",
+                "$ " to "echo shell-ctrlc-ok; exit\n",
+            ))
+            checkedShell(machine, "rm -f /usr/local/bin/awk")
+            assertFalse(protectedOut, protectedOut.contains("there is no user alice"))
+            assertTrue(protectedOut, protectedOut.contains("\nalice\nroot\n"))
+            assertTrue(protectedOut, protectedOut.contains("\nshell-ctrlc-ok\n"))
+
+            // Ctrl-C during an apk lock wait must skip installing immediately and still launch a
+            // working shell with SIGINT restored.
+            checkedShell(machine, "apk del -q --no-network --repositories-file /dev/null doas && rm -f /var/lib/appine/doas-installed")
+            val holder = Native.spawn(
+                machine, -1, "/bin/sh",
+                arrayOf("sh", "-c", "flock /lib/apk/db/lock sh -c 'touch /tmp/apk-held; sleep 30'; rm -f /tmp/apk-held"),
+                ConsolePty.ENVIRONMENT,
+            )
+            try {
+                checkedShell(
+                    machine,
+                    "i=0; while [ ! -e /tmp/apk-held ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i + 1)); done; [ -e /tmp/apk-held ]",
+                )
+                val skipped = plain(loginSteps(
+                    machine, "alice",
+                    "another apk is running; waiting for it to finish" to "\u0003",
+                    "$ " to "id -un; echo sl''eeping; sleep 30\n",
+                    "sleeping" to "\u0003",
+                    "$ " to "echo after-apk-skip; exit\n",
+                ))
+                assertTrue(skipped, skipped.contains("appine: skipped installing doas"))
+                assertTrue(skipped, skipped.contains("\nalice\n"))
+                assertTrue(skipped, skipped.contains("\nafter-apk-skip\n"))
+            } finally {
+                sh(machine, "kill -KILL $holder 2>/dev/null; rm -f /tmp/apk-held")
+                Native.waitFor(machine, holder)
+            }
+        }
+    }
+
+    /**
+     * [Rootfs.deleteTarball] removes only the abandoned distribution's cached tarball and `.part`
+     * file, leaving other distributions' cached tarballs intact.
+     */
+    @Test
+    fun deleteTarballRemovesOnlyAbandonedDistroCache() {
+        val debian = Rootfs.tarball(context, Rootfs.Distro.DEBIAN)
+        val debianPart = File(debian.path + ".part")
+        val alpine = Rootfs.tarball(context, Rootfs.Distro.ALPINE)
+        val alpineBytes = if (alpine.exists()) alpine.readBytes() else null
+        try {
+            debian.writeText("debian-tarball")
+            debianPart.writeText("debian-part")
+            alpine.writeText("alpine-tarball")
+            Rootfs.deleteTarball(context, Rootfs.Distro.DEBIAN)
+            assertFalse(debian.exists())
+            assertFalse(debianPart.exists())
+            assertTrue(alpine.exists())
+        } finally {
+            debian.delete()
+            debianPart.delete()
+            if (alpineBytes != null) alpine.writeBytes(alpineBytes) else alpine.delete()
         }
     }
 
@@ -970,6 +1115,12 @@ class MachineTest {
         assertEquals(1, saved?.current)
         assertTrue(saved!!.time > 0)
         assertEquals(tabs, Tabs.takeKilled(context)?.saved?.tabs)
+        // Two distinct layouts whose JSON strings share the same 32-bit String.hashCode()
+        assertEquals("/Aa".hashCode(), "/BB".hashCode())
+        Tabs.save(context, listOf(tabs[0].copy(cwd = "/Aa")), 0)
+        assertEquals(listOf("/Aa"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.cwd })
+        Tabs.save(context, listOf(tabs[0].copy(cwd = "/BB")), 0)
+        assertEquals(listOf("/BB"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.cwd })
         Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
         assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.transcript })
         val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
@@ -1206,44 +1357,65 @@ class MachineTest {
         }
     }
 
-    /**
-     * The fastest mirror goes into the sources only while they are still exactly what the import
-     * wrote: also while the kernel runs, and the guest sees it at once. Sources already switched,
-     * edited by the user or deleted are left alone.
-     */
-    @Test
-    fun mirrorIsWrittenOnlyIntoUntouchedSources() {
-        val machine = start(1)
+    @Test(timeout = 60000)
+    fun mirrorSelectionEndsBeforeTheGuestCanEditSources() = withTempStore("mirror-selection") { store ->
         val distro = Rootfs.Distro.ALPINE
+        val (official, tuna, ustc, aliyun) = distro.mirrors
+        val late = CompletableFuture<Double?>()
+        Rootfs.prepare(context, distro, store = store) {
+            mapOf(
+                official to CompletableFuture.completedFuture(1.0),
+                tuna to CompletableFuture.completedFuture(3.0),
+                ustc to CompletableFuture.completedFuture(3.0),
+                aliyun to late,
+            )
+        }
+
+        fun prepareAgain() = Rootfs.prepare(context, distro, store = store) {
+            error("a ready store started mirror probes")
+        }
+
         val path = "/etc/apk/repositories"
-        val before = sh(machine, "cat $path").first
-        val (official, tuna, ustc) = distro.mirrors
         val branch = BuildConfig.ALPINE_BRANCH
-        val sources = { mirror: String -> "$mirror/$branch/main\n$mirror/$branch/community\n" }
-        val write = { text: String -> Native.writeFile(Rootfs.store(context).path, path, text.toByteArray(), 420, true) }
-        try {
-            // The app's speed probe may already have switched the mirror: start as at import
-            write(sources(official))
-            // The official mirror being the fastest writes nothing
-            assertTrue(Rootfs.useMirror(context, distro, official))
-            assertEquals(sources(official), sh(machine, "cat $path").first)
-            assertTrue(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(sources(ustc), sh(machine, "cat $path").first)
-            // Once switched, never again
-            assertFalse(Rootfs.useMirror(context, distro, tuna))
-            assertEquals(sources(ustc), sh(machine, "cat $path").first)
-            // A line the user added, even with the official mirror still there
-            val edited = sources(official) + "@testing $official/edge/testing\n"
-            write(edited)
-            assertFalse(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(edited, sh(machine, "cat $path").first)
-            // The sources file is gone: not written again
-            sh(machine, "rm $path")
-            assertFalse(Rootfs.useMirror(context, distro, ustc))
-            assertEquals(null, Native.readFile(Rootfs.store(context).path, path))
-        } finally {
-            // Restore the original sources: other test cases and the app itself use this store
-            write(before)
+        withMachine(store.path) { machine ->
+            assertEquals("$tuna/$branch/main\n$tuna/$branch/community\n", checkedShell(machine, "cat $path"))
+            checkedShell(machine, "echo my-mirror > $path")
+            assertTrue(late.isCancelled)
+            assertFalse(late.complete(10.0))
+            prepareAgain()
+            assertEquals("my-mirror\n", checkedShell(machine, "cat $path"))
+            checkedShell(machine, "rm $path")
+            prepareAgain()
+            checkedShell(machine, "test ! -e $path")
+        }
+    }
+
+    @Test(timeout = 60000)
+    fun mirrorSelectionFallsBackToOfficialSources() = withTempStore("mirror-fallback") { store ->
+        val distro = Rootfs.Distro.ALPINE
+        val (official, tuna, ustc) = distro.mirrors
+        Rootfs.prepare(context, distro, store = store) {
+            mapOf(tuna to CompletableFuture.completedFuture(null), ustc to CompletableFuture<Double?>())
+        }
+        val branch = BuildConfig.ALPINE_BRANCH
+        val sources = Native.readFile(store.path, "/etc/apk/repositories")!!.decodeToString()
+        assertEquals("$official/$branch/main\n$official/$branch/community\n", sources)
+    }
+
+    /** Uses the pinned Debian tarball, like downloadedDistributionsRun. */
+    @Test
+    fun debianImportsBothSourcesWithTheSelectedMirror() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
+        withTempStore("debian-mirror") { store ->
+            val distro = Rootfs.Distro.DEBIAN
+            val mirror = distro.mirrors[1]
+            Rootfs.prepare(context, distro, store = store) {
+                mapOf(mirror to CompletableFuture.completedFuture(3.0))
+            }
+            withMachine(store.path) { machine ->
+                val uris = checkedShell(machine, "grep '^URIs:' /etc/apt/sources.list.d/debian.sources")
+                assertEquals("URIs: http://$mirror/debian\nURIs: http://$mirror/debian-security\n", uris)
+            }
         }
     }
 
@@ -1423,18 +1595,47 @@ class MachineTest {
             assertEquals("hi", read("/root/dt/a.txt"))
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
-            // Non-canonical IDs count as nonexistent (the query returns null).
+            // Non-canonical IDs count as nonexistent (the query returns null), including percent-
+            // encoded `.`/`/` and non-canonical `%XX` escapes that native decode_path decodes.
             assertEquals(listOf(listOf("text/plain")), rows(document("/root/dt/release"), mime))
-            assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
-            assertEquals(null, rows(document("/root//dt"), id))
-            // Tree grants: what is inside works, walking out with `..` does not
+            for (bad in listOf(
+                "/root/dt/../../etc/motd",
+                "/root//dt",
+                "/root/dt/%2e%2e/etc/motd",
+                "/root/dt/%2E%2E/a.txt",
+                "/root/dt/sub%2f..%2f..%2fetc%2fmotd",
+                "/root/dt/a%2fb",
+                "/root/dt/%61.txt",
+                "/root/dt/100%",
+                "/root/dt/a%00b",
+                "/root/dt/a%+ab",
+                "/root/dt/%ff",
+            )) {
+                assertEquals(bad, null, Documents.canonical(bad))
+                assertEquals(bad, null, rows(document(bad), id))
+            }
+            for (good in listOf("/", "/root/dt/100%25 中文.txt", "/root/dt/a%09b", "/root/dt/%FF%FE")) {
+                assertEquals(good, Documents.canonical(good))
+            }
+            assertEquals("/root/100%25 home", Documents.documentId("/root/100% home/"))
+            assertEquals(null, Documents.documentId("root/relative"))
+            assertEquals(null, Documents.documentId("//root"))
+            assertEquals(null, Documents.documentId("/root/../etc"))
+            // Tree grants: what is inside works, walking out with `..` or `%2E`/`%2F` does not
             val tree = DocumentsContract.buildTreeDocumentUri(authority, "/root/dt")
             assertEquals(
                 listOf(listOf("/root/dt/sub")),
                 rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/sub"), id),
             )
-            assertThrows(SecurityException::class.java) {
-                rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/../../etc/motd"), id)
+            for (escape in listOf(
+                "/root/dt/../../etc/motd",
+                "/root/dt/%2e%2e/%2e%2e/etc/motd",
+                "/root/dt/sub%2f..%2f..%2f..%2fetc%2fmotd",
+                "/root/dt/%2E%2E/a.txt",
+            )) {
+                assertThrows(escape, SecurityException::class.java) {
+                    rows(DocumentsContract.buildDocumentUriUsingTree(tree, escape), id)
+                }
             }
             // The Files app passes the name in the arguments when it searches
             val search = DocumentsContract.buildSearchDocumentsUri(authority, Documents.ROOT_HOME, "A.TXT")
@@ -1473,8 +1674,10 @@ class MachineTest {
     fun documentsWithoutAHomeDirectory() {
         val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
         val machine = start(1)
-        val setup = "deluser carol 2>/dev/null; deluser dave 2>/dev/null; " +
-            "adduser -D -H -h / -u 1601 carol && adduser -D -H -h /home/dave -u 1602 dave"
+        val setup = "deluser carol 2>/dev/null; deluser dave 2>/dev/null; deluser erin 2>/dev/null; " +
+            "rm -rf /home/dave /tmp/erin-home && printf x > /tmp/erin-home && " +
+            "adduser -D -H -h / -u 1601 carol && adduser -D -H -h /home/dave -u 1602 dave && " +
+            "adduser -D -H -h /tmp/erin-home -u 1603 erin"
         assertEquals(0, sh(machine, setup).second)
         val resolver = context.contentResolver
         val authority = Documents.authority(context)
@@ -1488,7 +1691,7 @@ class MachineTest {
         fun document(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
         try {
             // Each account is its own login setting, so the provider's cached home is not reused
-            for (account in listOf("carol", "dave")) {
+            for (account in listOf("carol", "dave", "erin")) {
                 prefs.edit().putString("login", account).putBoolean("file_access", false).commit()
                 assertEquals(account, emptyList<String>(), roots())
                 prefs.edit().putBoolean("file_access", true).commit()
@@ -1497,10 +1700,19 @@ class MachineTest {
                 val created = runCatching { DocumentsContract.createDocument(resolver, document("/"), "text/plain", "x") }
                 assertEquals(account, null, created.getOrNull())
             }
+            // rootsChanged clears the cached home immediately even when login is unchanged.
+            prefs.edit().putString("login", "dave").putBoolean("file_access", true).commit()
+            assertEquals(listOf("system"), roots())
+            assertEquals(0, sh(machine, "mkdir -p /home/dave").second)
+            Documents.rootsChanged(context)
+            assertEquals(listOf("home", "system"), roots())
+            assertEquals(0, sh(machine, "rmdir /home/dave").second)
+            Documents.rootsChanged(context)
+            assertEquals(listOf("system"), roots())
             assertEquals(1, sh(machine, "test -e /x").second)
         } finally {
             prefs.edit().remove("login").remove("file_access").commit()
-            sh(machine, "deluser carol; deluser dave")
+            sh(machine, "deluser carol; deluser dave; deluser erin; rm -rf /home/dave /tmp/erin-home")
         }
     }
 
@@ -1516,8 +1728,9 @@ class MachineTest {
     fun documentsWriteInTheHomeDirectory() {
         val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
         val machine = start(1)
-        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir /home/bob/dw && " +
-            "ln -s /etc /home/bob/dw/etc-link && chown -h bob:bob /home/bob/dw /home/bob/dw/etc-link"
+        val dw = "/home/bob/dw-${java.util.UUID.randomUUID()}"
+        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir $dw && " +
+            "ln -s /etc $dw/etc-link && chown -h bob:bob $dw $dw/etc-link"
         assertEquals(0, sh(machine, setup).second)
         prefs.edit().putString("login", "bob").putBoolean("file_access", true).commit()
         val resolver = context.contentResolver
@@ -1532,7 +1745,6 @@ class MachineTest {
             it.moveToFirst()
             it.getInt(it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS))
         }
-        val dw = "/home/bob/dw"
         try {
             assertEquals("$dw/notes.txt", create(dw, "text/plain", "notes"))
             assertEquals("$dw/notes (1).txt", create(dw, "text/plain", "notes.txt"))
@@ -1552,8 +1764,8 @@ class MachineTest {
             assertEquals(home, flags("/home/bob"))
             assertTrue(flags("$dw/notes.txt") and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0)
             assertTrue(flags("$dw/sub") and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0)
-            // Renaming does not replace; moving; deleting a whole directory
-            assertThrows(Exception::class.java) {
+            // Renaming does not replace (EEXIST -> IllegalStateException); moving; deleting a whole directory
+            assertThrows(IllegalStateException::class.java) {
                 DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "notes.txt")
             }
             val renamed = DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "renamed.txt")
@@ -1561,15 +1773,41 @@ class MachineTest {
             val moved = DocumentsContract.moveDocument(resolver, renamed!!, uri(dw), uri("$dw/sub"))
             assertEquals("$dw/sub/renamed.txt", id(moved))
             assertEquals("y" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
+            assertEquals(0, sh(machine, "ln -s sub $dw/alias").second)
+            val alias = uri("$dw/alias/renamed.txt")
+            val recipient = InstrumentationRegistry.getInstrumentation().context
+            val grant = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            context.grantUriPermission(recipient.packageName, alias, grant)
+            assertEquals(android.content.pm.PackageManager.PERMISSION_GRANTED,
+                context.checkUriPermission(alias, -1, recipient.applicationInfo.uid, grant))
+            assertEquals("y", resolver.openInputStream(alias)!!.bufferedReader().use { it.readText() })
             assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/sub")))
             assertEquals(1, sh(machine, "test -e $dw/sub").second)
+            // Reusing the path produces fresh IDs even for descendants whose transient
+            // grants Android cannot enumerate. A sibling's pre-existing URI still works.
+            val newDir = create(dw, DocumentsContract.Document.MIME_TYPE_DIR, "sub")!!
+            val newFile = create(newDir, "text/plain", "renamed.txt")!!
+            assertTrue(newFile != id(moved))
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                resolver.openInputStream(moved!!)!!.use { it.read() }
+            }
+            // Android still knows the transient grant. The provider rejects its stale ID.
+            assertEquals(android.content.pm.PackageManager.PERMISSION_GRANTED,
+                context.checkUriPermission(alias, -1, recipient.applicationInfo.uid, grant))
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                resolver.openInputStream(alias)!!.use { it.read() }
+            }
+            context.revokeUriPermission(alias, grant)
+            write(newFile, "wt", "new")
+            assertEquals("new" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
+            assertEquals("hello from Files again", resolver.openInputStream(uri("$dw/notes.txt"))!!.bufferedReader().use { it.readText() })
             // Outside the home directory, leading out through a symbolic link, the home directory
             // itself
             val motd = sh(machine, "cat /etc/motd").first
-            assertThrows(Exception::class.java) { create("/etc", "text/plain", "x") }
-            assertThrows(Exception::class.java) { create("$dw/etc-link", "text/plain", "x") }
-            assertThrows(Exception::class.java) { write("$dw/etc-link/motd", "wt", "gone") }
-            assertThrows(Exception::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
+            assertThrows(UnsupportedOperationException::class.java) { create("/etc", "text/plain", "x") }
+            assertThrows(SecurityException::class.java) { create("$dw/etc-link", "text/plain", "x") }
+            assertThrows(SecurityException::class.java) { write("$dw/etc-link/motd", "wt", "gone") }
+            assertThrows(UnsupportedOperationException::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
             assertEquals(motd to 0, sh(machine, "cat /etc/motd"))
             assertEquals(1, sh(machine, "test -e /etc/x").second)
             // Deleting a symbolic link deletes only the link
@@ -1707,6 +1945,147 @@ class MachineTest {
         } finally {
             prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "deluser --remove-home bob")
+        }
+    }
+
+    /**
+     * When `login` is `"auto"` and file access is enabled, `/etc/passwd` changes that change the
+     * resolved home root (e.g. `adduser` / `deluser`) invalidate the cached home and notify
+     * observers on the roots URI, while unrelated `/etc/passwd` edits (system users, second user,
+     * non-auto login, disabled file access) cause no churn.
+     */
+    @Test
+    fun documentsRefreshRootsWhenAutoLoginPasswdChanges() {
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val machine = start(1)
+        val cleanup = "deluser --remove-home autoalice 2>/dev/null; deluser --remove-home autobob 2>/dev/null; " +
+            "deluser autocara 2>/dev/null; deluser syswatch 2>/dev/null; rm -rf /home/autocara"
+        sh(machine, cleanup)
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        val rootsUri = DocumentsContract.buildRootsUri(authority)
+        fun homeDocId(): String? = resolver.query(rootsUri, null, null, null)?.use { c ->
+            val rootCol = c.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ROOT_ID)
+            val docCol = c.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_DOCUMENT_ID)
+            while (c.moveToNext()) {
+                if (c.getString(rootCol) == Documents.ROOT_HOME) return@use c.getString(docCol)
+            }
+            null
+        }
+        val notifications = AtomicInteger()
+        var latch = CountDownLatch(1)
+        val observer = object : ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                notifications.incrementAndGet()
+                latch.countDown()
+            }
+        }
+        prefs.edit().putString("login", ConsolePty.LOGIN_AUTO).putBoolean("file_access", true).commit()
+        Documents.rootsChanged(context)
+        resolver.registerContentObserver(rootsUri, false, observer)
+        try {
+            val watcher = Documents.AutoRootsWatcher(machine)
+            fun expectRootChange(
+                command: String,
+                expectedHome: String?,
+                changedDirs: Array<String>? = null,
+            ) {
+                latch = CountDownLatch(1)
+                assertEquals(0, sh(machine, command).second)
+                assertTrue(watcher.poll(context, changedDirs))
+                assertTrue(latch.await(5, TimeUnit.SECONDS))
+                assertEquals(expectedHome, homeDocId())
+            }
+            assertEquals("/root", homeDocId())
+            // Baseline and steady-state polls must not notify.
+            assertFalse(watcher.poll(context))
+            assertFalse(watcher.poll(context))
+            assertEquals(0, notifications.get())
+
+            // Unrelated system-user / nologin /etc/passwd edit leaves auto home at /root: no churn.
+            assertEquals(0, sh(machine, "adduser -D -S -H -s /sbin/nologin syswatch").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(0, notifications.get())
+
+            // Adding the first regular user switches auto home to /home/autoalice and notifies roots.
+            expectRootChange("adduser -D -u 1500 autoalice", "/home/autoalice")
+            assertFalse(watcher.poll(context))
+
+            // Adding a second user with a higher UID leaves auto home at /home/autoalice: no churn.
+            val beforeSecond = notifications.get()
+            assertEquals(0, sh(machine, "adduser -D -u 1501 autobob").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(beforeSecond, notifications.get())
+
+            // Removing autoalice shifts auto home to autobob, then removing autobob reverts to /root.
+            expectRootChange("deluser --remove-home autoalice", "/home/autobob")
+            expectRootChange("deluser --remove-home autobob", "/root")
+
+            // Adding an account without a home directory drops the home root, then mkdir restores it.
+            expectRootChange("adduser -D -H -u 1502 autocara", null)
+            expectRootChange("mkdir -p /home/autocara", "/home/autocara", changedDirs = arrayOf("/home"))
+
+            // Explicit non-auto login and disabled file access must not refresh roots.
+            val beforeFixed = notifications.get()
+            prefs.edit().putString("login", ConsolePty.LOGIN_ROOT).commit()
+            assertEquals(0, sh(machine, "deluser autocara && rm -rf /home/autocara").second)
+            assertFalse(watcher.poll(context))
+            prefs.edit().putString("login", ConsolePty.LOGIN_AUTO).putBoolean("file_access", false).commit()
+            assertEquals(0, sh(machine, "adduser -D -u 1500 autoalice").second)
+            assertFalse(watcher.poll(context))
+            assertEquals(beforeFixed, notifications.get())
+        } finally {
+            resolver.unregisterContentObserver(observer)
+            prefs.edit().remove("login").remove("file_access").commit()
+            sh(machine, cleanup)
+            Documents.rootsChanged(context)
+        }
+    }
+
+    /**
+     * Browse JNI errors map by errno rather than collapsing everything into `FileNotFoundException`:
+     * `ENOENT`/`ENOTDIR` throw `FileNotFoundException`, `EEXIST` throws
+     * `FileAlreadyExistsException`, `EACCES` throws `AccessDeniedException`, and other errnos
+     * (`EISDIR`, `EINVAL`) throw `IOException`.
+     */
+    @Test
+    fun browseJniErrorsMapByErrno() = withAlpineStore("browse-errors") { store ->
+        withMachine(store) { machine ->
+            checkedShell(
+                machine,
+                "mkdir -p /root/be/dir/sub && printf a > /root/be/a.txt && printf b > /root/be/b.txt && ln -s /etc /root/be/etc-link",
+            )
+            assertThrows(FileNotFoundException::class.java) { Native.browseStat(store, "/root/be/missing") }
+            assertThrows(FileNotFoundException::class.java) { Native.browseList(store, "/root/be/a.txt") }
+            assertThrows(FileAlreadyExistsException::class.java) { Native.browseRename(store, "/root", "/root/be/a.txt", "b.txt") }
+            assertThrows(AccessDeniedException::class.java) { Native.browseCreate(store, "/root", "/root/be/etc-link", "x", false, 0, 0) }
+            assertThrows(AccessDeniedException::class.java) { Native.browseOpenWrite(store, "/root", "/root/be/etc-link/passwd", false, false) }
+            assertThrows(AccessDeniedException::class.java) { Native.browseImport(store, "/", "x.txt", 0, 0) {} }
+            val isDir = assertThrows(IOException::class.java) { Native.browseOpen(store, "/root/be/dir") }
+            assertEquals(IOException::class.java, isDir.javaClass)
+            val invalid = assertThrows(IOException::class.java) { Native.browseMove(store, "/root", "/root/be/dir", "/root/be/dir/sub") }
+            assertEquals(IOException::class.java, invalid.javaClass)
+        }
+    }
+
+    /**
+     * Building large JNI string arrays (`string_array`, shared by `browseList`, `browseSearch`,
+     * `takeChangedDirs`, `takeListens` and `takeKills`) deletes per-element local references inside
+     * the loop rather than accumulating them past a small local-ref table.
+     */
+    @Test
+    fun browseListHandlesLargeDirectoriesWithoutLocalRefLeaks() {
+        val machine = start(1)
+        val dir = "/tmp/jni-ref-many"
+        try {
+            assertEquals(
+                0,
+                sh(machine, "rm -rf $dir && mkdir -p $dir && i=0; while [ \$i -lt 1200 ]; do : > $dir/f\$i; i=\$((i+1)); done").second,
+            )
+            val entries = Native.browseList(Rootfs.store(context).path, dir)
+            assertEquals(1200, entries.size)
+        } finally {
+            sh(machine, "rm -rf $dir")
         }
     }
 

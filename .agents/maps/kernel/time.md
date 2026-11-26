@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint raw ICMP tap references to kernel/rawicmp)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: retain exited zombie main thread's stopped CPU clock until process reap)
 
 ## Responsibilities
 
@@ -97,12 +97,16 @@ store, network, cgroup and I/O modules; it does not own their policies.
   A CPU clock id (`clock_getcpuclockid`, `pthread_getcpuclockid`) names its pid as the caller's
   pid namespace numbers it, for clock_gettime, clock_getres and clock_nanosleep too.
 - A CPU-clock timer keeps to the thread or process it was made for (number and serial, as Linux's
-  timer holds a `struct pid`), never one that takes the number over. Once that thread has left
-  the task table (an exited main thread included) or that process is reaped, the timer is gone:
-  it never fires and is disarmed, timer_gettime reads all zeros (the interval too) and
-  timer_settime is `ESRCH`, while timer_delete still works. A process whose threads have all
-  exited and that is not reaped yet still reads its stopped clock and can be set, but its timers
-  neither fire nor keep the timer thread ticking.
+  timer holds a `struct pid`), never one that takes the number over. Once a non-leader thread has
+  left the task table or a process is reaped (or a non-leader `execve` replaces the exited main
+  thread), the timer is gone: it never fires and is disarmed, `timer_gettime` reads all zeros (the
+  interval too) and `timer_settime` is `ESRCH`, while `timer_delete` still works. An exited
+  (zombie) main thread retains its stopped CPU clock (`ThreadGroup::leader_exit` and
+  `leader_serial`) until the process is reaped or replaced by non-leader `execve`: `clock_gettime`,
+  `clock_getres`, `timer_create`, `timer_gettime` and `timer_settime` keep working against that
+  stopped clock while its timers neither fire nor keep the timer thread ticking. A process whose
+  threads have all exited and that is not reaped yet likewise still reads its stopped clock and
+  can be set, without firing or ticking.
   A timer whose previous signal is still pending counts an overrun instead (`timer_getoverrun`
   reports the count when the last signal was dequeued). A `SIGEV_THREAD_ID` timer signals its
   thread only while that thread lives in the process; after it exits the signal is dropped, as on
@@ -151,9 +155,7 @@ store, network, cgroup and I/O modules; it does not own their policies.
 
 ## Confirmed bugs / technical debt
 
-- **An exited main thread's CPU clock is gone at once:** clock_gettime on it is `EINVAL`, and a
-  timer on it reads zeros and cannot be set (`ESRCH`), while the other threads run on; Linux keeps
-  the zombie leader's clock, stopped, until the process is reaped.
+None recorded.
 
 ## Open questions
 

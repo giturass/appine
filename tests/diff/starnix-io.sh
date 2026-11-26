@@ -10,12 +10,10 @@ SKIP="Pty.OpenDevTTY"
 # looked up), so the multicast-group test cannot change lo's address
 SKIP="$SKIP:IoctlTest.SIOCSIFFLAGS_Success:IoctlInvalidTest/IoctlInvalidTest.InvalidRequest/9"
 SKIP="$SKIP:RouteNetlinkSocket.AddDropMulticastGroup"
-# kernel/netlink: netlink requests are not validated as Linux validates them; single RTM_GETNEIGH
-# requests always answer ENOENT
+# kernel/netlink: validation of malformed rtnetlink requests differs from Linux
 SKIP="$SKIP:NetlinkRouteTest.IflaCacheInfoMissingBody:NetlinkRouteTest.IncompleteRouteFlow"
 SKIP="$SKIP:NetlinkRouteTest.MalformedMessageCausesErrorReturn"
 SKIP="$SKIP:RouteNetlinkSocket/RouteNetlinkSocketStrictOpt.MalformedDumpRequest/strict"
-SKIP="$SKIP:RouteNetlinkSocket/RouteNetlinkSocketGetNeigh.GetNeighErrors/*"
 # No tun device (kernel/net D1), which these suites create their interface with
 SKIP="$SKIP:RouteNetlinkSocket/RouteNetlinkSocketNewAddr.AddSubnetRoute/*"
 SKIP="$SKIP:RouteNetlinkSocketTestWithInterface.*"

@@ -18,6 +18,8 @@ pub const VA_BITS: u32 = 48;
 pub const TLB_ENTRIES: usize = 4096;
 /// Number of software instruction-fetch TLB entries per CPU.
 pub const ITLB_ENTRIES: usize = 512;
+/// Number of software 2 MiB superpage data TLB entries per CPU.
+pub const STLB_ENTRIES: usize = 1024;
 
 /// Page permissions, with the same values as Linux's `PROT_*`.
 pub mod prot {
@@ -49,6 +51,10 @@ struct ItlbEntry {
     tag: u64,
     addend: u64,
 }
+
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct Stlb([TlbEntry; STLB_ENTRIES]);
 
 /// Maximum number of hardware breakpoints, and of watchpoints (C's `APPINE_HW_SLOTS`).
 pub const HW_SLOTS: usize = 16;
@@ -104,7 +110,7 @@ pub struct CpuState {
     /// means none). [`Dbt::run`] invalidates it in place at the next dsb or isb; when an exit
     /// leaves it set, the caller collects and invalidates it.
     pub ivau_page: u64,
-    dbt_groups: [u64; 4],
+    dbt_groups: [u64; 8],
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
     /// V0–V31, the low 64 bits of each register first.
@@ -117,9 +123,16 @@ pub struct CpuState {
     reserved: u32,
     brk: [u64; HW_SLOTS],
     watch: [WatchSlot; HW_SLOTS],
+    stlb_used: [u64; STLB_ENTRIES / 64],
+    stlb: Stlb,
 }
 
 impl CpuState {
+    /// Clears the local exclusive monitor on a guest exception return.
+    pub fn clear_exclusive(&mut self) {
+        self.excl_size = 0;
+    }
+
     /// Sets hardware breakpoints (instruction addresses) and watchpoints (start, end,
     /// [`WATCH_LOAD`]/[`WATCH_STORE`]), at most [`HW_SLOTS`] of each. Only the interpreter checks
     /// them ([`Cpu::run`], [`Cpu::step`]): a hit exits with [`FaultKind::HwBreakpoint`] or
@@ -158,6 +171,7 @@ impl CpuState {
 unsafe extern "C" {
     fn appine_mmu_new() -> *mut RawMmu;
     fn appine_mmu_free(mmu: *mut RawMmu);
+    fn appine_mmu_table_bytes(mmu: *const RawMmu) -> u64;
     fn appine_mmu_map(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32) -> c_int;
     fn appine_mmu_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
@@ -185,6 +199,7 @@ unsafe extern "C" {
         off_jump_cache: usize,
         off_tlb: usize,
         off_v: usize,
+        off_stlb: usize,
     ) -> c_int;
 
     fn appine_fault_guard_install();
@@ -193,6 +208,7 @@ unsafe extern "C" {
     fn appine_guest_hwcap() -> u64;
     fn appine_guest_hwcap2() -> u64;
     fn appine_guest_midr() -> u64;
+    fn appine_fpcr_write_mask() -> u64;
 
     fn appine_dbt_new(key: u64, regs: DbtRegs) -> *mut RawDbt;
     fn appine_dbt_trim();
@@ -208,7 +224,6 @@ unsafe extern "C" {
     fn appine_dbt_attach(dbt: *mut RawDbt, tag: c_uint) -> *mut RawDbtThread;
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
-    fn appine_dbt_recheck(t: *mut RawDbtThread);
     fn appine_dbt_invalidate(t: *mut RawDbtThread, cpu: *const CpuState, start: u64, len: u64);
     fn appine_dbt_run(t: *mut RawDbtThread, cpu: *mut CpuState) -> c_int;
     fn appine_dbt_get_stats(t: *const RawDbtThread, out: *mut DbtStats);
@@ -362,6 +377,17 @@ impl Mmu {
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { appine_mmu_translate(self.raw.as_ptr(), gva, required_prot) }.cast())
     }
+
+    /// Total bytes of allocated soft-MMU page tables (root, intermediate, active and retired L3
+    /// tables; grows monotonically until the `Mmu` is dropped).
+    pub fn table_bytes(&self) -> u64 {
+        unsafe { appine_mmu_table_bytes(self.raw.as_ptr()) }
+    }
+
+    /// Allocated soft-MMU page tables in 4 KiB pages.
+    pub fn table_pages(&self) -> u64 {
+        self.table_bytes() / PAGE_SIZE
+    }
 }
 
 impl Default for Mmu {
@@ -432,7 +458,8 @@ pub enum Exit {
         /// The brk immediate.
         imm: u16,
     },
-    /// Memory access failure; pc points at the faulting instruction, which had no side effects.
+    /// Memory access failure. The local exclusive monitor is clear and pc points at the
+    /// faulting instruction.
     Fault {
         /// The faulting guest address (TBI tag removed).
         addr: u64,
@@ -671,6 +698,8 @@ pub struct DbtStats {
     /// Times a shared check failed and the block was invalidated and retranslated without
     /// grouping.
     pub ungrouped: u64,
+    /// Blocks compiled with a strip-mined in-page fast loop.
+    pub fast_loops: u64,
 }
 
 /// Which host registers Tier 1's translated code takes for itself (the guest registers with the
@@ -843,14 +872,6 @@ impl Dbt {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
     }
 
-    /// About to run in a different address space (after exec): keeps the translations and,
-    /// before the next run, checks the guest instruction words block by block, invalidating the
-    /// ones that do not match, and clearing everything when most do not match. Cheaper than
-    /// copying the translation templates again after [`Dbt::flush`].
-    pub fn recheck(&mut self) {
-        unsafe { appine_dbt_recheck(self.raw.as_ptr()) }
-    }
-
     /// Invalidates, among the blocks starting in the pages covered by `[start, start + len)`,
     /// those whose guest instruction words differ from the current ones in `cpu`'s address space
     /// (a translation depends only on the pc and the instruction words); when there is no room,
@@ -879,9 +900,8 @@ impl Drop for Dbt {
     }
 }
 
-/// Releases the Tier 1 translations kept in the pool: nobody is using them, so they can be
-/// dropped when host memory is tight (Android's `onTrimMemory`), and the next run of the same
-/// program copies the templates again.
+/// Releases pooled Tier 1 instances, spare thread workspaces and resident translation-template
+/// pages under memory pressure. Live spaces keep their installed translations.
 pub fn trim_dbt_pool() {
     unsafe { appine_dbt_trim() }
 }
@@ -926,6 +946,12 @@ pub fn guest_hwcap2() -> u64 {
 /// reading ID registers.
 pub fn guest_midr() -> u64 {
     unsafe { appine_guest_midr() }
+}
+
+/// FPCR bits writable by the guest (`AHP`, `DN`, `FZ`, `RMode` and, with FP16, `FZ16`), matching
+/// Tier 0's `msr fpcr` mask.
+pub fn fpcr_write_mask() -> u64 {
+    unsafe { appine_fpcr_write_mask() }
 }
 
 /// HWCAP bits, with the same values as Linux's `HWCAP_*`.
@@ -1007,6 +1033,7 @@ pub fn layout_matches() -> bool {
             offset_of!(CpuState, dbt_jump_cache),
             offset_of!(CpuState, tlb),
             offset_of!(CpuState, v),
+            offset_of!(CpuState, stlb),
         ) == 1
     }
 }
@@ -1016,6 +1043,16 @@ mod tests {
     #[test]
     fn layout_matches_c() {
         assert!(super::layout_matches());
+    }
+
+    #[test]
+    fn fpcr_write_mask_matches_tier0_msr() {
+        let mmu = super::Mmu::new();
+        let mut cpu = unsafe { super::Cpu::new(&mmu) };
+        cpu.state_mut().x[0] = u64::MAX;
+        // msr fpcr, x0
+        assert_eq!(cpu.exec_insn(0xd51b_4400), None);
+        assert_eq!(cpu.state().fpcr, super::fpcr_write_mask());
     }
 
     /// A failed internal check (an engine bug found without a host fault) under the guard ends

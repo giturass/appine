@@ -6,7 +6,12 @@
 #
 #   appine-<commit>.tar.gz            Appine itself (git archive HEAD; an error when the work tree
 #                                     has changes)
-#   appine-<commit>-vendor.tar.gz     cargo vendor: the crates statically linked into the app
+#   appine-<commit>-vendor.tar.gz     cargo vendor --locked: the locked Cargo workspace's vendored
+#                                     third-party crates (covering the crates statically linked into
+#                                     the app and the rest of the workspace lockfile required for
+#                                     offline --locked builds)
+#   virglrenderer-<version>.tar.gz    the pinned virglrenderer source archive (sha256 checked by
+#                                     fetch-virglrenderer; decoder patches live in Appine's archive)
 #   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK and of
 #                                     the packages bundled beside it (bash, readline, procps-ng,
 #                                     libintl, bubblewrap, libcap2, bridge): each one's
@@ -21,10 +26,10 @@
 # The Alpine part: packages, versions, licenses, and the aports origins and commits come from
 # lib/apk/db/installed in the tarball (the open-source licenses page lists them too), and packages
 # whose license includes GPL are deduplicated by origin. The aports directories are downloaded from
-# GitLab by commit and subdirectory; the upstream sources are the files listed in the APKBUILD's
-# sha512sums but missing from the directory, downloaded by file name from Alpine's distfiles
-# mirror and checked against the SHA-512 there. The APKBUILD is not executed (source= has
-# variables, and executing it would mean running downloaded code).
+# GitLab by commit and subdirectory (trying main/ then community/); the upstream sources are the
+# files listed in the APKBUILD's sha512sums but missing from the directory, downloaded by file name
+# from Alpine's distfiles mirror and checked against the SHA-512 there. The APKBUILD is not executed
+# (source= has variables, and executing it would mean running downloaded code).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -113,35 +118,46 @@ fi
 
 awk '{ print $3, $4 }' "$work/gpl" | sort -u | while read -r origin commit; do
     dest=$dir/$origin
-    mkdir -p "$dest"
-    curl -fsSL --retry 3 -o "$work/aports.tar.gz" \
-        "$aports/$commit/aports-$commit.tar.gz?path=main/$origin"
-    tar -xzf "$work/aports.tar.gz" -C "$dest" --strip-components 3
-    rm "$work/aports.tar.gz"
-    [ -f "$dest/APKBUILD" ] || { echo "release-sources: no APKBUILD for main/$origin at $commit" >&2; exit 1; }
+    aports_path=
+    for repo in main community; do
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        if curl -fsSL --retry 3 -o "$work/aports.tar.gz" \
+            "$aports/$commit/aports-$commit.tar.gz?path=$repo/$origin" &&
+            tar -xzf "$work/aports.tar.gz" -C "$dest" --strip-components 3 2>/dev/null &&
+            [ -f "$dest/APKBUILD" ]; then
+            aports_path=$repo/$origin
+        fi
+        rm -f "$work/aports.tar.gz"
+        [ -z "$aports_path" ] || break
+    done
+    [ -n "$aports_path" ] || {
+        echo "release-sources: no APKBUILD for $origin at $commit (tried main/$origin, community/$origin)" >&2
+        exit 1
+    }
     # sha512sums="<digest>  <file>…": the quotes may be single or double, and the first entry
     # may be on the same line as sha512sums=
     awk '/^sha512sums=/ { f = 1; sub(/^sha512sums=["'\'']/, "") }
          f { line = $0; done = sub(/["'\'']$/, "", line); n = split(line, a, " ");
              if (n == 2) print a[1], a[2]; if (done) exit }' "$dest/APKBUILD" >"$work/sums"
-    [ -s "$work/sums" ] || { echo "release-sources: no sha512sums in main/$origin/APKBUILD" >&2; exit 1; }
+    [ -s "$work/sums" ] || { echo "release-sources: no sha512sums in $aports_path/APKBUILD" >&2; exit 1; }
     while read -r want file; do
         if [ -e "$dest/$file" ]; then
             got=$(sha512 "$dest/$file")
         else
             curl -fsSL --retry 3 -o "$dest/$file" "$distfiles/$branch/$file" ||
                 curl -fsSL --retry 3 -o "$dest/$file" "$distfiles/edge/$file" || {
-                echo "release-sources: $file (main/$origin) is not on $distfiles" >&2
+                echo "release-sources: $file ($aports_path) is not on $distfiles" >&2
                 exit 1
             }
             got=$(sha512 "$dest/$file")
         fi
         if [ "$got" != "$want" ]; then
-            echo "release-sources: sha512 mismatch for $file (main/$origin)" >&2
+            echo "release-sources: sha512 mismatch for $file ($aports_path)" >&2
             exit 1
         fi
     done <"$work/sums"
-    echo "main/$origin at $commit: $(wc -l <"$work/sums" | tr -d ' ') files"
+    echo "$aports_path at $commit: $(wc -l <"$work/sums" | tr -d ' ') files"
 done
 
 tar -cf "$out/$name.tar" -C "$work" "$name"

@@ -515,7 +515,11 @@ impl Paths {
             Ok(st) => st,
             Err(e) => return Some(Err(e)),
         };
-        write(cpu, buf, &encode_statx(&encode_stat(&st, ROOT_DEV)))?;
+        write(
+            cpu,
+            buf,
+            &encode_statx(&encode_stat(&st, ROOT_DEV), ROOT_MOUNT),
+        )?;
         Some(Ok(0))
     }
 

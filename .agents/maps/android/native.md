@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: GPU-aware handles and four-argument start contract with pre-registration shared-storage mounting)
+> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: upstream's browse JNI errno-to-exception mapping alongside the retained four-argument start contract with pre-registration shared-storage mounting)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
   and never reused in a process) to `RegisteredMachine` (`Arc<Machine>` plus `has_gpu: bool`); a poisoned lock is recovered. `vt.rs` looks
   kernels up in the same table through `machine(handle)`.
-- `Native` — `internal object` with 38 `@JvmStatic external` functions, 17 of them
+- `Native` — `internal object` with 41 `@JvmStatic external` functions, 19 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -37,8 +37,8 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 - Init: `init(verbose)` (private; stderr redirect, debug log).
 - Store: `importRootfs`, `syncRootfs`, `writeFile`, `readFile` (null on `ENOENT`).
-- Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
-  `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
+- Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch`, `browseGenerations` (read);
+  `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
 - Kernel: `start(store, tier, gpu, sharedStorage)` (GPU probing defaults to false; the nullable
   fourth argument defaults to `Environment.getExternalStorageDirectory().absolutePath`,
@@ -49,7 +49,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
   `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
   into spaces, or null; it does not take the BKL), `takePower`, `processes`, `guestCpuTime`
-  (live-plus-exited guest CPU nanoseconds under the BKL; −1 for a stopped handle or caught panic), `takeChangedDirs`,
+  (live-plus-exited guest CPU nanoseconds under the BKL; −1 for a stopped handle or caught panic), `loginRuleInputs` (inode, size, mtime and ctime of the five rule inputs under one BKL hold; four zeros for a missing path), `takeChangedDirs`,
   `trimMemory`, `shutdown`, `stop`.
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
   `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`. The app
@@ -84,10 +84,17 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   last call on a removed kernel runs that drop.
 - After the kernel is gone: `read` and `write` return −1, `waitFor` −9, `openConsole` and `spawn`
   throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
-  arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
+  arrays, `bklStall`, `loginRuleInputs` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
   (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
-- Errors become `IOException`, or `FileNotFoundException` for every browse error whatever its
-  errno, or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
+- `browseImport` calls an `IntConsumer` synchronously with a borrowed staging fd, returns the
+  encoded name after publication, and propagates any exception thrown by the writer. All throwing
+  browse calls (`browseStat`, `browseGenerations`, `browseList`, `browseOpen`, `browseSniff`,
+  `browseSearch`, `browseImport`, `browseCreate`, `browseRemove`, `browseRename`, `browseMove`,
+  `browseOpenWrite`) map store/browse errnos via `browse_error`: `ENOENT`/`ENOTDIR` to
+  `FileNotFoundException`, `EEXIST` to `FileAlreadyExistsException`, `EACCES` to
+  `AccessDeniedException`, and all other errnos (`ENOSPC`, `EISDIR`, `EINVAL`, `ENAMETOOLONG`,
+  `ELOOP`, `EIO`, etc.) to `IOException`. Other runtime calls use `IOException` or sentinel values.
+  `openConsole` and `resize` clamp rows and columns to 1–65535.
 - `setRoutes` parses lines of `<hex destination>/<prefix> <hex gateway or -> <interface>` (later
   fields ignored); hex fields must be ASCII and even, the destination 4 or 16 bytes and the gateway
   the same length; the metric is 0 for IPv4, and for IPv6 1024 for a default route, else 256.
@@ -98,17 +105,19 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 - GPU context setup attaches its caller to the JVM to bind the service. The retirement thread attaches
   to release the binding. Other runtime JNI callers include the main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
   start), `appine-start` (`start`, OpenRC setup's `spawn`/`waitFor` and `boot` when setup installs it), the service's worker (the poll's calls, `setRoutes`,
-  `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
-  (`spawn`, `waitFor`, `boot` only when setup did not already boot), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
-  provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
-  the console through `Machine::read_console_run` in `vt.rs` and calls back into Java from inside
+  `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-login-rules` (the refresh's `waitFor`), `appine-boot`
+  (`spawn`, `waitFor`, `boot` only when setup did not already boot), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`),
+  the provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
+  the console through `Machine::read_console_run_timeout` in `vt.rs` and calls back into Java from inside
   `pump`.
 
 ### stderr and panics
 
-- `init` redirects stderr once: fd 2 becomes a pipe read by a `stderr-log` thread that writes each
-  line to logcat (tag `appine`, priority INFO; lines containing NUL are dropped); a failing `pipe`
-  or `dup2` leaves stderr as it was. `verbose` sets `APPINE_LOG=1`.
+- `init` redirects stderr once: creates a pipe, spawns the `stderr-log` thread first (writing each
+  line to logcat with tag `appine`, priority INFO; lines containing NUL are dropped), and only then
+  redirects fd 2 via `dup2` (closing `write_end` if `write_end != 2`). A failing `pipe` or thread
+  spawn closes any open pipe ends without touching fd 2; a failing `dup2` closes `write_end` so the
+  reader exits cleanly while fd 2 stays as it was. `verbose` sets `APPINE_LOG=1`.
 - Panics are contained at two layers. The kernel wraps most `Machine` methods in `host_call`,
   which turns a panic into an error of the call when containment is on (`APPINE_ON_BUG=kill`, or
   by default whenever debug assertions are off, which is always on Android) and aborts the process
@@ -120,7 +129,7 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
   `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a
   line names the function, and the call returns its fallback (−1 for console reads and writes,
   `openConsole`, `spawn`, `browseOpen` and `browseOpenWrite`; 0 for `start`, `takePower` and
-  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The 17 `@Throws` functions
+  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The `@Throws` functions
   also throw `IOException("internal error in …")` unless an exception is already pending. Kernel
   state a panic left half changed (a poisoned lock, a held BKL) is not repaired, so later calls
   may fail or wait.
@@ -170,22 +179,15 @@ with view, gesture and rendering portions in `android/vtview`, `android/vtgestur
 
 ## Confirmed bugs / technical debt
 
-- Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
-  `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
-  version); a failed string conversion with no pending exception makes void calls return silently
-  (unreachable from the non-null Kotlin signatures). If the `stderr-log` thread fails
-  to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
+- A failed string conversion with no pending exception makes void calls return silently
+  (unreachable from the non-null Kotlin signatures).
 
 ## Open questions
 
 - Successful hardware-backed 16 KiB-page operation still awaits a device test. Both tested AHB paths use one physical device.
-
-- Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
-  `FileNotFoundException`?
 
 ## To verify
 
 - Real-device shared-storage grant/revoke behavior and vendor restrictions; source-level JNI and
   Kotlin signature checks and both-tier host tests do not establish Android permission UI behavior.
 - The static browser launcher on Debian and a 16 KB-page device; current bridge tests use Alpine on API 34.
-- ART's local-reference limit on API 30 and later.

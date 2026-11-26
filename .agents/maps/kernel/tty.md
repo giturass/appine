@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: repoint dependencies to the split module maps)
+> Maintained: 2026-11-26 (targeted verification of `TIOCSETD` argument validation and slave-side job control)
 
 ## Responsibilities
 
@@ -31,9 +31,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 ## Key types
 
 - `Tty` — one PTY pair (shared by both sides): devpts device and index; `masters`/`slaves`
-  counts, `slave_closed`, `locked`, `hung_up`, per-side `vhangups` generations and `hupped`;
+  counts, `slave_closed`, `locked`, `hung_up`, per-side `exclusive` bits, `vhangups` generations and `hupped`;
   termios (the slave's, the only one), winsize; buffers `unprocessed` (master writes not taken by
-  the line discipline yet: Linux's flip buffer, 64 KiB), `editing` (canonical line being edited),
+  the line discipline yet: Linux's flip buffer, 64 KiB), `lookahead` (the prefix already scanned
+  for flow control), `editing` (canonical line being edited),
   `lines` (finished lines, each `Line` with data, whether VEOF ended it and whether that VEOF is the
   host console's end of file), `raw` (non-canonical and EXTPROC queue), `echoes` (waiting `Echo`
   operations), `output` (waiting for the master, 64 KiB); cursor `column` and `canon_column`;
@@ -45,6 +46,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - `Echo` — one echo operation of Linux's echo buffer: a character through output processing, a
   `^X` pair, backspaces over an erased tab, setting the line's start column, one column back.
 - `PtyEnd` — one open end: the `Tty`, master flag, mount, `pin` (keeps the devpts mount busy),
+  the optional controlling-terminal store device inode (`dev_ino`, set for `/dev/tty` 5:0 and
+  `/dev/console` 5:1 so metadata, `fstatfs`, `/proc/<pid>/fd` and `fdinfo` see the opened device
+  node rather than the devpts slave), the optional store or overlay device-node lock key, and
   `born` (the side's vhangup generation at open). Opening and dropping it maintain the counts (and
   opening a slave re-arms the slave side's vhangup); dropping the last master queues the terminal
   on `CLOSED`, and every drop wakes the terminal's waiters.
@@ -68,10 +72,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
   released).
 - Host console: `terminal::{open, attach, detach, wake_objects, take_output, take_output_run,
-  input_room, feed, fg_pgrp, fg_cwd, password_input, resize, close, initial_size, bridge}`,
-  wrapped by `Machine::{open_console, read_console, read_console_run, write_console,
-  resize_console, close_console,
-  console_foreground, console_cwd, console_password_input}`,
+  input_room, feed, fg_pgrp, fg_process, fg_cwd, password_input, resize, close, initial_size,
+  bridge}`, `ConsoleForeground`, wrapped by `Machine::{open_console, read_console,
+  read_console_run, read_console_run_timeout, write_console, resize_console, close_console,
+  console_foreground, console_foreground_process, console_cwd, console_password_input}`,
   `Stdio::Console` at spawn and the kernel's `run`.
 
 ## Data flow / lifecycle
@@ -84,24 +88,35 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Master-only ioctls: `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTN`, `TIOCPKT`/`TIOCGPKT`, `TIOCSIG`
   (INT, QUIT, TSTP; others `EINVAL`), `TIOCGPTPEER` (opens the slave through the master's mount,
   with the caller's flags and so with controlling-terminal acquisition, keeping access mode,
-  `O_APPEND`, `O_NONBLOCK`, honouring `O_CLOEXEC`; on a slave or hung master `EIO`).
-- Slave open: no live entry `ENOENT`; locked or no master `EIO`; without `O_NOCTTY` a session
+  `O_APPEND`, `O_NONBLOCK`, honouring `O_CLOEXEC`. With `O_PATH` it returns a path descriptor. On a
+  slave or hung master `EIO`).
+- Slave open: no live entry `ENOENT`; exclusive slave without initial-namespace `CAP_SYS_ADMIN` gives
+  `EBUSY`; locked or no master gives `EIO`; without `O_NOCTTY` a session
   leader without a controlling terminal acquires an unowned terminal when the open has read
   access (Job control below).
-- `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end through
-  the boot devpts mount (`ENXIO` without one), with no lock or master checks, and never acquire
-  one.
+- `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end
+  (`ENXIO` without one), with the same exclusivity check, keeping the opened store (or overlay)
+  device node (`dev_ino`, plus `OpenFile::mnt`/`ovl`/`path`) so `fstat`/`statx`,
+  `fchmod`/`fchown`/`futimens`, `fstatfs`, `/proc/<pid>/fd` and `fdinfo` report the opened 5:0 or
+  5:1 device node rather than `/dev/pts/N` (and keep its mount busy, not devpts). They skip the
+  lock and master checks and never acquire one.
 
 ### Input (master writes, host console feed)
 
 - A master write (or the host `feed`) goes to `unprocessed`, up to 64 KiB (`input_room`; a full
   buffer blocks the writer, returns `EAGAIN` or a short count; TCOOFF on the master makes the room
-  0). The line discipline takes from it while it has room: 4095 bytes in all (finished lines with
-  their VEOF, the edited line, the raw queue), and in canonical mode while no line is complete the
-  room never drops below one byte, so a terminator, an erase or a signal character gets through a
-  full line (the edited line keeps one byte for its terminator; other characters are dropped
-  without echo). What does not fit is taken when the slave reads, termios changes or `TIOCSTI`
-  injects, and signal characters then found are sent by those paths.
+  0). The 4096-byte line discipline counts finished lines with their VEOF, the edited line and
+  the raw queue. It reserves one slot and allows for three-byte parity marks under `PARMRK`.
+  While no canonical line is complete, editing, signals and terminators still work at capacity.
+  Ordinary characters echo under the usual rules, including output processing. Only the first
+  4095 data bytes enter the line, which can include the first byte of a doubled 0xff.
+  `IMAXBEL` has no effect and generates no BEL. With a complete line queued or in non-canonical
+  mode, excess input waits until a slave read or termios change makes room.
+- With `IXON`, lookahead scans new bytes waiting for room and acts on raw `VSTOP` and `VSTART`
+  immediately, including their packet notifications. It leaves the bytes queued. When the line
+  discipline receives them, current termios and quoting still apply. It consumes recognized
+  flow characters without repeating their action. Ordinary bytes can restart output with
+  `IXANY` only when received.
 - Each byte (Linux's `n_tty_receive_buf_standard`): `ISTRIP`, then `IUCLC` with `IEXTEN` (Latin-1
   `tolower`); after `VLNEXT` it is an ordinary character; with `EXTPROC` it is queued raw with no
   editing or echo; bytes in the special set (`char_map`: CR/NL when translated, the editing and
@@ -141,8 +156,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   terminal; with `CAP_SYS_ADMIN` its byte is added to what the master reads, regardless of the
   output limit. 6.2's `dev.tty.legacy_tiocsti` (off in distribution kernels, `EIO` for everyone
   without `CAP_SYS_ADMIN`) is not emulated.
-- Not implemented: `IMAXBEL`, `BRKINT`/`IGNBRK`, `HUPCL`, `VDISCARD`, and Linux's lookahead of
-  flow-control characters in input that does not fit yet.
+- Linux n_tty treats `VDISCARD` as ordinary input. It echoes under the usual rules and does
+  not toggle `FLUSHO`. Setting `FLUSHO` explicitly still lets PTY output through.
 
 ### Reading on the slave
 
@@ -164,8 +179,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ### Output (slave writes, master reads)
 
-- Slave writes are clamped to `output_room` (0 while output is stopped, otherwise 64 KiB minus
-  the queue), then output processing (Linux's `do_output_char`) with the cursor column: with
+- Slave writes are bounded per character against `OUTPUT_MAX` (64 KiB; 0 while output is stopped)
+  after `ONLCR` and tab expansion (`processed_len`), then output processing (Linux's
+  `do_output_char`) with the cursor column: with
   `OPOST`, `ONLCR`, `OCRNL`, `ONOCR` (CR at column 0 dropped), `ONLRET`, `OLCUC` (Latin-1
   `toupper`), tab expansion with `XTABS`; control characters take no column, UTF-8 continuation
   bytes none with `IUTF8`. Without `OPOST` bytes pass unchanged and the column is not followed.
@@ -185,7 +201,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Master reads: a pending packet status byte is returned alone; otherwise `TIOCPKT_DATA` (in
   packet mode) plus the output. Once the slave has been opened and all slaves closed, master reads
   return `EIO` after draining and poll reports `POLLHUP`; a never-opened slave does not count, so
-  reads block. `FIONREAD` and `TIOCOUTQ` on the master count the whole output queue.
+  reads block. Master `FIONREAD` counts up to the 4095 data bytes taken by the master's line
+  discipline, excluding packet headers and pending status. `TIOCOUTQ` is zero at either end
+  because a PTY driver has no transmit queue.
 - Packet status (each checked against Linux's recorded traces): `FLUSHREAD`/`FLUSHWRITE` (signal
   characters, slave flushes), `STOP`/`START` (each clears the other; a signal character, `IXANY`
   or clearing `IXON` restarts), `DOSTOP`/`NOSTOP` (when "default ^S/^Q flow" changes), `IOCTL`
@@ -196,15 +214,17 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 - Acquire: the console's session leader gets the console at spawn; a session leader opening an
   unowned slave with read access and without `O_NOCTTY` acquires it (`session`, `fg` = its group);
-  `TIOCSCTTY` (Linux's `tiocsctty`) returns 0 if already the caller's ctty, `EPERM` for
-  non-leaders or callers with a ctty, steals a terminal from another session only with argument 1
+  `TIOCSCTTY` (Linux's `tiocsctty`) returns `EPERM` for non-leaders (even when already their
+  ctty), 0 for a session leader whose ctty it already is, `EPERM` for leaders with another ctty,
+  steals a terminal from another session only with argument 1
   and `CAP_SYS_ADMIN` (clearing that session's links), and otherwise needs read access to the fd
   or `CAP_SYS_ADMIN` (`EPERM`). `CAP_SYS_ADMIN` counts only in the initial user namespace, so a
   sandbox's root cannot steal the terminal it was started on.
-- Foreground: `TIOCSPGRP` needs the caller's ctty (`ENOTTY`, also before a bad pointer is read),
-  passes the background check (an orphaned caller's `EIO` is returned as is), then `EINVAL` for
-  negative values, translates through the pid namespace, `EPERM` unless a group with that id
-  exists in the caller's session (also for 0 and unknown ids); because both ends share one `Tty`,
+- Foreground: `TIOCSPGRP` runs the background check (turning an orphaned caller's `EIO` into
+  `ENOTTY`), reads the argument (`EFAULT` on bad pointer) and rejects negative values (`EINVAL`)
+  before checking that the terminal is the caller's ctty (`ENOTTY`), translates through the pid
+  namespace, returns `ESRCH` for 0 or unknown ids and `EPERM` unless a group with that id exists
+  in the caller's session; because both ends share one `Tty`,
   it works on a master fd only when that terminal is the caller's ctty. `TIOCGPGRP`/`TIOCGSID`
   need the caller's ctty on a slave but answer any holder of the master (a tmux server has no
   ctty), and translate out (0 when invisible; `TIOCGSID` without a session is `ENOTTY`).
@@ -213,7 +233,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   is the caller's ctty and another group is in the foreground; an ignored or blocked signal makes
   reads `EIO` and lets writes proceed; an orphaned group gets `EIO`; otherwise the signal goes to
   the caller's group and the call returns `ERESTARTSYS`. Callers: slave reads, slave writes with
-  `TOSTOP`, termios sets, `TCFLSH`, `TCXONC`, `TCSBRK`/`TCSBRKP` and `TIOCSETD` from the slave
+  `TOSTOP`, termios sets, `TCFLSH`, `TCXONC`, all four break requests and `TIOCSETD` from the slave
   (Linux's `tty_check_change` callers), `TIOCSPGRP`.
 - Signals: line-discipline signals, `TIOCSTI`, `TCXONC` on the master, the host `feed` and
   `TIOCSIG` go to the foreground group; `TIOCSWINSZ` from either side and the host `resize` send
@@ -250,11 +270,14 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   drain, `F` forms flush slave input; signals from input the change lets in are sent; the
   background check runs on the slave only), `TIOCGWINSZ`/`TIOCSWINSZ`, `TCFLSH`, `TCXONC` (slave:
   TCOOFF/TCOON; master: stops input; 2/3 send VSTOP/VSTART, on the master from the slave's
-  termios into the input without a room check), `TCSBRK`/`TCSBRKP` (no-ops after the background
-  check), `TIOCEXCL`/`TIOCNXCL` (no-ops), `TIOCSETD` (argument never read) / `TIOCGETD` (always 0),
-  `FIONREAD`, `TIOCOUTQ`, `TIOCSTI`; other requests are counted as unimplemented paths
-  (`kernel/signal`) and return `ENOTTY` (`TIOCSBRK`, `TIOCCBRK`, `TIOCGEXCL` and `TIOCGDEV` among
-  them).
+  termios into the input without a room check), `TCSBRK`/`TCSBRKP`/`TIOCSBRK`/`TIOCCBRK`
+  (success after the slave-side background check, no break event for `BRKINT` or `IGNBRK`), `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL` (set, clear and query the opened end's exclusive bit),
+  `TIOCSETD` (checks background access first on the slave, then reads an `int` on either end,
+  returning `EFAULT` for an invalid pointer, accepting `N_TTY` (0) as a no-op and returning
+  `EINVAL` for any other value), `TIOCGETD` (always reports `N_TTY`, 0),
+  `FIONREAD`, `TIOCOUTQ`, `TIOCSTI` and `TIOCGDEV` (the slave's encoded 136:index device
+  number, including through the master or `/dev/tty`). Other requests are counted as
+  unimplemented paths (`kernel/signal`) and return `ENOTTY`.
 - `TCFLSH` follows `pty_flush_buffer`: on the slave, TCIFLUSH discards the input (taken or not)
   and TCOFLUSH only output beyond the 4095 bytes the master side has taken, both reported in packet
   mode; on the master, TCIFLUSH discards all unread output and TCOFLUSH the input not taken yet.
@@ -263,8 +286,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   become raw data (a `VEOF` mark a NUL byte, except the host console's end of file, which becomes
   the old `VEOF` character); into canonical mode all queued data becomes one line, readable at
   once, a final NUL taken as its `VEOF`. Clearing `IXON` restarts output stopped by ^S.
-- Defaults match Linux's pts `init_termios` (`tty_std_termios` without `HUPCL`); a control
-  character of 0 is disabled.
+- Defaults match Linux's pts `init_termios`. `HUPCL` starts clear and round-trips in `cflag`.
+  Last-slave close and last-master hangup follow the same rules with either setting. A control
+  character of 0 is disabled in normal input processing.
 
 ### Host console
 
@@ -289,8 +313,13 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   read passwords and Ghostty tests; the app draws a lock for the cursor then), and closes (drop
   the master, hang up
   immediately, so the number is free again at once, lowest-first, for consoles and `/dev/ptmx`).
-  `write_console` keeps feeding input after the attached session has ended and fails with `EIO`
-  only when the input room is 0, which in canonical mode without a complete line never happens.
+  `write_console` and `terminal::feed` check `terminal::ended` (`attached && slaves == 0`) first
+  and fail with `EIO` once the attached session has ended, without feeding input or generating
+  echoes. Console reads drain queued output and then return EOF at that same boundary. Losing
+  the controlling session leaves inherited slave descriptors usable for trailing child output.
+  Android's `vt-waiter` waits for the login process, gives the native pump up to 500 ms to
+  drain, then posts completion. `VtSession.exited` closes the master through `ConsolePty`
+  and wakes the pump even when a background job still holds a slave.
   Host threads take the BKL and wait on the terminal's wake object like guest threads; a panic in
   a console read, write or resize closes the console and returns `EIO`. A kill report names the
   console of the killed process's controlling terminal.
@@ -305,18 +334,23 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   line editor) reads the `VEOF` character instead of Linux's NUL, which the line editor would
   insert into its line and then wait forever. The bridge stops when the console closes, the
   session ends, or the program has exited and no task is left (once output is drained); `run`
-  joins it. Stop signals to `appine-run` reach the program through `Machine::signal`, not the
+  waits for the launched process, kills remaining guests (or shuts down init), then joins the
+  bridge. A background process holding a slave therefore cannot keep the CLI waiting for its
+  natural exit. Stop signals to `appine-run` reach the program through `Machine::signal`, not the
   console.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files` (open by device number, `devpts_beside`, read/write/ioctl dispatch, devpts
-  `nodev`), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
+- `kernel/files` (open by device number, `devpts_beside`, ioctl dispatch, devpts `nodev`),
+  `kernel/fileio` (read/write dispatch), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
   exit releasing the ctty, spawn with `Stdio::Console`), `Bkl::drop` (`hang_up_closed`), the
   machine and JNI/CLI hosts (console API, bridge), the bug reporter (console of a killed process),
   procfs (stat of `/dev/pts/N`, `tty_nr`/`tpgid`).
+
+- The `pty` differential group and the 83 recorded `line-discipline` scenarios compare guest
+  PTY behavior with native Linux.
 
 ### Outbound
 
@@ -334,8 +368,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   terminal on `CLOSED` (or call `hang_up` directly, as console close does).
 - `/dev/tty` opens count as slaves, so they affect `slave_closed` and console end-of-session.
 - `session` and `fg` are bare ids, not references; a ctty link is a strong reference.
-- The output limit is soft: room is measured before `ONLCR` and tab expansion, and `TIOCSTI` on a
-  master ignores it.
+- Slave writes clamp per character after output expansion (`ONLCR`, `XTABS`) so they cannot
+  overshoot `OUTPUT_MAX`, while `TIOCSTI` on a master still ignores the output limit.
 - Input can be taken by the line discipline on a slave read, a termios change or `TIOCSTI`, not
   only on a master write, so those paths must send what `take_signals` returns.
 - A signal character discards all unread output, while Linux discards only what its workqueue has
@@ -351,41 +385,17 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ## Confirmed bugs / technical debt
 
-- **One slave write can overshoot the output limit** by its `ONLCR` and tab expansion (the write is
-  clamped to the room before output processing).
-- **`TIOCSCTTY` returns 0 to a non-leader** whose controlling terminal it is: the "already the
-  caller's ctty" test runs before the session-leader check, where Linux answers `EPERM`.
-- **`TIOCSPGRP` error codes:** `EPERM` instead of `ESRCH` for unknown groups, `ENOTTY` instead of
-  `EINVAL` for negative values (or `EFAULT` for a bad pointer) from a non-ctty caller, `EIO`
-  instead of `ENOTTY` for orphaned callers.
-- **Console input after the session ended is accepted** instead of failing with `EIO` as
-  `write_console`'s comment and the JNI documentation promise; with echo on, its echoes reach the
-  host after the end was reported.
-- **`/dev/tty` cannot be told apart from the slave it opens:** the descriptor is a plain slave end,
-  so fstat reports the pts device (136:N, with the devpts inode and owner) instead of 5:0 (5:1 for
-  `/dev/console`); programs that recognise the controlling-terminal device by its number see a
-  different device than on Linux.
-- **Fidelity gaps:** `IMAXBEL`, break handling, `HUPCL` and `VDISCARD` are not implemented;
-  `TIOCEXCL` is a no-op; `TIOCGETD` is always 0; `TIOCGEXCL` and `TIOCGDEV` are `ENOTTY`;
-  `FIONREAD` and `TIOCOUTQ` on the master count the whole output queue; flow-control characters
-  are not looked ahead in input waiting for room. The line-discipline rules themselves match all
-  83 recorded scenarios of the `line-discipline` differential case.
+- At canonical overflow, Appine preserves the stored line prefix even with `PARMRK`. Linux can
+  overwrite earlier input when a doubled 0xff crosses the end of its circular buffer.
+- Only `N_TTY` (0) is implemented. `TIOCGETD` reports 0 and `TIOCSETD` returns `EINVAL`
+  for every other discipline.
 
 ## Open questions
 
 - Is mapping `/dev/console` to the caller's controlling terminal (rather than a system console)
-  intended, and should an fd opened through `/dev/tty` for a terminal of another devpts instance
-  carry the boot mount?
-- Should a console's end of session be its leader's exit rather than its last slave closing (a
-  background job holding the terminal keeps a tab open)?
+  intended?
 
 ## To verify
 
-- Linux 6.1's `TIOCOUTQ` and `TIOCSBRK`/`TIOCCBRK` results on ptys (believed 0 and success; here
-  the output queue length and `ENOTTY`); whether Linux notifies an edge-triggered slave watcher
-  again for each input batch while an unread line waits, as Appine does.
-- The comparisons with Linux in this map come from knowledge of `tty_io.c`, `tty_jobctrl.c` and
-  `pty.c`, not from a source checkout; of `n_tty.c`, only the special-character order, erasing,
-  output processing and mode switches were checked against 6.1's source. The differential tests
-  `pty` and `line-discipline` (Starnix's 83 recorded scenarios, all compared natively) cover the
-  common paths and the line-discipline rules above.
+- Whether Linux notifies an edge-triggered slave watcher again for each input batch while an
+  unread line waits, as Appine does.

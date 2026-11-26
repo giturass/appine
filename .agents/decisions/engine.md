@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-22 (HEAD = e0719858). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -215,6 +215,14 @@
 - **Tradeoffs**: Trades deterministic white-box single-step interleaving for a stochastic multi-threaded test that runs on every `cargo test` and CI build.
 - **Watch out**: Very rare interleavings may not fire on every single run despite repeated concurrent rounds.
 - **Source**: c8f01dbf
+
+### D30: `struct appine_cpu::dbt_groups` holds eight spill slots before `tlb`
+
+- **What**: Both C `struct appine_cpu::dbt_groups` and Rust `CpuState::dbt_groups` expand from 4 to 8 `uint64_t` slots, shifting `TLB_OFF` from 448 to 480 bytes within the 504-byte `ldp` immediate limit.
+- **Why**: Widening Tier 1 concurrent access grouping from 4 to 8 groups (engine/dbt D5) required four more host-base spill slots before `tlb` without adding extra address arithmetic.
+- **Tradeoffs**: Consumes 32 of the remaining 40 bytes of `ldp` immediate headroom before `struct appine_cpu::tlb`, leaving only 8 bytes before `TLB_OFF` hits the 496/504 limit.
+- **Watch out**: Any future field placed before `tlb` in `struct appine_cpu` will trip the `TLB_OFF + 16 <= 504` static assertion and require relocating cold fields or changing TLB addressing while keeping C and Rust synced via `layout_matches_c`.
+- **Source**: 011b7445
 
 ## Superseded
 

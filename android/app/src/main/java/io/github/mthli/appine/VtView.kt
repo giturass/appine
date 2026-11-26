@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.DialogInterface
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
@@ -35,6 +36,7 @@ import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.TextAttribute
 import android.widget.OverScroller
 import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AlertDialog
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
@@ -81,8 +83,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         /** The grid's size, first known or changed. */
         fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int)
 
-        /** Bytes for the program: keys, text, pastes, mouse and focus events. */
+        /** Bytes for the program: keys, text, pastes and mouse events. */
         fun onInput(data: ByteArray)
+
+        /**
+         * Focus bytes (mode 1004) for a specific [session], so tab switches deliver focus-out to
+         * the outgoing session and focus-in to the incoming session. Defaults to [onInput].
+         */
+        fun onFocus(session: VtSession, data: ByteArray) = onInput(data)
 
         /** Pinch zoom changed the font size (pixels), to keep for next time. */
         fun onZoom(fontPx: Int)
@@ -111,6 +119,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The tab shown, null for none. */
     var session: VtSession? = null
         private set
+
+    /**
+     * Whether this view's window currently has focus, or null before the first
+     * [onWindowFocusChanged] callback (or after detach), and the session that currently holds
+     * terminal focus (mode 1004) in this view.
+     */
+    private var windowFocused: Boolean? = null
+    private var focusedSession: VtSession? = null
+
+    private var pasteQuestion: AlertDialog? = null
 
     /** The shown tab's terminal, 0 when there is none or its shell has not started. */
     private val tab: Long get() = session?.tab ?: 0L
@@ -402,10 +420,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * again, and a selection drag, menu, fling or search of the previous tab ends.
      */
     fun attach(s: VtSession?) {
-        if (s === session) return
+        val previous = session
+        if (s === previous) return
+        if (windowFocused == true && previous != null) clearSessionFocus(previous)
+        pasteQuestion?.dismiss()
+        pasteQuestion = null
         clearResizePreview()
         endSearch()
-        session?.let { if (it.view === this) it.view = null }
+        previous?.let { if (it.view === this) it.view = null }
         menu?.finish()
         if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS || drag == DRAG_POINTER) {
             VtNative.gestureEnd(tab)
@@ -414,11 +436,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         autoscroll = 0
         removeCallbacks(autoscrollTick)
         stopPasswordCheck()
-        if (imePassword) {
-            // The other tab's frames say whether it reads one too
-            imePassword = false
-            restartInput()
-        }
+        // Drop any active composition and password mode when switching or detaching tabs.
+        val hadIme = imePassword || preedit.isNotEmpty()
+        imePassword = false
+        setPreedit("")
+        if (previous != null || hadIme) restartInput()
         hoverCell = -1
         hoverLink = false
         scroller.forceFinished(true)
@@ -428,6 +450,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollOffset = 0
         scrollLen = 0
         dropImages()
+        val hadTerminal = s != null && s.tab != 0L
         session = s
         hasFrame = false
         s?.view = this
@@ -436,6 +459,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             // A tab whose shell has not started yet starts on this grid
             host.onGrid(cols, rows, cellWidth, cellHeight)
         }
+        if (windowFocused == true && s != null) {
+            focusedSession = s
+            if (hadTerminal) sendFocus(s, true)
+        } else {
+            focusedSession = null
+        }
+        updateBlink()
         full = true
         invalidate()
     }
@@ -812,7 +842,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * otherwise no timer runs and the cursor stays shown (hollow without the focus).
      */
     private fun updateBlink() {
-        val blinking = screen.cursorBlinking && screen.cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
+        val blinking = tab != 0L && screen.cursorBlinking && screen.cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
         if (blinking == blinkRunning) return
         blinkRunning = blinking
         removeCallbacks(blinkTick)
@@ -838,16 +868,53 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Focus and visibility ----
 
+    private fun sendFocus(target: VtSession, gained: Boolean) {
+        val t = target.tab
+        if (t == 0L) return
+        VtNative.focus(t, gained)?.takeIf { it.isNotEmpty() }?.let { host.onFocus(target, it) }
+    }
+
+    private fun clearSessionFocus(fallback: VtSession? = session) {
+        val target = focusedSession ?: fallback
+        focusedSession = null
+        if (target != null) sendFocus(target, false)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (windowFocused == null && hasWindowFocus()) {
+            windowFocused = true
+            session?.let {
+                focusedSession = it
+                sendFocus(it, true)
+            }
+        }
+    }
+
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
+        val changed = windowFocused != hasWindowFocus
+        windowFocused = hasWindowFocus
         // A fling not drawn to its end would jump there when the window draws again; a viewport it
         // leaves between rows comes to rest on the nearest (a short scroll that may end unseen)
         if (!hasWindowFocus) {
             scroller.forceFinished(true)
             if (scrollPx != 0) settle()
         }
-        // Focus events (mode 1004): editors reload changed files when they regain focus
-        if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
+        // Focus events (mode 1004): editors reload changed files when they regain focus. Sent
+        // directly so losing or regaining focus does not cancel settle() or jump a scrolled-back
+        // viewport to the bottom.
+        val current = session
+        if (changed) {
+            if (hasWindowFocus) {
+                if (current != null && focusedSession !== current) {
+                    focusedSession = current
+                    sendFocus(current, true)
+                }
+            } else {
+                clearSessionFocus(current)
+            }
+        }
         updateBlink()
         invalidate()
     }
@@ -859,6 +926,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        if (windowFocused == true) clearSessionFocus() else focusedSession = null
+        windowFocused = null
         clearResizePreview()
         // Still counted as attached during this call
         blinkRunning = false
@@ -1105,16 +1174,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
         }
 
-        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
+            deleteSurrounding(beforeLength) { super.deleteSurroundingText(beforeLength, afterLength) }
+
+        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+            deleteSurrounding(beforeLength) { super.deleteSurroundingTextInCodePoints(beforeLength, afterLength) }
+
+        private fun deleteSurrounding(beforeLength: Int, delete: () -> Boolean): Boolean {
             if (editable.isNullOrEmpty()) {
                 repeat(beforeLength) { press(KeyEvent.KEYCODE_DEL) }
                 return true
             }
-            return super.deleteSurroundingText(beforeLength, afterLength)
+            return delete().also { setPreedit(editable?.toString().orEmpty()) }
         }
-
-        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
-            deleteSurroundingText(beforeLength, afterLength)
 
         override fun performEditorAction(editorAction: Int): Boolean {
             press(KeyEvent.KEYCODE_ENTER)
@@ -1176,27 +1248,35 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     private fun paste(text: String) {
         if (Privacy.locked(context)) return
-        if (tab == 0L) return
-        val bytes = VtNative.paste(tab, text, false)
-        if (bytes != null) {
-            input(bytes)
-            return
-        }
+        val target = session ?: return
+        if (target.tab == 0L) return
+        val bytes = VtNative.paste(target.tab, text, false)
+        if (bytes == null) confirmPaste(target, text) else input(bytes)
+    }
+
+    private fun confirmPaste(target: VtSession, text: String) {
+        pasteQuestion?.dismiss()
+        fun canPaste(dialog: DialogInterface) =
+            pasteQuestion === dialog && session === target && target.tab != 0L && !Privacy.locked(context)
+
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
         val dialog = MaterialAlertDialogBuilder(context)
+            .setOnDismissListener { if (pasteQuestion === it) pasteQuestion = null }
             .setTitle(R.string.paste_unsafe_title)
             .setMessage(context.monospaceMessage(R.string.paste_unsafe, preview))
-            .setPositiveButton(R.string.paste_as_is) { _, _ ->
-                if (tab != 0L) input(VtNative.paste(tab, text, true))
+            .setPositiveButton(R.string.paste_as_is) { question, _ ->
+                if (canPaste(question)) input(VtNative.paste(target.tab, text, true))
             }
             .setNegativeButton(android.R.string.cancel, null)
         val trimmed = text.trimEnd('\r', '\n')
         if (trimmed.isNotEmpty() && trimmed.length < text.length &&
-            VtNative.paste(tab, trimmed, false)?.isNotEmpty() == true
+            VtNative.paste(target.tab, trimmed, false)?.isNotEmpty() == true
         ) {
-            dialog.setNeutralButton(R.string.paste_without_trailing_newlines) { _, _ -> paste(trimmed) }
+            dialog.setNeutralButton(R.string.paste_without_trailing_newlines) { question, _ ->
+                if (canPaste(question)) paste(trimmed)
+            }
         }
-        dialog.showPrivate()
+        pasteQuestion = dialog.showPrivate()
     }
 
     // ---- Selection ----

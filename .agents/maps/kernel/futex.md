@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: repoint copy-on-write references to kernel/cow)
+> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: hand over held PI futexes to waiters on execve)
 
 ## Responsibilities
 
@@ -14,7 +14,8 @@
 - futex keys for private, shared anonymous and shared file memory;
 - the futex syscall's commands, argument checks and wake counts, `FUTEX_WAKE_OP`, and
   `futex_waitv`;
-- PI locks without priority inheritance, and handing them on when their owner exits;
+- PI locks without priority inheritance, and handing them on when their owner exits or calls
+  execve;
 - robust lists and `clear_child_tid` wakes at thread exit and execve;
 - the one waiter queue shared by the BKL path and the fast path.
 
@@ -40,7 +41,7 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
 - **Syscalls**: `futex`, `futex_waitv`, `set_robust_list`/`get_robust_list`; `futex` on the fast
   path (`syscall::fast`).
 - **Kernel-internal**: `exit_robust_list` (thread exit and execve), `pi_owners_exited` (thread
-  exit), `Shared::futexes` (the lock and queue).
+  exit and execve), `Shared::futexes` (the lock and queue).
 
 ## Data flow / lifecycle
 
@@ -90,10 +91,12 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
   for LOCK_PI2 unless `FUTEX_CLOCK_REALTIME`) ends it with `ETIMEDOUT`. UNLOCK_PI needs the caller
   to own the word (`EPERM`) and hands it to the first PI waiter (its tid with `FUTEX_WAITERS`,
   `wake_futex_pi`) or clears it. Plain wakes and requeues leave PI waiters alone.
-- When a thread exits (after it leaves the task table), every PI lock with waiters whose owner no
-  longer exists goes to its first waiter with `FUTEX_WAITERS` and `FUTEX_OWNER_DIED`
-  (`exit_pi_state_list`, `fixup_pi_state_owner`), so a robust mutex reports `EOWNERDEAD`; a waiter
-  whose word cannot be written then is skipped until a later exit.
+- When a thread exits (after it leaves the task table) or completes `release_mm` during `execve`
+  (passing `released_tid = Some(tid)`), every PI lock with waiters whose owner no longer exists,
+  is 0 after robust-list `OWNER_DIED` cleanup, or matches `released_tid` goes to its first waiter
+  with `FUTEX_WAITERS` and `FUTEX_OWNER_DIED` (`exit_pi_state_list`, `fixup_pi_state_owner`), so a
+  robust mutex reports `EOWNERDEAD`; a waiter whose word cannot be written then is skipped until a
+  later exit or execve.
 - Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
   share one queue without lost wakeups.
 - On the fast path (the conditions and the deadline hand-over are `kernel/process`'s fast path), a
@@ -106,7 +109,7 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
 
 - The syscall dispatcher and the fast path (`kernel/process`).
 - Thread exit (`kernel/process`: robust list, `clear_child_tid`, `pi_owners_exited`) and execve
-  (`kernel/exec`: robust list, `clear_child_tid`).
+  (`kernel/exec`: robust list, `clear_child_tid`, `pi_owners_exited`).
 
 ### Outbound
 
@@ -127,9 +130,7 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
 
 - **PI futexes are partial:** no priority is inherited (waiters are served first come, first
   served, and owners are not boosted); `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_CMP_REQUEUE_PI` are
-  `ENOSYS` (glibc since 2.25 and musl do not use them); an execve marks robust PI locks the thread
-  holds owner-died with no owner but hands none to its waiters, which sleep until some thread exits
-  or another locker takes and releases the word.
+  `ENOSYS` (glibc since 2.25 and musl do not use them).
 
 ## Open questions
 

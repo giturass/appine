@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-22 (targeted verification only since the full mapping; latest change: gesture ownership and same-draw clearing with the accepted frame background)
+> Maintained: 2026-11-26 (targeted verification of SGR 8 drawing and alternate-screen cursor behavior against libghostty-vt 1.0.0 and a native C harness; the retained same-draw clearing with the accepted frame background was rechecked after the upstream merge)
 
 ## Responsibilities
 
@@ -43,8 +43,10 @@ it does not transfer those lifecycle methods here.
 
 ## Public entry points
 
-- Native: `appine_vt_frame` and `appine_vt_image`, reached through android/vtcore's `VtNative.frame`
-  and `VtNative.image` with its tab lock and JNI buffer/bitmap handling.
+- Native: `appine_vt_render_new`, `appine_vt_render_free`, `appine_vt_frame_begin`,
+  `appine_vt_frame_end` and `appine_vt_image`, reached through android/vtcore's `VtNative.frame`
+  (holding `Tab.render` across both phases and `Tab.term` only during `begin`) and
+  `VtNative.image` (holding `Tab.term`) with its JNI buffer/bitmap handling.
 - `VtFrame`: header accessors, `placement` and `takeRows`; the format is shared with vt.c.
 - `VtScreen`: `resize`, `span`, cell arrays, default colours and cursor state.
 - `VtRenderer`: `setFont`, cell metrics, `resize`, `hasGrid`, `takeRows`, `drawGrid`, `drawCursor`,
@@ -55,16 +57,18 @@ it does not transfer those lifecycle methods here.
 ### Frames and drawing
 
 - `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
-  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, shows the animation
-  frames due (unless a synchronized-output hold is active), updates the render state (likewise),
-  reads the image placements again when their generation changed, catches a running search up
-  with the terminal for at most 4 ms and marks its matches in the viewport, and writes a 64-byte
-  header, the image placements (56 bytes each) and the dirty rows and the rows whose search marks
-  changed since the last frame (all rows when the view asks for a full frame, or when the
-  placements changed while some were or are on the screen) in the format documented in `vt.c`
-  (12-byte row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
-  `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets a header flag, and
-  the view draws again on the next animation frame to go on.
+  (`VtNative.frame`, main thread only) in two phases and applies it: `frame` clears `dirty`, locks
+  `Tab.render`, then locks `Tab.term` only for `appine_vt_frame_begin` (shows animation frames due
+  unless held, runs `ghostty_render_state_begin_update` or hands off `vt->held_state`, reads image
+  placements when their generation changed, catches a running search up for at most 4 ms and marks
+  its viewport matches, and snapshots terminal-owned header metadata into `FrameSnap`). After
+  releasing `Tab.term`, `appine_vt_frame_end` runs under `Tab.render` alone: calls
+  `ghostty_render_state_end_update` to finish deferred style denormalization, writes the 64-byte
+  header, image placements (56 bytes each) and dirty/mark-changed rows (all rows when full or
+  placements changed while some were or are shown) in the format documented in `vt.c` (12-byte row
+  headers, 16-byte cells, a grapheme's extra codepoints after its row), and cleans the render
+  state; the direct `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets
+  a header flag, and the view draws again on the next animation frame to go on.
 - Overscan: while the viewport is scrolled back the render state captures the row after it too,
   the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
   iterator, which is right while nothing above the viewport is asked for), with the same cells,
@@ -90,10 +94,14 @@ it does not transfer those lifecycle methods here.
   which the next frame copies them again from libghostty-vt while the backing bitmap still holds
   the rows painted with them. Pixels that arrive in a frame that does not repaint every row ask
   for a full frame.
-- A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
-  full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
-  rows, cursor and colours come from the capture, and so does the overscan byte, while the
-  header's modes, selection and scroll position are read live.
+- A hold (mode 2026) captures the screen into `vt->held_state` (under `Tab.term` only, never
+  racing with `AppineVtRender`) when it begins; it ends with the program, a resize or a full
+  reset, or by force once a frame is taken more than 1 s after it began. On the first frame while
+  held, `vt->held_state` is moved into `AppineVtRender.state`; if a hold began and ended between
+  frames, `AppineVtRender.state` is rebuilt fresh before `begin_update` so rows whose dirty flags
+  `held_state` consumed are never missed. During a hold the rows, cursor and colours come from the
+  capture, and so does the overscan byte, while the header's modes, selection and scroll position
+  are read live.
 - The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
   reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
   shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
@@ -132,7 +140,8 @@ it does not transfer those lifecycle methods here.
   (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
   (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
   double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
-  invisible hides the glyph but not its decorations; blink is ignored.
+  SGR 8 hides both glyph and decorations. Cell, search and selection backgrounds still draw.
+  Text blink is ignored.
 - The cursor (bar and underline two light lines thick, block with the glyph redrawn in the
   background colour, underline, hollow; a block is drawn hollow while the view lacks focus; all
   but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
@@ -190,11 +199,15 @@ it does not transfer those lifecycle methods here.
 
 ## Invariants and gotchas
 
-- A cursor shape set while a full-screen program shows the alternate screen reaches only that
-  screen: libghostty-vt keeps the shape per screen, and leaving the alternate screen with mode 1049
-  restores no shape (its saved cursor carries none), so the primary keeps the old one until the
-  next DECSCUSR 0, DECSTR, RIS or setting change; leaving with mode 47 or 1047 copies the whole
-  cursor, shape included, back (from libghostty-vt's source, not tried).
+- libghostty-vt 1.0.0 stores the concrete cursor shape per screen. DECSCUSR on the alternate
+  screen carries its shape back through modes 47 and 1047, which copy the cursor in both
+  directions. Mode 1049 copies on entry and restores a saved cursor without a shape on exit,
+  leaving the primary shape intact. Blink mode and the flag that selects default or explicit
+  appearance are terminal-wide. Desktop Ghostty uses the same code. xterm uses one shape across
+  both buffers, including mode 1049.
+- Settings always updates the stored defaults. While following defaults, only the active shape
+  changes immediately, along with the global blink mode. With an explicit DECSCUSR appearance,
+  both new defaults wait for DECSCUSR 0, DECSTR or RIS.
 - The frame format is defined in `vt.c` and read by `VtFrame`; the two change together.
 - The render state's source rectangles are whole image pixels, so a virtual placement's rows,
   drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
@@ -207,38 +220,39 @@ it does not transfer those lifecycle methods here.
   them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
   ones fail for a match that starts above the viewport), and resends a row whose marks differ from
   the last frame's, since the render state does not count them as a change.
-- Capture and consume frames on the main thread. android/vtcore holds the tab lock during native
-  capture; the direct buffer remains valid until the next frame call, so it is read after unlocking.
+- Capture and consume frames on the main thread. android/vtcore holds `Tab.render` across both
+  phases and `Tab.term` only during `appine_vt_frame_begin`; the direct buffer remains valid until
+  the next frame call, so it is read after unlocking.
 - `VtView` remains the owner of full-frame requests and repaint scheduling. Changing the frame
   format or its view consumers requires checking this map, `android/vtview` and
   `android/vtgestures`; search queries, selection and scrolling use the same terminal state
   through `android/vtcore`'s lock.
+- Each screen of each tab keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and while a
+  tab is shown the view holds a second copy of those placed on its screen (dropped on tab switch or
+  window hide). `android/service` trims non-current tabs down to 4 MiB a screen via
+  `VtNative.dropImages` (after 60 s with the UI hidden, after 60 s unseen or beyond 2 recently left
+  background tabs while switching, on periodic saves for already-trimmed unseen tabs, and under
+  system memory pressure); a tab restored from a snapshot saved before trimming gets its pre-trim
+  images back (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though
+  a comment in its `snapshot/terminal.zig` says otherwise), while one restored from its plain
+  transcript has text only.
 
 ## Confirmed bugs / technical debt
 
+- Changing cursor Settings on the alternate screen can leave the primary screen showing its
+  previous default shape after mode 1049 exits. The C API exposes neither an inactive-screen
+  shape setter nor per-screen default ownership. Reapplying defaults on exit could overwrite
+  a primary shape chosen by a program.
+
 - **libghostty-vt's drawing features left unused**: the default palette option (the colour scheme
-  reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`; the two-phase render update: `frame` holds the tab's
-  lock while it encodes every row (about 95% of its time on a macOS build), where only
-  libghostty-vt's deferred style work would leave it, and taking the encoding out would need the
-  render state kept apart from the terminal's lock; `ghostty_render_state_row_cells_get_multi`
-  in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
-  the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
-  and luminance), of use only with themes.
-- **libghostty-vt's images are trimmed only under pressure before Android 14**: each screen of
-  each tab keeps up to 32 MiB of decoded Kitty images, and while a tab is shown the view holds a
-  second copy of those placed on its screen (dropped while the window is hidden). Only the
-  `RUNNING_LOW` and higher trim levels, which Android 14 and later no longer send, cut the tabs
-  not shown down to 4 MiB a screen (android/vtcore), deleting the oldest images outright; the routine
-  trim after the UI leaves keeps them all. A tab restored from its snapshot gets its images back
-  (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though a comment
-  in its `snapshot/terminal.zig` says otherwise); one restored from its plain transcript has text
-  only.
+  reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`;
+  `ghostty_render_state_row_cells_get_multi` in place of the four to six reads `frame` makes per
+  cell (it stops at the first failing key, so the colours would go last; gain unmeasured); the
+  colour utilities (`palette_generate`, contrast and luminance), of use only with themes.
 
 ## Open questions
 
 - Should a Nerd Font or a CJK fallback font be bundled?
-- Should invisible cells keep their decorations (as now) or hide them as Ghostty's renderer does?
-- Should a cursor shape changed while a full-screen program shows reach the primary screen too?
 
 ## To verify
 

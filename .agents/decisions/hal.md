@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-21 (HEAD = 125f3d00). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-23 (HEAD = cc72b093). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -140,6 +140,14 @@
 - **Tradeoffs**: One function per such option.
 - **Watch out**: The Android build takes `SO_GET_FILTER` from bionic's libc and is checked only by CI.
 - **Source**: c65da9d
+
+### D21: Non-destructive `madvise` hints go through `appine_hal::advise`
+
+- **What**: `core/hal/src/lib.rs` exposes an `unsafe appine_hal::advise(ptr, len, advice)` wrapper returning raw host errnos for non-destructive host-page-aligned `madvise(2)` hints (kernel/mm D49).
+- **Why**: Forwarding guest readahead and access-pattern hints needed a single HAL boundary distinct from the destructive `discard` and `remove` helpers.
+- **Tradeoffs**: Callers enforce host-page alignment and non-destructive advice values rather than relying on per-hint enum wrappers.
+- **Watch out**: Passing destructive advice through `advise` would bypass `discard`/`remove` edge-zeroing and copy-on-write invariants.
+- **Source**: d0945a96
 
 ## Superseded
 

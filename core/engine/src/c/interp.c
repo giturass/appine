@@ -98,12 +98,6 @@ static inline enum appine_exit next(cpu_t *c)
     return APPINE_EXIT_NONE;
 }
 
-static inline enum appine_exit undef(cpu_t *c, uint32_t insn)
-{
-    c->exit_info = insn;
-    return APPINE_EXIT_UNDEF;
-}
-
 /* SP-based accesses require SP to be 16-byte aligned (Linux enables SCTLR_EL1.SA0) */
 static inline bool sp_aligned(cpu_t *c, unsigned rn, uint32_t access)
 {
@@ -754,14 +748,15 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
             c->fpcr = rx(c, rt) & fpcr_write_mask();
         return next(c);
     }
-    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC: exception return clears the exclusive mark */
+    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC */
         c->exit_info = FIELD(insn, 20, 5);
-        c->excl_size = 0;
         c->pc += 4;
+        clear_exclusive(c);
         return APPINE_EXIT_SVC;
     }
     if ((insn & 0xffe0001f) == 0xd4200000) { /* BRK */
         c->exit_info = FIELD(insn, 20, 5);
+        clear_exclusive(c);
         return APPINE_EXIT_BRK;
     }
     /* HINT: NOP, YIELD and the PAC/BTI family are all treated as NOP (the engine map) */
