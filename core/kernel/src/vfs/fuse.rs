@@ -543,6 +543,10 @@ impl Drop for BgWriteback {
     }
 }
 
+/// A periodic background writeback whose WRITE was answered, with the reply, as handed to
+/// [`finish_bg_writeback`].
+type AnsweredWriteback = (BgWriteback, Result<Vec<u8>, Errno>);
+
 /// One request (Linux's `struct fuse_req`).
 struct Req {
     /// The whole message, header included.
@@ -868,7 +872,7 @@ impl Conn {
         &mut self,
         unique: u64,
         reply: Result<Vec<u8>, Errno>,
-    ) -> (bool, Option<(BgWriteback, Result<Vec<u8>, Errno>)>) {
+    ) -> (bool, Option<AnsweredWriteback>) {
         let (opcode, background) = match self.requests.get(&unique) {
             Some(r) if matches!(r.state, ReqState::Sent) => (
                 u32::from_le_bytes(r.message[4..8].try_into().unwrap()),
